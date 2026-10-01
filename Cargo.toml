@@ -2,6 +2,27 @@
 name = "powerqueue"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Turn Linear tickets into Claude Code sessions: one git worktree and tmux window per task, with usage learning, crash recovery and model-budget pacing"
+license = "MIT"
+repository = "https://github.com/edgar/powerqueue"
+homepage = "https://github.com/edgar/powerqueue"
+documentation = "https://github.com/edgar/powerqueue#readme"
+readme = "README.md"
+keywords = ["claude", "linear", "tmux", "agent", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [".github/", ".claude/", "docs/reference/", "justfile"]
+
+[[bin]]
+name = "powerqueue"
+path = "src/main.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+# panic stays "unwind": the dashboard installs a panic hook that restores the
+# terminal before the message is printed.
 
 [dependencies]
 anyhow = "1.0.104"

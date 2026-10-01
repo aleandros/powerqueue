@@ -1,0 +1,37 @@
+name: Feature request
+description: Propose a change or an addition.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that powerqueue makes hard or impossible today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: How could it work? Config keys, commands, PRIORITY.md syntax, dashboard changes.
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried or other designs that would also solve it.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - linear / priority / jev
+        - runtime (tmux, worktrees, sessions)
+        - budget / scheduler
+        - dashboard / doctor / cli
+        - docs
+        - other

@@ -1,0 +1,233 @@
+# Architecture
+
+This expands [AGENTS.md](../AGENTS.md). The code is the source of truth; this
+document explains how the pieces fit and why they look the way they do.
+
+## Module map
+
+```text
+src/
+  main.rs            parse CLI, dispatch, exit code
+  lib.rs             module tree; VERSION, APP_NAME
+  domain.rs          plain data: Task, Session, TokenUsage, ModelTier, Criticality,
+                     TaskState (+ transitions), SessionState, Event, DaemonCommand, HookEvent
+  config.rs          config.toml + .powerqueue.toml; defaults; validate()
+  paths.rs           XDG dirs; POWERQUEUE_HOME; per-task dirs; lock/pid
+  secrets.rs         env → keychain → 0600 file
+  logging.rs         tracing: stderr + rotating JSON file
+  store/             SQLite (rusqlite, WAL); schema.sql; all queries
+  linear/            GraphQL client; issue → task sync
+  priority/          PRIORITY.md parser/evaluator; file watcher
+  jev.rs             Jev "score" client (optional)
+  budget/            period clock, ledger, estimator, policy
+  worktree.rs        git worktree ops (shell out to git)
+  tmux.rs            tmux ops (shell out to tmux)
+  session/           launcher (prompt, hooks, launch.sh), hook interpretation,
+                     transcript tailing, liveness + resource probes
+  scheduler/         Daemon (tick loop), pick_next, cleanup_task
+  hook.rs            `powerqueue hook` entry (called by Claude Code)
+  dashboard/         ratatui TUI: Snapshot (data) / ui (render)
+  doctor.rs          checks + fix hints
+  cli/               clap definitions (mod.rs), Context, output helpers, one file per command
+```
+
+Dependency direction: `cli` and `scheduler` orchestrate; `budget`, `priority`,
+`linear`, `session` depend on `domain`, `config`, `store`; `domain` depends on
+nothing in the crate. `tmux.rs` and `worktree.rs` know nothing about tasks.
+
+## Data flow
+
+```text
+                 ┌──────────────┐  fetch_issues   ┌───────────────┐
+   Linear API ◀──┤ linear::sync ├────────────────▶│  tasks table  │◀── powerqueue add
+                 └──────────────┘                 └──────┬────────┘
+                                                         │ evaluate (PRIORITY.md, Jev)
+                                                         ▼
+                                                  score, criticality, model pref
+                                                         │ pick_next
+                                                         ▼
+   Policy::decide ◀── Ledger (usage table) ◀── Estimator (task_usage_summaries)
+         │ model or retry_at
+         ▼
+   worktree::Repo::add_worktree ─▶ session::Launcher::prepare/launch ─▶ tmux new-window
+                                                         │
+             ┌───────────────────────────────────────────┤
+             ▼                                           ▼
+   Claude Code hooks ─▶ powerqueue hook ─▶ hook_events   transcript .jsonl ─▶ usage table
+             │                                           │
+             └──────────────── daemon tick drains both ──┘
+                                     │
+                                     ▼
+          state transitions ─▶ events table ─▶ task show / dashboard / logs --events
+                                     │
+                                     ▼ completed
+                      cleanup_task: push, remove worktree, kill window, Linear update
+```
+
+## Storage
+
+One SQLite file, `<data>/powerqueue.db`, in WAL mode. The daemon holds one
+connection behind a mutex; the CLI and dashboard open their own read
+connections. Timestamps are RFC 3339 UTC strings so they sort as text.
+
+| Table | Written by | Read by |
+|-------|------------|---------|
+| `tasks` | `linear::sync` (create/update/cancel), `add`, scheduler (state, attempts, model, worktree, branch, not_before, summary), `priority` re-score (score, criticality, reasons), `task *` commands via `commands` | everything |
+| `sessions` | `Launcher::launch` (insert), scheduler probes and hook drain (state, pid, pane, transcript_path, exit_code, last_activity_at) | scheduler, `task show`, dashboard, `attach`, `task output` |
+| `usage` | scheduler from `TranscriptReader::read_new` (one row per `message_id`; duplicates ignored) | `Ledger::load` (per tier, period/window), `Estimator` via `task_usage_summaries`, `task show`, dashboard |
+| `resource_samples` | scheduler every `resource_sample_secs` (CPU%, RSS, process count per session) | dashboard, `task show`; pruned by age |
+| `events` | `store.log_event` on every state change, hook, crash, cleanup, error | `task show`, `logs --events`, dashboard, `doctor` (crash/idle/throttle rates by `kind`) |
+| `commands` | `task pause/resume/cancel/retry/model`, `stop`, dashboard keys (`DaemonCommand` as JSON) | daemon `drain_commands` at the start of each tick (marks `consumed_at`) |
+| `hook_events` | `powerqueue hook` (raw stdin JSON + event name) | daemon `drain_hook_events`; `task show` (`hook_events_for_task`) |
+| `kv` | daemon heartbeat (`daemon.heartbeat` = pid + time), budget calibration (`budget.calibration`), rate-limit cooldowns (`budget.rate_limits`), estimator state | `doctor`, dashboard header, `budget show`, policy |
+| `jev_scores` | priority re-score when Jev is enabled (keyed by task, with content hash) | priority re-score (cache hit unless the hash changed) |
+
+The schema is applied idempotently and versioned with `PRAGMA user_version`.
+Foreign keys are on; deleting a task cascades to its sessions.
+
+## State machines
+
+### TaskState
+
+From `TaskState::can_transition_to` in `domain.rs`. A state may always
+transition to itself.
+
+| from \ to | queued | starting | running | idle | crashed | throttled | paused | needs_attention | completed | failed | cancelled |
+|-----------|:------:|:--------:|:-------:|:----:|:-------:|:---------:|:------:|:---------------:|:---------:|:------:|:---------:|
+| queued | | ✓ | | | | ✓ | ✓ | | | | ✓ |
+| starting | ✓ | | ✓ | | ✓ | | | | | ✓ | ✓ |
+| running | | | | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| idle | | | ✓ | | ✓ | | ✓ | ✓ | ✓ | ✓ | ✓ |
+| crashed | ✓ | ✓ | | | | ✓ | ✓ | | | ✓ | ✓ |
+| throttled | ✓ | ✓ | | | | | ✓ | | | | ✓ |
+| paused | ✓ | | | | | | | | | | ✓ |
+| needs_attention | | | ✓ | ✓ | ✓ | | ✓ | | ✓ | ✓ | ✓ |
+| completed | ✓ | | | | | | | | | | |
+| failed | ✓ | | | | | | | | | | |
+| cancelled | ✓ | | | | | | | | | | |
+
+```mermaid
+stateDiagram-v2
+    [*] --> queued
+    queued --> starting: slot + model
+    queued --> throttled: no eligible tier
+    queued --> paused: task pause
+    starting --> running: SessionStart hook
+    starting --> crashed: launch failed
+    starting --> queued: setup aborted
+    running --> idle: Stop without marker
+    running --> needs_attention: BLOCKED / question / permission prompt
+    running --> completed: DONE / task complete
+    running --> crashed: pane died
+    running --> throttled: StopFailure rate_limit
+    idle --> running: nudge / task send
+    idle --> needs_attention: idle_timeout
+    crashed --> starting: backoff elapsed (resume)
+    crashed --> failed: max_attempts
+    throttled --> queued: retry_at reached
+    paused --> queued: task resume
+    needs_attention --> running: task resume
+    completed --> queued: task retry
+    failed --> queued: task retry
+    cancelled --> queued: task retry
+    queued --> cancelled
+    running --> cancelled
+```
+
+Helper predicates: `is_terminal` (completed, failed, cancelled),
+`has_live_session` (starting, running, idle, needs_attention),
+`is_schedulable` (queued, crashed, throttled).
+
+### SessionState
+
+One session is one attempt. `launching → running → idle ↔ running → exited |
+crashed | killed`. `is_live` is true for launching, running and idle. A new
+attempt after a crash is a new `Session` row with the same Claude session id
+(so `--resume` works) and `attempt + 1`.
+
+## The daemon tick
+
+`Daemon::run` acquires `<state>/daemon.lock` (fd-lock), writes `daemon.pid`,
+then loops `tick().await` followed by a sleep of `scheduler.tick_secs`, writing
+a heartbeat to `kv` each tick. `run --once` performs one tick. SIGINT/SIGTERM
+or a `Shutdown` command ends the loop; sessions keep running in tmux.
+
+Each tick, in order (`scheduler/mod.rs`):
+
+1. drain `commands` (pause, resume, cancel, retry, set model, sync now, reload, shutdown);
+2. reload `PRIORITY.md` if the watcher flagged a change; re-score open tasks;
+3. poll Linear when `poll_interval_secs` has elapsed; `sync_issues` creates,
+   updates and cancels tasks (running tasks are never cancelled by sync);
+4. drain `hook_events` and read new transcript lines for live sessions;
+   update session and task state (`interpret_hook` maps payloads to outcomes);
+5. probe tmux panes: a dead pane without completion ⇒ `crashed`, set
+   `not_before` from `backoff_for_attempt`, next launch uses `--resume`;
+6. detect stale (`stale_session_secs`) and idle (`idle_timeout_secs`)
+   sessions: nudge once with `tmux send-keys`, then `needs_attention`;
+7. finish completed and failed tasks with `cleanup_task`; update Linear state
+   and post a comment;
+8. while `running + starting < max_concurrent`: `pick_next`, `Policy::decide`,
+   create the worktree, run setup, `Launcher::prepare` + `launch`.
+
+Every transition goes through `store.log_event` so `task show` replays the
+story.
+
+## IPC through SQLite
+
+There is no socket, no HTTP, no signals beyond stop. Two tables are the bus:
+
+- **`commands`**: CLI and dashboard insert a JSON `DaemonCommand`; the daemon
+  consumes them in id order at the start of a tick and marks `consumed_at`.
+  Commands are durable: a `task cancel` issued while the daemon is down is
+  applied when it starts.
+- **`hook_events`**: `powerqueue hook` (spawned by Claude Code, possibly
+  several times a second) appends the raw payload and exits 0 immediately.
+  The daemon drains them in order. For a `Stop` with the done/blocked marker
+  the hook also flips the task state right away so the dashboard does not
+  wait for the next tick.
+
+The cost is latency of up to one tick (5 s). The benefit is that every writer
+is a short-lived process with no connection to manage, and every reader can
+replay history.
+
+## Why these decisions
+
+**Shell out to git and tmux.** No libgit2 or tmux control-mode client. The
+binary stays small, behaves exactly like the user's git (hooks, config,
+credential helpers, SSH agent), and errors carry the tool's own stderr. tmux
+is the user's terminal multiplexer anyway; using its CLI means `attach` is
+`tmux select-window`.
+
+**SQLite in WAL mode instead of a socket server.** One file holds state,
+history, the command bus and the hook inbox. The CLI works whether or not the
+daemon runs, the dashboard reads concurrently, `doctor` can inspect
+everything, and crash recovery is a matter of reading tables on start. A
+socket server would need its own protocol, versioning and a running process
+to answer `status`.
+
+**Interactive Claude sessions instead of `claude -p`.** Print mode is
+simpler to drive but nobody can step in. Interactive sessions in tmux let a
+human `attach`, answer a permission prompt or a question, type a
+correction, and leave again, while the daemon keeps tracking the session
+through hooks. The price is that permission prompts block, which is why the
+default permission mode is `acceptEdits` and why the `Notification` hook is
+wired.
+
+**Hooks instead of output parsing.** Claude Code's hook events deliver
+structured JSON (`last_assistant_message`, `error_type`, `transcript_path`,
+`notification_type`) at the moments that matter. Scraping the pane would be
+fragile across UI changes and could not distinguish a rate limit from a
+crash. The transcript JSONL is read only for token usage, where it is the
+authoritative source, and pane capture is kept for humans (`task output`).
+
+**Markdown for rules.** `PRIORITY.md` can be edited in any editor, reviewed
+in a pull request, and read by the agent itself. Live reload makes the edit
+loop immediate.
+
+**Weighted tokens, not dollars.** Subscriptions are capped in usage, not
+spend, and the cap is unpublished. Pacing on a weighted token model with user
+calibration (`budget set-observed`) and rate-limit signals is the most honest
+approximation available.
+
+**XDG paths and `POWERQUEUE_HOME`.** Short, predictable paths that show well
+in diagnostics; a single variable isolates test and parallel instances.

@@ -1,0 +1,60 @@
+name: Bug report
+description: Something does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Run `powerqueue doctor` first; it often names the fix.
+        Remove API keys and anything private before pasting output.
+
+  - type: input
+    id: version
+    attributes:
+      label: powerqueue version
+      description: Output of `powerqueue --version`.
+      placeholder: powerqueue 0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS and version, `tmux -V`, `claude --version`.
+      placeholder: macOS 15.1, tmux 3.5a, Claude Code 2.1.287
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you saw.
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: powerqueue doctor --json
+      description: Paste the output of `powerqueue doctor --offline --json`.
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and task details
+      description: |
+        Relevant lines from `powerqueue logs -n 200` and, for a task problem,
+        `powerqueue task show <task> --json`.
+      render: text
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: Relevant parts of `powerqueue config show` and `.powerqueue.toml`.
+      render: toml
