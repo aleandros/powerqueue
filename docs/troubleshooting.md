@@ -204,6 +204,35 @@ git -C <repo> worktree list
 - Orphans (no open task references them): `powerqueue doctor --fix` removes
   the clean, pushed ones and lists the rest.
 
+## I want to start over
+
+**Symptom**: a bad first run left tasks, worktrees and tmux windows you
+would rather forget.
+
+```sh
+powerqueue reset --dry-run        # shows exactly what would go
+powerqueue reset                  # asks, then does it (-y skips the prompt)
+```
+
+`reset` stops the daemon if it is running (or tells you to `powerqueue stop`
+when it will not go), kills the task windows and the `powerqueue` tmux
+session, removes every task worktree and stray directory under the worktree
+root, deletes `state/tasks/*` and empties every table of the database. It
+never touches `config.toml`, secrets, `PRIORITY.md` or the logs, and nothing
+outside the worktree root, the task state directory and the database is
+deleted.
+
+- Worktrees with uncommitted changes or unpushed commits are **kept and
+  listed** with the reason; `--force` removes them anyway.
+- Local `pq/*` branches stay unless you pass `--delete-branches` (the default
+  branch and anything not matching `repo.branch_template` are always kept;
+  remote branches are never deleted).
+- Budget calibration, rate-limit cooldowns and probe results (the `kv` table)
+  survive so pacing keeps its learning; `--everything` clears them too.
+- Linear issues are left as they are; `--revert-linear` moves the issues of
+  open tasks back to the first `linear.queued_states` entry (needs the Linear
+  key; failures are reported per issue).
+
 ## Keys not found
 
 **Symptom**: `Linear API key not configured`, or `secrets list` shows nothing

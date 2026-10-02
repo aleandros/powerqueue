@@ -1056,6 +1056,84 @@ impl Store {
             None => false,
         })
     }
+
+    // ----------------------------------------------------------------- reset
+
+    /// Row counts of every table [`Store::reset`] would empty (`kv` included,
+    /// whether or not it will be wiped), without changing anything.
+    pub fn reset_counts(&self) -> Result<ResetCounts> {
+        let conn = self.lock();
+        let count = |table: &str| -> Result<u64> {
+            let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+            Ok(n as u64)
+        };
+        Ok(ResetCounts {
+            tasks: count("tasks")?,
+            sessions: count("sessions")?,
+            usage: count("usage")?,
+            resource_samples: count("resource_samples")?,
+            events: count("events")?,
+            commands: count("commands")?,
+            hook_events: count("hook_events")?,
+            jev_scores: count("jev_scores")?,
+            kv: count("kv")?,
+        })
+    }
+
+    /// Delete every row from `tasks` (sessions cascade), `sessions`, `usage`,
+    /// `resource_samples`, `events`, `commands`, `hook_events` and
+    /// `jev_scores` in one transaction; with `everything` also `kv` (budget
+    /// calibration, cooldowns, probe results, the daemon heartbeat).
+    /// Returns how many rows each table held. The schema and its version are
+    /// untouched; a `VACUUM` afterwards is best effort.
+    pub fn reset(&self, everything: bool) -> Result<ResetCounts> {
+        let counts = self.reset_counts()?;
+        {
+            let mut conn = self.lock();
+            let tx = conn.transaction().context("begin reset transaction")?;
+            for table in ["tasks", "sessions", "usage", "resource_samples", "events", "commands", "hook_events", "jev_scores"] {
+                tx.execute(&format!("DELETE FROM {table}"), []).with_context(|| format!("empty table {table}"))?;
+            }
+            if everything {
+                tx.execute("DELETE FROM kv", []).context("empty table kv")?;
+            }
+            tx.commit().context("commit reset transaction")?;
+        }
+        if let Err(e) = self.lock().execute_batch("VACUUM") {
+            tracing::warn!(error = %e, "VACUUM after reset failed (database is still consistent)");
+        }
+        Ok(ResetCounts { kv: if everything { counts.kv } else { 0 }, ..counts })
+    }
+}
+
+/// Rows per table counted or removed by [`Store::reset`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct ResetCounts {
+    pub tasks: u64,
+    pub sessions: u64,
+    pub usage: u64,
+    pub resource_samples: u64,
+    pub events: u64,
+    pub commands: u64,
+    pub hook_events: u64,
+    pub jev_scores: u64,
+    /// Rows in `kv`; after [`Store::reset`] this is 0 unless `everything` was set.
+    pub kv: u64,
+}
+
+impl ResetCounts {
+    /// Sum of every table.
+    pub fn total(&self) -> u64 {
+        self.tasks
+            + self.sessions
+            + self.usage
+            + self.resource_samples
+            + self.events
+            + self.commands
+            + self.hook_events
+            + self.jev_scores
+            + self.kv
+    }
 }
 
 /// A hook event waiting for the daemon.
@@ -1261,6 +1339,32 @@ mod tests {
         let c = store.counts().unwrap();
         assert_eq!((c.queued, c.running, c.completed), (1, 1, 1));
         assert_eq!(store.list_open_tasks().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn reset_empties_tables_and_keeps_kv_unless_everything() {
+        let store = Store::open_in_memory().unwrap();
+        let t = linear_task("R-1");
+        store.insert_task(&t).unwrap();
+        store.log_event(Some(t.id), None, EventLevel::Info, "x", "y", serde_json::json!({})).unwrap();
+        store.enqueue_command(&DaemonCommand::SyncNow).unwrap();
+        store.kv_set("budget.calibration.claude", &serde_json::json!({ "observed_fraction": 0.5 })).unwrap();
+        let before = store.reset_counts().unwrap();
+        assert_eq!((before.tasks, before.events, before.commands, before.kv), (1, 1, 1, 1));
+
+        let removed = store.reset(false).unwrap();
+        assert_eq!((removed.tasks, removed.events, removed.commands, removed.kv), (1, 1, 1, 0));
+        assert!(store.list_tasks().unwrap().is_empty());
+        assert!(store.recent_events(10).unwrap().is_empty());
+        assert!(store.drain_commands().unwrap().is_empty());
+        assert!(store.kv_get::<serde_json::Value>("budget.calibration.claude").unwrap().is_some(), "kv survives");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+
+        let removed = store.reset(true).unwrap();
+        assert_eq!(removed.kv, 1);
+        assert!(store.kv_get::<serde_json::Value>("budget.calibration.claude").unwrap().is_none());
+        assert_eq!(store.reset_counts().unwrap().total(), 0);
+        assert_eq!(store.integrity_check().unwrap(), "ok");
     }
 
     /// The v1 schema as `powerqueue` 0.1.0 created it (no `agent_session_id`,

@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   10 when a newer release exists; `--json` prints `current`, `latest`,
   `updated` and `path`. `GITHUB_TOKEN`, `POWERQUEUE_UPDATE_API` and
   `POWERQUEUE_UPDATE_TARGET` are honoured.
+- `powerqueue reset`: start over after a bad run. Stops the daemon, kills the
+  task windows and the tmux session, removes task worktrees and stray
+  directories under the worktree root (dirty or unpushed worktrees are kept
+  and reported unless `--force`), deletes the per-task state directories and
+  empties the database while keeping config, secrets, `PRIORITY.md` and logs.
+  `--dry-run` prints the plan (`--json` supported), `-y` skips the prompt,
+  `--delete-branches` also deletes the local `pq/*` branches, `--everything`
+  also clears the `kv` table (budget calibration, cooldowns, probe results),
+  `--revert-linear` moves the open tasks' Linear issues back to the first
+  `linear.queued_states` entry. `Store::reset` backs it.
 
 ### Fixed
 
