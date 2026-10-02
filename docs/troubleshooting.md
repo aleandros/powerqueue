@@ -150,7 +150,7 @@ Fixes:
 - No `period_anchor`: `budget set-reset <time from /usage>`. Without it the
   period boundary is a guess.
 - Spend looks too high compared with `/usage`: `budget set-observed 43%`
-  corrects the offset; or raise `budget.period_weighted_tokens` /
+  corrects the offset; or raise `budget.providers.claude.period_weighted_tokens` /
   `window_weighted_tokens`.
 - A tier is on cooldown after a rate limit: wait, or
   `budget clear-limits` once `/usage` confirms the window reset.
@@ -230,7 +230,7 @@ Precedence is environment (`LINEAR_API_KEY`, `JEV_API_KEY`) → keychain → fil
 **Symptom**: `budget.rate_limited` events (`<tier> reported rate_limit;
 cooling down until ...`), tasks `throttled`.
 
-The tier goes on cooldown for `budget.rate_limit_cooldown_mins` (never past
+The tier goes on cooldown for `budget.providers.<provider>.rate_limit_cooldown_mins` (never past
 the period end) and the task is throttled; if its session is still alive when
 the cooldown passes it resumes as `running`. This is expected; it means the
 subscription window is full. Check `/usage` inside Claude Code, run

@@ -18,8 +18,8 @@ that explains what is wrong and how to tune the algorithm.
 src/
   main.rs            thin entry point
   lib.rs             module tree + crate docs
-  domain.rs          core types (Task, Session, TokenUsage, ModelTier, ...)
-  config.rs          config.toml + per-repo .powerqueue.toml
+  domain.rs          core types (Task, Session, TokenUsage, Provider, ModelTier (string-backed, provider inferred), ...)
+  config.rs          config.toml + per-repo .powerqueue.toml; per-provider budgets, legacy key migration
   paths.rs           XDG directories; POWERQUEUE_HOME override
   secrets.rs         keychain (keyring) with 0600-file fallback; env wins
   logging.rs         tracing: stderr + rotating JSON file
@@ -27,10 +27,10 @@ src/
   linear/            GraphQL client + issue→task sync
   priority/          PRIORITY.md parser/evaluator + live reload
   jev.rs             TypeSafe Jev "score" client (optional scoring)
-  budget/            period clock, ledger, cost estimator, model policy
+  budget/            period clock, ledger (one per provider: Ledgers), probe.rs (observed usage + UsageProbe), cost estimator, model policy
   worktree.rs        git worktree ops (shell out to git)
   tmux.rs            tmux ops (shell out to tmux)
-  session/           launcher (prompt, hooks, launch.sh), transcript tailing, probes
+  session/           agent.rs (AgentCli trait: ClaudeCli, CodexCli/GeminiCli stubs), launcher (prompt, launch.sh), transcript tailing, probes
   scheduler/         daemon loop (daemon.rs), pure transitions (transitions.rs), pick_next + cleanup (lifecycle.rs)
   hook.rs            `powerqueue hook` (called by Claude Code hooks)
   dashboard/         ratatui TUI
@@ -47,7 +47,7 @@ docs/                user docs (priority grammar, budget algorithm, troubleshoot
 2. `priority::PriorityRules::evaluate` sets `criticality`, `score`, an optional *preferred* model, `skip` (→ `paused`).
 3. `scheduler` picks the best task (`pick_next`), asks `budget::Policy::decide` for a model (or a `retry_at` when throttled). `task.model_override` (CLI only) and the rules' model are both preferences the policy may downgrade.
 4. `worktree::Repo::add_worktree` creates `<worktree_root>/<slug>` on branch `pq/<slug>`; `repo.setup` commands run.
-5. `session::Launcher::prepare` writes `<state>/tasks/<id>/{prompt.md,settings.json,launch.sh,env}`; `launch` opens a tmux window running `launch.sh`.
+5. `session::Launcher::prepare` writes `<state>/tasks/<id>/{prompt.md,launch.sh,env}` plus whatever `session::agent_for(model.provider()).prepare` asks for (`settings.json` for Claude); `launch` runs the provider's `pre_launch` and opens a tmux window running `launch.sh`.
 6. Claude Code hooks (`SessionStart`, `Stop`, `StopFailure`, `SessionEnd`, `Notification`, ...) call `powerqueue hook`, which stores the payload in `hook_events`.
 7. The daemon drains hook events + tails the transcript JSONL for usage (dedupe by `message.id`), samples CPU/RSS via sysinfo, probes tmux panes.
 8. Completion: Claude runs `powerqueue task complete <id> --summary ...` and/or prints `[[POWERQUEUE:DONE]]` (either suffices). Dead pane without completion ⇒ `crashed` ⇒ backoff ⇒ relaunch with `--resume <same session id>`.
@@ -74,8 +74,8 @@ Module ownership is coarse so agents can work on branches without conflicts:
 | area | files |
 |------|-------|
 | linear + priority + jev | `src/linear/**`, `src/priority/**`, `src/jev.rs`, `src/cli/commands/{linear,priority}.rs` |
-| runtime | `src/tmux.rs`, `src/worktree.rs`, `src/session/**`, `src/cli/commands/attach.rs` |
-| budget + scheduler | `src/budget/**`, `src/scheduler/**`, `src/hook.rs`, `src/cli/commands/{run,budget,hook}.rs` |
+| runtime | `src/tmux.rs`, `src/worktree.rs`, `src/session/**` (incl. `session/agent.rs`, the provider trait), `src/cli/commands/attach.rs` |
+| budget + scheduler | `src/budget/**` (incl. `budget/probe.rs`, observed usage), `src/scheduler/**`, `src/hook.rs`, `src/cli/commands/{run,budget,hook}.rs` |
 | ux | `src/dashboard/**`, `src/doctor.rs`, `src/cli/commands/{init,status,add,task,logs,config,secrets,doctor}.rs` |
 
 Shared files (`domain.rs`, `config.rs`, `store/**`, `cli/mod.rs`, `Cargo.toml`) may be

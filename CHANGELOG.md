@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Config: per-provider budgets (`[budget.providers.<p>]` for `claude`, `codex`
+  and `gemini`, each with its own period, window and model table; shared
+  knobs stay in `[budget]`); old keys still load (`budget.period_hours`,
+  `[budget.models.<tier>]` are moved under `budget.providers.claude` on read,
+  `doctor` / `config validate` note it and `config set` rewrites the file).
+  Models carry a `rank` (capability order) and any model name can be added in
+  config; `[codex]` and `[gemini]` sections hold the launch settings of the
+  (experimental, not yet launching) Codex CLI and Antigravity CLI providers.
+- `budget set-reset`, `budget set-observed` and `budget clear-limits` take
+  `--provider <claude|codex|gemini>` (default `claude`); `hook` takes
+  `--provider` too. `task model` and `add --model` accept any provider's model.
+- Database schema v2: `sessions.agent_session_id` for CLIs that generate
+  their own ids; the Claude calibration moved to kv `budget.calibration.claude`.
+
 - `dashboard --once` renders one frame as plain text and exits (works without
   a TTY; `--json` prints the snapshot), and `dashboard --ascii` draws with
   `*`/`>`/`#` and `+-|` borders (automatic when the locale is not UTF-8).

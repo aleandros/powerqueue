@@ -7,10 +7,10 @@ use chrono::{DateTime, Duration, Utc};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Serialize;
 
-use crate::budget::{Ledger, PeriodClock};
+use crate::budget::{Ledger, Ledgers};
 use crate::cli::output::{human_bytes, human_duration, human_f64};
 use crate::config::Config;
-use crate::domain::{Criticality, Event, ModelTier, ResourceSample, Session, Task, TaskId, TaskState};
+use crate::domain::{Criticality, Event, ModelTier, Provider, ResourceSample, Session, Task, TaskId, TaskState};
 use crate::store::Store;
 
 /// Everything the UI needs for one frame. Serialises to JSON for
@@ -58,12 +58,13 @@ impl Snapshot {
                 resources.insert(task.id, sample);
             }
         }
-        let clock = PeriodClock::from_config(&cfg.budget, now);
-        let ledger = Ledger::load(store, &cfg.budget, &clock, now).ok();
+        // The budget panel shows Claude's ledger (per-provider gauges come with the UX work).
+        let ledger = Ledgers::load(store, &cfg.budget, now).ok().and_then(|mut l| l.by_provider.remove(&Provider::Claude));
         let max_age = Duration::seconds(3 * cfg.scheduler.tick_secs.max(1) as i64);
         let daemon_alive = store.daemon_alive(max_age)?;
         let daemon_pid = store.daemon_heartbeat()?.map(|(pid, _)| pid);
-        let shares = cfg.budget.models.iter().filter(|(_, m)| m.enabled).map(|(t, m)| (*t, m.share)).collect();
+        let shares =
+            cfg.budget.providers.claude.models.iter().filter(|(_, m)| m.enabled).map(|(t, m)| (t.clone(), m.share)).collect();
         Ok(Snapshot {
             taken_at: Some(now),
             daemon_alive,
@@ -138,7 +139,7 @@ pub fn rows_for(snapshot: &Snapshot, hide_terminal: bool, now: DateTime<Utc>) ->
                 key: t.key.clone(),
                 state: t.state,
                 criticality: t.criticality,
-                model: t.model.or(t.model_override),
+                model: t.model.clone().or(t.model_override.clone()),
                 tokens: snapshot.weighted_tokens.get(&t.id).map(|w| human_f64(*w)).unwrap_or_else(|| "-".into()),
                 cpu: sample.map(|s| format!("{:.0}%", s.cpu_percent)).unwrap_or_else(|| "-".into()),
                 rss: sample.map(|s| human_bytes(s.rss_bytes)).unwrap_or_else(|| "-".into()),

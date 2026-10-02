@@ -216,7 +216,7 @@ Global flags work on every command.
 | `task resume <task>` | resume a paused or needs-attention task |
 | `task retry <task>` | re-queue a failed, cancelled or completed task (also crashed, throttled, paused, needs-attention) |
 | `task explain <task>` | current score and model decision, with reasons |
-| `task model <task> <fable\|opus\|sonnet\|haiku\|auto>` | force (or clear) the model for the next attempt; the policy may still downgrade it when the tier is out of budget |
+| `task model <task> <model\|auto>` | force (or clear) the model for the next attempt (`fable`, `opus`, `sonnet`, `haiku`, or another provider's model such as `gpt-6.1-sol`, `gemini-3-pro`, `codex:<name>`); the policy may still downgrade it within the same provider when the model is out of budget |
 | `task output <task> [-n LINES]` | last screen of the task's tmux pane (default 60 lines) |
 | `task send <task> "message"` | type a message into the running session |
 | `attach [<task>] [--print]` | open the task's tmux window; no task = the powerqueue session |
@@ -240,11 +240,13 @@ state machine allows it. `complete` and `block` always write directly.
 
 | Command | What it does |
 |---------|--------------|
-| `budget show` | period/window spend per tier and what the policy would allow |
-| `budget set-reset <when>` | record the period reset instant from `/usage` (RFC 3339 or `in 3d4h`) |
-| `budget set-observed <percent>` | calibrate pacing with the percentage from `/usage` (e.g. `43%`) |
-| `budget clear-limits` | forget rate-limit cooldowns |
+| `budget show` | period/window spend per model and what the policy would allow (Claude's ledger; other enabled providers are summarised in one line) |
+| `budget set-reset <when> [--provider P]` | record a provider's period reset instant (from `/usage` in Claude Code; RFC 3339 or `in 3d4h`); default provider `claude` |
+| `budget set-observed <percent> [--provider P]` | calibrate a provider's pacing with the percentage it shows (e.g. `43%`) |
+| `budget clear-limits [--provider P]` | forget a provider's rate-limit cooldowns |
 | `budget estimate [<task>]` | the cost estimator's view of a task (or all history) |
+
+`--provider` accepts `claude`, `codex` or `gemini` (`antigravity`/`agy` are aliases of `gemini`).
 
 ### Linear
 
@@ -423,32 +425,91 @@ Code's own classifier approves routine commands, or `bypassPermissions`,
 and/or pre-approve what your repo needs in `allowed_tools`, for example
 `["Bash(git *)", "Bash(cargo *)", "Bash(npm test*)"]`.
 
-### `[budget]` and `[budget.models.<tier>]`
+### `[codex]` (experimental)
+
+Settings for OpenAI Codex CLI sessions. This version tracks a Codex budget
+(`[budget.providers.codex]`) and validates these keys, but does not launch
+Codex sessions yet; `doctor` says so while `budget.providers.codex.enabled`
+is true.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `period_hours` | `168` | usage period length (subscriptions reset weekly) |
-| `period_anchor` | none | RFC 3339 start of a period; set with `budget set-reset` |
-| `window_hours` | `5` | rolling short window |
-| `period_weighted_tokens` | `80000000` | weighted tokens the period may consume |
-| `window_weighted_tokens` | `12000000` | weighted tokens the window may consume |
+| `binary` | `"codex"` | Codex CLI executable |
+| `approval` | `"workspace-write"` | `workspace-write` (`-a never -s workspace-write`), `approve-for-me`, `yolo` (`--dangerously-bypass-approvals-and-sandbox`) or `on-request` |
+| `reasoning_effort` | `"high"` | `-c model_reasoning_effort=…` (`low`, `medium`, `high`, `xhigh`, `max`, `ultra`); unset to leave Codex's default |
+| `extra_args` | `[]` | flags appended verbatim |
+| `env` | `{}` | environment variables for the session |
+| `trust_workspace` | `true` | pass `-c 'projects."<worktree>".trust_level="trusted"'` so Codex never stops at its trust prompt |
+
+### `[gemini]` (experimental)
+
+Settings for Google's Antigravity CLI (`agy`, the CLI behind Google AI
+Pro/Ultra). As with Codex, the budget is tracked and the keys validated, but
+sessions are not launched yet.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `binary` | `"agy"` | Antigravity CLI executable |
+| `mode` | `"skip-permissions"` | `skip-permissions` (`--dangerously-skip-permissions`), `accept-edits` or `plan` (`--mode`) |
+| `effort` | `"high"` | `--effort` (`low`, `medium`, `high`); unset to leave the default |
+| `extra_args` | `[]` | flags appended verbatim |
+| `env` | `{}` | environment variables for the session |
+
+### `[budget]` and `[budget.providers.<provider>]`
+
+Budgets are per provider: each of `claude`, `codex` and `gemini` has its own
+period, window and model table under `[budget.providers.<provider>]`; the
+shared pacing knobs stay in `[budget]`. Older files with the flat keys
+(`budget.period_hours`, `[budget.models.fable]`, ...) still load: they are
+moved under `budget.providers.claude` on read, `doctor` and `config validate`
+note the move, and `config set` rewrites the file to the new shape. Only
+Claude is enabled by default.
+
+Shared keys in `[budget]`:
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `provider_order` | `["claude", "codex", "gemini"]` | fallback order between enabled providers |
 | `default_model` | `"sonnet"` | model when nothing else applies |
 | `low_model` | `"sonnet"` | model for `low` tasks |
 | `safety_margin` | `0.05` | fraction of the remaining budget kept unspent (0 to 0.5) |
 | `endgame_fraction` | `0.8` | after this fraction of the period, reserved capacity is released |
-| `rate_limit_cooldown_mins` | `30` | pause a tier after a `rate_limit` error (never past the period end) |
+| `probe_interval_mins` | `15` | how often usage probes run (0 disables them) |
 
-Per tier (`[budget.models.fable]`, `.opus`, `.sonnet`, `.haiku`):
+Per provider (`[budget.providers.claude]`, `.codex`, `.gemini`); keys you
+omit keep the provider's defaults:
+
+| Key | claude | codex | gemini | Meaning |
+|-----|--------|-------|--------|---------|
+| `enabled` | `true` | `false` | `false` | schedule tasks on this provider |
+| `period_hours` | `168` | `168` | `168` | usage period length (subscriptions reset weekly) |
+| `period_anchor` | none | none | none | RFC 3339 start of a period; set with `budget set-reset --provider <p>` |
+| `window_hours` | `5` | `5` | `5` | rolling short window; `0` = no window |
+| `period_weighted_tokens` | `80000000` | `60000000` | `40000000` | weighted tokens the period may consume |
+| `window_weighted_tokens` | `12000000` | `8000000` | `6000000` | weighted tokens the window may consume |
+| `rate_limit_cooldown_mins` | `30` | `30` | `30` | pause the provider after a `rate_limit` error (never past the period end) |
+
+Per model (`[budget.providers.claude.models.fable]`, `.opus`, `.sonnet`,
+`.haiku`); a model you mention keeps the shipped values for keys you omit,
+models you do not mention stay as shipped (disable one with `enabled = false`):
 
 | Key | fable | opus | sonnet | haiku | Meaning |
 |-----|-------|------|--------|-------|---------|
+| `rank` | `10` | `20` | `30` | `40` | capability order within the provider (lower = more capable; your own additions default to 50) |
 | `share` | `0.25` | `0.35` | `0.35` | `0.05` | fraction of `period_weighted_tokens` |
 | `min_criticality` | `critical` | `high` | `low` | `low` | minimum criticality early in the period |
-| `relax_after_fraction` | `0.5` | `0.3` | `0.0` | `0.0` | when under-spent tiers open up one level |
+| `relax_after_fraction` | `0.5` | `0.3` | `0.0` | `0.0` | when under-spent models open up one level |
 | `weight` | `5.0` | `3.0` | `1.0` | `0.2` | cost weight relative to Sonnet |
-| `enabled` | `true` | `true` | `true` | `true` | tier may be used |
+| `enabled` | `true` | `true` | `true` | `true` | model may be used |
 
-Enabled shares must sum to at most 1.0.
+Shipped Codex models (`[budget.providers.codex.models."gpt-6.1-sol"]`, ...):
+`gpt-6.1-sol` (rank 10, share 0.4, critical, weight 2.0), `gpt-6-astra` (20,
+0.4, high, 1.5), `gpt-6-luna` (30, 0.2, low, 0.5). Gemini: `gemini-3-pro` (10,
+0.7, high, 1.0), `gemini-3-flash` (20, 0.3, low, 0.2). Model names infer their
+provider (`fable|opus|sonnet|haiku|claude-*` → claude, `gpt-*|o1*|o3*|o4*|codex*`
+→ codex, `gemini-*` → gemini); anything else needs the explicit
+`"codex:<name>"` form. Enabled shares must sum to at most 1.0 per provider,
+and `default_model` / `low_model` must belong to an enabled provider.
 
 ### `[cleanup]`
 
@@ -495,6 +556,12 @@ remove_worktree = false     # also: push_branch, delete_branch, keep_failed, run
 
 [claude]
 permission_mode = "plan"    # also: effort, extra_args, allowed_tools, append_system_prompt
+
+[codex]
+approval = "on-request"     # also: reasoning_effort, extra_args
+
+[gemini]
+mode = "accept-edits"       # also: effort, extra_args
 ```
 
 ## Priority rules (PRIORITY.md)
@@ -536,8 +603,8 @@ budget. Full grammar, evaluation order and idioms:
 ## Budget pacing
 
 Every API call's usage is weighted (`input + 1.25·cache_write + 0.1·cache_read + 5·output`),
-multiplied by the tier weight, and charged against a period budget and a
-rolling window. Each tier has a share of the period and a minimum criticality.
+multiplied by the model's weight, and charged against its provider's period
+budget and rolling window. Each model has a share of the period and a minimum criticality.
 Early in the period Fable only serves `critical` tasks; if a tier is under-spent
 past `relax_after_fraction`, one level lower qualifies; in the end game two
 levels. The predicted cost must also fit the tier's remaining share, the

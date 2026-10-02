@@ -4,7 +4,7 @@
 use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::config::BudgetConfig;
+use crate::config::ProviderBudget;
 
 /// A half-open interval `[start, end)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,36 +30,69 @@ impl Period {
     }
 }
 
-/// Computes periods from config.
+/// Where the period anchor came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AnchorSource {
+    /// `budget.providers.<p>.period_anchor`.
+    Config,
+    /// A usage probe reported the next reset.
+    Observed,
+    /// Nothing known: Monday 00:00 UTC of the current week.
+    #[default]
+    Default,
+}
+
+/// Computes periods from one provider's budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeriodClock {
     pub period: Duration,
+    /// Zero when the provider has no rolling window (`window_hours = 0`).
     pub window: Duration,
     /// A known period start; periods repeat every `period` before and after it.
     pub anchor: DateTime<Utc>,
+    pub anchor_source: AnchorSource,
 }
 
 impl PeriodClock {
-    /// Build from config. Without an anchor we default to Monday 00:00 UTC of
-    /// the current week, which is wrong for most accounts but stable; `doctor`
-    /// nags until `budget set-reset` is used.
+    /// Build from a provider's budget. Without an anchor we default to Monday
+    /// 00:00 UTC of the current week, which is wrong for most accounts but
+    /// stable; `doctor` nags until `budget set-reset` is used or a probe
+    /// learns the reset.
     ///
     /// An anchor that does not parse as RFC 3339 is ignored (config validation
-    /// reports it separately) and the Monday default is used instead. Period and
-    /// window lengths are clamped to at least one hour so the clock never
-    /// divides by zero.
-    pub fn from_config(cfg: &BudgetConfig, now: DateTime<Utc>) -> Self {
-        let anchor = cfg
+    /// reports it separately) and the Monday default is used instead. The
+    /// period length is clamped to at least one hour so the clock never
+    /// divides by zero; `window_hours = 0` is kept as "no window".
+    pub fn from_provider(budget: &ProviderBudget, now: DateTime<Utc>) -> Self {
+        let configured = budget
             .period_anchor
             .as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s.trim()).ok())
-            .map(|d| d.with_timezone(&Utc))
-            .unwrap_or_else(|| most_recent_monday(now));
+            .map(|d| d.with_timezone(&Utc));
+        let (anchor, anchor_source) = match configured {
+            Some(a) => (a, AnchorSource::Config),
+            None => (most_recent_monday(now), AnchorSource::Default),
+        };
         Self {
-            period: Duration::hours(cfg.period_hours.max(1) as i64),
-            window: Duration::hours(cfg.window_hours.max(1) as i64),
+            period: Duration::hours(budget.period_hours.max(1) as i64),
+            window: Duration::hours(budget.window_hours as i64),
             anchor,
+            anchor_source,
         }
+    }
+
+    /// Replace the anchor with a reset instant a probe observed. Any instant
+    /// on the period grid works because periods repeat around the anchor.
+    pub fn with_observed_anchor(mut self, resets_at: DateTime<Utc>) -> Self {
+        self.anchor = resets_at;
+        self.anchor_source = AnchorSource::Observed;
+        self
+    }
+
+    /// False when the provider has no rolling window.
+    pub fn has_window(&self) -> bool {
+        self.window > Duration::zero()
     }
 
     /// The period containing `now`. Works before and after the anchor: the
@@ -72,7 +105,7 @@ impl PeriodClock {
         Period { start, end: start + Duration::seconds(period_secs) }
     }
 
-    /// The rolling window ending at `now`.
+    /// The rolling window ending at `now` (empty, `[now, now)`, without a window).
     pub fn current_window(&self, now: DateTime<Utc>) -> Period {
         Period { start: now - self.window, end: now }
     }
@@ -88,23 +121,26 @@ fn most_recent_monday(now: DateTime<Utc>) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Provider;
 
     fn at(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
     }
 
-    fn cfg_with_anchor(anchor: Option<&str>) -> BudgetConfig {
-        BudgetConfig { period_anchor: anchor.map(str::to_string), ..BudgetConfig::default() }
+    fn budget_with_anchor(anchor: Option<&str>) -> ProviderBudget {
+        ProviderBudget { period_anchor: anchor.map(str::to_string), ..ProviderBudget::defaults_for(Provider::Claude) }
     }
 
     #[test]
     fn default_anchor_is_most_recent_monday_midnight() {
         // 2026-10-01 is a Thursday.
         let now = at("2026-10-01T15:30:00Z");
-        let clock = PeriodClock::from_config(&cfg_with_anchor(None), now);
+        let clock = PeriodClock::from_provider(&budget_with_anchor(None), now);
         assert_eq!(clock.anchor, at("2026-09-28T00:00:00Z"));
+        assert_eq!(clock.anchor_source, AnchorSource::Default);
         assert_eq!(clock.period, Duration::hours(24 * 7));
         assert_eq!(clock.window, Duration::hours(5));
+        assert!(clock.has_window());
         let p = clock.current_period(now);
         assert_eq!(p.start, at("2026-09-28T00:00:00Z"));
         assert_eq!(p.end, at("2026-10-05T00:00:00Z"));
@@ -114,7 +150,7 @@ mod tests {
     #[test]
     fn monday_itself_is_its_own_anchor() {
         let now = at("2026-09-28T00:00:00Z");
-        let clock = PeriodClock::from_config(&cfg_with_anchor(None), now);
+        let clock = PeriodClock::from_provider(&budget_with_anchor(None), now);
         assert_eq!(clock.anchor, now);
         assert_eq!(clock.current_period(now).start, now);
     }
@@ -122,8 +158,9 @@ mod tests {
     #[test]
     fn explicit_anchor_in_the_past() {
         let now = at("2026-10-01T15:30:00Z");
-        let clock = PeriodClock::from_config(&cfg_with_anchor(Some("2026-09-02T09:00:00+02:00")), now);
+        let clock = PeriodClock::from_provider(&budget_with_anchor(Some("2026-09-02T09:00:00+02:00")), now);
         assert_eq!(clock.anchor, at("2026-09-02T07:00:00Z"));
+        assert_eq!(clock.anchor_source, AnchorSource::Config);
         let p = clock.current_period(now);
         // 2026-09-02T07:00Z + 4 weeks = 2026-09-30T07:00Z.
         assert_eq!(p.start, at("2026-09-30T07:00:00Z"));
@@ -134,7 +171,7 @@ mod tests {
     #[test]
     fn explicit_anchor_in_the_future_uses_floor_division() {
         let now = at("2026-10-01T15:30:00Z");
-        let clock = PeriodClock::from_config(&cfg_with_anchor(Some("2026-10-20T12:00:00Z")), now);
+        let clock = PeriodClock::from_provider(&budget_with_anchor(Some("2026-10-20T12:00:00Z")), now);
         let p = clock.current_period(now);
         assert_eq!(p.start, at("2026-09-29T12:00:00Z"));
         assert_eq!(p.end, at("2026-10-06T12:00:00Z"));
@@ -142,9 +179,20 @@ mod tests {
     }
 
     #[test]
+    fn observed_anchor_overrides_the_configured_one() {
+        let now = at("2026-10-01T15:30:00Z");
+        let clock = PeriodClock::from_provider(&budget_with_anchor(Some("2026-10-20T12:00:00Z")), now)
+            .with_observed_anchor(at("2026-10-03T08:00:00Z"));
+        assert_eq!(clock.anchor_source, AnchorSource::Observed);
+        let p = clock.current_period(now);
+        assert_eq!(p.start, at("2026-09-26T08:00:00Z"));
+        assert_eq!(p.end, at("2026-10-03T08:00:00Z"));
+    }
+
+    #[test]
     fn period_boundaries_are_half_open() {
         let now = at("2026-10-01T00:00:00Z");
-        let clock = PeriodClock::from_config(&cfg_with_anchor(Some("2026-10-01T00:00:00Z")), now);
+        let clock = PeriodClock::from_provider(&budget_with_anchor(Some("2026-10-01T00:00:00Z")), now);
         let p = clock.current_period(now);
         assert_eq!(p.start, now);
         assert!(p.contains(now));
@@ -158,8 +206,9 @@ mod tests {
     #[test]
     fn invalid_anchor_falls_back_to_monday() {
         let now = at("2026-10-01T15:30:00Z");
-        let clock = PeriodClock::from_config(&cfg_with_anchor(Some("not a date")), now);
+        let clock = PeriodClock::from_provider(&budget_with_anchor(Some("not a date")), now);
         assert_eq!(clock.anchor, at("2026-09-28T00:00:00Z"));
+        assert_eq!(clock.anchor_source, AnchorSource::Default);
     }
 
     #[test]
@@ -178,19 +227,22 @@ mod tests {
     #[test]
     fn window_ends_now() {
         let now = at("2026-10-01T15:30:00Z");
-        let clock = PeriodClock::from_config(&cfg_with_anchor(None), now);
+        let clock = PeriodClock::from_provider(&budget_with_anchor(None), now);
         let w = clock.current_window(now);
         assert_eq!(w.end, now);
         assert_eq!(w.start, now - Duration::hours(5));
     }
 
     #[test]
-    fn zero_lengths_are_clamped() {
+    fn zero_period_is_clamped_and_zero_window_means_no_window() {
         let now = at("2026-10-01T15:30:00Z");
-        let cfg = BudgetConfig { period_hours: 0, window_hours: 0, ..BudgetConfig::default() };
-        let clock = PeriodClock::from_config(&cfg, now);
+        let budget = ProviderBudget { period_hours: 0, window_hours: 0, ..ProviderBudget::defaults_for(Provider::Claude) };
+        let clock = PeriodClock::from_provider(&budget, now);
         assert_eq!(clock.period, Duration::hours(1));
-        assert_eq!(clock.window, Duration::hours(1));
+        assert_eq!(clock.window, Duration::zero());
+        assert!(!clock.has_window());
         assert!(clock.current_period(now).contains(now));
+        let w = clock.current_window(now);
+        assert_eq!(w.start, w.end, "no window: an empty range");
     }
 }

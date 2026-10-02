@@ -1,12 +1,15 @@
 //! Build everything a session needs on disk, then start it in tmux.
 //!
 //! Per task we write `<state>/tasks/<task-id>/`:
-//! * `prompt.md`     – the task brief Claude receives as its first message
-//! * `settings.json` – hooks that call back into `powerqueue hook`
+//! * `prompt.md`     – the task brief the agent receives as its first message
+//! * `settings.json` – (Claude) hooks that call back into `powerqueue hook`
 //! * `launch.sh`     – the exact command line (kept for diagnostics; re-run to resume)
 //! * `env`           – environment variables (0600)
 //!
-//! Resuming after a crash reuses the same Claude session id with `--resume`.
+//! The provider-specific parts (extra files, env, argv, transcript path) come
+//! from [`crate::session::agent::AgentCli::prepare`]; this module owns the
+//! provider-neutral files and the tmux window. Resuming after a crash reuses
+//! the same session id (`--resume` for Claude Code).
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -17,8 +20,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::config::{ClaudeConfig, Config};
-use crate::domain::{BLOCKED_MARKER, DONE_MARKER, HookEvent, ModelTier, Session, SessionState, Task, TaskId, TaskSource};
+use crate::domain::{
+    BLOCKED_MARKER, DONE_MARKER, HookEvent, ModelTier, Provider, Session, SessionState, Task, TaskId, TaskSource,
+};
 use crate::paths::Paths;
+use crate::session::agent::{LaunchContext, agent_for};
 use crate::tmux::{Tmux, shell_quote};
 use crate::worktree::branch_name;
 
@@ -31,11 +37,26 @@ pub const ALWAYS_ALLOWED_TOOLS: [&str; 1] = ["Bash(powerqueue task *)"];
 pub struct LaunchPlan {
     pub task_dir: PathBuf,
     pub prompt_path: PathBuf,
+    /// `settings.json` (Claude Code hooks); other providers may not write it.
     pub settings_path: PathBuf,
     pub script_path: PathBuf,
     /// The shell command tmux runs (`bash launch.sh`).
     pub shell_command: String,
     pub resume: bool,
+    /// Which CLI the plan launches.
+    #[serde(default = "default_provider")]
+    pub provider: Provider,
+    /// Where the CLI will write its transcript, when known at launch time.
+    #[serde(default)]
+    pub transcript_path: Option<PathBuf>,
+    /// Scan the transcript for the DONE / BLOCKED markers as a fallback
+    /// completion signal.
+    #[serde(default)]
+    pub poll_transcript_for_completion: bool,
+}
+
+fn default_provider() -> Provider {
+    Provider::Claude
 }
 
 /// Hooks that only record activity and may run in the background.
@@ -135,20 +156,41 @@ impl Launcher {
         Ok(Self { paths, tmux, self_bin })
     }
 
-    /// Write prompt, settings, env and launch script. `resume` = reuse the
-    /// Claude session id (after a crash) instead of starting fresh.
-    /// Fails when the task has no worktree yet.
+    /// Write prompt, the provider's files, env and launch script. `resume` =
+    /// reuse the session id (after a crash) instead of starting fresh; for
+    /// CLIs with their own ids the previous session's `agent_session_id` is
+    /// passed through `resume_id`. Fails when the task has no worktree yet
+    /// or the model's provider cannot launch sessions in this version.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &self,
         cfg: &Config,
         task: &Task,
         session_id: uuid::Uuid,
-        model: ModelTier,
+        model: &ModelTier,
         attempt: u32,
         resume: bool,
         previous_error: Option<&str>,
     ) -> Result<LaunchPlan> {
+        self.prepare_with_resume_id(cfg, task, session_id, model, attempt, resume, None, previous_error)
+    }
+
+    /// [`Launcher::prepare`] with an explicit provider session id to resume.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_with_resume_id(
+        &self,
+        cfg: &Config,
+        task: &Task,
+        session_id: uuid::Uuid,
+        model: &ModelTier,
+        attempt: u32,
+        resume: bool,
+        resume_id: Option<&str>,
+        previous_error: Option<&str>,
+    ) -> Result<LaunchPlan> {
         let worktree = worktree_of(task)?;
+        let provider = model.provider();
+        let agent = agent_for(provider);
         let task_dir = self.paths.task_dir(&task.id.to_string());
         std::fs::create_dir_all(&task_dir).with_context(|| format!("cannot create {}", task_dir.display()))?;
         let prompt_path = task_dir.join("prompt.md");
@@ -159,11 +201,34 @@ impl Launcher {
         std::fs::write(&prompt_path, build_prompt(task, cfg, attempt, previous_error))
             .with_context(|| format!("cannot write {}", prompt_path.display()))?;
 
-        let settings = hook_settings(&self.self_bin, task.id, session_id, &cfg.claude);
-        std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)? + "\n")
-            .with_context(|| format!("cannot write {}", settings_path.display()))?;
+        let own_id = session_id.to_string();
+        let resume_ref = if resume { Some(resume_id.unwrap_or(own_id.as_str())) } else { None };
+        let ctx = LaunchContext {
+            cfg,
+            task,
+            session_id,
+            model,
+            attempt,
+            resume: resume_ref,
+            task_dir: &task_dir,
+            prompt_path: &prompt_path,
+            worktree,
+            self_bin: &self.self_bin,
+        };
+        let launch = agent.prepare(&ctx).with_context(|| format!("prepare {provider} launch for {}", task.key))?;
+        for (path, contents, mode) in &launch.files {
+            std::fs::write(path, contents).with_context(|| format!("cannot write {}", path.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode))
+                    .with_context(|| format!("cannot chmod {}", path.display()))?;
+            }
+            #[cfg(not(unix))]
+            let _ = mode;
+        }
 
-        let env = session_env(cfg, task, session_id);
+        let env = launch.env;
         let env_text = env.iter().fold(String::new(), |mut acc, (k, v)| {
             let _ = writeln!(acc, "{k}={v}");
             acc
@@ -171,7 +236,7 @@ impl Launcher {
         crate::config::write_private(&env_path, env_text.as_bytes())
             .with_context(|| format!("cannot write {}", env_path.display()))?;
 
-        let argv = Self::claude_command(cfg, model, session_id, &settings_path, &prompt_path, resume, &task.key);
+        let argv = launch.argv;
         let script = launch_script(task, attempt, worktree, &env, &argv, &self.self_bin);
         // The script exports `claude.env`, which may hold secrets: owner-only.
         crate::config::write_private(&script_path, script.as_bytes())
@@ -183,7 +248,7 @@ impl Launcher {
                 .with_context(|| format!("cannot chmod {}", script_path.display()))?;
         }
 
-        tracing::info!(task = %task.key, session = %session_id, attempt, resume, model = %model, dir = %task_dir.display(), "prepared launch files");
+        tracing::info!(task = %task.key, session = %session_id, attempt, resume, model = %model, provider = %provider, dir = %task_dir.display(), "prepared launch files");
         Ok(LaunchPlan {
             shell_command: format!("sh {}", shell_quote(&script_path.to_string_lossy())),
             task_dir,
@@ -191,41 +256,30 @@ impl Launcher {
             settings_path,
             script_path,
             resume,
+            provider,
+            transcript_path: launch.transcript_path,
+            poll_transcript_for_completion: launch.poll_transcript_for_completion,
         })
     }
 
-    /// Create the tmux window and return the new [`Session`] record.
+    /// Run the provider's pre-launch step (trust seeding for Claude Code),
+    /// create the tmux window and return the new [`Session`] record.
     pub fn launch(
         &self,
         cfg: &Config,
         task: &Task,
         plan: &LaunchPlan,
         session_id: uuid::Uuid,
-        model: ModelTier,
+        model: &ModelTier,
         attempt: u32,
     ) -> Result<Session> {
         let worktree = worktree_of(task)?;
-        if cfg.claude.trust_workspace {
-            let file = crate::session::trust::claude_json_path();
-            let targets = crate::session::trust::trust_targets(&cfg.repo_path(), worktree);
-            let refs: Vec<&Path> = targets.iter().map(|p| p.as_path()).collect();
-            match crate::session::trust::ensure_trusted(&file, &refs) {
-                Ok(newly) if !newly.is_empty() => {
-                    tracing::info!(task = %task.key, file = %file.display(), paths = ?newly, "marked workspace as trusted for Claude Code")
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(task = %task.key, error = %format!("{e:#}"), "could not pre-trust workspace; the session may wait on the trust dialog")
-                }
-            }
-        }
+        agent_for(plan.provider)
+            .pre_launch(cfg, &cfg.repo_path(), worktree)
+            .with_context(|| format!("pre-launch step of {} for {}", plan.provider, task.key))?;
         let tmux_session = cfg.tmux.session_name.clone();
         self.tmux.ensure_session(&tmux_session, &cfg.repo_path())?;
         let window = self.tmux.new_window(&tmux_session, &task.slug(), worktree, &plan.shell_command, cfg.tmux.remain_on_exit)?;
-        // Claude Code encodes its *physical* cwd, so resolve symlinks (e.g. /tmp → /private/tmp).
-        let physical = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
-        let transcript =
-            crate::session::transcript::transcript_path_for(&crate::session::transcript::claude_home(), &physical, session_id);
         let now = Utc::now();
         tracing::info!(
             task = %task.key,
@@ -242,18 +296,19 @@ impl Launcher {
             id: session_id,
             task_id: task.id,
             attempt,
-            model,
+            model: model.clone(),
             state: SessionState::Launching,
             tmux_session,
             tmux_window: window.window_id,
             pane_id: Some(window.pane_id),
             pid: Some(window.pane_pid),
-            transcript_path: Some(transcript.to_string_lossy().to_string()),
+            transcript_path: plan.transcript_path.as_ref().map(|p| p.to_string_lossy().to_string()),
             exit_code: None,
             started_at: now,
             ended_at: None,
             last_activity_at: now,
             error: None,
+            agent_session_id: None,
         })
     }
 
@@ -264,7 +319,7 @@ impl Launcher {
     /// reads the prompt from disk. Everything before it is a literal argument.
     pub fn claude_command(
         cfg: &Config,
-        model: ModelTier,
+        model: &ModelTier,
         session_id: uuid::Uuid,
         settings_path: &Path,
         prompt_path: &Path,
@@ -313,10 +368,10 @@ fn worktree_of(task: &Task) -> Result<&Path> {
     }
 }
 
-/// Environment exported to the session: `claude.env` plus powerqueue's own
-/// variables (so `powerqueue task complete` inside the session finds the
+/// Environment exported to a Claude session: `claude.env` plus powerqueue's
+/// own variables (so `powerqueue task complete` inside the session finds the
 /// same home as the daemon).
-fn session_env(cfg: &Config, task: &Task, session_id: uuid::Uuid) -> Vec<(String, String)> {
+pub(crate) fn session_env(cfg: &Config, task: &Task, session_id: uuid::Uuid) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = cfg.claude.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     env.push(("POWERQUEUE_TASK_ID".to_string(), task.id.to_string()));
     env.push(("POWERQUEUE_TASK_KEY".to_string(), task.key.clone()));
@@ -455,7 +510,7 @@ mod tests {
         let sid = uuid::Uuid::new_v4();
         let argv = Launcher::claude_command(
             &cfg,
-            ModelTier::Opus,
+            &ModelTier::opus(),
             sid,
             Path::new("/s/settings.json"),
             Path::new("/s/prompt.md"),
@@ -492,7 +547,7 @@ mod tests {
         let cfg = config();
         let argv = Launcher::claude_command(
             &cfg,
-            ModelTier::Sonnet,
+            &ModelTier::sonnet(),
             sid,
             Path::new("/s/settings.json"),
             Path::new("/s/prompt.md"),
@@ -519,9 +574,12 @@ mod tests {
         t.worktree_path = Some(dir.path().join("wt").to_string_lossy().to_string());
         let sid = uuid::Uuid::new_v4();
 
-        let plan = launcher.prepare(&cfg, &t, sid, ModelTier::Fable, 2, true, Some("crashed")).unwrap();
+        let plan = launcher.prepare(&cfg, &t, sid, &ModelTier::fable(), 2, true, Some("crashed")).unwrap();
         assert_eq!(plan.task_dir, dir.path().join("state/tasks").join(t.id.to_string()));
         assert!(plan.resume);
+        assert_eq!(plan.provider, Provider::Claude);
+        assert!(plan.transcript_path.as_ref().unwrap().to_string_lossy().ends_with(&format!("{sid}.jsonl")));
+        assert!(!plan.poll_transcript_for_completion);
         assert_eq!(plan.shell_command, format!("sh {}", shell_quote(&plan.script_path.to_string_lossy())));
 
         let prompt = std::fs::read_to_string(&plan.prompt_path).unwrap();
@@ -571,7 +629,7 @@ mod tests {
         }
 
         // Re-preparing (fresh, attempt 1) overwrites in place.
-        let plan2 = launcher.prepare(&cfg, &t, sid, ModelTier::Sonnet, 1, false, None).unwrap();
+        let plan2 = launcher.prepare(&cfg, &t, sid, &ModelTier::sonnet(), 1, false, None).unwrap();
         assert_eq!(plan2.task_dir, plan.task_dir);
         assert!(!plan2.resume);
         let script = std::fs::read_to_string(&plan2.script_path).unwrap();
@@ -586,8 +644,20 @@ mod tests {
         let mut t = task();
         t.worktree_path = None;
         let err =
-            launcher.prepare(&config(), &t, uuid::Uuid::new_v4(), ModelTier::Sonnet, 1, false, None).unwrap_err().to_string();
+            launcher.prepare(&config(), &t, uuid::Uuid::new_v4(), &ModelTier::sonnet(), 1, false, None).unwrap_err().to_string();
         assert!(err.contains("no worktree"), "{err}");
         assert!(!dir.path().join("state/tasks").exists());
+    }
+
+    #[test]
+    fn prepare_refuses_providers_without_a_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher =
+            Launcher { paths: Paths::rooted(dir.path()), tmux: Tmux::new("tmux", None), self_bin: PathBuf::from("/bin/pq") };
+        let mut t = task();
+        t.worktree_path = Some(dir.path().join("wt").to_string_lossy().to_string());
+        let err =
+            launcher.prepare(&config(), &t, uuid::Uuid::new_v4(), &ModelTier::new("gpt-6.1-sol"), 1, false, None).unwrap_err();
+        assert!(format!("{err:#}").contains("session branch"), "{err:#}");
     }
 }

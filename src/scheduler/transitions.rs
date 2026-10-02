@@ -159,21 +159,22 @@ pub fn on_hook_outcome(
             ));
         }
         HookOutcome::RateLimited { error_type, message } => {
-            let cooldown = Duration::minutes(cfg.budget.rate_limit_cooldown_mins.max(1) as i64);
+            let provider = session.model.provider();
+            let cooldown = Duration::minutes(cfg.budget.provider(provider).rate_limit_cooldown_mins.max(1) as i64);
             let until = (now + cooldown).min(period_end).max(now + Duration::minutes(1));
             task.state = TaskState::Throttled;
             task.not_before = Some(until);
             task.last_error = Some(format!("{error_type}: {message}"));
             // Subscription limits (5-hour window, weekly cap) are account-wide,
-            // so a `rate_limit` pauses every tier; `overloaded` is specific to
-            // the model that reported it.
+            // so a `rate_limit` pauses every model of the provider; `overloaded`
+            // is specific to the model that reported it.
             let account_wide = error_type != "overloaded";
             if account_wide {
-                for tier in ModelTier::ALL {
+                for tier in cfg.budget.models_for(provider) {
                     effects.push(Effect::RateLimit { tier, until });
                 }
             } else {
-                effects.push(Effect::RateLimit { tier: session.model, until });
+                effects.push(Effect::RateLimit { tier: session.model.clone(), until });
             }
             effects.push(Effect::log(
                 EventLevel::Warn,
@@ -469,7 +470,7 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             task_id: crate::domain::TaskId::new(),
             attempt,
-            model: ModelTier::Opus,
+            model: ModelTier::opus(),
             state,
             tmux_session: "powerqueue".into(),
             tmux_window: "@1".into(),
@@ -481,6 +482,7 @@ mod tests {
             ended_at: None,
             last_activity_at: now() - Duration::minutes(1),
             error: None,
+            agent_session_id: None,
         }
     }
 
@@ -591,7 +593,7 @@ mod tests {
         assert_eq!(t.state, TaskState::Throttled);
         assert_eq!(t.not_before, Some(now() + Duration::minutes(30)));
         assert_eq!(s.state, SessionState::Running, "the session stays alive; Claude retries by itself");
-        for tier in ModelTier::ALL {
+        for tier in [ModelTier::fable(), ModelTier::opus(), ModelTier::sonnet(), ModelTier::haiku()] {
             assert!(fx.contains(&Effect::RateLimit { tier, until: now() + Duration::minutes(30) }), "rate_limit is account-wide");
         }
         assert_eq!(kinds(&fx), vec!["ratelimit", "ratelimit", "ratelimit", "ratelimit", "budget.rate_limited"]);
@@ -604,7 +606,7 @@ mod tests {
         let mut t = task(TaskState::Running, 1);
         let out = HookOutcome::RateLimited { error_type: "overloaded".into(), message: "busy".into() };
         let fx = on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), period_end());
-        assert_eq!(fx[0], Effect::RateLimit { tier: ModelTier::Opus, until: now() + Duration::minutes(30) });
+        assert_eq!(fx[0], Effect::RateLimit { tier: ModelTier::opus(), until: now() + Duration::minutes(30) });
         assert_eq!(kinds(&fx), vec!["ratelimit", "budget.rate_limited"], "overloaded only affects the reporting tier");
     }
 

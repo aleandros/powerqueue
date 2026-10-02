@@ -1,13 +1,15 @@
 //! `powerqueue hook`.
 //!
-//! Runs inside a Claude Code hook, so it never writes to stdout (Claude Code
+//! Runs inside an agent CLI hook, so it never writes to stdout (Claude Code
 //! may interpret hook output) and never fails: problems go to stderr and the
-//! exit code is 0 regardless.
+//! exit code is 0 regardless. `--provider` names the CLI that sent the hook;
+//! payload normalisation for non-Claude providers lands with their
+//! launchers, so until then their events are stored as received.
 
 use anyhow::Result;
 
 use crate::cli::{Context, HookArgs};
-use crate::domain::{HookEvent, TaskId};
+use crate::domain::{HookEvent, Provider, TaskId};
 
 pub fn run(ctx: &mut Context, args: HookArgs) -> Result<i32> {
     match run_inner(ctx, &args) {
@@ -20,6 +22,9 @@ pub fn run(ctx: &mut Context, args: HookArgs) -> Result<i32> {
 }
 
 fn run_inner(ctx: &mut Context, args: &HookArgs) -> Result<i32> {
+    if args.provider != Provider::Claude {
+        tracing::debug!(provider = %args.provider, event = %args.event, "hook from a non-Claude provider stored as received");
+    }
     let event: HookEvent = args.event.parse().map_err(|e: String| anyhow::anyhow!(e))?;
     let session_id = match &args.session {
         Some(s) => Some(uuid::Uuid::parse_str(s.trim()).map_err(|e| anyhow::anyhow!("bad --session `{s}`: {e}"))?),

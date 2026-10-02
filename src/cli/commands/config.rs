@@ -2,9 +2,13 @@
 //! keys of the configuration.
 //!
 //! `get`/`set`/`unset` address keys by dotted path (`claude.permission_mode`,
-//! `budget.models.fable.share`). Edits go through `toml_edit` so comments and
-//! formatting in `config.toml` survive, and nothing is written unless the
-//! result parses as a [`Config`] and passes [`Config::validate`].
+//! `budget.providers.claude.models.fable.share`). Edits go through
+//! `toml_edit` so comments and formatting in `config.toml` survive, and
+//! nothing is written unless the result parses as a [`Config`] and passes
+//! [`Config::validate`]. Legacy budget keys (`budget.models.fable.share`,
+//! `budget.period_hours`) are rewritten to their `budget.providers.claude`
+//! location, and a file still in the old shape is migrated in place before
+//! the edit so old and new keys never coexist.
 
 use std::path::{Path, PathBuf};
 
@@ -14,7 +18,7 @@ use toml_edit::{DocumentMut, Item, Table};
 
 use crate::cli::commands::status::daemon_status;
 use crate::cli::{ConfigCommand, Context};
-use crate::config::{Config, REPO_CONFIG_FILE, RepoOverrides, write_private};
+use crate::config::{Config, LEGACY_BUDGET_KEYS, REPO_CONFIG_FILE, RepoOverrides, rewrite_legacy_key, write_private};
 use crate::domain::DaemonCommand;
 use crate::paths::Paths;
 
@@ -27,11 +31,58 @@ fn key_segments(key: &str) -> Result<Vec<&str>> {
     Ok(segs)
 }
 
+/// The key to actually edit: legacy budget keys map to their new location.
+/// Returns the effective key and the note to show when it was rewritten.
+pub fn effective_key(key: &str) -> (String, Option<String>) {
+    match rewrite_legacy_key(key) {
+        Some(new) => {
+            let note = format!("`{key}` now lives at `{new}`; edited that key instead");
+            (new, Some(note))
+        }
+        None => (key.to_string(), None),
+    }
+}
+
+/// Move the legacy flat `[budget]` keys and `[budget.models.*]` of a
+/// `toml_edit` document under `budget.providers.claude`, keeping the rest
+/// of the document (comments included) intact. Returns the moved keys.
+pub fn migrate_legacy_document(doc: &mut DocumentMut) -> Vec<String> {
+    let mut moved = Vec::new();
+    let Some(budget) = doc.get_mut("budget").and_then(|b| b.as_table_like_mut()) else { return moved };
+    let mut taken: Vec<(String, Item)> = Vec::new();
+    for key in LEGACY_BUDGET_KEYS.iter().chain(["models"].iter()) {
+        if let Some(item) = budget.remove(key) {
+            taken.push((key.to_string(), item));
+        }
+    }
+    if taken.is_empty() {
+        return moved;
+    }
+    let providers = budget.entry("providers").or_insert_with(|| {
+        let mut t = Table::new();
+        t.set_implicit(true);
+        Item::Table(t)
+    });
+    let Some(providers) = providers.as_table_like_mut() else { return moved };
+    let claude = providers.entry("claude").or_insert_with(|| Item::Table(Table::new()));
+    let Some(claude) = claude.as_table_like_mut() else { return moved };
+    for (key, item) in taken {
+        if claude.get(&key).is_none() {
+            // Inline `models.fable = {...}` would be unusual; keep whatever shape the item has.
+            claude.insert(&key, item);
+            moved.push(format!("budget.{key} -> budget.providers.claude.{key}"));
+        } else {
+            moved.push(format!("budget.{key} dropped (budget.providers.claude.{key} already set)"));
+        }
+    }
+    moved
+}
+
 /// Parse `raw` as a TOML value (`3`, `true`, `0.25`, `"x"`, `["ENG", "OPS"]`,
 /// `{ a = 1 }`); anything that does not parse is taken as a plain string, so
 /// `auto` and `In Progress` work without quotes. Date-times are kept as
 /// strings too, because every timestamp in the configuration is a string
-/// (`budget.period_anchor`).
+/// (`budget.providers.claude.period_anchor`).
 pub fn parse_toml_value(raw: &str) -> toml_edit::Value {
     match raw.trim().parse::<toml_edit::Value>() {
         Ok(v) if v.is_datetime() => toml_edit::Value::from(raw.trim()),
@@ -46,8 +97,11 @@ pub fn parse_toml_value(raw: &str) -> toml_edit::Value {
 /// valid [`Config`] (unknown key, wrong type) or when [`Config::validate`]
 /// reports problems.
 pub fn set_in_toml(text: &str, key: &str, raw: &str) -> Result<String> {
+    let (key, _) = effective_key(key);
+    let key = key.as_str();
     let segs = key_segments(key)?;
     let mut doc: DocumentMut = text.parse().context("config.toml does not parse")?;
+    migrate_legacy_document(&mut doc);
     let value = parse_toml_value(raw);
     let (last, parents) = segs.split_last().expect("key_segments returns at least one segment");
     let mut table: &mut dyn toml_edit::TableLike = doc.as_table_mut();
@@ -69,14 +123,17 @@ pub fn set_in_toml(text: &str, key: &str, raw: &str) -> Result<String> {
 /// contents and whether the key was present. Fails like [`set_in_toml`] when
 /// the result is invalid (for example after removing `repo.path`).
 pub fn unset_in_toml(text: &str, key: &str) -> Result<(String, bool)> {
+    let (key, _) = effective_key(key);
+    let key = key.as_str();
     let segs = key_segments(key)?;
     let mut doc: DocumentMut = text.parse().context("config.toml does not parse")?;
+    let migrated = !migrate_legacy_document(&mut doc).is_empty();
     let (last, parents) = segs.split_last().expect("key_segments returns at least one segment");
     let mut table: &mut dyn toml_edit::TableLike = doc.as_table_mut();
     for seg in parents {
         match table.get_mut(seg).and_then(|i| i.as_table_like_mut()) {
             Some(t) => table = t,
-            None => return Ok((text.to_string(), false)),
+            None => return Ok((if migrated { doc.to_string() } else { text.to_string() }, false)),
         }
     }
     let present = table.remove(last).is_some();
@@ -98,7 +155,8 @@ fn check_edited(text: &str, key: &str) -> Result<()> {
 /// The effective value at `key` (file plus defaults, no repo overrides) as
 /// JSON; `None` when the key names nothing in the configuration or is unset.
 pub fn get_value(cfg: &Config, key: &str) -> Result<Option<serde_json::Value>> {
-    let segs = key_segments(key)?;
+    let (key, _) = effective_key(key);
+    let segs = key_segments(&key)?;
     let root = serde_json::to_value(cfg)?;
     let mut cur = &root;
     for seg in segs {
@@ -269,6 +327,12 @@ pub fn run(ctx: &mut Context, cmd: ConfigCommand) -> Result<i32> {
             super::status::ensure_initialised(ctx)?;
             let file = ctx.paths.config_file();
             let text = std::fs::read_to_string(&file).with_context(|| format!("cannot read {}", file.display()))?;
+            let (key, note) = effective_key(&key);
+            if let Some(n) = &note
+                && !ctx.json
+            {
+                eprintln!("{n}");
+            }
             let edited = match set_in_toml(&text, &key, &value) {
                 Ok(t) => t,
                 Err(e) => {
@@ -297,6 +361,12 @@ pub fn run(ctx: &mut Context, cmd: ConfigCommand) -> Result<i32> {
             super::status::ensure_initialised(ctx)?;
             let file = ctx.paths.config_file();
             let text = std::fs::read_to_string(&file).with_context(|| format!("cannot read {}", file.display()))?;
+            let (key, note) = effective_key(&key);
+            if let Some(n) = &note
+                && !ctx.json
+            {
+                eprintln!("{n}");
+            }
             let (edited, present) = match unset_in_toml(&text, &key) {
                 Ok(r) => r,
                 Err(e) => {
@@ -454,23 +524,63 @@ mod tests {
         let out = set_in_toml(BASE, "linear.team_keys", "[\"ENG\", \"OPS\"]").unwrap();
         assert_eq!(Config::from_toml(&out).unwrap().linear.team_keys, vec!["ENG".to_string(), "OPS".to_string()]);
 
-        let out = set_in_toml(BASE, "budget.models.fable.share", "0.1").unwrap();
-        assert!(out.contains("[budget.models.fable]\nshare = 0.1"), "{out}");
+        let fable = crate::domain::ModelTier::fable();
+        let out = set_in_toml(BASE, "budget.providers.claude.models.fable.share", "0.1").unwrap();
+        assert!(out.contains("[budget.providers.claude.models.fable]\nshare = 0.1"), "{out}");
         assert!(!out.contains("[budget]\n"), "intermediate tables stay implicit: {out}");
         let cfg = Config::from_toml(&out).unwrap();
-        assert_eq!(cfg.budget.models[&crate::domain::ModelTier::Fable].share, 0.1);
-        // Untouched fields of the partially specified table use `ModelBudget`'s
-        // defaults, and the map replaces the default map (`init` writes every
-        // tier, so a normal config.toml keeps the other tiers).
-        assert_eq!(cfg.budget.models[&crate::domain::ModelTier::Fable].weight, 1.0);
-        assert_eq!(cfg.budget.models.len(), 1);
+        assert_eq!(cfg.budget.providers.claude.models[&fable].share, 0.1);
+        // Untouched fields of the partially specified table keep the shipped
+        // defaults, and the other shipped models stay.
+        assert_eq!(cfg.budget.providers.claude.models[&fable].weight, 5.0);
+        assert_eq!(cfg.budget.providers.claude.models.len(), 4);
 
         let full = Config::default().to_toml().unwrap().replace("path = \"\"", "path = \"/tmp/repo\"");
-        let out = set_in_toml(&full, "budget.models.fable.share", "0.1").unwrap();
+        let out = set_in_toml(&full, "budget.providers.claude.models.fable.share", "0.1").unwrap();
         let cfg = Config::from_toml(&out).unwrap();
-        assert_eq!(cfg.budget.models[&crate::domain::ModelTier::Fable].share, 0.1);
-        assert_eq!(cfg.budget.models[&crate::domain::ModelTier::Fable].weight, 5.0);
-        assert_eq!(cfg.budget.models.len(), 4);
+        assert_eq!(cfg.budget.providers.claude.models[&fable].share, 0.1);
+        assert_eq!(cfg.budget.providers.claude.models[&fable].weight, 5.0);
+        assert_eq!(cfg.budget.providers.claude.models.len(), 4);
+    }
+
+    const LEGACY: &str = "# header\n[repo]\npath = \"/tmp/repo\"\n\n[budget]\nperiod_hours = 100 # old\ndefault_model = \"haiku\"\n\n[budget.models.fable]\nshare = 0.2\nweight = 4.0\n\n[budget.models.opus]\nshare = 0.3\n";
+
+    #[test]
+    fn legacy_keys_are_rewritten_and_the_file_migrated() {
+        let fable = crate::domain::ModelTier::fable();
+        let (key, note) = effective_key("budget.models.fable.share");
+        assert_eq!(key, "budget.providers.claude.models.fable.share");
+        assert!(note.unwrap().contains("now lives at"));
+        assert_eq!(effective_key("claude.binary"), ("claude.binary".to_string(), None));
+
+        let out = set_in_toml(LEGACY, "budget.models.fable.share", "0.3").unwrap();
+        assert!(out.starts_with("# header\n"), "{out}");
+        assert!(!out.contains("[budget.models.fable]"), "old table is gone: {out}");
+        assert!(out.contains("[budget.providers.claude.models.fable]"), "{out}");
+        assert!(out.contains("period_hours = 100"), "{out}");
+        assert!(out.contains("default_model = \"haiku\""), "shared keys stay in [budget]: {out}");
+        let cfg = Config::from_toml(&out).unwrap();
+        assert!(cfg.budget.migrated_keys.is_empty(), "the written file is in the new shape: {:?}", cfg.budget.migrated_keys);
+        assert_eq!(cfg.budget.providers.claude.period_hours, 100);
+        assert_eq!(cfg.budget.providers.claude.models[&fable].share, 0.3);
+        assert_eq!(cfg.budget.providers.claude.models[&fable].weight, 4.0);
+        assert_eq!(cfg.budget.providers.claude.models[&crate::domain::ModelTier::opus()].share, 0.3);
+        assert_eq!(cfg.budget.default_model, crate::domain::ModelTier::haiku());
+
+        let out = set_in_toml(LEGACY, "budget.period_anchor", "2026-10-06T07:00:00Z").unwrap();
+        let cfg = Config::from_toml(&out).unwrap();
+        assert_eq!(cfg.budget.providers.claude.period_anchor.as_deref(), Some("2026-10-06T07:00:00Z"));
+        assert_eq!(cfg.budget.providers.claude.period_hours, 100);
+
+        let (out, present) = unset_in_toml(LEGACY, "budget.models.opus.share").unwrap();
+        assert!(present);
+        assert!(!out.contains("[budget.models.opus]"), "{out}");
+        let cfg = Config::from_toml(&out).unwrap();
+        assert_eq!(cfg.budget.providers.claude.models[&crate::domain::ModelTier::opus()].share, 0.35);
+
+        let cfg = Config::from_toml(LEGACY).unwrap();
+        let v = get_value(&cfg, "budget.models.fable.share").unwrap().unwrap();
+        assert_eq!(toml_display(&v).unwrap(), "0.2");
     }
 
     #[test]
@@ -514,10 +624,12 @@ mod tests {
         assert_eq!(toml_display(&v).unwrap(), "2");
         let v = get_value(&cfg, "linear.queued_states").unwrap().unwrap();
         assert_eq!(toml_display(&v).unwrap(), "[\"Todo\"]");
-        let v = get_value(&cfg, "budget.models.fable.share").unwrap().unwrap();
+        let v = get_value(&cfg, "budget.providers.claude.models.fable.share").unwrap().unwrap();
         assert_eq!(toml_display(&v).unwrap(), "0.25");
-        let v = get_value(&cfg, "budget.models.fable").unwrap().unwrap();
+        let v = get_value(&cfg, "budget.providers.claude.models.fable").unwrap().unwrap();
         assert!(toml_display(&v).unwrap().contains("share = 0.25"));
+        let v = get_value(&cfg, "budget.providers.codex.enabled").unwrap().unwrap();
+        assert_eq!(toml_display(&v).unwrap(), "false");
         assert!(get_value(&cfg, "repo.default_branch").unwrap().is_none());
         assert!(get_value(&cfg, "nope.nothing").unwrap().is_none());
     }

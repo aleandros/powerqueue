@@ -201,7 +201,7 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
         let t = &row.task;
         let state = if color { output::state_colored(t.state) } else { t.state.to_string() };
         let crit = if color { output::criticality_colored(t.criticality) } else { t.criticality.to_string() };
-        let model = t.model.or(t.model_override);
+        let model = t.model.as_ref().or(t.model_override.as_ref());
         let model_text = if color { output::model_colored(model) } else { model.map(|m| m.to_string()).unwrap_or("-".into()) };
         let model_text = if t.model_override.is_some() { format!("{model_text}*") } else { model_text };
         let attempts = match t.max_attempts {
