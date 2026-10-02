@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Linear queue scoping: `linear.cycle` (`any`, `active`/`current`, `next`,
+  `active-or-next`, `none`) and `linear.projects` (project names) filter
+  issues server-side. Issues carry their cycle into tasks (database schema
+  v3: `tasks.cycle`, `tasks.cycle_number`), `task show` and `linear sync`
+  print it, and `PRIORITY.md` conditions can use `cycle`
+  (`active|next|past|future`) and `cycle_number` (`>`/`<` supported), e.g.
+  `+150 if cycle: active`.
+- `linear.manage_states = false` stops the daemon from moving issues between
+  workflow states (for users whose own Claude skills or CI own the status);
+  comments still follow `post_comments`. An empty `in_progress_state`,
+  `done_state` or `blocked_state` now means "no state change" for that
+  transition.
+- Customisable task prompt: `[prompt] template` points to a Markdown file
+  with `{{placeholders}}` (`key`, `title`, `description`, `url`, `labels`,
+  `cycle`, `branch`, `working_rules`, `completion_protocol`,
+  `attempt_notes`, `default_prompt`, ...); `[prompt] instructions` appends
+  a `## Instructions` section to every prompt; `.powerqueue.toml` can set
+  `prompt_template` per repository. A missing or unreadable template falls
+  back to the built-in prompt with a `prompt.template_error` event (also
+  raised once per unknown placeholder), `doctor` checks the template, and
+  `powerqueue task prompt <task>` prints the prompt a task would receive
+  (`--json` includes the template path and warnings). An example template
+  that reproduces the built-in prompt ships in
+  `docs/examples/prompt-template.md`.
+
 ## [0.2.0] - 2026-10-02
 
 ### Added

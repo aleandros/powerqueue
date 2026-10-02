@@ -11,6 +11,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+pub use crate::config::CycleScope;
+
 /// The authenticated user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Viewer {
@@ -54,6 +56,9 @@ pub struct LinearIssue {
     pub team_key: String,
     pub project: Option<String>,
     pub assignee_id: Option<String>,
+    /// The issue's cycle, if it is in one.
+    #[serde(default)]
+    pub cycle: Option<CycleInfo>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -63,6 +68,73 @@ impl LinearIssue {
     pub fn has_label(&self, label: &str) -> bool {
         self.labels.iter().any(|l| l.eq_ignore_ascii_case(label.trim()))
     }
+
+    /// The cycle status word stored on tasks (`active`, `next`, `past`,
+    /// `future`, `other`); `None` when the issue is in no cycle.
+    pub fn cycle_status(&self) -> Option<&'static str> {
+        self.cycle.as_ref().map(|c| c.status.as_str())
+    }
+}
+
+/// Where a cycle sits relative to today, from Linear's `isActive` /
+/// `isNext` / `isPast` / `isFuture` flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CycleStatus {
+    /// The team's current cycle.
+    Active,
+    /// The cycle right after the active one.
+    Next,
+    /// Already ended.
+    Past,
+    /// Starts later than the next cycle.
+    Future,
+    /// None of the flags were set (should not happen; kept for safety).
+    Other,
+}
+
+impl CycleStatus {
+    /// Derive from the booleans Linear returns; `isActive` wins, then
+    /// `isNext`, `isPast`, `isFuture`.
+    pub fn from_flags(is_active: bool, is_next: bool, is_past: bool, is_future: bool) -> Self {
+        if is_active {
+            Self::Active
+        } else if is_next {
+            Self::Next
+        } else if is_past {
+            Self::Past
+        } else if is_future {
+            Self::Future
+        } else {
+            Self::Other
+        }
+    }
+
+    /// Lower-case word as used in `PRIORITY.md` (`cycle: active`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Next => "next",
+            Self::Past => "past",
+            Self::Future => "future",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl std::fmt::Display for CycleStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The cycle an issue belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CycleInfo {
+    /// Linear's `Cycle.number` (a float in the schema; always integral).
+    pub number: u32,
+    pub name: Option<String>,
+    pub status: CycleStatus,
 }
 
 /// Server-side filter for [`LinearClient::fetch_issues`].
@@ -75,6 +147,10 @@ pub struct IssueFilter {
     pub state_names: Vec<String>,
     pub required_labels: Vec<String>,
     pub excluded_labels: Vec<String>,
+    /// Which cycles to pull from (server-side).
+    pub cycle: CycleScope,
+    /// Project names to restrict to (server-side, `project.name in [...]`); empty = any.
+    pub projects: Vec<String>,
     /// Maximum number of issues returned; `0` means no limit.
     pub max: u32,
 }
@@ -88,8 +164,48 @@ impl IssueFilter {
             state_names: cfg.queued_states.clone(),
             required_labels: cfg.required_labels.clone(),
             excluded_labels: cfg.excluded_labels.clone(),
+            cycle: cfg.cycle_scope(),
+            projects: cfg.project_names(),
             max: cfg.max_issues,
         }
+    }
+
+    /// The `IssueFilter` GraphQL input this filter sends, minus the
+    /// assignee (which needs a network round-trip for `me`). Exposed so the
+    /// shape can be unit-tested and shown by `linear sync`.
+    pub fn server_filter(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut f = serde_json::Map::new();
+        if !self.team_keys.is_empty() {
+            f.insert("team".into(), serde_json::json!({ "key": { "in": self.team_keys } }));
+        }
+        if !self.state_names.is_empty() {
+            f.insert("state".into(), serde_json::json!({ "name": { "in": self.state_names } }));
+        }
+        if !self.projects.is_empty() {
+            f.insert("project".into(), serde_json::json!({ "name": { "in": self.projects } }));
+        }
+        match self.cycle {
+            CycleScope::Any => {}
+            CycleScope::Active => {
+                f.insert("cycle".into(), serde_json::json!({ "isActive": { "eq": true } }));
+            }
+            CycleScope::Next => {
+                f.insert("cycle".into(), serde_json::json!({ "isNext": { "eq": true } }));
+            }
+            CycleScope::ActiveOrNext => {
+                f.insert(
+                    "or".into(),
+                    serde_json::json!([
+                        { "cycle": { "isActive": { "eq": true } } },
+                        { "cycle": { "isNext": { "eq": true } } }
+                    ]),
+                );
+            }
+            CycleScope::None => {
+                f.insert("cycle".into(), serde_json::json!({ "null": true }));
+            }
+        }
+        f
     }
 
     /// Client-side label check: at least one required label (if any are
@@ -105,7 +221,8 @@ impl IssueFilter {
 /// Fields requested for every issue query; shared by list and single lookups.
 const ISSUE_FIELDS: &str = "id identifier title description url priority estimate \
      labels { nodes { name } } state { name type } team { key } \
-     project { name } assignee { id } createdAt updatedAt";
+     project { name } assignee { id } \
+     cycle { number name isActive isNext isPast isFuture } createdAt updatedAt";
 
 /// Page size for issue pagination.
 const PAGE_SIZE: u32 = 50;
@@ -140,8 +257,37 @@ struct RawIssue {
     project: Option<Named>,
     #[serde(default)]
     assignee: Option<Ided>,
+    #[serde(default)]
+    cycle: Option<RawCycle>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawCycle {
+    #[serde(default)]
+    number: Option<f64>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    is_active: bool,
+    #[serde(default)]
+    is_next: bool,
+    #[serde(default)]
+    is_past: bool,
+    #[serde(default)]
+    is_future: bool,
+}
+
+impl From<RawCycle> for CycleInfo {
+    fn from(raw: RawCycle) -> Self {
+        CycleInfo {
+            number: raw.number.filter(|n| n.is_finite() && *n >= 0.0).map(|n| n.round() as u32).unwrap_or(0),
+            name: raw.name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()),
+            status: CycleStatus::from_flags(raw.is_active, raw.is_next, raw.is_past, raw.is_future),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -202,6 +348,7 @@ impl From<RawIssue> for LinearIssue {
             team_key: raw.team.map(|t| t.key).unwrap_or_default(),
             project: raw.project.map(|p| p.name),
             assignee_id: raw.assignee.map(|a| a.id),
+            cycle: raw.cycle.map(CycleInfo::from),
             created_at: raw.created_at,
             updated_at: raw.updated_at,
         }
@@ -359,15 +506,11 @@ impl LinearClient {
 
     /// Fetch issues matching `filter`, paginating in pages of 50 until
     /// `filter.max` issues pass the client-side label filter (or the server
-    /// runs out of pages). `assignee = "me"` is resolved to the viewer id.
+    /// runs out of pages). Teams, states, projects and the cycle scope are
+    /// filtered server-side ([`IssueFilter::server_filter`]);
+    /// `assignee = "me"` is resolved to the viewer id.
     pub async fn fetch_issues(&self, filter: &IssueFilter) -> Result<Vec<LinearIssue>> {
-        let mut server_filter = serde_json::Map::new();
-        if !filter.team_keys.is_empty() {
-            server_filter.insert("team".into(), serde_json::json!({ "key": { "in": filter.team_keys } }));
-        }
-        if !filter.state_names.is_empty() {
-            server_filter.insert("state".into(), serde_json::json!({ "name": { "in": filter.state_names } }));
-        }
+        let mut server_filter = filter.server_filter();
         if let Some(assignee) = filter.assignee.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
             let id = if assignee.eq_ignore_ascii_case("me") { self.viewer().await?.id } else { assignee.to_string() };
             server_filter.insert("assignee".into(), serde_json::json!({ "id": { "eq": id } }));
@@ -507,9 +650,88 @@ mod tests {
             team_key: "ENG".into(),
             project: None,
             assignee_id: None,
+            cycle: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn server_filter_covers_cycle_scopes_and_projects() {
+        let base = IssueFilter { team_keys: vec!["ENG".into()], state_names: vec!["Todo".into()], ..Default::default() };
+        let f = serde_json::Value::Object(base.server_filter());
+        assert_eq!(f["team"]["key"]["in"], serde_json::json!(["ENG"]));
+        assert!(f.get("cycle").is_none() && f.get("or").is_none() && f.get("project").is_none(), "{f}");
+
+        let f = serde_json::Value::Object(IssueFilter { cycle: CycleScope::Active, ..base.clone() }.server_filter());
+        assert_eq!(f["cycle"], serde_json::json!({ "isActive": { "eq": true } }));
+        let f = serde_json::Value::Object(IssueFilter { cycle: CycleScope::Next, ..base.clone() }.server_filter());
+        assert_eq!(f["cycle"], serde_json::json!({ "isNext": { "eq": true } }));
+        let f = serde_json::Value::Object(IssueFilter { cycle: CycleScope::None, ..base.clone() }.server_filter());
+        assert_eq!(f["cycle"], serde_json::json!({ "null": true }));
+        let f = serde_json::Value::Object(IssueFilter { cycle: CycleScope::ActiveOrNext, ..base.clone() }.server_filter());
+        assert!(f.get("cycle").is_none());
+        assert_eq!(
+            f["or"],
+            serde_json::json!([{ "cycle": { "isActive": { "eq": true } } }, { "cycle": { "isNext": { "eq": true } } }])
+        );
+        // Teams and states still apply next to the `or`.
+        assert_eq!(f["state"]["name"]["in"], serde_json::json!(["Todo"]));
+
+        let f =
+            serde_json::Value::Object(IssueFilter { projects: vec!["Launch".into(), "Platform".into()], ..base }.server_filter());
+        assert_eq!(f["project"]["name"]["in"], serde_json::json!(["Launch", "Platform"]));
+    }
+
+    #[test]
+    fn filter_from_config_reads_cycle_and_projects() {
+        let mut cfg = crate::config::LinearConfig { cycle: "current".into(), ..Default::default() };
+        cfg.projects = vec![" Launch ".into(), "".into()];
+        let f = IssueFilter::from_config(&cfg);
+        assert_eq!(f.cycle, CycleScope::Active);
+        assert_eq!(f.projects, vec!["Launch".to_string()]);
+        cfg.cycle = "bogus".into();
+        assert_eq!(IssueFilter::from_config(&cfg).cycle, CycleScope::Any, "unknown values never narrow the queue");
+    }
+
+    #[test]
+    fn cycle_status_from_flags() {
+        assert_eq!(CycleStatus::from_flags(true, false, false, false), CycleStatus::Active);
+        assert_eq!(CycleStatus::from_flags(false, true, false, true), CycleStatus::Next);
+        assert_eq!(CycleStatus::from_flags(false, false, true, false), CycleStatus::Past);
+        assert_eq!(CycleStatus::from_flags(false, false, false, true), CycleStatus::Future);
+        assert_eq!(CycleStatus::from_flags(false, false, false, false), CycleStatus::Other);
+        assert_eq!(CycleStatus::Active.as_str(), "active");
+    }
+
+    #[test]
+    fn raw_issue_parses_cycle_and_tolerates_missing_cycle_fields() {
+        let base = serde_json::json!({
+            "id": "abc", "identifier": "ENG-9", "title": "T", "url": "https://x",
+            "createdAt": "2026-01-01T00:00:00.000Z", "updatedAt": "2026-01-02T00:00:00.000Z"
+        });
+        let mut with_cycle = base.clone();
+        with_cycle["cycle"] = serde_json::json!({ "number": 14.0, "name": null, "isActive": false, "isNext": true, "isPast": false, "isFuture": true });
+        let raw: RawIssue = serde_json::from_value(with_cycle).unwrap();
+        let issue = LinearIssue::from(raw);
+        let cycle = issue.cycle.clone().expect("cycle");
+        assert_eq!(cycle.number, 14);
+        assert_eq!(cycle.name, None);
+        assert_eq!(cycle.status, CycleStatus::Next);
+        assert_eq!(issue.cycle_status(), Some("next"));
+
+        // A cycle object with only a number (older API shapes) and an explicit null.
+        let mut bare = base.clone();
+        bare["cycle"] = serde_json::json!({ "number": 3, "name": "Sprint 3" });
+        let issue = LinearIssue::from(serde_json::from_value::<RawIssue>(bare).unwrap());
+        assert_eq!(issue.cycle, Some(CycleInfo { number: 3, name: Some("Sprint 3".into()), status: CycleStatus::Other }));
+        let mut null = base.clone();
+        null["cycle"] = serde_json::Value::Null;
+        let issue = LinearIssue::from(serde_json::from_value::<RawIssue>(null).unwrap());
+        assert_eq!(issue.cycle, None);
+        assert_eq!(issue.cycle_status(), None);
+        let issue = LinearIssue::from(serde_json::from_value::<RawIssue>(base).unwrap());
+        assert_eq!(issue.cycle, None, "a missing `cycle` key is fine too");
     }
 
     #[test]

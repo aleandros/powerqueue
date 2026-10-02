@@ -212,7 +212,12 @@ fn plan(
                         action: "create",
                         key: issue.identifier.clone(),
                         title: issue.title.clone(),
-                        detail: format!("{} / {}", issue.state_name, issue.labels.join(",")),
+                        detail: match &issue.cycle {
+                            Some(c) => {
+                                format!("{} / {} / cycle {} ({})", issue.state_name, issue.labels.join(","), c.number, c.status)
+                            }
+                            None => format!("{} / {}", issue.state_name, issue.labels.join(",")),
+                        },
                     });
                 }
             }
@@ -268,6 +273,12 @@ fn describe_filter(f: &IssueFilter) -> String {
     }
     if !f.excluded_labels.is_empty() {
         parts.push(format!("not {}", f.excluded_labels.join(",")));
+    }
+    if f.cycle != crate::linear::CycleScope::Any {
+        parts.push(format!("cycle {}", f.cycle));
+    }
+    if !f.projects.is_empty() {
+        parts.push(format!("projects {}", f.projects.join(",")));
     }
     if f.max > 0 {
         parts.push(format!("max {}", f.max));

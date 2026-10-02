@@ -268,6 +268,15 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     if let Some(p) = &task.project {
         kv("project", p.clone());
     }
+    if let Some(c) = &task.cycle {
+        kv(
+            "cycle",
+            match task.cycle_number {
+                Some(n) => format!("{c} (#{n})"),
+                None => c.clone(),
+            },
+        );
+    }
     if let Some(e) = task.estimate {
         kv("estimate", format!("{e}"));
     }
@@ -456,6 +465,55 @@ pub fn parse_model_arg(s: &str) -> Result<Option<ModelTier>> {
     }
 }
 
+/// Render the prompt the next attempt of `task` would receive: the template
+/// (global or repo override) with attempt `attempts + 1`, the task's last
+/// error, its forced/last model (else `budget.default_model`), and the
+/// branch and worktree it would get. Nothing is written or launched.
+pub fn preview_prompt(cfg: &Config, paths: &crate::paths::Paths, task: &Task) -> crate::session::RenderedPrompt {
+    let model = effective_model(task).cloned().unwrap_or_else(|| cfg.budget.default_model.clone());
+    let mut preview = task.clone();
+    if preview.branch.is_none() {
+        preview.branch = Some(crate::worktree::branch_name(&cfg.repo.branch_template, &task.slug(), &task.id.short()));
+    }
+    if preview.worktree_path.is_none() {
+        preview.worktree_path =
+            Some(crate::scheduler::worktree_dir(&cfg.worktree_root(paths), task).to_string_lossy().to_string());
+    }
+    let ctx = crate::session::PromptContext {
+        provider: model.provider(),
+        model: Some(&model),
+        attempt: task.attempts.saturating_add(1),
+        previous_error: task.last_error.as_deref(),
+    };
+    crate::session::render_prompt(&preview, cfg, &ctx)
+}
+
+fn prompt(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
+    let cfg = ctx.config_cloned()?;
+    let store = ctx.store()?.clone();
+    let task = find_task(&store, &task_ref.task)?;
+    let rendered = preview_prompt(&cfg, &ctx.paths, &task);
+    if ctx.json {
+        let out = serde_json::json!({
+            "task": task.key,
+            "task_id": task.id,
+            "template": rendered.template,
+            "prompt": rendered.text,
+            "warnings": rendered.warnings,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(0);
+    }
+    for w in &rendered.warnings {
+        output::print_warning(w);
+    }
+    print!("{}", rendered.text);
+    if !rendered.text.ends_with('\n') {
+        println!();
+    }
+    Ok(0)
+}
+
 /// Handle `powerqueue task ...`.
 pub fn run(ctx: &mut Context, cmd: TaskCommand) -> Result<i32> {
     ensure_initialised(ctx)?;
@@ -463,6 +521,7 @@ pub fn run(ctx: &mut Context, cmd: TaskCommand) -> Result<i32> {
         TaskCommand::List(args) => super::status::run(ctx, args),
         TaskCommand::Show(t) => show(ctx, &t),
         TaskCommand::Explain(t) => explain(ctx, &t),
+        TaskCommand::Prompt(t) => prompt(ctx, &t),
         TaskCommand::Complete { task, summary } => {
             let store = ctx.store()?.clone();
             let mut t = find_task(&store, &task.task)?;

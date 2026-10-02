@@ -17,6 +17,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     linear_priority INTEGER,
     estimate        REAL,
     project         TEXT,
+    cycle           TEXT,                      -- active | next | past | future (v3)
+    cycle_number    INTEGER,                   -- Linear Cycle.number (v3)
     model_override  TEXT,
     model           TEXT,
     worktree_path   TEXT,

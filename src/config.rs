@@ -29,6 +29,7 @@ pub struct Config {
     pub repo: RepoConfig,
     pub linear: LinearConfig,
     pub priority: PriorityConfig,
+    pub prompt: PromptConfig,
     pub scheduler: SchedulerConfig,
     pub claude: ClaudeConfig,
     pub codex: CodexConfig,
@@ -86,12 +87,22 @@ pub struct LinearConfig {
     pub required_labels: Vec<String>,
     /// Issues with any of these labels are ignored.
     pub excluded_labels: Vec<String>,
-    /// State to move an issue to when a session starts.
+    /// Cycle scope: `any` (default), `active` (alias `current`), `next`,
+    /// `active-or-next`, or `none` (issues without a cycle). Applied server-side.
+    pub cycle: String,
+    /// Only issues in one of these projects (matched by project *name*,
+    /// server-side). Empty = any project.
+    pub projects: Vec<String>,
+    /// State to move an issue to when a session starts. Empty = no change.
     pub in_progress_state: Option<String>,
-    /// State to move an issue to when the task completes.
+    /// State to move an issue to when the task completes. Empty = no change.
     pub done_state: Option<String>,
     /// State to move an issue to when the task fails permanently or is blocked.
     pub blocked_state: Option<String>,
+    /// Let powerqueue move issues between workflow states at all. `false`
+    /// when your own Claude skills or CI own the status; comments still
+    /// follow `post_comments`.
+    pub manage_states: bool,
     /// Post progress comments on the issue.
     pub post_comments: bool,
     pub poll_interval_secs: u64,
@@ -110,14 +121,113 @@ impl Default for LinearConfig {
             queued_states: vec!["Todo".to_string()],
             required_labels: Vec::new(),
             excluded_labels: vec!["no-agent".to_string()],
+            cycle: "any".to_string(),
+            projects: Vec::new(),
             in_progress_state: Some("In Progress".to_string()),
             done_state: Some("In Review".to_string()),
             blocked_state: None,
+            manage_states: true,
             post_comments: true,
             poll_interval_secs: 60,
             max_issues: 100,
             endpoint: "https://api.linear.app/graphql".to_string(),
         }
+    }
+}
+
+/// Which cycles `[linear]` pulls issues from (`linear.cycle`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CycleScope {
+    /// Every issue regardless of cycle.
+    #[default]
+    Any,
+    /// Only the team's active cycle.
+    Active,
+    /// Only the upcoming cycle.
+    Next,
+    /// The active cycle or the upcoming one.
+    ActiveOrNext,
+    /// Only issues that are in no cycle.
+    None,
+}
+
+impl CycleScope {
+    /// Accepted spellings of `linear.cycle` (for messages).
+    pub const NAMES: [&'static str; 6] = ["any", "active", "current", "next", "active-or-next", "none"];
+
+    /// Parse a config value (case-insensitive; `current` is an alias of `active`).
+    /// `None` for an unknown word.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "" | "any" | "all" => Self::Any,
+            "active" | "current" => Self::Active,
+            "next" | "upcoming" => Self::Next,
+            "active-or-next" | "current-or-next" => Self::ActiveOrNext,
+            "none" | "null" => Self::None,
+            _ => return None,
+        })
+    }
+
+    /// Canonical spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::Active => "active",
+            Self::Next => "next",
+            Self::ActiveOrNext => "active-or-next",
+            Self::None => "none",
+        }
+    }
+}
+
+impl std::fmt::Display for CycleScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl LinearConfig {
+    /// The parsed cycle scope; an unknown value (reported by
+    /// [`Config::validate`]) reads as `any` so sync never silently narrows.
+    pub fn cycle_scope(&self) -> CycleScope {
+        CycleScope::parse(&self.cycle).unwrap_or_default()
+    }
+
+    /// Project names to filter on, trimmed, empty entries dropped.
+    pub fn project_names(&self) -> Vec<String> {
+        self.projects.iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
+    }
+}
+
+/// How the first message of a session is composed (`[prompt]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct PromptConfig {
+    /// Path to a Markdown template with `{{placeholders}}` (see README,
+    /// "Prompt template"). `~` is expanded; a relative path is resolved
+    /// against the config directory (or the repository root when it comes
+    /// from `.powerqueue.toml`). `None` = the built-in prompt.
+    pub template: Option<String>,
+    /// Extra instructions appended to every prompt under `## Instructions`
+    /// (also available to templates as `{{instructions}}`).
+    pub instructions: Option<String>,
+    /// Directory relative `template` paths resolve against; set by
+    /// [`Config::load`] to the config directory. Not part of the file.
+    #[serde(skip)]
+    pub base_dir: Option<PathBuf>,
+}
+
+impl PromptConfig {
+    /// Absolute path of the template, if one is configured. `~` is expanded
+    /// and a relative path is joined to `base_dir` (left as-is without one).
+    pub fn template_path(&self) -> Option<PathBuf> {
+        let raw = self.template.as_deref().map(str::trim).filter(|t| !t.is_empty())?;
+        let path = expand_tilde(raw);
+        Some(match (&self.base_dir, path.is_absolute()) {
+            (Some(base), false) => base.join(path),
+            _ => path,
+        })
     }
 }
 
@@ -875,6 +985,9 @@ pub struct RepoOverrides {
     pub gemini: Option<GeminiOverrides>,
     /// Extra instructions appended to every task prompt for this repo.
     pub instructions: Option<String>,
+    /// Prompt template for this repo (overrides `[prompt] template`); a
+    /// relative path is resolved against the repository root.
+    pub prompt_template: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -924,7 +1037,9 @@ impl Config {
         let file = paths.config_file();
         let text = std::fs::read_to_string(&file)
             .with_context(|| format!("cannot read {} (run `powerqueue init` first)", file.display()))?;
-        Self::from_toml(&text).with_context(|| format!("invalid config {}", file.display()))
+        let mut cfg = Self::from_toml(&text).with_context(|| format!("invalid config {}", file.display()))?;
+        cfg.prompt.base_dir = Some(paths.config_dir.clone());
+        Ok(cfg)
     }
 
     /// Load if present, otherwise defaults (for commands that must work before init).
@@ -944,7 +1059,25 @@ impl Config {
         let (conflicts, moved): (Vec<String>, Vec<String>) = notes.into_iter().partition(|n| n.starts_with("conflict: "));
         cfg.budget.migrated_keys = moved;
         cfg.budget.migration_conflicts = conflicts.into_iter().map(|c| c.trim_start_matches("conflict: ").to_string()).collect();
+        cfg.normalise();
         Ok(cfg)
+    }
+
+    /// Post-load clean-up: an empty `linear.in_progress_state` /
+    /// `done_state` / `blocked_state` means "no state change for that
+    /// transition" and becomes `None`; an empty `prompt.template` /
+    /// `prompt.instructions` becomes `None` too.
+    pub fn normalise(&mut self) {
+        let blank = |s: &mut Option<String>| {
+            if s.as_deref().is_some_and(|v| v.trim().is_empty()) {
+                *s = None;
+            }
+        };
+        blank(&mut self.linear.in_progress_state);
+        blank(&mut self.linear.done_state);
+        blank(&mut self.linear.blocked_state);
+        blank(&mut self.prompt.template);
+        blank(&mut self.prompt.instructions);
     }
 
     pub fn to_toml(&self) -> Result<String> {
@@ -966,7 +1099,12 @@ impl Config {
             return Ok(None);
         }
         let text = std::fs::read_to_string(&file)?;
-        let ov: RepoOverrides = toml::from_str(&text).with_context(|| format!("invalid {}", file.display()))?;
+        let mut ov: RepoOverrides = toml::from_str(&text).with_context(|| format!("invalid {}", file.display()))?;
+        if let Some(t) = ov.prompt_template.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            let path = expand_tilde(t);
+            let resolved = if path.is_absolute() { path } else { repo_path.join(path) };
+            ov.prompt_template = Some(resolved.to_string_lossy().to_string());
+        }
         self.merge_overrides(ov);
         Ok(Some(file))
     }
@@ -1048,6 +1186,9 @@ impl Config {
                 Some(existing) => format!("{existing}\n\n{instr}"),
                 None => instr,
             });
+        }
+        if let Some(t) = ov.prompt_template.filter(|t| !t.trim().is_empty()) {
+            self.prompt.template = Some(t);
         }
     }
 
@@ -1222,6 +1363,16 @@ impl Config {
         }
         if self.linear.enabled && self.linear.queued_states.is_empty() {
             problems.push("linear.queued_states is empty; no issues would ever be picked up".to_string());
+        }
+        if CycleScope::parse(&self.linear.cycle).is_none() {
+            problems.push(format!(
+                "linear.cycle `{}` is not one of {} (use `any` to ignore cycles)",
+                self.linear.cycle,
+                CycleScope::NAMES.join("|")
+            ));
+        }
+        if !self.linear.projects.is_empty() && self.linear.project_names().is_empty() {
+            problems.push("linear.projects lists only empty names; remove the key or name the projects".to_string());
         }
         problems
     }
@@ -1551,5 +1702,86 @@ mod tests {
         assert!(text.contains("[codex]\n"), "{text}");
         assert!(text.contains("[gemini]\n"), "{text}");
         assert!(cfg.budget.migrated_keys.is_empty());
+    }
+
+    #[test]
+    fn linear_cycle_and_projects_are_validated() {
+        let mut cfg = Config::default();
+        cfg.repo.path = "/x".into();
+        for v in ["any", "active", "Current", "next", "active-or-next", "active_or_next", "none"] {
+            cfg.linear.cycle = v.into();
+            assert!(cfg.validate().is_empty(), "{v}: {:?}", cfg.validate());
+        }
+        assert_eq!(LinearConfig { cycle: "current".into(), ..Default::default() }.cycle_scope(), CycleScope::Active);
+        assert_eq!(LinearConfig { cycle: "ACTIVE-OR-NEXT".into(), ..Default::default() }.cycle_scope(), CycleScope::ActiveOrNext);
+        cfg.linear.cycle = "sprint 3".into();
+        let problems = cfg.validate();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("linear.cycle `sprint 3` is not one of any|active|current|next|active-or-next|none")),
+            "{problems:?}"
+        );
+        assert_eq!(cfg.linear.cycle_scope(), CycleScope::Any, "an invalid value never narrows the queue");
+        cfg.linear.cycle = "any".into();
+        cfg.linear.projects = vec![" ".into()];
+        assert!(cfg.validate().iter().any(|p| p.contains("linear.projects")), "{:?}", cfg.validate());
+        cfg.linear.projects = vec!["Launch".into(), " ".into()];
+        assert!(cfg.validate().is_empty());
+        assert_eq!(cfg.linear.project_names(), vec!["Launch".to_string()]);
+
+        let cfg = Config::from_toml("[linear]\ncycle = 'next'\nprojects = ['A', 'B']\nmanage_states = false\n").unwrap();
+        assert_eq!(cfg.linear.cycle_scope(), CycleScope::Next);
+        assert_eq!(cfg.linear.projects, vec!["A".to_string(), "B".to_string()]);
+        assert!(!cfg.linear.manage_states);
+        assert!(Config::default().linear.manage_states);
+    }
+
+    #[test]
+    fn empty_state_names_mean_no_state_change() {
+        let cfg = Config::from_toml(
+            "[repo]\npath = '/x'\n[linear]\nin_progress_state = ''\ndone_state = '  '\nblocked_state = 'Blocked'\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.linear.in_progress_state, None);
+        assert_eq!(cfg.linear.done_state, None);
+        assert_eq!(cfg.linear.blocked_state.as_deref(), Some("Blocked"));
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+    }
+
+    #[test]
+    fn prompt_template_paths_resolve_against_config_dir_and_repo_root() {
+        let mut cfg = Config::from_toml("[prompt]\ntemplate = 'prompt.md'\ninstructions = ''\n").unwrap();
+        assert_eq!(cfg.prompt.instructions, None);
+        assert_eq!(cfg.prompt.template_path(), Some(PathBuf::from("prompt.md")), "no base dir: left as-is");
+        cfg.prompt.base_dir = Some(PathBuf::from("/cfg"));
+        assert_eq!(cfg.prompt.template_path(), Some(PathBuf::from("/cfg/prompt.md")));
+        cfg.prompt.template = Some("/abs/p.md".into());
+        assert_eq!(cfg.prompt.template_path(), Some(PathBuf::from("/abs/p.md")));
+        cfg.prompt.template = Some("  ".into());
+        assert_eq!(cfg.prompt.template_path(), None);
+        assert_eq!(Config::default().prompt.template_path(), None);
+
+        // `Config::load` sets the base dir; `.powerqueue.toml` resolves against the repo root and wins.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            paths.config_file(),
+            format!("[repo]\npath = '{}'\n[prompt]\ntemplate = 'global.md'\ninstructions = 'Be brief.'\n", repo.display()),
+        )
+        .unwrap();
+        let mut cfg = Config::load(&paths).unwrap();
+        assert_eq!(cfg.prompt.template_path(), Some(paths.config_dir.join("global.md")));
+        assert_eq!(cfg.prompt.instructions.as_deref(), Some("Be brief."));
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "prompt_template = 'docs/agent-prompt.md'\n").unwrap();
+        cfg.apply_repo_overrides(&repo).unwrap();
+        assert_eq!(cfg.prompt.template_path(), Some(repo.join("docs/agent-prompt.md")));
+        let text = cfg.to_toml().unwrap();
+        assert!(text.contains("[prompt]"), "{text}");
+        assert!(!text.contains("base_dir"), "{text}");
+        assert!(Config::from_toml("[prompt]\nbogus = 1\n").is_err());
     }
 }

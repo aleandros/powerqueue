@@ -42,8 +42,8 @@ A condition compares one task field with a value.
 | `field: value` | equals, case-insensitive; for `label`, membership in the label list (`=` and `==` are accepted too) | `label: incident` |
 | `field != value` | not equals (for `label`: label absent) | `project != Sandbox` |
 | `field ~ regex` | case-insensitive regex match (for `label`: any label matches) | `title ~ "^hotfix"` |
-| `field > n` | numeric greater than (`priority`, `estimate` only) | `estimate > 8` |
-| `field < n` | numeric less than (`priority`, `estimate` only) | `priority < 3` |
+| `field > n` | numeric greater than (`priority`, `estimate`, `cycle_number` only) | `estimate > 8` |
+| `field < n` | numeric less than (`priority`, `estimate`, `cycle_number` only) | `priority < 3` |
 
 Join conditions with ` and `. All conditions in a rule must hold. There is no
 `or`: write a second bullet instead.
@@ -65,6 +65,8 @@ regex metacharacters.
 | `priority` | enum / number | `urgent`, `high`, `normal` (`medium`), `low`, `none`, or Linear's 0–4 (0 = none, 1 = urgent) |
 | `estimate` | number | Linear estimate points |
 | `project` | string | Linear project name |
+| `cycle` | enum | `active`, `next`, `past` or `future`: where the issue's cycle sits today; missing when the issue is in no cycle (and on manual tasks) |
+| `cycle_number` | number | the cycle's number (`Cycle.number` in Linear); missing without a cycle |
 | `team` | string | Linear team key (`ENG`); missing on manual tasks |
 | `title` | string | task title |
 | `description` | string | task description (Markdown) |
@@ -316,6 +318,21 @@ Claude's for everything else.
 
 `priority.age_boost_per_hour` (2 points per hour, at most 200) still lets a
 chore surface after a quiet day.
+
+**Prefer the current cycle**
+
+```markdown
+## Scoring
+- +150 if cycle: active
+- -100 if cycle: future
+```
+
+Issues in the active cycle jump ahead of everything else at the same
+criticality; issues planned for a later cycle wait. Issues in no cycle match
+neither line and keep their base score. `cycle_number > 14` works too when
+you want to pin a specific sprint. To not pull later cycles at all, set
+`linear.cycle = "active"` (or `"active-or-next"`) in `config.toml` instead:
+that filters on the server, so those issues never become tasks.
 
 **Let Jev break ties**
 

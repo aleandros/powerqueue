@@ -22,7 +22,8 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// * v1: initial schema.
 /// * v2: `sessions.agent_session_id`; kv `budget.calibration` renamed to
 ///   `budget.calibration.claude` (budgets are per provider).
-pub const SCHEMA_VERSION: i64 = 2;
+/// * v3: `tasks.cycle` and `tasks.cycle_number` (the Linear cycle an issue is in).
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// kv key of the Claude calibration before schema v2.
 const LEGACY_CALIBRATION_KEY: &str = "budget.calibration";
@@ -128,13 +129,14 @@ impl Store {
         let conn = self.lock();
         conn.execute_batch(SCHEMA).context("apply schema")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version < 2 {
-            let has_column = conn
-                .prepare("PRAGMA table_info(sessions)")?
+        let columns_of = |table: &str| -> Result<Vec<String>> {
+            Ok(conn
+                .prepare(&format!("PRAGMA table_info({table})"))?
                 .query_map([], |r| r.get::<_, String>(1))?
-                .collect::<rusqlite::Result<Vec<String>>>()?
-                .iter()
-                .any(|c| c == "agent_session_id");
+                .collect::<rusqlite::Result<Vec<String>>>()?)
+        };
+        if version < 2 {
+            let has_column = columns_of("sessions")?.iter().any(|c| c == "agent_session_id");
             if !has_column {
                 conn.execute("ALTER TABLE sessions ADD COLUMN agent_session_id TEXT", [])
                     .context("add sessions.agent_session_id")?;
@@ -153,6 +155,22 @@ impl Store {
                 legacy_dropped = dropped > 0,
                 "migrated database schema"
             );
+        }
+        if version < 3 {
+            let cols = columns_of("tasks")?;
+            let mut added = Vec::new();
+            for (name, sql) in [
+                ("cycle", "ALTER TABLE tasks ADD COLUMN cycle TEXT"),
+                ("cycle_number", "ALTER TABLE tasks ADD COLUMN cycle_number INTEGER"),
+            ] {
+                if !cols.iter().any(|c| c == name) {
+                    conn.execute(sql, []).with_context(|| format!("add tasks.{name}"))?;
+                    added.push(name);
+                }
+            }
+            if !added.is_empty() {
+                tracing::info!(from = version, to = SCHEMA_VERSION, columns_added = ?added, "migrated database schema to v3");
+            }
         }
         if version < SCHEMA_VERSION {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -184,8 +202,8 @@ impl Store {
         conn.execute(
             "INSERT INTO tasks (id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score,
                 labels, linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts,
-                not_before, last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+                not_before, last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
             params![
                 task.id.to_string(),
                 task.key,
@@ -215,6 +233,8 @@ impl Store {
                 ts(&task.updated_at),
                 task.started_at.as_ref().map(ts),
                 task.completed_at.as_ref().map(ts),
+                task.cycle,
+                task.cycle_number,
             ],
         )
         .with_context(|| format!("insert task {}", task.key))?;
@@ -228,7 +248,7 @@ impl Store {
             "UPDATE tasks SET key=?2, title=?3, description=?4, source=?5, source_kind=?6, linear_issue_id=?7, state=?8,
                 criticality=?9, score=?10, labels=?11, linear_priority=?12, estimate=?13, project=?14, model_override=?15,
                 model=?16, worktree_path=?17, branch=?18, attempts=?19, max_attempts=?20, not_before=?21, last_error=?22,
-                summary=?23, score_reasons=?24, updated_at=?25, started_at=?26, completed_at=?27
+                summary=?23, score_reasons=?24, updated_at=?25, started_at=?26, completed_at=?27, cycle=?28, cycle_number=?29
              WHERE id=?1",
             params![
                 task.id.to_string(),
@@ -258,6 +278,8 @@ impl Store {
                 ts(&Utc::now()),
                 task.started_at.as_ref().map(ts),
                 task.completed_at.as_ref().map(ts),
+                task.cycle,
+                task.cycle_number,
             ],
         )?;
         if n == 0 {
@@ -291,6 +313,8 @@ impl Store {
             linear_priority: row.get("linear_priority")?,
             estimate: row.get("estimate")?,
             project: row.get("project")?,
+            cycle: row.get("cycle")?,
+            cycle_number: row.get("cycle_number")?,
             model_override: model_override.map(|m| ModelTier::from_str(&m)).transpose().map_err(|e| conv(anyhow!(e)))?,
             model: model.map(|m| ModelTier::from_str(&m)).transpose().map_err(|e| conv(anyhow!(e)))?,
             worktree_path: row.get("worktree_path")?,
@@ -311,7 +335,7 @@ impl Store {
     const TASK_COLS: &'static str =
         "id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score, labels,
         linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts, not_before,
-        last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at";
+        last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number";
 
     pub fn get_task(&self, id: TaskId) -> Result<Option<Task>> {
         let conn = self.lock();
@@ -1318,5 +1342,77 @@ mod tests {
         assert_eq!(cal["observed_fraction"].as_f64(), Some(0.4));
         assert!(store.kv_get::<serde_json::Value>("budget.calibration").unwrap().is_none());
         assert_eq!(store.integrity_check().unwrap(), "ok");
+        // v1 → v3 in one go also added the cycle columns.
+        let t = store.get_task_by_key("ENG-1").unwrap().unwrap();
+        assert_eq!((t.cycle, t.cycle_number), (None, None));
+    }
+
+    /// The v2 schema (0.2.0): `agent_session_id` present, no cycle columns.
+    const V2_SCHEMA: &str = "
+        CREATE TABLE tasks (id TEXT PRIMARY KEY, key TEXT NOT NULL UNIQUE, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL, source_kind TEXT NOT NULL, linear_issue_id TEXT, state TEXT NOT NULL, criticality TEXT NOT NULL,
+            score REAL NOT NULL DEFAULT 0, labels TEXT NOT NULL DEFAULT '[]', linear_priority INTEGER, estimate REAL, project TEXT,
+            model_override TEXT, model TEXT, worktree_path TEXT, branch TEXT, attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER,
+            not_before TEXT, last_error TEXT, summary TEXT, score_reasons TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL, started_at TEXT, completed_at TEXT);
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, attempt INTEGER NOT NULL,
+            model TEXT NOT NULL, state TEXT NOT NULL, tmux_session TEXT NOT NULL, tmux_window TEXT NOT NULL, pane_id TEXT, pid INTEGER,
+            transcript_path TEXT, exit_code INTEGER, started_at TEXT NOT NULL, ended_at TEXT, last_activity_at TEXT NOT NULL, error TEXT,
+            agent_session_id TEXT);
+        CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+        INSERT INTO kv (key, value, updated_at) VALUES ('budget.calibration.claude', '{\"observed_fraction\":0.4,\"at\":\"2026-09-29T00:00:00Z\",\"measured_fraction\":0.1}', '2026-09-29T00:00:00Z');
+        INSERT INTO tasks (id, key, title, source, source_kind, state, criticality, created_at, updated_at)
+            VALUES ('0199a000-0000-7000-8000-000000000002', 'ENG-2', 't', '{\"kind\":\"manual\"}', 'manual', 'queued', 'normal', '2026-09-29T00:00:00Z', '2026-09-29T00:00:00Z');
+        PRAGMA user_version = 2;
+    ";
+
+    #[test]
+    fn migrates_a_v2_database_file_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pq.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V2_SCHEMA).unwrap();
+        }
+        for pass in 0..2 {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+            let mut t = store.get_task_by_key("ENG-2").unwrap().unwrap();
+            let expected = if pass == 0 { (None, None) } else { (Some("active".to_string()), Some(12)) };
+            assert_eq!((t.cycle.clone(), t.cycle_number), expected, "pass {pass}: the columns survive reopening");
+            t.cycle = Some("active".into());
+            t.cycle_number = Some(12);
+            store.update_task(&t).unwrap();
+            // The calibration key was already in its v2 place and is left alone.
+            let cal: serde_json::Value = store.kv_get("budget.calibration.claude").unwrap().unwrap();
+            assert_eq!(cal["observed_fraction"].as_f64(), Some(0.4));
+        }
+        // A database whose user_version was reset but which already has the columns is not broken by the ALTERs.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let t = store.get_task_by_key("ENG-2").unwrap().unwrap();
+        assert_eq!(t.cycle_number, Some(12));
+        assert_eq!(store.integrity_check().unwrap(), "ok");
+    }
+
+    #[test]
+    fn cycle_fields_round_trip() {
+        let store = Store::open_in_memory().unwrap();
+        let mut t = linear_task("A-1");
+        t.cycle = Some("next".into());
+        t.cycle_number = Some(3);
+        store.insert_task(&t).unwrap();
+        let back = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(back.cycle.as_deref(), Some("next"));
+        assert_eq!(back.cycle_number, Some(3));
+        t.cycle = None;
+        t.cycle_number = None;
+        store.update_task(&t).unwrap();
+        let back = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!((back.cycle, back.cycle_number), (None, None));
     }
 }
