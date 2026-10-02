@@ -31,8 +31,9 @@ fn template_parses_cleanly() {
     let r = rules();
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     assert_eq!(r.default_criticality, Criticality::Normal);
-    assert_eq!(r.models[&Criticality::Critical], ModelTier::fable());
-    assert_eq!(r.models[&Criticality::High], ModelTier::opus());
+    assert_eq!(r.models[&Criticality::Critical], vec![ModelTier::fable()]);
+    assert_eq!(r.models[&Criticality::High], vec![ModelTier::opus()]);
+    assert_eq!(r.model_for(Criticality::Normal), &[ModelTier::sonnet()]);
     assert!(!r.jev.enabled);
     assert_eq!(r.jev.levels.len(), 4);
 }
@@ -45,6 +46,7 @@ fn incident_label_is_critical_on_fable() {
     let e = r.evaluate(&t, t.created_at, None, 300.0, 2.0);
     assert_eq!(e.criticality, Criticality::Critical);
     assert_eq!(e.model, Some(ModelTier::fable()));
+    assert_eq!(e.models, vec![ModelTier::fable()]);
     assert!(!e.skip);
     assert_eq!(e.score, Criticality::Critical.base_score());
     assert!(e.reasons.iter().any(|r| r.starts_with("critical: matched rule at line")), "{:?}", e.reasons);
@@ -99,6 +101,32 @@ fn overrides_pin_tickets() {
     let e = r.evaluate(&linear_task("ENG-8", "x"), Utc::now(), None, 0.0, 0.0);
     assert_eq!(e.criticality, Criticality::Critical);
     assert_eq!(e.model, Some(ModelTier::haiku()));
+}
+
+#[test]
+fn model_lists_accept_alternatives_across_providers() {
+    let md = format!(
+        "{}\n## Overrides\n- ENG-7: model = gpt-6-astra | sonnet\n",
+        template().replace("- critical: fable\n", "- critical: fable | gpt-6.1-sol | opus\n")
+    );
+    let r = PriorityRules::parse(&md).unwrap();
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert_eq!(r.model_for(Criticality::Critical), &[ModelTier::fable(), ModelTier::new("gpt-6.1-sol"), ModelTier::opus()]);
+    let mut t = linear_task("ENG-1", "Prod down");
+    t.labels = vec!["incident".into()];
+    let e = r.evaluate(&t, t.created_at, None, 0.0, 0.0);
+    assert_eq!(e.models.len(), 3);
+    assert_eq!(e.model, Some(ModelTier::fable()));
+    let e = r.evaluate(&linear_task("ENG-7", "x"), Utc::now(), None, 0.0, 0.0);
+    assert_eq!(e.models, vec![ModelTier::new("gpt-6-astra"), ModelTier::sonnet()]);
+    assert!(e.reasons.iter().any(|x| x == "model gpt-6-astra | sonnet from ## Overrides"), "{:?}", e.reasons);
+
+    // Unknown names fail with the line number and the alias rules.
+    let bad = template().replace("- high: opus\n", "- high: opus | llama\n");
+    let errs = PriorityRules::parse(&bad).unwrap_err();
+    assert_eq!(errs.len(), 1);
+    assert!(errs[0].message.contains("unknown model `llama`") && errs[0].message.contains("codex:<name>"), "{}", errs[0].message);
+    assert_eq!(bad.lines().nth(errs[0].line - 1).unwrap().trim(), "- high: opus | llama");
 }
 
 #[test]

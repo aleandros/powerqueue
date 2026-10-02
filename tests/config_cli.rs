@@ -170,3 +170,46 @@ fn init_rejects_bad_permission_mode_and_reconfigure_keeps_other_settings() {
     pq(home.path()).args(["config", "get", "repo.setup"]).assert().success().stdout(predicate::str::diff("[\"make\"]\n"));
     pq(home.path()).args(["config", "get", "linear.enabled"]).assert().success().stdout(predicate::str::diff("false\n"));
 }
+
+#[test]
+fn init_with_provider_flag_enables_codex() {
+    let Some(repo) = git_repo() else {
+        eprintln!("git not available; skipping");
+        return;
+    };
+    let home = tempfile::tempdir().unwrap();
+    pq(home.path())
+        .args(["init", "--non-interactive", "--no-linear", "--repo"])
+        .arg(repo.path())
+        .args(["--provider", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("providers      claude, codex"));
+    pq(home.path())
+        .args(["config", "get", "budget.providers.codex.enabled"])
+        .assert()
+        .success()
+        .stdout(predicate::str::diff("true\n"));
+    pq(home.path())
+        .args(["config", "get", "budget.providers.gemini.enabled"])
+        .assert()
+        .success()
+        .stdout(predicate::str::diff("false\n"));
+    // `--provider` also accepts the gemini aliases; reconfigure keeps codex on.
+    pq(home.path())
+        .args(["init", "--reconfigure", "--non-interactive", "--provider", "agy"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("providers      claude, codex, gemini"));
+    pq(home.path())
+        .args(["config", "get", "budget.providers.gemini.enabled"])
+        .assert()
+        .success()
+        .stdout(predicate::str::diff("true\n"));
+    pq(home.path())
+        .args(["init", "--non-interactive", "--no-linear", "--provider", "llama", "--repo"])
+        .arg(repo.path())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("codex"));
+}

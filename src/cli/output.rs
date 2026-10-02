@@ -131,6 +131,41 @@ pub fn model_colored(m: Option<&ModelTier>) -> String {
     }
 }
 
+/// `gpt-6-astra (codex)`: a model with its provider when it is not Claude,
+/// which stays the plain alias (the common case).
+pub fn model_with_provider(m: &ModelTier) -> String {
+    match m.provider() {
+        Provider::Claude => m.as_str().to_string(),
+        p => format!("{} ({p})", m.as_str()),
+    }
+}
+
+/// [`model_colored`] followed by the provider for non-Claude models.
+pub fn model_colored_with_provider(m: Option<&ModelTier>) -> String {
+    match m {
+        Some(m) if m.provider() != Provider::Claude => {
+            let suffix = format!(" ({})", m.provider());
+            format!("{}{}", model_colored(Some(m)), if color_enabled() { suffix.dimmed().to_string() } else { suffix })
+        }
+        other => model_colored(other),
+    }
+}
+
+/// A preference list (`fable | gpt-6.1-sol (codex)`), each model coloured;
+/// `-` when empty.
+pub fn model_list_colored(models: &[ModelTier]) -> String {
+    if models.is_empty() {
+        return model_colored(None);
+    }
+    models.iter().map(|m| model_colored_with_provider(Some(m))).collect::<Vec<_>>().join(" | ")
+}
+
+/// Print a warning line to stderr (`warning: ...`), so `--json` output on
+/// stdout stays clean.
+pub fn print_warning(msg: &str) {
+    eprintln!("{} {msg}", paint("warning:", |t| t.yellow().bold().to_string()));
+}
+
 /// Truncate to `max` columns with an ellipsis.
 pub fn truncate(s: &str, max: usize) -> String {
     use unicode_width::UnicodeWidthChar;
@@ -173,5 +208,16 @@ mod tests {
         assert_eq!(human_duration(90_000), "1d1h");
         assert_eq!(truncate("hello world", 6), "hello…");
         assert_eq!(truncate("hi", 6), "hi");
+    }
+
+    #[test]
+    fn models_print_their_provider_unless_claude() {
+        set_color(false);
+        assert_eq!(model_with_provider(&ModelTier::opus()), "opus");
+        assert_eq!(model_with_provider(&ModelTier::new("gpt-6-astra")), "gpt-6-astra (codex)");
+        assert_eq!(model_colored_with_provider(Some(&ModelTier::new("gemini-3-pro"))), "gemini-3-pro (gemini)");
+        assert_eq!(model_colored_with_provider(None), "-");
+        assert_eq!(model_list_colored(&[]), "-");
+        assert_eq!(model_list_colored(&[ModelTier::fable(), ModelTier::new("gpt-6.1-sol")]), "fable | gpt-6.1-sol (codex)");
     }
 }

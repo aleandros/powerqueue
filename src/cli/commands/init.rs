@@ -22,6 +22,7 @@ use owo_colors::{OwoColorize, Stream, Style};
 use crate::cli::{Context, InitArgs};
 use crate::config::{BudgetConfig, Config, RepoConfig, config_template, write_private};
 use crate::doctor::claude_auth_status;
+use crate::domain::Provider;
 use crate::jev::JevClient;
 use crate::linear::client::{LinearClient, WorkflowState};
 use crate::secrets::{SecretKind, SecretOrigin};
@@ -45,6 +46,9 @@ pub struct Answers {
     pub permission_mode: String,
     pub period_weighted_tokens: u64,
     pub period_anchor: Option<DateTime<Utc>>,
+    /// Providers other than Claude that tasks may run on
+    /// (`budget.providers.<p>.enabled`); Claude is always enabled by `init`.
+    pub providers: Vec<Provider>,
 }
 
 impl Default for Answers {
@@ -64,6 +68,7 @@ impl Default for Answers {
             permission_mode: crate::config::ClaudeConfig::default().permission_mode,
             period_weighted_tokens: budget.providers.claude.period_weighted_tokens,
             period_anchor: None,
+            providers: Vec::new(),
         }
     }
 }
@@ -92,7 +97,15 @@ impl Answers {
                 .as_deref()
                 .and_then(|a| DateTime::parse_from_rfc3339(a).ok())
                 .map(|a| a.with_timezone(&Utc)),
+            providers: cfg.budget.providers.enabled().into_iter().filter(|p| *p != Provider::Claude).collect(),
         }
+    }
+
+    /// Every enabled provider, Claude first (for summaries).
+    pub fn enabled_providers(&self) -> Vec<Provider> {
+        let mut out = vec![Provider::Claude];
+        out.extend(Provider::ALL.iter().copied().filter(|p| *p != Provider::Claude && self.providers.contains(p)));
+        out
     }
 
     /// Write the answers into `cfg`, leaving every other key untouched.
@@ -112,6 +125,12 @@ impl Answers {
         cfg.budget.providers.claude.period_weighted_tokens = self.period_weighted_tokens;
         cfg.budget.providers.claude.period_anchor =
             self.period_anchor.map(|a| a.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        cfg.budget.providers.claude.enabled = true;
+        for p in Provider::ALL {
+            if p != Provider::Claude {
+                cfg.budget.providers.get_mut(p).enabled = self.providers.contains(&p);
+            }
+        }
     }
 }
 
@@ -595,6 +614,67 @@ fn tools_step(ui: &Ui, claude_binary: &str, tmux_binary: &str) {
     }
 }
 
+/// The question `init` asks about an optional provider.
+pub fn provider_prompt(p: Provider, binary: &str) -> String {
+    let extra = if p == Provider::Gemini { " (experimental)" } else { "" };
+    format!("Also run tasks on {} (`{binary}`){extra}? It has its own weekly budget.", p.display_name())
+}
+
+/// Codex and Antigravity: offer each one whose binary is on PATH (interactive)
+/// or enable the ones named with `--provider`. The values already in
+/// `answers.providers` (the current config when reconfiguring) are the
+/// defaults; a `--provider` flag always enables. An enabled provider that is
+/// not logged in gets a warning, not an error: `doctor` checks it again.
+fn providers_step(ui: &Ui, args: &InitArgs, interactive: bool, answers: &mut Answers) -> Result<()> {
+    ui.section("Other providers (optional)");
+    let defaults = Config::default();
+    let mut chosen: Vec<Provider> = Vec::new();
+    for p in [Provider::Codex, Provider::Gemini] {
+        let settings = defaults.launch_settings(p);
+        let binary = settings.binary.as_str();
+        let on_path = which::which(binary).is_ok();
+        let wanted = answers.providers.contains(&p) || args.provider.contains(&p);
+        let enable = if !on_path {
+            if wanted {
+                ui.warn(&format!(
+                    "`{binary}` is not on PATH; enabling {} anyway (install it before `powerqueue run`)",
+                    p.display_name()
+                ));
+            } else {
+                println!("  {} not found (`{binary}`); skipped", p.display_name());
+            }
+            wanted
+        } else if interactive {
+            Confirm::with_theme(ui.theme()).with_prompt(provider_prompt(p, binary)).default(wanted).interact()?
+        } else {
+            wanted
+        };
+        if !enable {
+            continue;
+        }
+        chosen.push(p);
+        if on_path {
+            match crate::session::agent_for(p).auth_status(binary) {
+                Ok(a) if a.logged_in => ui.ok(&format!("{} enabled; {binary} is logged in ({})", p.display_name(), a.detail)),
+                Ok(a) => ui.warn(&format!(
+                    "{} enabled but `{binary}` is not logged in ({}); log in before `powerqueue run`",
+                    p.display_name(),
+                    a.detail
+                )),
+                Err(e) => ui.warn(&format!("{} enabled; `{binary}` login check failed: {e:#}", p.display_name())),
+            }
+        }
+        if p == Provider::Gemini {
+            ui.warn("Antigravity support is experimental; `doctor` keeps an eye on it");
+        }
+    }
+    answers.providers = chosen;
+    if answers.providers.is_empty() {
+        ui.ok("tasks run on Claude Code only (enable others later with `powerqueue init --reconfigure` or `config set budget.providers.codex.enabled true`)");
+    }
+    Ok(())
+}
+
 fn jev_step(ctx: &mut Context, ui: &Ui, args: &InitArgs, interactive: bool, rt: &tokio::runtime::Runtime) -> Result<bool> {
     ui.section("Jev (optional ticket scoring by TypeSafe)");
     let mut candidate = args.jev_key.clone().map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
@@ -824,6 +904,7 @@ fn reconfigure(ctx: &mut Context, ui: &Ui, args: &InitArgs, interactive: bool) -
     }
 
     tuning_step(ui, args, interactive, &mut answers)?;
+    providers_step(ui, args, interactive, &mut answers)?;
 
     answers.apply_to(&mut cfg);
     cfg.ensure_valid()?;
@@ -832,6 +913,7 @@ fn reconfigure(ctx: &mut Context, ui: &Ui, args: &InitArgs, interactive: bool) -
     ui.ok(&ctx.paths.config_file().display().to_string());
     println!();
     println!("  repository     {}", answers.repo_path.display());
+    println!("  providers      {}", providers_summary(&answers));
     println!(
         "  linear         {}",
         if answers.linear_enabled {
@@ -845,6 +927,11 @@ fn reconfigure(ctx: &mut Context, ui: &Ui, args: &InitArgs, interactive: bool) -
     println!();
     println!("{}", super::config::apply_note(ctx)?);
     Ok(0)
+}
+
+/// `claude, codex` for the summaries.
+fn providers_summary(answers: &Answers) -> String {
+    answers.enabled_providers().iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
 }
 
 /// Handle `powerqueue init`.
@@ -914,6 +1001,7 @@ pub fn run(ctx: &mut Context, args: InitArgs) -> Result<i32> {
 
     let defaults = Config::default();
     tools_step(&ui, &defaults.claude.binary, &defaults.tmux.binary);
+    providers_step(&ui, &args, interactive, &mut answers)?;
     answers.jev_enabled = jev_step(ctx, &ui, &args, interactive, &rt)?;
     tuning_step(&ui, &args, interactive, &mut answers)?;
 
@@ -933,6 +1021,7 @@ pub fn run(ctx: &mut Context, args: InitArgs) -> Result<i32> {
         }
     );
     println!("  repository     {}", answers.repo_path.display());
+    println!("  providers      {}", providers_summary(&answers));
     println!(
         "  linear         {}",
         if answers.linear_enabled {
@@ -1053,6 +1142,16 @@ mod tests {
         assert_eq!(cfg.claude.permission_mode, "bypassPermissions");
         assert_eq!(cfg.budget.providers.claude.period_anchor.as_deref(), Some("2026-03-02T09:00:00Z"));
         assert!(cfg.validate().is_empty());
+        assert!(!cfg.budget.providers.codex.enabled);
+
+        let answers = Answers { repo_path: PathBuf::from("/tmp/repo"), providers: vec![Provider::Codex], ..Answers::default() };
+        let cfg = Config::from_toml(&render_config(&answers).unwrap()).unwrap();
+        assert!(cfg.budget.providers.codex.enabled);
+        assert!(!cfg.budget.providers.gemini.enabled);
+        assert!(cfg.budget.providers.claude.enabled);
+        assert_eq!(answers.enabled_providers(), vec![Provider::Claude, Provider::Codex]);
+        assert!(provider_prompt(Provider::Codex, "codex").contains("Codex CLI (`codex`)"));
+        assert!(provider_prompt(Provider::Gemini, "agy").contains("experimental"));
     }
 
     #[test]
@@ -1101,8 +1200,10 @@ mod tests {
         cfg.claude.allowed_tools = vec!["Bash(git *)".into()];
         cfg.scheduler.max_concurrent = 4;
         cfg.budget.providers.claude.period_anchor = Some("2026-03-02T09:00:00Z".into());
+        cfg.budget.providers.gemini.enabled = true;
 
         let mut answers = Answers::from_config(&cfg);
+        assert_eq!(answers.providers, vec![Provider::Gemini]);
         assert_eq!(answers.repo_path, PathBuf::from("/tmp/repo"));
         assert_eq!(answers.default_branch.as_deref(), Some("develop"));
         assert_eq!(answers.team_keys, vec!["ENG".to_string()]);
@@ -1116,9 +1217,11 @@ mod tests {
 
         answers.permission_mode = "auto".into();
         answers.max_concurrent = 1;
+        answers.providers = vec![Provider::Codex];
         answers.apply_to(&mut cfg);
         assert_eq!(cfg.claude.permission_mode, "auto");
         assert_eq!(cfg.scheduler.max_concurrent, 1);
+        assert!(cfg.budget.providers.codex.enabled && !cfg.budget.providers.gemini.enabled);
         // Keys the wizard does not ask about are untouched.
         assert_eq!(cfg.repo.setup, vec!["make".to_string()]);
         assert_eq!(cfg.linear.required_labels, vec!["agent".to_string()]);

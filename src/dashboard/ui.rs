@@ -12,7 +12,6 @@ use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap};
 
-use crate::cli::output::human_duration;
 use crate::domain::{Criticality, ModelTier, Provider, TaskState};
 
 use super::app::DashboardApp;
@@ -53,6 +52,8 @@ pub struct Symbols {
     pub arrows: &'static str,
     /// Suffix of truncated titles.
     pub ellipsis: &'static str,
+    /// "Not applicable" marker (a provider without a window).
+    pub na: &'static str,
     pub border: border::Set<'static>,
 }
 
@@ -69,6 +70,7 @@ impl Symbols {
                 keys: KEYS_ASCII,
                 arrows: "up/dn",
                 ellipsis: "...",
+                na: "-",
                 border: ASCII_BORDER,
             }
         } else {
@@ -81,6 +83,7 @@ impl Symbols {
                 keys: KEYS,
                 arrows: "↑/↓  ",
                 ellipsis: "…",
+                na: "–",
                 border: border::PLAIN,
             }
         }
@@ -160,6 +163,36 @@ pub fn model_style(m: Option<&ModelTier>) -> Style {
     }
 }
 
+/// Two-letter provider tag for the header summary (`cl 34/12%`).
+pub fn provider_tag(p: Provider) -> &'static str {
+    match p {
+        Provider::Claude => "cl",
+        Provider::Codex => "cx",
+        Provider::Gemini => "gm",
+    }
+}
+
+/// Colour of a window fraction: red when nearly spent, yellow when high.
+pub fn window_color(window: f64) -> Color {
+    if window > 0.9 {
+        Color::Red
+    } else if window > 0.7 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+/// Rows the budget panel needs: one header row plus one gauge per model for
+/// every provider (one row when there is nothing to show).
+pub fn budget_rows(app: &DashboardApp) -> u16 {
+    let ledgers = app.snapshot.ordered_ledgers();
+    if ledgers.is_empty() {
+        return 1;
+    }
+    ledgers.iter().map(|l| 1 + l.tiers.len()).sum::<usize>().min(u16::MAX as usize) as u16
+}
+
 /// Gauge colour from pacing: spent fraction vs elapsed fraction of the period.
 pub fn pacing_color(spent: f64, elapsed: f64) -> Color {
     if spent >= 1.0 {
@@ -187,10 +220,10 @@ pub fn draw(frame: &mut Frame, app: &DashboardApp) {
         .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
         .split(chunks[1]);
     draw_table(frame, app, main[0], &sym);
-    let tiers = app.snapshot.ledger.as_ref().map(|l| l.tiers.len()).unwrap_or(app.snapshot.shares.len().max(1)) as u16;
+    let rows = budget_rows(app);
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(tiers + 2), Constraint::Min(5)])
+        .constraints([Constraint::Length(rows + 2), Constraint::Min(5)])
         .split(main[1]);
     draw_budget(frame, app, right[0], &sym);
     draw_detail(frame, app, right[1], &sym);
@@ -216,31 +249,27 @@ fn draw_header(frame: &mut Frame, app: &DashboardApp, area: Rect) {
         daemon,
         Span::raw(format!("  slots {}/{}", s.slots_used(), s.max_concurrent)),
     ];
-    match &s.ledger {
-        Some(l) => {
+    let ledgers = s.ordered_ledgers();
+    if ledgers.is_empty() {
+        spans.push(Span::styled("  budget: n/a", Style::default().fg(Color::DarkGray)));
+    } else {
+        // Compact per-provider summary: `cl 34/12%` = period / window spent.
+        spans.push(Span::raw(" "));
+        for l in &ledgers {
             let period = l.period_fraction();
             let elapsed = l.elapsed_fraction();
-            spans.push(Span::raw("  period "));
-            spans.push(Span::styled(format!("{:.0}%", period * 100.0), Style::default().fg(pacing_color(period, elapsed))));
-            spans.push(Span::raw(format!(
-                " (elapsed {:.0}%, {} left)",
-                elapsed * 100.0,
-                human_duration(l.period.remaining(l.now).num_seconds())
-            )));
-            let window = l.window_fraction();
-            spans.push(Span::raw("  window "));
+            let window = if l.window_enabled { format!("{:.0}", l.window_fraction() * 100.0) } else { sym.na.to_string() };
+            spans.push(Span::raw(format!(" {} ", provider_tag(l.provider))));
             spans.push(Span::styled(
-                format!("{:.0}%", window * 100.0),
-                Style::default().fg(if window > 0.9 {
-                    Color::Red
-                } else if window > 0.7 {
-                    Color::Yellow
-                } else {
-                    Color::Green
-                }),
+                format!("{:.0}/{window}%", period * 100.0),
+                Style::default().fg(pacing_color(period, elapsed)),
             ));
         }
-        None => spans.push(Span::styled("  budget: n/a", Style::default().fg(Color::DarkGray))),
+        spans.push(Span::raw("  next "));
+        match &s.next_model {
+            Some(m) => spans.push(Span::styled(m.as_str().to_string(), model_style(Some(m)))),
+            None => spans.push(Span::styled("none", Style::default().fg(Color::DarkGray))),
+        }
     }
     let when = s.taken_at.unwrap_or_else(Utc::now).with_timezone(&chrono::Local).format("%H:%M:%S").to_string();
     let left = Line::from(spans);
@@ -251,7 +280,7 @@ fn draw_header(frame: &mut Frame, app: &DashboardApp, area: Rect) {
 
 fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) {
     let rows = app.rows();
-    let title_width = area.width.saturating_sub(2 + 12 + 11 + 9 + 7 + 7 + 5 + 9 + 7 + 8).max(10);
+    let title_width = area.width.saturating_sub(2 + 12 + 11 + 9 + 13 + 7 + 5 + 9 + 7 + 8).max(10);
     let header =
         Row::new(["KEY", "STATE", "CRIT", "MODEL", "TOKENS", "CPU", "RSS", "AGE", "TITLE"].map(|h| Cell::from(h).bold()))
             .style(Style::default().fg(Color::DarkGray));
@@ -276,7 +305,8 @@ fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) 
             Constraint::Length(12),
             Constraint::Length(11),
             Constraint::Length(8),
-            Constraint::Length(6),
+            // Wide enough for Codex / Gemini names (`gpt-6.1-sol`).
+            Constraint::Length(12),
             Constraint::Length(6),
             Constraint::Length(4),
             Constraint::Length(8),
@@ -305,39 +335,78 @@ fn draw_budget(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols)
     let block = sym.panel(" budget ".into());
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let Some(ledger) = &app.snapshot.ledger else {
+    let ledgers = app.snapshot.ordered_ledgers();
+    if ledgers.is_empty() {
         frame.render_widget(
             Paragraph::new("ledger unavailable (run `powerqueue doctor`)").style(Style::default().fg(Color::DarkGray)),
             inner,
         );
         return;
-    };
-    let elapsed = ledger.elapsed_fraction();
-    let tiers: Vec<_> = ledger.tiers.clone();
+    }
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(tiers.iter().map(|_| Constraint::Length(1)).collect::<Vec<_>>())
+        .constraints((0..budget_rows(app)).map(|_| Constraint::Length(1)).collect::<Vec<_>>())
         .split(inner);
-    for (i, tier) in tiers.iter().enumerate() {
-        let share = if ledger.period_budget > 0.0 { tier.period_budget / ledger.period_budget } else { 0.0 };
-        let share = app.snapshot.shares.get(&tier.tier).copied().unwrap_or(share);
-        let spent_of_total = if ledger.period_budget > 0.0 { tier.period_weighted / ledger.period_budget } else { 0.0 };
-        let spent = tier.period_spent_fraction();
-        let label = format!("{:<6} {:>3.0}% / {:>3.0}%", tier.tier.alias(), spent_of_total * 100.0, share * 100.0);
-        let Some(r) = rows.get(i) else { continue };
-        let colour = pacing_color(spent, elapsed);
-        if sym.ascii {
-            // A textual bar survives plain-text dumps and fonts without block glyphs.
-            let bar = text_bar(spent, (r.width as usize).saturating_sub(label.len() + 1).clamp(4, 30));
-            let line = Line::from(vec![Span::raw(format!("{label} ")), Span::styled(bar, Style::default().fg(colour))]);
-            frame.render_widget(Paragraph::new(line), *r);
-        } else {
-            // No hard-coded background: the unfilled part keeps the terminal's
-            // own colours so it does not show up as black blocks on light themes.
-            let gauge = Gauge::default().gauge_style(Style::default().fg(colour)).ratio(spent.clamp(0.0, 1.0)).label(label);
-            frame.render_widget(gauge, *r);
+    let mut next_row = 0usize;
+    for ledger in ledgers {
+        let Some(r) = rows.get(next_row) else { break };
+        next_row += 1;
+        frame.render_widget(Paragraph::new(provider_header(app, ledger, sym)), *r);
+        let elapsed = ledger.elapsed_fraction();
+        let name_width = ledger.tiers.iter().map(|t| t.tier.alias().len()).max().unwrap_or(6).clamp(6, 12);
+        for tier in &ledger.tiers {
+            let Some(r) = rows.get(next_row) else { break };
+            next_row += 1;
+            let share = if ledger.period_budget > 0.0 { tier.period_budget / ledger.period_budget } else { 0.0 };
+            let share = app.snapshot.shares.get(&tier.tier).copied().unwrap_or(share);
+            let spent_of_total = if ledger.period_budget > 0.0 { tier.period_weighted / ledger.period_budget } else { 0.0 };
+            let spent = tier.period_spent_fraction();
+            let label = format!(
+                "{:<name_width$} {:>3.0}% / {:>3.0}%",
+                sym.truncate(tier.tier.alias(), name_width),
+                spent_of_total * 100.0,
+                share * 100.0
+            );
+            let colour = pacing_color(spent, elapsed);
+            if sym.ascii {
+                // A textual bar survives plain-text dumps and fonts without block glyphs.
+                let bar = text_bar(spent, (r.width as usize).saturating_sub(label.len() + 1).clamp(4, 30));
+                let line = Line::from(vec![Span::raw(format!("{label} ")), Span::styled(bar, Style::default().fg(colour))]);
+                frame.render_widget(Paragraph::new(line), *r);
+            } else {
+                // No hard-coded background: the unfilled part keeps the terminal's
+                // own colours so it does not show up as black blocks on light themes.
+                let gauge = Gauge::default().gauge_style(Style::default().fg(colour)).ratio(spent.clamp(0.0, 1.0)).label(label);
+                frame.render_widget(gauge, *r);
+            }
         }
     }
+}
+
+/// The dim header row of a provider block:
+/// `claude  period 34% (elapsed 59%)  window 12%  [cooldown until 14:30]`.
+fn provider_header(app: &DashboardApp, ledger: &crate::budget::Ledger, sym: &Symbols) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let period = ledger.period_fraction();
+    let elapsed = ledger.elapsed_fraction();
+    let mut spans = vec![
+        Span::styled(format!("{:<7}", ledger.provider), dim.add_modifier(Modifier::BOLD)),
+        Span::styled(" period ".to_string(), dim),
+        Span::styled(format!("{:.0}%", period * 100.0), Style::default().fg(pacing_color(period, elapsed))),
+        Span::styled(format!(" (elapsed {:.0}%)", elapsed * 100.0), dim),
+        Span::styled("  window ".to_string(), dim),
+    ];
+    if ledger.window_enabled {
+        let window = ledger.window_fraction();
+        spans.push(Span::styled(format!("{:.0}%", window * 100.0), Style::default().fg(window_color(window))));
+    } else {
+        spans.push(Span::styled(sym.na.to_string(), dim));
+    }
+    if let Some(until) = app.snapshot.cooldowns.get(&ledger.provider) {
+        let when = until.with_timezone(&chrono::Local).format("%H:%M").to_string();
+        spans.push(Span::styled(format!("  [cooldown until {when}]"), Style::default().fg(Color::Magenta)));
+    }
+    Line::from(spans)
 }
 
 fn draw_detail(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) {
@@ -460,12 +529,28 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    /// A snapshot with Claude and Codex enabled (empty ledgers) and one task.
+    fn two_provider_snapshot(key: &str, title: &str) -> Snapshot {
+        use crate::config::Config;
+        use crate::store::Store;
+        let store = Store::open_in_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.budget.providers.codex.enabled = true;
+        let mut s = Snapshot::load(&store, &cfg, Utc::now()).unwrap();
+        let mut t = Task::new(key, title, TaskSource::Manual);
+        t.state = TaskState::Running;
+        s.tasks = vec![t];
+        s.max_concurrent = 2;
+        s.cooldowns.insert(Provider::Codex, Utc::now() + chrono::Duration::minutes(20));
+        s
+    }
+
     #[test]
     fn smoke_render() {
         let mut t = Task::new("ENG-1", "Fix the login flow", TaskSource::Manual);
         t.state = TaskState::Running;
         let snapshot = Snapshot { tasks: vec![t], max_concurrent: 2, ..Default::default() };
-        let mut app = DashboardApp::new(snapshot);
+        let app = DashboardApp::new(snapshot);
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
@@ -473,6 +558,31 @@ mod tests {
         assert!(text.contains("powerqueue"));
         assert!(text.contains("ENG-1"));
         assert!(text.contains("ledger unavailable"));
+        assert!(text.contains("budget: n/a"));
+
+        // Two providers: one block each with a header row and a gauge per model.
+        let mut app = DashboardApp::new(two_provider_snapshot("ENG-1", "Fix the login flow"));
+        assert_eq!(budget_rows(&app), 1 + 4 + 1 + 3);
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = crate::dashboard::buffer_to_text(terminal.backend().buffer());
+        for needle in [
+            "claude ",
+            "codex ",
+            "fable",
+            "haiku",
+            "gpt-6.1-sol",
+            "gpt-6-luna",
+            "cooldown until",
+            " cl 0/0%",
+            " cx 0/0%",
+            "next sonnet",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+        }
+        let claude_line = text.lines().position(|l| l.contains("claude ") && l.contains("period")).unwrap();
+        let codex_line = text.lines().position(|l| l.contains("codex ") && l.contains("period")).unwrap();
+        assert_eq!(codex_line - claude_line, 5, "claude's four gauges sit between the two headers:\n{text}");
         app.add_input = Some("new".into());
         app.show_help = true;
         terminal.draw(|f| draw(f, &app)).unwrap();
@@ -508,6 +618,28 @@ mod tests {
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("● daemon not running") && text.contains("▶ ENG-2"), "{text}");
+    }
+
+    #[test]
+    fn ascii_frame_stays_ascii_with_two_providers() {
+        let mut app = DashboardApp::new(two_provider_snapshot("ENG-3", "Plain title"));
+        app.ascii = true;
+        let text = crate::dashboard::render_once_app(&app, 200, 40);
+        assert!(text.is_ascii(), "non-ASCII in ASCII mode:\n{text}");
+        assert!(text.contains("claude ") && text.contains("codex "), "{text}");
+        assert!(text.contains("[#") || text.contains("[."), "textual bars: {text}");
+        assert!(text.contains("cooldown until"), "{text}");
+    }
+
+    #[test]
+    fn provider_tags_and_window_colour() {
+        assert_eq!(provider_tag(Provider::Claude), "cl");
+        assert_eq!(provider_tag(Provider::Codex), "cx");
+        assert_eq!(provider_tag(Provider::Gemini), "gm");
+        assert_eq!(window_color(0.95), Color::Red);
+        assert_eq!(window_color(0.8), Color::Yellow);
+        assert_eq!(window_color(0.1), Color::Green);
+        assert!(Symbols::for_mode(true).na.is_ascii());
     }
 
     #[test]

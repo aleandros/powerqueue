@@ -7,10 +7,10 @@ use chrono::{DateTime, Duration, Utc};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Serialize;
 
-use crate::budget::{Ledger, Ledgers};
+use crate::budget::{Ledger, Ledgers, Policy, Prediction, RATE_LIMITS_KEY, RateLimitState};
 use crate::cli::output::{human_bytes, human_duration, human_f64};
 use crate::config::Config;
-use crate::domain::{Criticality, Event, ModelTier, Provider, ResourceSample, Session, Task, TaskId, TaskState};
+use crate::domain::{Criticality, Event, ModelTier, Provider, ResourceSample, Session, Task, TaskId, TaskSource, TaskState};
 use crate::store::Store;
 
 /// Everything the UI needs for one frame. Serialises to JSON for
@@ -22,14 +22,27 @@ pub struct Snapshot {
     pub daemon_pid: Option<u32>,
     pub tasks: Vec<Task>,
     pub sessions: Vec<Session>,
+    /// One ledger per enabled provider; `None` when they could not be loaded.
+    pub ledgers: Option<Ledgers>,
+    /// Claude's ledger, duplicated from `ledgers` so JSON readers of earlier
+    /// versions keep working. New code reads `ledgers`.
     pub ledger: Option<Ledger>,
+    /// Enabled providers in `budget.provider_order` (the order of the blocks).
+    pub provider_order: Vec<Provider>,
+    /// Until when a provider is on cooldown (rate-limit marks or an
+    /// observation that says the allowance is exhausted).
+    pub cooldowns: BTreeMap<Provider, DateTime<Utc>>,
+    /// The model the policy would give a normal-criticality, default-cost
+    /// task right now (`None` = throttled or nothing enabled).
+    pub next_model: Option<ModelTier>,
     pub recent_events: Vec<Event>,
     pub max_concurrent: u32,
     /// Weighted tokens per task.
     pub weighted_tokens: BTreeMap<TaskId, f64>,
     /// Latest resource sample of each task's live session.
     pub resources: BTreeMap<TaskId, ResourceSample>,
-    /// Per-tier share of the period budget (from config), for gauge labels.
+    /// Per-model share of its provider's period budget (from config, every
+    /// enabled provider), for gauge labels.
     pub shares: BTreeMap<ModelTier, f64>,
     pub tmux_session: String,
 }
@@ -58,27 +71,46 @@ impl Snapshot {
                 resources.insert(task.id, sample);
             }
         }
-        // The budget panel shows Claude's ledger (per-provider gauges come with the UX work).
-        let ledger = Ledgers::load(store, &cfg.budget, now).ok().and_then(|mut l| l.by_provider.remove(&Provider::Claude));
+        let ledgers = match Ledgers::load(store, &cfg.budget, now) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "cannot load budget ledgers for the dashboard");
+                None
+            }
+        };
+        let mut limits: RateLimitState = store.kv_get(RATE_LIMITS_KEY).ok().flatten().unwrap_or_default();
+        limits.clear_expired(now);
+        let (cooldowns, next_model) = match &ledgers {
+            Some(l) => (provider_cooldowns(cfg, l, &limits, now), next_model(cfg, l, &limits)),
+            None => (BTreeMap::new(), None),
+        };
+        let ledger = ledgers.as_ref().and_then(|l| l.get(Provider::Claude).cloned());
         let max_age = Duration::seconds(3 * cfg.scheduler.tick_secs.max(1) as i64);
         let daemon_alive = store.daemon_alive(max_age)?;
         let daemon_pid = store.daemon_heartbeat()?.map(|(pid, _)| pid);
-        let shares =
-            cfg.budget.providers.claude.models.iter().filter(|(_, m)| m.enabled).map(|(t, m)| (t.clone(), m.share)).collect();
         Ok(Snapshot {
             taken_at: Some(now),
             daemon_alive,
             daemon_pid,
             tasks,
             sessions,
+            ledgers,
             ledger,
+            provider_order: cfg.budget.enabled_providers_in_order(),
+            cooldowns,
+            next_model,
             recent_events: store.recent_events(100)?,
             max_concurrent: cfg.scheduler.max_concurrent,
             weighted_tokens,
             resources,
-            shares,
+            shares: model_shares(cfg),
             tmux_session: cfg.tmux.session_name.clone(),
         })
+    }
+
+    /// Ledgers in `provider_order` (the order the budget panel draws them).
+    pub fn ordered_ledgers(&self) -> Vec<&Ledger> {
+        self.ledgers.as_ref().map(|l| l.ordered(&self.provider_order)).unwrap_or_default()
     }
 
     /// Number of tasks currently holding a slot.
@@ -103,6 +135,48 @@ impl Snapshot {
         }
         v
     }
+}
+
+/// Share of every enabled model of every enabled provider, keyed by model
+/// (model names are unique across providers).
+pub fn model_shares(cfg: &Config) -> BTreeMap<ModelTier, f64> {
+    cfg.budget
+        .providers
+        .iter()
+        .filter(|(_, pb)| pb.enabled)
+        .flat_map(|(_, pb)| pb.models.iter().filter(|(_, m)| m.enabled).map(|(t, m)| (t.clone(), m.share)))
+        .collect()
+}
+
+/// What the policy would run now for a normal-criticality, default-cost task
+/// (the same question `budget show` asks); `None` when nothing is eligible.
+pub fn next_model(cfg: &Config, ledgers: &Ledgers, limits: &RateLimitState) -> Option<ModelTier> {
+    let mut probe = Task::new("probe", "probe", TaskSource::Manual);
+    probe.criticality = Criticality::Normal;
+    Policy::new(&cfg.budget, ledgers, limits).decide(&probe, Prediction::default_guess(), &[]).model
+}
+
+/// Until when each provider is cooling down: every enabled model
+/// rate-limited, or its observation says the allowance is exhausted (the
+/// later instant wins). Providers that are not on cooldown are absent.
+pub fn provider_cooldowns(
+    cfg: &Config,
+    ledgers: &Ledgers,
+    limits: &RateLimitState,
+    now: DateTime<Utc>,
+) -> BTreeMap<Provider, DateTime<Utc>> {
+    ledgers
+        .iter()
+        .filter_map(|(p, ledger)| {
+            let marks = limits.provider_blocked_until(&cfg.budget, p, now);
+            let observed = ledger.observed.as_ref().and_then(|o| o.cooldown_until()).filter(|u| *u > now);
+            let until = match (marks, observed) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            until.map(|u| (p, u))
+        })
+        .collect()
 }
 
 /// One row of the task table, already formatted.
@@ -437,5 +511,38 @@ mod tests {
         assert_eq!(s.slots_used(), 1);
         assert!(s.latest_session(s.tasks[0].id).is_none());
         assert!(s.events_for(s.tasks[0].id, 10).is_empty());
+        assert!(s.ordered_ledgers().is_empty());
+    }
+
+    #[test]
+    fn snapshot_loads_one_ledger_per_enabled_provider() {
+        let store = Store::open_in_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.budget.providers.codex.enabled = true;
+        cfg.budget.provider_order = vec![Provider::Codex, Provider::Claude];
+        let now = Utc::now();
+        let s = Snapshot::load(&store, &cfg, now).unwrap();
+        let providers: Vec<Provider> = s.ordered_ledgers().iter().map(|l| l.provider).collect();
+        assert_eq!(providers, vec![Provider::Codex, Provider::Claude]);
+        assert_eq!(s.provider_order, vec![Provider::Codex, Provider::Claude]);
+        assert!(s.ledger.is_some(), "claude's ledger is still exposed for JSON compatibility");
+        assert!(s.shares.contains_key(&ModelTier::fable()) && s.shares.contains_key(&ModelTier::new("gpt-6.1-sol")));
+        assert!(!s.shares.contains_key(&ModelTier::new("gemini-3-pro")), "gemini is disabled");
+        assert!(s.cooldowns.is_empty());
+        // A normal task prefers `budget.default_model` (sonnet) whatever the provider order.
+        assert_eq!(s.next_model, Some(ModelTier::sonnet()));
+        let json = serde_json::to_value(&s).unwrap();
+        assert!(json["ledgers"]["by_provider"]["codex"].is_object());
+        assert!(json["ledger"]["provider"] == "claude");
+        assert_eq!(json["next_model"], "sonnet");
+
+        // A rate-limited provider shows a cooldown and `next` moves to the other one.
+        let mut limits = RateLimitState::default();
+        limits.mark_provider(&cfg.budget, Provider::Claude, now + Duration::minutes(30));
+        store.kv_set(RATE_LIMITS_KEY, &limits).unwrap();
+        let s = Snapshot::load(&store, &cfg, now).unwrap();
+        assert_eq!(s.cooldowns.get(&Provider::Claude), Some(&(now + Duration::minutes(30))));
+        assert!(!s.cooldowns.contains_key(&Provider::Codex));
+        assert_eq!(s.next_model.as_ref().map(|m| m.provider()), Some(Provider::Codex), "{:?}", s.next_model);
     }
 }

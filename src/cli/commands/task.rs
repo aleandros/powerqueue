@@ -11,8 +11,9 @@ use chrono::Utc;
 use comfy_table::Cell;
 use owo_colors::{OwoColorize, Stream, Style};
 
-use crate::cli::output::{self, human_bytes, human_f64};
+use crate::cli::output::{self, human_bytes, human_f64, model_with_provider};
 use crate::cli::{Context, TaskCommand, TaskRef};
+use crate::config::Config;
 use crate::domain::{DaemonCommand, Event, EventLevel, ModelTier, Session, Task, TaskState};
 use crate::store::Store;
 use crate::tmux::Tmux;
@@ -207,6 +208,7 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     if ctx.json {
         let out = serde_json::json!({
             "task": task,
+            "provider": effective_model(&task).map(|m| m.provider()),
             "usage": usage,
             "weighted_tokens": usage.weighted(),
             "sessions": session_rows.iter().map(|(s, u, stats)| serde_json::json!({
@@ -248,8 +250,10 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
         );
     }
     let model_line = match (&task.model, &task.model_override) {
-        (m, Some(o)) => format!("{} (forced: {})", m.as_ref().map(|m| m.to_string()).unwrap_or("-".into()), o),
-        (Some(m), None) => m.to_string(),
+        (m, Some(o)) => {
+            format!("{} (forced: {})", m.as_ref().map(model_with_provider).unwrap_or("-".into()), model_with_provider(o))
+        }
+        (Some(m), None) => model_with_provider(m),
         (None, None) => "auto".to_string(),
     };
     kv("model", model_line);
@@ -356,6 +360,7 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
             "score_reasons": task.score_reasons,
             "model": task.model,
             "model_override": task.model_override,
+            "provider": effective_model(&task).map(|m| m.provider()),
             "not_before": task.not_before,
             "last_throttled": throttled,
             "last_model_decision": chosen,
@@ -379,11 +384,11 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
         println!("    · {r}");
     }
     if let Some(o) = &task.model_override {
-        println!("  model        forced to {o}");
+        println!("  model        forced to {}", model_with_provider(o));
     } else {
         println!(
             "  model        {} (chosen by the budget policy)",
-            task.model.as_ref().map(|m| m.to_string()).unwrap_or("not chosen yet".into())
+            task.model.as_ref().map(model_with_provider).unwrap_or("not chosen yet".into())
         );
     }
     if let Some(nb) = task.not_before {
@@ -424,6 +429,22 @@ fn print_data(data: &serde_json::Value) {
             }
         }
         _ => {}
+    }
+}
+
+/// The model a task runs (or will run) on: the chosen one, else the override.
+pub fn effective_model(task: &Task) -> Option<&ModelTier> {
+    task.model.as_ref().or(task.model_override.as_ref())
+}
+
+/// Warn (on stderr) when a forced model belongs to a provider that is not
+/// enabled: the policy will never pick it, so the task would wait forever.
+pub fn warn_if_provider_disabled(cfg: &Config, model: &ModelTier) {
+    let p = model.provider();
+    if !cfg.budget.provider(p).enabled {
+        output::print_warning(&format!(
+            "{p} is disabled in config (budget.providers.{p}.enabled = false); the policy will not pick {model} until you enable it"
+        ));
     }
 }
 
@@ -479,6 +500,10 @@ pub fn run(ctx: &mut Context, cmd: TaskCommand) -> Result<i32> {
         TaskCommand::Retry(t) => control(ctx, &t, |task| DaemonCommand::Retry { task_id: task.id }, "retry"),
         TaskCommand::Model { task, model } => {
             let tier = parse_model_arg(&model)?;
+            if let Some(m) = &tier {
+                let cfg = ctx.config_cloned()?;
+                warn_if_provider_disabled(&cfg, m);
+            }
             let store = ctx.store()?.clone();
             let mut t = find_task(&store, &task.task)?;
             store.enqueue_command(&DaemonCommand::SetModel { task_id: t.id, model: tier.clone() })?;
@@ -500,7 +525,7 @@ pub fn run(ctx: &mut Context, cmd: TaskCommand) -> Result<i32> {
                     "{} {} will use {} on its next attempt",
                     "ok".if_supports_color(Stream::Stdout, |t| t.green()),
                     t.key.if_supports_color(Stream::Stdout, |t| t.bold()),
-                    m
+                    model_with_provider(&m)
                 ),
                 None => println!(
                     "{} {} will let the budget policy choose its model",

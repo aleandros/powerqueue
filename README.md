@@ -59,6 +59,8 @@ rate limits, and `doctor` tells you when the pacing is off.
 | git | any recent | worktrees are created with `git worktree` |
 | tmux | ≥ 3.2 | one session (`powerqueue`), one window per task |
 | Claude Code | ≥ 2.1.2xx, logged in | `claude auth status` must succeed |
+| Codex CLI | optional | `codex login status` must succeed; adds OpenAI's weekly budget (see [Providers](#providers)) |
+| Antigravity CLI (`agy`) | optional, experimental | signed in to Google AI Pro/Ultra |
 | Linear API key | personal key | stored in the OS keychain by `init` |
 | Jev (TypeSafe) API key | optional | adds a model-based urgency score |
 
@@ -193,12 +195,12 @@ Global flags work on every command.
 
 | Command | What it does |
 |---------|--------------|
-| `init [--repo PATH] [--team KEY]... [--linear-key K] [--jev-key K] [--no-linear] [--permission-mode MODE] [--non-interactive] [--reconfigure] [--force]` | guided first-time setup; writes `config.toml` and `PRIORITY.md`, stores keys; `--no-linear` sets `linear.enabled = false` (manual tasks only); `--permission-mode` picks `acceptEdits` (default), `auto`, `bypassPermissions`, `dontAsk`, `plan` or `default`; on an existing install the menu offers "Change settings", and `--reconfigure` walks the editable settings (repository, default branch, Linear team and states, concurrency, permission mode, weekly budget, reset anchor) with the current values as defaults, keeping keys and every other key |
+| `init [--repo PATH] [--team KEY]... [--linear-key K] [--jev-key K] [--no-linear] [--permission-mode MODE] [--provider P]... [--non-interactive] [--reconfigure] [--force]` | guided first-time setup; writes `config.toml` and `PRIORITY.md`, stores keys; `--no-linear` sets `linear.enabled = false` (manual tasks only); `--permission-mode` picks `acceptEdits` (default), `auto`, `bypassPermissions`, `dontAsk`, `plan` or `default`; when `codex` / `agy` are on PATH it asks whether to run tasks on them too (`--provider codex --provider gemini` answers yes non-interactively and warns when the CLI is not logged in); on an existing install the menu offers "Change settings", and `--reconfigure` walks the editable settings (repository, default branch, Linear team and states, concurrency, permission mode, weekly budget, reset anchor, providers) with the current values as defaults, keeping keys and every other key |
 | `run [--once] [--offline]` | run the scheduler in the foreground; `--once` does one pass; `--offline` skips Linear |
 | `stop` | ask the running daemon to exit (sessions keep running in tmux) |
-| `dashboard [--once] [--ascii]` (`ui`, `top`) | live TUI; needs an interactive terminal (exit 2 otherwise). `--once` prints one frame as text and exits (works in pipes; with `--json` prints the snapshot); `--ascii` uses `*`/`>`/`#` and `+-\|` borders (automatic when the locale is not UTF-8) |
+| `dashboard [--once] [--ascii]` (`ui`, `top`) | live TUI: task table, one budget block per enabled provider (period, window, cooldown, a gauge per model), a header with the compact per-provider summary (`cl 34/12%  cx 17/–` = period/window spent) and `next <model>` (what the policy would run now); needs an interactive terminal (exit 2 otherwise). `--once` prints one frame as text and exits (works in pipes; with `--json` prints the snapshot); `--ascii` uses `*`/`>`/`#` and `+-\|` borders (automatic when the locale is not UTF-8) |
 | `status [-a]` (`ls`) | one-shot table; `-a` includes completed/failed/cancelled |
-| `doctor [--fix] [--offline]` | diagnostics and tuning advice; `--fix` applies safe repairs |
+| `doctor [--fix] [--offline]` | diagnostics and tuning advice, per enabled provider (binary and version, logged in, model shares, period anchor source, probe freshness, top-model pacing, window pressure); `--fix` applies safe repairs |
 | `logs [-f] [-n N] [-t TASK] [-l LEVEL] [--events]` | read the daemon log (default 200 lines); `--events` shows the DB timeline instead; `-f` follows either |
 | `completions <shell>` | shell completions (bash, elvish, fish, powershell, zsh) |
 
@@ -230,8 +232,8 @@ state machine allows it. `complete` and `block` always write directly.
 
 | Command | What it does |
 |---------|--------------|
-| `priority show` | print the parsed rules |
-| `priority check` | validate `PRIORITY.md` and report problems with line numbers |
+| `priority show` | print the parsed rules (model preference lists joined with ` \| `) |
+| `priority check` | validate `PRIORITY.md`, report problems with line numbers and print the `## Models` lists |
 | `priority edit` | open `PRIORITY.md` in `$EDITOR` |
 | `priority explain <task>` | show how the rules score one task |
 | `priority path` | print the path of the rules file |
@@ -342,6 +344,37 @@ worktree when `cleanup.keep_failed` is true.
 [Paths](#logs-and-diagnostics)). Every key is optional; defaults are shown.
 Unknown keys are rejected. `powerqueue config validate` and `doctor` explain
 problems in plain language.
+
+### Providers
+
+powerqueue can run tasks on three coding-agent CLIs, each paid for by its own
+subscription and paced against its own weekly budget:
+
+| Provider | CLI | What it needs | Shipped models (most capable first) |
+|----------|-----|---------------|-------------------------------------|
+| `claude` (default, always on) | Claude Code (`claude`) | logged in with your Pro/Max subscription (`claude auth status`) | `fable`, `opus`, `sonnet`, `haiku` |
+| `codex` | OpenAI Codex CLI (`codex`) | `npm install -g @openai/codex`, then `codex login` with a ChatGPT Plus/Pro/Business account | `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-luna` |
+| `gemini` (experimental) | Google Antigravity CLI (`agy`) | install `agy` and sign in with a Google AI Pro/Ultra account | `gemini-3-pro`, `gemini-3-flash` |
+
+Enable a provider with `init` (it asks when the binary is on PATH; `init
+--provider codex` / `init --reconfigure` do the same), or by hand:
+`powerqueue config set budget.providers.codex.enabled true`. Each provider has
+its own `[budget.providers.<p>]` table (period, window, model shares), its own
+usage probe, its own rate-limit cooldowns and its own ledger; `budget show`
+and the dashboard print one block per enabled provider, and `doctor` checks
+each one (binary and version, logged in, shares, anchor, probe freshness).
+
+Which provider a task lands on: a `task model` / `add --model` override is a
+hard choice (it never crosses providers; the CLI warns when that provider is
+disabled). Otherwise the task's **preference list** is tried in order: the
+`## Overrides` model list in `PRIORITY.md` (`ENG-1: model = fable |
+gpt-6.1-sol`), else the `## Models` entry for its criticality (`critical:
+fable | gpt-6.1-sol`), each alternative through its provider's downgrade
+chain. When nothing on the list is eligible, the first eligible model in
+`budget.provider_order` (default `["claude", "codex", "gemini"]`) runs it, so
+a provider that is out of budget or rate-limited falls back to the next one.
+Model names infer their provider (`gpt-*` → codex, `gemini-*` → gemini);
+anything else uses the explicit `codex:<name>` form.
 
 ### `[repo]`
 
@@ -634,20 +667,23 @@ headings; rules are bullets. A ticket's criticality is the first section
 
 ## Overrides
 - ENG-123: critical
-- ENG-200: model = opus
+- ENG-200: model = opus | gpt-6-astra
 - ENG-300: skip
 
 ## Models
-- critical: fable
-- high: opus
+- critical: fable | gpt-6.1-sol
+- high: opus | gpt-6-astra
 - normal: sonnet
 - low: sonnet
 ```
 
-The file is re-read whenever it changes. `## Models` and `KEY: model = x` are
-preferences handed to the budget policy; only `task model` and `add --model`
-set a hard override, and even that is downgraded when the tier is out of
-budget. Full grammar, evaluation order and idioms:
+The file is re-read whenever it changes. `## Models` and `KEY: model = ...`
+are preference lists handed to the budget policy (`|`-separated, most wanted
+first; alternatives may belong to other enabled providers); the policy tries
+each one through its provider's downgrade chain and falls back to
+`budget.provider_order` when none fits. Only `task model` and `add --model`
+set a hard override, and even that is downgraded (within its provider) when
+the model is out of budget. Full grammar, evaluation order and idioms:
 [docs/priority.md](docs/priority.md).
 
 ## Budget pacing
@@ -694,7 +730,7 @@ isolated instances run.
 - `powerqueue logs -f` tails `logs/powerqueue.log.<date>` (JSON lines by default); `--task ENG-123` filters; `--events` replays the DB timeline.
 - `powerqueue task show ENG-123` prints the task's timeline, sessions and usage.
 - `powerqueue task output ENG-123` shows the last screen of the pane; `attach` opens it.
-- `powerqueue dashboard --once` prints the dashboard frame as plain text (`--json` for the raw snapshot); paste it when the live dashboard looks wrong.
+- `powerqueue dashboard --once` prints the dashboard frame as plain text (`--json` for the raw snapshot, with `ledgers.by_provider.<p>`, `cooldowns` and `next_model`); paste it when the live dashboard looks wrong.
 - `powerqueue doctor --json` is what to paste into bug reports.
 
 Symptoms and fixes: [docs/troubleshooting.md](docs/troubleshooting.md).

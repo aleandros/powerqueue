@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, anyhow, bail};
 use owo_colors::{OwoColorize, Stream};
 
-use crate::cli::output::{criticality_colored, model_colored};
+use crate::cli::output::{criticality_colored, model_list_colored};
 use crate::cli::{Context, PriorityCommand, TaskRef};
 use crate::priority::{PriorityRules, RuleError};
 
@@ -115,7 +115,18 @@ fn check(ctx: &mut Context) -> Result<i32> {
         rules.overrides.len(),
         rules.warnings.len()
     );
+    print_model_lists(&rules);
     Ok(0)
+}
+
+/// The `## Models` preference lists, one line per criticality that has one.
+fn print_model_lists(rules: &PriorityRules) {
+    for c in crate::domain::Criticality::ALL {
+        let models = rules.model_for(c);
+        if !models.is_empty() {
+            println!("  models {:<9} {}", format!("{c}:"), model_list_colored(models));
+        }
+    }
 }
 
 fn edit(ctx: &mut Context) -> Result<i32> {
@@ -183,7 +194,7 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     println!("  rules:       {}", path.display());
     println!("  criticality: {}", criticality_colored(eval.criticality));
     println!("  score:       {:.1}", eval.score);
-    println!("  model:       {}", model_colored(eval.model.as_ref()));
+    println!("  model:       {}", model_list_colored(&eval.models));
     if eval.skip {
         println!("  skip:        {}", "yes (override)".if_supports_color(Stream::Stdout, |t| t.red()));
     }
