@@ -27,7 +27,7 @@ fn write_minimal_config(home: &Path, repo: &Path) {
 #[test]
 fn help_and_completions() {
     let home = tempfile::tempdir().unwrap();
-    pq(home.path()).arg("--help").assert().success().stdout(predicate::str::contains("Linear tickets into Claude Code"));
+    pq(home.path()).arg("--help").assert().success().stdout(predicate::str::contains("Linear tickets\ninto Claude Code sessions").or(predicate::str::contains("Linear tickets into Claude Code")));
     pq(home.path()).args(["completions", "zsh"]).assert().success().stdout(predicate::str::contains("#compdef powerqueue"));
 }
 
