@@ -95,7 +95,7 @@ pub enum Command {
     /// Manage stored API keys.
     #[command(subcommand)]
     Secrets(SecretsCommand),
-    /// Internal: receive a Claude Code hook event.
+    /// Internal: receive an agent CLI hook event (Claude Code hooks, Codex `notify`, agy hooks).
     #[command(hide = true)]
     Hook(HookArgs),
     /// Generate shell completions.
@@ -377,6 +377,10 @@ pub struct HookArgs {
     /// Which agent CLI sent the hook; payloads of other providers are normalised to the Claude shape.
     #[arg(long, value_enum, default_value_t = Provider::Claude)]
     pub provider: Provider,
+    /// The JSON payload, when the CLI passes it as the last argument instead
+    /// of on stdin (Codex `notify`).
+    #[arg(value_name = "PAYLOAD")]
+    pub payload: Option<String>,
 }
 
 fn parse_criticality(s: &str) -> Result<Criticality, String> {

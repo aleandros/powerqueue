@@ -271,7 +271,7 @@ state machine allows it. `complete` and `block` always write directly.
 | `secrets set <linear\|jev> [value]` | store a key (prompts if omitted) |
 | `secrets unset <name>` | remove a key |
 | `secrets list` | which keys are configured and where they come from |
-| `hook --task ID [--session SID] --event EVENT` | internal; called by Claude Code hooks (hidden) |
+| `hook --task ID [--session SID] --event EVENT [--provider P] [PAYLOAD]` | internal; called by Claude Code hooks, Codex `notify` (payload as the last argument) and Antigravity hooks (hidden) |
 
 ## How a task is run
 
@@ -425,27 +425,65 @@ Code's own classifier approves routine commands, or `bypassPermissions`,
 and/or pre-approve what your repo needs in `allowed_tools`, for example
 `["Bash(git *)", "Bash(cargo *)", "Bash(npm test*)"]`.
 
-### `[codex]` (experimental)
+### `[codex]`
 
-Settings for OpenAI Codex CLI sessions. This version tracks a Codex budget
-(`[budget.providers.codex]`) and validates these keys, but does not launch
-Codex sessions yet; `doctor` says so while `budget.providers.codex.enabled`
-is true.
+Settings for OpenAI Codex CLI sessions (tasks whose model belongs to Codex,
+e.g. `gpt-6.1-sol`). Each session runs
+
+```
+codex -C <worktree> -m <model> <approval flags> \
+  -c 'notify=["<powerqueue>","hook","--provider","codex",...,"--event","Notify"]' \
+  [-c model_reasoning_effort="<e>"] [-c 'projects={ "<worktree>" = { trust_level = "trusted" } }'] \
+  --add-dir <data dir> --add-dir <state dir> [--add-dir <repo>/.git] <extra_args> "<prompt>"
+```
+
+and a crash restart runs `codex resume <thread id> ...` with the same flags.
+Codex picks its own thread id: the daemon finds it in the session's rollout
+(`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`, matched by working
+directory; `CODEX_HOME` from `codex.env`, else the daemon's environment, else
+`~/.codex`), records it as the session's `agent_session_id` and tails the
+rollout for token usage. Completion arrives through Codex's `notify` program
+after every turn (no files are written to the worktree); throttling errors in
+the rollout (`You've hit your usage limit`, `Quota exceeded`, ...) put Codex on
+its rate-limit cooldown.
+
+The `workspace-write` sandbox only lets the session write inside the
+worktree, so powerqueue adds its data and state directories (for `powerqueue
+task complete`) and the main checkout's `.git` (for commits) with `--add-dir`.
+The `[[POWERQUEUE:DONE]]` marker in the final message completes the task even
+if the completion command fails.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `binary` | `"codex"` | Codex CLI executable |
-| `approval` | `"workspace-write"` | `workspace-write` (`-a never -s workspace-write`), `approve-for-me`, `yolo` (`--dangerously-bypass-approvals-and-sandbox`) or `on-request` |
+| `approval` | `"workspace-write"` | `workspace-write` (`-a never -s workspace-write`), `approve-for-me` (`--approve-for-me`), `yolo` (`--dangerously-bypass-approvals-and-sandbox`) or `on-request` (`-a on-request -s workspace-write`) |
 | `reasoning_effort` | `"high"` | `-c model_reasoning_effort=…` (`low`, `medium`, `high`, `xhigh`, `max`, `ultra`); unset to leave Codex's default |
 | `extra_args` | `[]` | flags appended verbatim |
-| `env` | `{}` | environment variables for the session |
-| `trust_workspace` | `true` | pass `-c 'projects."<worktree>".trust_level="trusted"'` so Codex never stops at its trust prompt |
+| `env` | `{}` | environment variables for the session (`CODEX_HOME` here is also where the daemon looks for rollouts) |
+| `trust_workspace` | `true` | mark the worktree as a trusted project for the session (`-c projects={...}`, an inline table because Codex splits dotted `-c` keys on `.`) so Codex never stops at its folder-trust dialog |
 
 ### `[gemini]` (experimental)
 
 Settings for Google's Antigravity CLI (`agy`, the CLI behind Google AI
-Pro/Ultra). As with Codex, the budget is tracked and the keys validated, but
-sessions are not launched yet.
+Pro/Ultra). **Experimental:** the flags, hook file and transcript layout come
+from vendor docs and community reports and were not verified against a real
+`agy`; `doctor` says so while `budget.providers.gemini.enabled` is true. Each
+session runs, inside the worktree,
+
+```
+agy [--conversation <id>] --model <model> <mode flag> [--effort <e>] \
+  --add-dir <data dir> --add-dir <state dir> <extra_args> -i "<prompt>"
+```
+
+powerqueue writes `<worktree>/.agents/hooks.json` with a `Stop` hook calling
+`powerqueue hook --provider gemini` (merged into an existing file) and adds
+`.agents/` to the repository's `.git/info/exclude` once. The conversation id
+comes from `~/.gemini/antigravity-cli/cache/last_conversations.json`; as a
+fallback the daemon also polls the conversation transcript for the DONE /
+BLOCKED markers. agy transcripts carry no token counts, so no usage is
+recorded for gemini sessions. Set `POWERQUEUE_AGY_HOME` (in `gemini.env` or
+the daemon's environment) if agy keeps its state somewhere other than
+`~/.gemini/antigravity-cli`.
 
 | Key | Default | Meaning |
 |-----|---------|---------|

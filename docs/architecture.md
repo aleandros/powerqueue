@@ -22,11 +22,14 @@ src/
   budget/            period clock, ledger, estimator, policy
   worktree.rs        git worktree ops (shell out to git)
   tmux.rs            tmux ops (shell out to tmux)
-  session/           launcher (prompt, hooks, launch.sh), hook interpretation,
+  session/           agent.rs (AgentCli trait, agent_for, shared helpers) with one
+                     implementation per CLI: claude.rs, codex.rs, gemini.rs (experimental);
+                     launcher (prompt, launch.sh), hook interpretation,
                      transcript tailing, liveness + resource probes
   scheduler/         daemon.rs (Daemon, tick loop, effects), transitions.rs (pure
                      state logic → Effect list), lifecycle.rs (pick_next, cleanup_task)
-  hook.rs            `powerqueue hook` entry (called by Claude Code)
+  hook.rs            `powerqueue hook` entry (Claude Code hooks, Codex notify, agy hooks;
+                     payloads normalised to the Claude shape via AgentCli::normalize_hook)
   dashboard/         ratatui TUI: Snapshot (data) / ui (render)
   doctor.rs          checks + fix hints
   cli/               clap definitions (mod.rs), Context, output helpers, one file per command
@@ -147,10 +150,36 @@ retry`); the daemon's transitions are written as computed.
 
 One session is one attempt. `launching → running → idle ↔ running → exited |
 crashed | killed`. `is_live` is true for launching, running and idle. The
-`sessions` primary key is the Claude session id. A relaunch after a crash
-reuses that id with `--resume`, so the daemon overwrites the same row with
-`attempt + 1`; a fresh attempt (after cancel + retry, or a non-crash end)
-gets a new id and a new row.
+`sessions` primary key is powerqueue's session id (Claude Code's
+`--session-id`). CLIs that generate their own id (Codex thread, Antigravity
+conversation) get it recorded in `agent_session_id` once the daemon discovers
+it (`AgentCli::discover_session`: the Codex rollout whose `session_meta.cwd`
+is the worktree, agy's `last_conversations.json`), together with the
+transcript path. A relaunch after a crash on the same provider reuses the row
+and resumes the provider's session (`claude --resume <id>`, `codex resume
+<thread>`, `agy --conversation <id>`), so the daemon overwrites the same row
+with `attempt + 1`; a fresh attempt (after cancel + retry, a non-crash end, a
+different provider, or a Codex/agy session whose id was never found) gets a
+new id and a new row.
+
+### Session layer
+
+`session::agent::AgentCli` is everything provider-specific; the launcher,
+`launch.sh`, tmux, probes and cleanup are shared.
+
+| | Claude Code | Codex CLI | Antigravity CLI (experimental) |
+|-|-|-|-|
+| session id | ours (`--session-id`) | generated; discovered from the rollout | generated; from `last_conversations.json` |
+| completion | `Stop` hook in `settings.json` | `-c notify=[...]` after every turn | `Stop` hook in `<worktree>/.agents/hooks.json` + transcript polling |
+| usage | transcript `message.usage` | rollout `token_count.info.last_token_usage`, model from `turn_context` | none (no token counts) |
+| rate limit | `StopFailure{rate_limit}` hook | rollout `event_msg/error` or notify text matching the signatures → synthesised `StopFailure` | hook `error` / transcript error steps |
+| trust | `~/.claude.json` seeded | `-c projects={...}` per session | n/a |
+
+`TranscriptReader` is provider-neutral: each line goes through
+`observe_transcript_line` (side state: current model, rate-limit snapshot and
+errors, last assistant message) and `parse_transcript_line` (usage records).
+The daemon turns the side state into hook rows (`StopFailure`, or a `Stop` for
+polled DONE / BLOCKED markers) that the hook phase handles on the next tick.
 
 ## The daemon tick
 
@@ -174,8 +203,10 @@ still runs):
 4. drain `hook_events`; `interpret_hook` maps each payload to an outcome and
    `transitions::on_hook_outcome` to state changes plus effects (cleanup,
    Linear update, rate-limit cooldown);
-5. read new transcript lines for live sessions (and those ended within the
-   last 5 minutes) into `usage`;
+5. discover the provider session id and transcript of Codex / agy sessions
+   (`session.discovered`), then read new transcript lines for live sessions
+   (and those ended within the last 5 minutes) into `usage`; throttling
+   errors and polled completion markers become hook rows;
 6. probe tmux panes (`transitions::on_probe`): a dead pane without completion
    ⇒ `crashed` with `not_before` from `backoff_for_attempt` (next launch uses
    `--resume`); no activity for `stale_session_secs` or an attempt older than

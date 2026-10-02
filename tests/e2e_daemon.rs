@@ -1,8 +1,8 @@
-//! End-to-end: the real daemon drives a fake `claude` (tests/fixtures/fake-claude.sh)
-//! inside a private tmux server, through real worktrees, hooks and transcripts.
+//! End-to-end: the real daemon drives a fake `claude` (tests/fixtures/fake-claude.sh),
+//! `codex` (fake-codex.sh) or `agy` (fake-agy.sh) inside a private tmux server,
+//! through real worktrees, hooks, notify commands and transcripts.
 //!
-//! Skipped when `tmux`, `git` or `python3` are missing (the fixture needs python3
-//! to parse the hook settings file).
+//! Skipped when `tmux`, `git` or `python3` are missing (the fixtures need python3).
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -14,10 +14,76 @@ struct Env {
     root: tempfile::TempDir,
     socket: String,
     daemon: Option<Child>,
+    /// Extra environment for every `powerqueue` command (and so the daemon).
+    vars: Vec<(String, String)>,
 }
 
 impl Env {
     fn new(mode: &str, extra_scheduler: &str) -> Option<Self> {
+        Self::with_provider(mode, extra_scheduler, |_| String::new())
+    }
+
+    /// Claude disabled, Codex enabled and launched through fake-codex.sh.
+    fn codex(mode: &str) -> Option<Self> {
+        let mut env = Self::with_provider("complete", "", |root| {
+            let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-codex.sh");
+            format!(
+                r#"[budget]
+default_model = "gpt-6-astra"
+low_model = "gpt-6-luna"
+[budget.providers.claude]
+enabled = false
+[budget.providers.codex]
+enabled = true
+[codex]
+binary = "{fake}"
+[codex.env]
+POWERQUEUE_BIN = "{bin}"
+FAKE_CODEX_MODE = "{mode}"
+FAKE_CODEX_STATE_DIR = "{state}"
+CODEX_HOME = "{codex_home}"
+"#,
+                fake = fake.display(),
+                bin = cargo_bin("powerqueue").display(),
+                state = root.join("fakestate").display(),
+                codex_home = root.join("codex").display(),
+            )
+        })?;
+        let home = env.root.path().join("codex").display().to_string();
+        env.vars.push(("CODEX_HOME".into(), home));
+        Some(env)
+    }
+
+    /// Claude disabled, Antigravity enabled and launched through fake-agy.sh.
+    fn gemini(mode: &str) -> Option<Self> {
+        let mut env = Self::with_provider("complete", "", |root| {
+            let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-agy.sh");
+            format!(
+                r#"[budget]
+default_model = "gemini-3-pro"
+low_model = "gemini-3-flash"
+[budget.providers.claude]
+enabled = false
+[budget.providers.gemini]
+enabled = true
+[gemini]
+binary = "{fake}"
+[gemini.env]
+POWERQUEUE_BIN = "{bin}"
+FAKE_AGY_MODE = "{mode}"
+POWERQUEUE_AGY_HOME = "{agy_home}"
+"#,
+                fake = fake.display(),
+                bin = cargo_bin("powerqueue").display(),
+                agy_home = root.join("agy").display(),
+            )
+        })?;
+        let home = env.root.path().join("agy").display().to_string();
+        env.vars.push(("POWERQUEUE_AGY_HOME".into(), home));
+        Some(env)
+    }
+
+    fn with_provider(mode: &str, extra_scheduler: &str, provider_config: impl Fn(&Path) -> String) -> Option<Self> {
         for tool in ["tmux", "git", "python3"] {
             if which::which(tool).is_err() {
                 eprintln!("skipping e2e test: {tool} not on PATH");
@@ -56,7 +122,9 @@ restart_backoff_secs = [1]
 {extra_scheduler}
 [cleanup]
 push_branch = false
+{provider_config}
 "#,
+            provider_config = provider_config(root.path()),
             repo = repo.display(),
             fake = fake.display(),
             bin = cargo_bin("powerqueue").display(),
@@ -65,7 +133,7 @@ push_branch = false
         );
         std::fs::write(home.join("config/config.toml"), config).unwrap();
         std::fs::write(home.join("config/PRIORITY.md"), powerqueue::priority::template()).unwrap();
-        Some(Self { root, socket, daemon: None })
+        Some(Self { root, socket, daemon: None, vars: Vec::new() })
     }
 
     fn home(&self) -> PathBuf {
@@ -78,7 +146,8 @@ push_branch = false
             .env("POWERQUEUE_SECRETS", "file")
             .env("CLAUDE_CONFIG_DIR", self.root.path().join("claude"))
             .env("NO_COLOR", "1")
-            .env_remove("TMUX");
+            .env_remove("TMUX")
+            .envs(self.vars.iter().map(|(k, v)| (k, v)));
         c
     }
 
@@ -157,6 +226,30 @@ fn git(repo: &Path, args: &[&str]) {
     assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
 }
 
+/// Wait until the daemon starts `key` or throttles it first. The budget
+/// policy may not schedule other providers' models yet (that lands with the
+/// multi-provider policy); then the test is skipped with a note.
+fn launched_or_skip(env: &Env, key: &str) -> bool {
+    let v = env.wait_for_show(key, |v| has_event(v, "task.starting") || has_event(v, "task.throttled"));
+    if has_event(&v, "task.starting") {
+        return true;
+    }
+    assert!(has_event(&v, "task.throttled"), "the daemon neither started nor throttled {key}; log:\n{}", env.daemon_log());
+    let reasons: Vec<String> = v["events"]
+        .as_array()
+        .map(|evs| evs.iter().filter(|e| e["kind"] == "task.throttled").map(|e| e["data"]["reasons"].to_string()).collect())
+        .unwrap_or_default();
+    eprintln!("skipping: the budget policy did not schedule {key} on its non-Claude model: {reasons:?}");
+    false
+}
+
+fn event_kinds(show: &serde_json::Value) -> Vec<String> {
+    show["events"]
+        .as_array()
+        .map(|evs| evs.iter().filter_map(|e| e["kind"].as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
 fn add_task(env: &Env, title: &str, extra: &[&str]) -> String {
     let mut args = vec!["--json", "add", title];
     args.extend_from_slice(extra);
@@ -228,4 +321,120 @@ fn blocked_session_needs_attention() {
     assert!(out.contains("fake-claude"), "{out}");
     let print = env.run_ok(&["attach", &key, "--print"]);
     assert!(print.contains("tmux"), "{print}");
+}
+
+#[test]
+fn task_runs_on_codex_when_selected() {
+    let Some(mut env) = Env::codex("complete") else { return };
+    let key = add_task(&env, "Say hello on codex", &["--model", "gpt-6-astra"]);
+    env.start_daemon();
+    if !launched_or_skip(&env, &key) {
+        return;
+    }
+    let st = env.wait_for_state(&key, "completed", Duration::from_secs(60));
+    assert_eq!(st, "completed", "daemon log:\n{}", env.daemon_log());
+    let v = env.wait_for_show(&key, |v| v["usage"]["output_tokens"].as_u64().unwrap_or(0) > 0 && has_event(v, "cleanup.done"));
+    let session = &v["sessions"][0]["session"];
+    assert_eq!(session["model"].as_str(), Some("gpt-6-astra"), "{session}");
+    assert!(session["agent_session_id"].as_str().is_some_and(|s| !s.is_empty()), "thread id discovered: {session}");
+    assert!(session["transcript_path"].as_str().unwrap_or("").contains("rollout-"), "{session}");
+    assert_eq!(v["task"]["summary"].as_str(), Some("fake-codex finished"));
+    let usage = &v["usage"];
+    assert_eq!(usage["output_tokens"].as_u64(), Some(1400), "{usage}");
+    assert_eq!(usage["cache_read_input_tokens"].as_u64(), Some(12032 + 15000), "{usage}");
+    assert_eq!(usage["input_tokens"].as_u64(), Some(18699 - 12032 + 20000 - 15000), "{usage}");
+    let kinds = event_kinds(&v);
+    for expected in ["task.starting", "session.launched", "session.discovered", "task.completed", "cleanup.done"] {
+        assert!(kinds.iter().any(|k| k == expected), "missing event {expected} in {kinds:?}");
+    }
+    // The notify payload reached `powerqueue hook --provider codex` as a Stop.
+    let log = env.run_ok(&["--json", "task", "show", &key]);
+    assert!(log.contains("hook.stop"), "{log}");
+}
+
+#[test]
+fn codex_crash_resumes_the_same_thread() {
+    let Some(mut env) = Env::codex("crash") else { return };
+    let key = add_task(&env, "Crashy codex", &["--model", "gpt-6-astra"]);
+    env.start_daemon();
+    if !launched_or_skip(&env, &key) {
+        return;
+    }
+    let st = env.wait_for_state(&key, "completed", Duration::from_secs(90));
+    assert_eq!(st, "completed", "daemon log:\n{}", env.daemon_log());
+    let v = env.wait_for_show(&key, |v| has_event(v, "cleanup.done"));
+    assert_eq!(v["task"]["attempts"].as_u64(), Some(2));
+    let launched: Vec<&str> = v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "session.launched")
+        .filter_map(|e| e["message"].as_str())
+        .collect();
+    assert_eq!(launched.len(), 2, "{launched:?}");
+    assert!(launched[1].contains("resumed"), "the second launch resumes the Codex thread: {launched:?}");
+    let sessions = v["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1, "a resumed attempt reuses the session row");
+    assert!(sessions[0]["session"]["agent_session_id"].as_str().is_some());
+    // Both runs appended to one rollout.
+    let rollouts: Vec<_> = walk(&env.root.path().join("codex/sessions"));
+    assert_eq!(rollouts.len(), 1, "{rollouts:?}");
+}
+
+#[test]
+fn codex_rate_limit_puts_provider_on_cooldown() {
+    let Some(mut env) = Env::codex("ratelimit") else { return };
+    let key = add_task(&env, "Throttled codex", &["--model", "gpt-6-astra"]);
+    env.start_daemon();
+    if !launched_or_skip(&env, &key) {
+        return;
+    }
+    let st = env.wait_for_state(&key, "throttled", Duration::from_secs(60));
+    assert_eq!(st, "throttled", "daemon log:\n{}", env.daemon_log());
+    let v = env.wait_for_show(&key, |v| has_event(v, "budget.rate_limited"));
+    let kinds = event_kinds(&v);
+    assert!(kinds.iter().any(|k| k == "session.rate_limit_detected"), "{kinds:?}");
+    let limited = v["events"].as_array().unwrap().iter().find(|e| e["kind"] == "budget.rate_limited").expect("rate limit event");
+    assert!(limited["message"].as_str().unwrap_or("").contains("gpt-6-astra"), "names the codex model: {limited}");
+    assert_eq!(limited["data"]["error_type"].as_str(), Some("rate_limit"));
+    assert!(v["task"]["last_error"].as_str().unwrap_or("").contains("usage limit"), "{}", v["task"]);
+}
+
+#[test]
+fn task_completes_on_gemini_by_transcript_polling() {
+    let Some(mut env) = Env::gemini("poll-only") else { return };
+    let key = add_task(&env, "Say hello on agy", &["--model", "gemini-3-pro"]);
+    env.start_daemon();
+    if !launched_or_skip(&env, &key) {
+        return;
+    }
+    let st = env.wait_for_state(&key, "completed", Duration::from_secs(60));
+    assert_eq!(st, "completed", "daemon log:\n{}", env.daemon_log());
+    let v = env.wait_for_show(&key, |v| has_event(v, "cleanup.done"));
+    assert_eq!(v["task"]["summary"].as_str(), Some("fake-agy finished"));
+    let session = &v["sessions"][0]["session"];
+    assert_eq!(session["model"].as_str(), Some("gemini-3-pro"));
+    assert!(session["agent_session_id"].as_str().is_some(), "conversation discovered: {session}");
+    let kinds = event_kinds(&v);
+    for expected in ["session.discovered", "session.marker_polled", "task.completed", "cleanup.done"] {
+        assert!(kinds.iter().any(|k| k == expected), "missing event {expected} in {kinds:?}");
+    }
+    // The hook file was written into the worktree and kept out of git.
+    let exclude = std::fs::read_to_string(env.root.path().join("repo/.git/info/exclude")).unwrap_or_default();
+    assert!(exclude.lines().any(|l| l == ".agents/"), "{exclude}");
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walk(&p));
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
 }

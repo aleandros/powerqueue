@@ -442,8 +442,8 @@ fn check_period_anchors(cfg: &Config) -> Vec<CheckResult> {
         .collect()
 }
 
-/// Enabled non-Claude providers: binary on PATH, login state, and a note that
-/// sessions for them are not launched by this version.
+/// Enabled non-Claude providers: binary on PATH, login state, mode, and a
+/// note that the Antigravity integration is experimental.
 fn check_providers(cfg: &Config) -> Vec<CheckResult> {
     let mut out = Vec::new();
     for p in cfg.budget.enabled_providers_in_order() {
@@ -481,17 +481,17 @@ fn check_providers(cfg: &Config) -> Vec<CheckResult> {
                 }
             }
         }
-        out.push(CheckResult::warn(
-            CONF,
-            name,
-            format!(
-                "{} support is experimental: its budget is tracked but this version does not launch {name} sessions",
-                p.display_name()
-            ),
-            format!(
-                "keep budget.providers.{p}.enabled = false until the {name} launcher ships, or accept that tasks stay on Claude"
-            ),
-        ));
+        if p == Provider::Gemini {
+            out.push(CheckResult::warn(
+                CONF,
+                name,
+                format!(
+                    "{} support is experimental: its launch flags, hooks and transcript layout come from community reports and were not verified",
+                    p.display_name()
+                ),
+                "watch the first gemini tasks (`powerqueue attach <task>`) and report mismatches",
+            ));
+        }
     }
     out
 }

@@ -1,4 +1,7 @@
-//! `powerqueue hook` — invoked by Claude Code hooks inside a task session.
+//! `powerqueue hook` — invoked by agent CLI hooks inside a task session
+//! (Claude Code hooks, Codex `notify`, Antigravity hooks). Payloads of other
+//! providers are normalised to the Claude shape first
+//! ([`crate::session::AgentCli::normalize_hook`]).
 //!
 //! It must be fast and must never fail the hook: it reads the JSON payload
 //! from stdin, stores it in `hook_events` for the daemon, and exits 0. For
@@ -11,7 +14,8 @@ use std::io::Read;
 use anyhow::Result;
 use chrono::Utc;
 
-use crate::domain::{BLOCKED_MARKER, DONE_MARKER, EventLevel, HookEvent, TaskId, TaskState};
+use crate::domain::{BLOCKED_MARKER, DONE_MARKER, EventLevel, HookEvent, Provider, TaskId, TaskState};
+use crate::session::agent_for;
 use crate::store::Store;
 
 /// Longest payload preview stored in the `hook.*` event.
@@ -33,11 +37,52 @@ pub fn handle(
     if let Err(e) = stdin.read_to_string(&mut raw) {
         tracing::warn!(error = %e, "hook: cannot read stdin; storing an empty payload");
     }
-    let payload: serde_json::Value = match serde_json::from_str(raw.trim()) {
+    store_payload(store, task_id, session_id, event, parse_payload(&raw))
+}
+
+/// Parse a raw hook payload: a JSON object as is, other JSON wrapped as
+/// `{"value": ...}`, anything else (empty, malformed) as `{}`.
+pub fn parse_payload(raw: &str) -> serde_json::Value {
+    match serde_json::from_str(raw.trim()) {
         Ok(v @ serde_json::Value::Object(_)) => v,
         Ok(other) => serde_json::json!({ "value": other }),
         Err(_) => serde_json::json!({}),
-    };
+    }
+}
+
+/// Entry point for a hook sent by `provider`: normalise `(event, raw
+/// payload)` with the provider's [`crate::session::AgentCli::normalize_hook`]
+/// and store the result like [`handle`]. Events the provider says to ignore
+/// (Codex title side turns, unknown names) are dropped with a debug log;
+/// an unknown Claude event name is an error (reported on stderr by the
+/// caller, exit code still 0).
+pub fn handle_provider(
+    store: &Store,
+    provider: Provider,
+    task_id: TaskId,
+    session_id: Option<uuid::Uuid>,
+    event: &str,
+    raw: &str,
+) -> Result<i32> {
+    let payload = parse_payload(raw);
+    match agent_for(provider).normalize_hook(event, payload) {
+        Some((normalized, payload)) => store_payload(store, task_id, session_id, normalized, payload),
+        None if provider == Provider::Claude => anyhow::bail!("unknown hook event `{event}`"),
+        None => {
+            tracing::debug!(task = %task_id, %provider, event, "hook ignored after normalisation");
+            Ok(0)
+        }
+    }
+}
+
+/// Store a (Claude-shaped) payload and apply completion markers.
+fn store_payload(
+    store: &Store,
+    task_id: TaskId,
+    session_id: Option<uuid::Uuid>,
+    event: HookEvent,
+    payload: serde_json::Value,
+) -> Result<i32> {
     let session_id =
         session_id.or_else(|| payload.get("session_id").and_then(|s| s.as_str()).and_then(|s| uuid::Uuid::parse_str(s).ok()));
 
@@ -211,6 +256,33 @@ mod tests {
         let code = handle(&store, TaskId::new(), None, HookEvent::Stop, &mut Cursor::new(payload.to_string())).unwrap();
         assert_eq!(code, 0);
         assert_eq!(store.drain_hook_events().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn provider_payloads_are_normalised() {
+        let (store, id) = store_with_task();
+        let sid = uuid::Uuid::new_v4();
+        let notify = serde_json::json!({"type":"agent-turn-complete","thread-id":"01a0","cwd":"/w","input-messages":["go"],"last-assistant-message":format!("ok\n{DONE_MARKER} codex finished")});
+        assert_eq!(handle_provider(&store, Provider::Codex, id, Some(sid), "Notify", &notify.to_string()).unwrap(), 0);
+        let events = store.drain_hook_events().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, HookEvent::Stop);
+        assert_eq!(events[0].session_id, Some(sid));
+        let task = store.get_task(id).unwrap().unwrap();
+        assert_eq!(task.state, TaskState::Completed);
+        assert_eq!(task.summary.as_deref(), Some("codex finished"));
+
+        let (store, id) = store_with_task();
+        let title = serde_json::json!({"type":"agent-turn-complete","input-messages":["Generate a concise, single-line task title"],"last-assistant-message":"{}"});
+        assert_eq!(handle_provider(&store, Provider::Codex, id, None, "Notify", &title.to_string()).unwrap(), 0);
+        assert!(store.drain_hook_events().unwrap().is_empty(), "title side turns are dropped");
+
+        assert_eq!(handle_provider(&store, Provider::Claude, id, None, "SessionStart", "{}").unwrap(), 0);
+        assert_eq!(store.drain_hook_events().unwrap()[0].event, HookEvent::SessionStart);
+        assert!(handle_provider(&store, Provider::Claude, id, None, "Bogus", "{}").is_err());
+        assert_eq!(handle_provider(&store, Provider::Gemini, id, None, "PreToolUse", "{}").unwrap(), 0);
+        assert!(store.drain_hook_events().unwrap().is_empty());
+        assert_eq!(parse_payload("[1]"), serde_json::json!({ "value": [1] }));
     }
 
     #[test]

@@ -1,6 +1,11 @@
-//! Incremental reader for Claude Code JSONL transcripts.
+//! Incremental reader for agent JSONL transcripts.
 //!
-//! Each assistant API response is written as one line *per content block*,
+//! The reader is provider-neutral: each complete line goes through the
+//! provider's [`AgentCli::observe_transcript_line`](crate::session::agent::AgentCli::observe_transcript_line) (side state such as the
+//! current model, rate-limit snapshots and errors, the last assistant
+//! message) and [`AgentCli::parse_transcript_line`](crate::session::agent::AgentCli::parse_transcript_line) (usage records).
+//!
+//! Claude Code specifics: each assistant API response is written as one line *per content block*,
 //! all sharing the same `message.id` and `message.usage`, so usage must be
 //! counted once per message id. `input_tokens` is frequently a streaming
 //! placeholder (0/1); cache fields and output tokens are reliable.
@@ -11,7 +16,40 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
-use crate::domain::{ModelTier, TaskId, TokenUsage, UsageRecord};
+use crate::domain::{ModelTier, Provider, TaskId, TokenUsage, UsageRecord};
+use crate::session::agent::agent_for;
+
+/// Per-reader state a provider updates from transcript lines
+/// ([`AgentCli::observe_transcript_line`](crate::session::agent::AgentCli::observe_transcript_line)). The trait is stateless; this is
+/// where a provider keeps what later lines need (e.g. Codex reports the
+/// model once per turn in `turn_context`, not on every usage line).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TranscriptState {
+    /// Model the transcript last reported (Codex `turn_context.model`);
+    /// used instead of the launched model when set.
+    pub model: Option<ModelTier>,
+    /// The provider's own session id, when the transcript names it (Codex
+    /// `session_meta.payload.id`).
+    pub agent_session_id: Option<String>,
+    /// Latest rate-limit snapshot (Codex `token_count.rate_limits`).
+    pub rate_limits: Option<serde_json::Value>,
+    /// Rate-limit error messages not yet handed to the daemon.
+    pub rate_limit_errors: Vec<String>,
+    /// The newest assistant message not yet handed to the daemon (completion
+    /// polling for CLIs without a reliable `Stop` hook).
+    pub pending_message: Option<String>,
+}
+
+impl TranscriptState {
+    /// Take the rate-limit errors seen since the last call.
+    pub fn take_rate_limit_errors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.rate_limit_errors)
+    }
+    /// Take the newest assistant message seen since the last call.
+    pub fn take_pending_message(&mut self) -> Option<String> {
+        self.pending_message.take()
+    }
+}
 
 /// `~/.claude/projects/<encoded cwd>/<session id>.jsonl`.
 ///
@@ -48,11 +86,41 @@ pub struct TranscriptReader {
     pub last_text: Option<String>,
     /// Timestamp of the newest line read.
     pub last_line_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Which CLI wrote the transcript.
+    pub provider: Provider,
+    /// The model the session was launched with (fallback for usage lines
+    /// that do not name their model).
+    pub launched_model: ModelTier,
+    /// Provider side state (see [`TranscriptState`]).
+    pub state: TranscriptState,
 }
 
 impl TranscriptReader {
+    /// A reader for a Claude Code transcript.
     pub fn new(path: PathBuf, session_id: uuid::Uuid, task_id: TaskId) -> Self {
-        Self { path, offset: 0, seen: Default::default(), session_id, task_id, last_text: None, last_line_at: None }
+        Self::for_provider(path, session_id, task_id, Provider::Claude, ModelTier::sonnet())
+    }
+
+    /// A reader for `provider`'s transcript of a session launched with `launched_model`.
+    pub fn for_provider(
+        path: PathBuf,
+        session_id: uuid::Uuid,
+        task_id: TaskId,
+        provider: Provider,
+        launched_model: ModelTier,
+    ) -> Self {
+        Self {
+            path,
+            offset: 0,
+            seen: Default::default(),
+            session_id,
+            task_id,
+            last_text: None,
+            last_line_at: None,
+            provider,
+            launched_model,
+            state: TranscriptState::default(),
+        }
     }
 
     /// Read lines appended since the last call and return *new* usage
@@ -99,7 +167,13 @@ impl TranscriptReader {
                 continue;
             }
             self.observe_line(line);
-            if let Some(rec) = parse_line(line, self.session_id, self.task_id)
+            let agent = agent_for(self.provider);
+            agent.observe_transcript_line(line, &mut self.state);
+            if let Some(text) = &self.state.pending_message {
+                self.last_text = Some(text.clone());
+            }
+            let model = self.state.model.as_ref().unwrap_or(&self.launched_model);
+            if let Some(rec) = agent.parse_transcript_line(line, self.session_id, self.task_id, model)
                 && self.seen.insert(rec.message_id.clone())
             {
                 records.push(rec);
@@ -114,7 +188,7 @@ impl TranscriptReader {
     /// Update `last_line_at` / `last_text` from any complete line.
     fn observe_line(&mut self, line: &str) {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
-        if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()).and_then(parse_timestamp) {
+        if let Some(ts) = v.get("timestamp").or_else(|| v.get("created_at")).and_then(|t| t.as_str()).and_then(parse_timestamp) {
             self.last_line_at = Some(ts);
         }
         if v.get("type").and_then(|t| t.as_str()) == Some("assistant")
@@ -163,7 +237,7 @@ pub fn parse_line(line: &str, session_id: uuid::Uuid, task_id: TaskId) -> Option
     })
 }
 
-fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s).ok().map(|t| t.with_timezone(&Utc))
 }
 

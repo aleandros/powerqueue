@@ -264,9 +264,7 @@ pub const CODEX_APPROVAL_MODES: [&str; 4] = ["workspace-write", "approve-for-me"
 /// Permission modes for Antigravity sessions (`gemini.mode`).
 pub const GEMINI_MODES: [&str; 3] = ["skip-permissions", "accept-edits", "plan"];
 
-/// How OpenAI Codex CLI is launched. Experimental: this version does not
-/// launch Codex sessions yet; the settings are validated and reported by
-/// `doctor` so the budget side can be configured ahead of time.
+/// How OpenAI Codex CLI is launched (see `session::codex`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CodexConfig {
@@ -298,8 +296,8 @@ impl Default for CodexConfig {
     }
 }
 
-/// How Google's Antigravity CLI (`agy`) is launched. Experimental: this
-/// version does not launch Antigravity sessions yet.
+/// How Google's Antigravity CLI (`agy`) is launched (see `session::gemini`).
+/// Experimental: the CLI shapes are unverified community reports.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GeminiConfig {
