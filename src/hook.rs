@@ -14,7 +14,15 @@ use crate::domain::{HookEvent, TaskId};
 use crate::store::Store;
 
 /// Entry point for the subcommand. Returns the process exit code.
-pub fn handle(store: &Store, task_id: TaskId, session_id: Option<uuid::Uuid>, event: HookEvent, stdin: &mut dyn Read) -> Result<i32> {
+pub fn handle(
+    store: &Store,
+    task_id: TaskId,
+    session_id: Option<uuid::Uuid>,
+    event: HookEvent,
+    stdin: &mut dyn Read,
+) -> Result<i32> {
     let _ = (store, task_id, session_id, event, stdin);
-    todo!("TODO(agent-budget): read stdin (may be empty), insert_hook_event, log event; Stop+DONE marker => mark task Completed-pending")
+    todo!(
+        "TODO(agent-budget): read stdin (may be empty), insert_hook_event, log event; Stop+DONE marker => mark task Completed-pending"
+    )
 }

@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use crate::cli::{Context, ConfigCommand};
+use crate::cli::{ConfigCommand, Context};
 
 pub fn run(ctx: &mut Context, cmd: ConfigCommand) -> Result<i32> {
     let _ = (ctx, cmd);

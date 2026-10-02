@@ -61,12 +61,7 @@ pub fn init(paths: &Paths, cfg: &LoggingConfig, verbosity: Verbosity, stderr: bo
     let file_filter = EnvFilter::try_new(&cfg.level).unwrap_or_else(|_| EnvFilter::new("info"));
     let file_layer: Box<dyn Layer<_> + Send + Sync> = if cfg.json {
         Box::new(
-            fmt::layer()
-                .json()
-                .with_current_span(false)
-                .with_span_list(false)
-                .with_writer(file_writer)
-                .with_filter(file_filter),
+            fmt::layer().json().with_current_span(false).with_span_list(false).with_writer(file_writer).with_filter(file_filter),
         )
     } else {
         Box::new(fmt::layer().with_ansi(false).with_writer(file_writer).with_filter(file_filter))

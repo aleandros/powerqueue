@@ -41,7 +41,14 @@ pub struct CheckResult {
 }
 
 /// Run every check. `fix` applies safe repairs. `online` allows network calls.
-pub async fn run_all(cfg: &Config, paths: &Paths, store: &Store, secrets: &Secrets, fix: bool, online: bool) -> Result<Vec<CheckResult>> {
+pub async fn run_all(
+    cfg: &Config,
+    paths: &Paths,
+    store: &Store,
+    secrets: &Secrets,
+    fix: bool,
+    online: bool,
+) -> Result<Vec<CheckResult>> {
     let _ = (cfg, paths, store, secrets, fix, online);
     todo!("TODO(agent-ux)")
 }

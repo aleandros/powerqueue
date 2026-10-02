@@ -60,7 +60,9 @@ impl Ledger {
     /// Aggregate usage rows into a ledger.
     pub fn load(store: &Store, cfg: &BudgetConfig, clock: &PeriodClock, now: DateTime<Utc>) -> anyhow::Result<Ledger> {
         let _ = (store, cfg, clock, now);
-        todo!("TODO(agent-budget): usage_by_tier for period and window, weights from cfg.models or default_weight, calibration from kv 'budget.calibration'")
+        todo!(
+            "TODO(agent-budget): usage_by_tier for period and window, weights from cfg.models or default_weight, calibration from kv 'budget.calibration'"
+        )
     }
 
     pub fn tier(&self, tier: ModelTier) -> TierLedger {

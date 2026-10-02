@@ -1,14 +1,34 @@
 //! Terminal output helpers: colours, tables, humanised numbers.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use owo_colors::OwoColorize;
 
 use crate::domain::{Criticality, ModelTier, TaskState};
 
+static COLOR: AtomicBool = AtomicBool::new(true);
+
+/// Enable or disable ANSI colours for every helper in this module.
+pub fn set_color(enabled: bool) {
+    COLOR.store(enabled, Ordering::Relaxed);
+    owo_colors::set_override(enabled);
+}
+
+/// Whether colours are currently enabled.
+pub fn color_enabled() -> bool {
+    COLOR.load(Ordering::Relaxed)
+}
+
+/// Apply `style` only when colours are enabled.
+pub fn paint(text: &str, style: impl Fn(&str) -> String) -> String {
+    if color_enabled() { style(text) } else { text.to_string() }
+}
+
 /// Print an anyhow error chain.
 pub fn print_error(err: &anyhow::Error) {
-    eprintln!("{} {}", "error:".red().bold(), err);
+    eprintln!("{} {}", paint("error:", |t| t.red().bold().to_string()), err);
     for cause in err.chain().skip(1) {
-        eprintln!("  {} {}", "caused by:".dimmed(), cause);
+        eprintln!("  {} {}", paint("caused by:", |t| t.dimmed().to_string()), cause);
     }
 }
 
@@ -64,6 +84,9 @@ pub fn ago(dt: chrono::DateTime<chrono::Utc>) -> String {
 /// Colour a task state consistently across status/dashboard.
 pub fn state_colored(state: TaskState) -> String {
     let s = state.as_str();
+    if !color_enabled() {
+        return s.to_string();
+    }
     match state {
         TaskState::Running => s.green().to_string(),
         TaskState::Queued | TaskState::Starting => s.cyan().to_string(),
@@ -77,6 +100,9 @@ pub fn state_colored(state: TaskState) -> String {
 }
 
 pub fn criticality_colored(c: Criticality) -> String {
+    if !color_enabled() {
+        return c.as_str().to_string();
+    }
     match c {
         Criticality::Critical => c.as_str().red().bold().to_string(),
         Criticality::High => c.as_str().yellow().to_string(),
@@ -86,6 +112,9 @@ pub fn criticality_colored(c: Criticality) -> String {
 }
 
 pub fn model_colored(m: Option<ModelTier>) -> String {
+    if !color_enabled() {
+        return m.map(|m| m.alias().to_string()).unwrap_or_else(|| "-".to_string());
+    }
     match m {
         Some(ModelTier::Fable) => "fable".magenta().bold().to_string(),
         Some(ModelTier::Opus) => "opus".blue().to_string(),

@@ -74,9 +74,7 @@ fn ts(dt: &DateTime<Utc>) -> String {
 }
 
 fn parse_ts(s: &str) -> Result<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s)
-        .map(|d| d.with_timezone(&Utc))
-        .map_err(|e| anyhow!("bad timestamp `{s}`: {e}"))
+    DateTime::parse_from_rfc3339(s).map(|d| d.with_timezone(&Utc)).map_err(|e| anyhow!("bad timestamp `{s}`: {e}"))
 }
 
 fn opt_ts(s: Option<String>) -> Result<Option<DateTime<Utc>>> {
@@ -264,7 +262,8 @@ impl Store {
         })
     }
 
-    const TASK_COLS: &'static str = "id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score, labels,
+    const TASK_COLS: &'static str =
+        "id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score, labels,
         linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts, not_before,
         last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at";
 
@@ -298,7 +297,8 @@ impl Store {
             return Ok(Some(t));
         }
         let conn = self.lock();
-        let sql = format!("SELECT {} FROM tasks WHERE replace(id, '-', '') LIKE ?1 || '%' ORDER BY created_at DESC", Self::TASK_COLS);
+        let sql =
+            format!("SELECT {} FROM tasks WHERE replace(id, '-', '') LIKE ?1 || '%' ORDER BY created_at DESC", Self::TASK_COLS);
         let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query_map(params![needle.replace('-', "").to_lowercase()], Self::row_to_task)?;
         let first = rows.next().transpose()?;
@@ -435,7 +435,8 @@ impl Store {
         })
     }
 
-    const SESSION_COLS: &'static str = "id, task_id, attempt, model, state, tmux_session, tmux_window, pane_id, pid, transcript_path,
+    const SESSION_COLS: &'static str =
+        "id, task_id, attempt, model, state, tmux_session, tmux_window, pane_id, pid, transcript_path,
         exit_code, started_at, ended_at, last_activity_at, error";
 
     pub fn get_session(&self, id: uuid::Uuid) -> Result<Option<Session>> {
@@ -620,7 +621,14 @@ impl Store {
         conn.execute(
             "INSERT INTO resource_samples (session_id, task_id, timestamp, cpu_percent, rss_bytes, process_count)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![s.session_id.to_string(), s.task_id.to_string(), ts(&s.timestamp), s.cpu_percent as f64, s.rss_bytes as i64, s.process_count as i64],
+            params![
+                s.session_id.to_string(),
+                s.task_id.to_string(),
+                ts(&s.timestamp),
+                s.cpu_percent as f64,
+                s.rss_bytes as i64,
+                s.process_count as i64
+            ],
         )?;
         Ok(())
     }
@@ -796,7 +804,13 @@ impl Store {
 
     // ------------------------------------------------------------ hook events
 
-    pub fn insert_hook_event(&self, task_id: TaskId, session_id: Option<uuid::Uuid>, event: HookEvent, payload: &serde_json::Value) -> Result<i64> {
+    pub fn insert_hook_event(
+        &self,
+        task_id: TaskId,
+        session_id: Option<uuid::Uuid>,
+        event: HookEvent,
+        payload: &serde_json::Value,
+    ) -> Result<i64> {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO hook_events (task_id, session_id, event, payload, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -895,7 +909,8 @@ impl Store {
 
     pub fn kv_updated_at(&self, key: &str) -> Result<Option<DateTime<Utc>>> {
         let conn = self.lock();
-        let v: Option<String> = conn.query_row("SELECT updated_at FROM kv WHERE key = ?1", params![key], |r| r.get(0)).optional()?;
+        let v: Option<String> =
+            conn.query_row("SELECT updated_at FROM kv WHERE key = ?1", params![key], |r| r.get(0)).optional()?;
         opt_ts(v)
     }
 
@@ -1066,7 +1081,12 @@ mod tests {
             message_id: "msg_1".into(),
             model_id: "claude-sonnet-5-5".into(),
             tier: ModelTier::Sonnet,
-            usage: TokenUsage { input_tokens: 10, output_tokens: 20, cache_creation_input_tokens: 30, cache_read_input_tokens: 40 },
+            usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+                cache_creation_input_tokens: 30,
+                cache_read_input_tokens: 40,
+            },
             timestamp: now,
         };
         assert!(store.record_usage(&rec).unwrap());

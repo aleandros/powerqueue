@@ -48,8 +48,8 @@ pub struct Cli {
     /// Machine-readable JSON output where supported.
     #[arg(long, global = true)]
     pub json: bool,
-    /// Disable colours.
-    #[arg(long, global = true, env = "NO_COLOR")]
+    /// Disable colours (also honours the `NO_COLOR` environment variable).
+    #[arg(long, global = true)]
     pub no_color: bool,
     #[command(subcommand)]
     pub command: Command,

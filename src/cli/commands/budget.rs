@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use crate::cli::{Context, BudgetCommand};
+use crate::cli::{BudgetCommand, Context};
 
 pub fn run(ctx: &mut Context, cmd: BudgetCommand) -> Result<i32> {
     let _ = (ctx, cmd);

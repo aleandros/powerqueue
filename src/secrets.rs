@@ -168,7 +168,7 @@ impl FileBackend {
             return Ok(SecretsFile::default());
         }
         let text = std::fs::read_to_string(&self.path).with_context(|| format!("read {}", self.path.display()))?;
-        Ok(toml::from_str(&text).with_context(|| format!("parse {}", self.path.display()))?)
+        toml::from_str(&text).with_context(|| format!("parse {}", self.path.display()))
     }
     fn write(&self, file: &SecretsFile) -> Result<()> {
         if let Some(parent) = self.path.parent() {
@@ -252,9 +252,8 @@ impl Secrets {
 
     /// Like `get` but an error with setup instructions when missing.
     pub fn require(&self, kind: SecretKind) -> Result<String> {
-        self.get(kind)?.ok_or_else(|| {
-            anyhow!("{} not configured. Run `powerqueue init` or set {}.", kind.label(), kind.env_var())
-        })
+        self.get(kind)?
+            .ok_or_else(|| anyhow!("{} not configured. Run `powerqueue init` or set {}.", kind.label(), kind.env_var()))
     }
 
     pub fn set(&self, kind: SecretKind, value: &str) -> Result<()> {

@@ -26,11 +26,7 @@ impl Paths {
     pub fn resolve() -> Self {
         if let Some(home) = std::env::var_os("POWERQUEUE_HOME") {
             let home = PathBuf::from(home);
-            return Self {
-                config_dir: home.join("config"),
-                data_dir: home.join("data"),
-                state_dir: home.join("state"),
-            };
+            return Self { config_dir: home.join("config"), data_dir: home.join("data"), state_dir: home.join("state") };
         }
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -52,11 +48,7 @@ impl Paths {
 
     /// Build a layout rooted at a single directory (tests, `POWERQUEUE_HOME`).
     pub fn rooted(root: &Path) -> Self {
-        Self {
-            config_dir: root.join("config"),
-            data_dir: root.join("data"),
-            state_dir: root.join("state"),
-        }
+        Self { config_dir: root.join("config"), data_dir: root.join("data"), state_dir: root.join("state") }
     }
 
     pub fn config_file(&self) -> PathBuf {
@@ -96,14 +88,8 @@ impl Paths {
 
     /// Create every directory in the layout.
     pub fn ensure(&self) -> std::io::Result<()> {
-        for dir in [
-            &self.config_dir,
-            &self.data_dir,
-            &self.state_dir,
-            &self.worktrees_dir(),
-            &self.logs_dir(),
-            &self.tasks_dir(),
-        ] {
+        for dir in [&self.config_dir, &self.data_dir, &self.state_dir, &self.worktrees_dir(), &self.logs_dir(), &self.tasks_dir()]
+        {
             std::fs::create_dir_all(dir)?;
         }
         Ok(())

@@ -277,11 +277,23 @@ impl Default for BudgetConfig {
         let mut models = BTreeMap::new();
         models.insert(
             ModelTier::Fable,
-            ModelBudget { share: 0.25, min_criticality: Criticality::Critical, relax_after_fraction: 0.5, weight: 5.0, enabled: true },
+            ModelBudget {
+                share: 0.25,
+                min_criticality: Criticality::Critical,
+                relax_after_fraction: 0.5,
+                weight: 5.0,
+                enabled: true,
+            },
         );
         models.insert(
             ModelTier::Opus,
-            ModelBudget { share: 0.35, min_criticality: Criticality::High, relax_after_fraction: 0.3, weight: 3.0, enabled: true },
+            ModelBudget {
+                share: 0.35,
+                min_criticality: Criticality::High,
+                relax_after_fraction: 0.3,
+                weight: 3.0,
+                enabled: true,
+            },
         );
         models.insert(
             ModelTier::Sonnet,
@@ -350,7 +362,14 @@ pub struct CleanupConfig {
 
 impl Default for CleanupConfig {
     fn default() -> Self {
-        Self { remove_worktree: true, push_branch: true, delete_branch: false, keep_failed: true, run: Vec::new(), close_tmux_window: true }
+        Self {
+            remove_worktree: true,
+            push_branch: true,
+            delete_branch: false,
+            keep_failed: true,
+            run: Vec::new(),
+            close_tmux_window: true,
+        }
     }
 }
 
@@ -538,11 +557,8 @@ impl Config {
         match &self.repo.worktree_root {
             Some(p) => expand_tilde(p),
             None => {
-                let name = self
-                    .repo_path()
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "repo".to_string());
+                let name =
+                    self.repo_path().file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "repo".to_string());
                 paths.worktrees_dir().join(name)
             }
         }
@@ -619,11 +635,7 @@ impl Config {
     /// `validate` as a hard error.
     pub fn ensure_valid(&self) -> Result<()> {
         let problems = self.validate();
-        if problems.is_empty() {
-            Ok(())
-        } else {
-            bail!("invalid configuration:\n  - {}", problems.join("\n  - "))
-        }
+        if problems.is_empty() { Ok(()) } else { bail!("invalid configuration:\n  - {}", problems.join("\n  - ")) }
     }
 }
 

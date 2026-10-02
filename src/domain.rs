@@ -50,12 +50,7 @@ impl FromStr for TaskId {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TaskSource {
     /// A Linear issue. `issue_id` is Linear's UUID, `identifier` the human key (`ENG-123`).
-    Linear {
-        issue_id: String,
-        identifier: String,
-        url: String,
-        team_key: String,
-    },
+    Linear { issue_id: String, identifier: String, url: String, team_key: String },
     /// Added by hand through `powerqueue add` or the dashboard.
     Manual,
 }
@@ -81,12 +76,7 @@ pub enum Criticality {
 }
 
 impl Criticality {
-    pub const ALL: [Criticality; 4] = [
-        Criticality::Critical,
-        Criticality::High,
-        Criticality::Normal,
-        Criticality::Low,
-    ];
+    pub const ALL: [Criticality; 4] = [Criticality::Critical, Criticality::High, Criticality::Normal, Criticality::Low];
 
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -129,11 +119,12 @@ impl FromStr for Criticality {
 
 /// Claude model tiers that the scheduler can pick between.
 /// `weight` orders by cost: Fable is the most capable and the scarcest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelTier {
     Fable,
     Opus,
+    #[default]
     Sonnet,
     Haiku,
 }
@@ -186,12 +177,6 @@ impl ModelTier {
             ModelTier::Sonnet => 1.0,
             ModelTier::Haiku => 0.2,
         }
-    }
-}
-
-impl Default for ModelTier {
-    fn default() -> Self {
-        ModelTier::Sonnet
     }
 }
 
@@ -631,12 +616,23 @@ pub struct Event {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum DaemonCommand {
-    Pause { task_id: TaskId },
-    Resume { task_id: TaskId },
-    Cancel { task_id: TaskId },
-    Retry { task_id: TaskId },
+    Pause {
+        task_id: TaskId,
+    },
+    Resume {
+        task_id: TaskId,
+    },
+    Cancel {
+        task_id: TaskId,
+    },
+    Retry {
+        task_id: TaskId,
+    },
     /// Force a model for the next attempt.
-    SetModel { task_id: TaskId, model: Option<ModelTier> },
+    SetModel {
+        task_id: TaskId,
+        model: Option<ModelTier>,
+    },
     /// Re-read Linear immediately.
     SyncNow,
     /// Reload config + PRIORITY.md.
@@ -745,7 +741,8 @@ mod tests {
 
     #[test]
     fn weighted_usage_prefers_output() {
-        let u = TokenUsage { input_tokens: 100, output_tokens: 100, cache_creation_input_tokens: 0, cache_read_input_tokens: 1000 };
+        let u =
+            TokenUsage { input_tokens: 100, output_tokens: 100, cache_creation_input_tokens: 0, cache_read_input_tokens: 1000 };
         assert_eq!(u.total(), 1200);
         assert!((u.weighted() - (100.0 + 500.0 + 100.0)).abs() < 1e-9);
     }
