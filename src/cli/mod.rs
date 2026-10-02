@@ -7,7 +7,7 @@
 //! powerqueue dashboard            live TUI
 //! powerqueue status               one-shot table
 //! powerqueue add "title" [...]    enqueue a manual task
-//! powerqueue task <show|list|complete|block|cancel|pause|resume|retry|explain|model>
+//! powerqueue task <show|list|complete|block|cancel|pause|resume|retry|explain|model|prompt|output|send>
 //! powerqueue attach <task>        open the task's tmux window
 //! powerqueue priority <show|check|edit|explain|simulate|path>
 //! powerqueue budget <show|set-reset|set-observed|clear-limits|estimate> [--provider <p>]
@@ -234,6 +234,8 @@ pub enum TaskCommand {
         /// warns when that provider is disabled in config
         model: String,
     },
+    /// Print the prompt the next attempt would receive (renders `prompt.template`; nothing is launched).
+    Prompt(TaskRef),
     /// Print the last screen of the task's tmux pane.
     Output {
         #[command(flatten)]

@@ -183,9 +183,12 @@ pub struct Evaluation {
 pub const MAX_AGE_BOOST: f64 = 200.0;
 
 /// Fields a condition may reference.
-const FIELDS: [&str; 9] = ["label", "priority", "estimate", "project", "team", "title", "description", "source", "key"];
+const FIELDS: [&str; 11] =
+    ["label", "priority", "estimate", "project", "cycle", "cycle_number", "team", "title", "description", "source", "key"];
 /// Fields that support `>` / `<`.
-const NUMERIC_FIELDS: [&str; 2] = ["priority", "estimate"];
+const NUMERIC_FIELDS: [&str; 3] = ["priority", "estimate", "cycle_number"];
+/// Values `cycle` may be compared with (the status word stored on the task).
+const CYCLE_WORDS: [&str; 4] = ["active", "next", "past", "future"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -462,8 +465,8 @@ impl PriorityRules {
 
 /// Evaluate a single condition against a task (exposed for tests and `priority explain`).
 ///
-/// A missing optional field (`priority`, `estimate`, `project`, `team`) never
-/// matches, except for `!=`, which does.
+/// A missing optional field (`priority`, `estimate`, `project`, `cycle`,
+/// `cycle_number`, `team`) never matches, except for `!=`, which does.
 pub fn condition_matches(cond: &Condition, task: &Task) -> bool {
     match cond {
         Condition::Equals { field, value } => field_equals(field, value, task).unwrap_or(false),
@@ -492,6 +495,10 @@ fn field_equals(field: &str, value: &str, task: &Task) -> Option<bool> {
             let wanted = value.trim().parse::<f64>().ok()?;
             task.estimate.map(|e| (e - wanted).abs() < 1e-9)
         }
+        "cycle_number" => {
+            let wanted = value.trim().parse::<f64>().ok()?;
+            task.cycle_number.map(|n| (f64::from(n) - wanted).abs() < 1e-9)
+        }
         _ => field_text(field, task).map(|t| t.trim().eq_ignore_ascii_case(value.trim())),
     }
 }
@@ -503,6 +510,8 @@ fn field_text(field: &str, task: &Task) -> Option<String> {
         "priority" => task.linear_priority.map(|p| priority_name(p).to_string()),
         "estimate" => task.estimate.map(fmt_num),
         "project" => task.project.clone(),
+        "cycle" => task.cycle.clone(),
+        "cycle_number" => task.cycle_number.map(|n| n.to_string()),
         "team" => match &task.source {
             TaskSource::Linear { team_key, .. } => Some(team_key.clone()),
             TaskSource::Manual => None,
@@ -519,6 +528,7 @@ fn field_number(field: &str, task: &Task) -> Option<f64> {
     match field {
         "priority" => task.linear_priority.map(f64::from),
         "estimate" => task.estimate,
+        "cycle_number" => task.cycle_number.map(f64::from),
         _ => None,
     }
 }
@@ -664,7 +674,14 @@ fn parse_condition(text: &str, line: usize) -> Result<Condition, RuleError> {
 /// Equality values on numeric fields must be parseable now, not at evaluation.
 fn validate_value(field: &str, value: &str, line: usize) -> Result<(), RuleError> {
     match field {
-        "priority" | "estimate" => parse_number_for(field, value, line).map(|_| ()),
+        "priority" | "estimate" | "cycle_number" => parse_number_for(field, value, line).map(|_| ()),
+        "cycle" => {
+            if CYCLE_WORDS.contains(&value.trim().to_ascii_lowercase().as_str()) {
+                Ok(())
+            } else {
+                Err(RuleError::new(line, format!("`cycle` must be one of {}, not `{value}`", CYCLE_WORDS.join("|"))))
+            }
+        }
         "source" => {
             if matches!(value.to_ascii_lowercase().as_str(), "linear" | "manual") {
                 Ok(())
@@ -698,7 +715,9 @@ fn parse_priority_value(value: &str) -> Result<f64, String> {
     }
 }
 
-fn priority_name(p: u8) -> &'static str {
+/// The word `PRIORITY.md` uses for a Linear priority number (`urgent`, `high`,
+/// `normal`, `low`, `none`; `unknown` outside 0..=4).
+pub fn priority_name(p: u8) -> &'static str {
     match p {
         0 => "none",
         1 => "urgent",
@@ -1224,6 +1243,41 @@ mod tests {
         assert!(text.contains("+40 if label: customer"));
         assert!(text.contains("critical: fable"));
         assert!(text.contains("Jev: disabled"));
+    }
+
+    #[test]
+    fn cycle_fields_match_like_project_and_estimate() {
+        let rules = parse_ok(
+            "## High\n- cycle: active\n## Low\n- cycle: future\n\
+             ## Scoring\n- +150 if cycle: active\n- -100 if cycle: future\n- +5 if cycle_number > 10\n- +1 if cycle_number: 12\n- +7 if cycle != active\n",
+        );
+        let mut t = linear_task("ENG-1");
+        t.cycle = Some("active".into());
+        t.cycle_number = Some(12);
+        let e = eval(&rules, &t);
+        assert_eq!(e.criticality, Criticality::High);
+        assert_eq!(e.score, Criticality::High.base_score() + 150.0 + 5.0 + 1.0, "{:?}", e.reasons);
+
+        t.cycle = Some("future".into());
+        t.cycle_number = Some(3);
+        let e = eval(&rules, &t);
+        assert_eq!(e.criticality, Criticality::Low);
+        assert_eq!(e.score, Criticality::Low.base_score() - 100.0 + 7.0, "{:?}", e.reasons);
+
+        // No cycle: nothing matches except `!=`.
+        t.cycle = None;
+        t.cycle_number = None;
+        let e = eval(&rules, &t);
+        assert_eq!(e.criticality, Criticality::Normal);
+        assert_eq!(e.score, Criticality::Normal.base_score() + 7.0, "{:?}", e.reasons);
+        assert!(!condition_matches(&Condition::Matches { field: "cycle".into(), pattern: "act".into() }, &linear_task("x")));
+
+        // Values are validated at parse time.
+        let errs = parse_err("## High\n- cycle: sprint-3\n- cycle_number > soon\n");
+        assert_eq!(errs.len(), 2, "{errs:?}");
+        assert!(errs[0].message.contains("active|next|past|future"), "{}", errs[0].message);
+        assert!(errs[1].message.contains("needs a number"), "{}", errs[1].message);
+        assert!(parse_err("## High\n- cycle > 3\n")[0].message.contains("numeric field"));
     }
 
     #[test]

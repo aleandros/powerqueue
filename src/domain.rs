@@ -553,6 +553,13 @@ pub struct Task {
     pub estimate: Option<f64>,
     /// Linear project name if any.
     pub project: Option<String>,
+    /// Cycle status word of the Linear issue (`active`, `next`, `past`,
+    /// `future`); `None` for manual tasks and issues outside any cycle.
+    #[serde(default)]
+    pub cycle: Option<String>,
+    /// Number of the issue's cycle (Linear's `Cycle.number`), if any.
+    #[serde(default)]
+    pub cycle_number: Option<u32>,
     /// Model forced by the user or `PRIORITY.md`; `None` lets the budget policy choose.
     pub model_override: Option<ModelTier>,
     /// Model actually used by the latest session.
@@ -591,6 +598,8 @@ impl Task {
             linear_priority: None,
             estimate: None,
             project: None,
+            cycle: None,
+            cycle_number: None,
             model_override: None,
             model: None,
             worktree_path: None,

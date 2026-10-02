@@ -11,6 +11,8 @@ use crate::domain::{EventLevel, Task, TaskId, TaskSource, TaskState};
 use crate::store::Store;
 
 use super::LinearIssue;
+#[cfg(test)]
+use super::{CycleInfo, CycleStatus};
 
 /// What a sync pass changed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -175,6 +177,8 @@ pub fn task_from_issue(issue: &LinearIssue) -> Task {
     task.linear_priority = Some(issue.priority);
     task.estimate = issue.estimate;
     task.project = issue.project.clone();
+    task.cycle = issue.cycle_status().map(str::to_string);
+    task.cycle_number = issue.cycle.as_ref().map(|c| c.number);
     task.created_at = issue.created_at;
     task
 }
@@ -207,6 +211,13 @@ pub fn apply_issue(task: &mut Task, issue: &LinearIssue) -> Vec<&'static str> {
     if task.project != issue.project {
         task.project = issue.project.clone();
         changed.push("project");
+    }
+    let cycle = issue.cycle_status().map(str::to_string);
+    let cycle_number = issue.cycle.as_ref().map(|c| c.number);
+    if task.cycle != cycle || task.cycle_number != cycle_number {
+        task.cycle = cycle;
+        task.cycle_number = cycle_number;
+        changed.push("cycle");
     }
     let source = TaskSource::Linear {
         issue_id: issue.id.clone(),
@@ -241,9 +252,38 @@ mod tests {
             team_key: "ENG".into(),
             project: Some("Launch".into()),
             assignee_id: None,
+            cycle: Some(CycleInfo { number: 7, name: Some("Sprint 7".into()), status: CycleStatus::Active }),
             created_at: Utc::now() - chrono::Duration::hours(5),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn cycle_is_copied_and_updated() {
+        let store = Store::open_in_memory().unwrap();
+        let cfg = LinearConfig::default();
+        let mut issues = vec![issue("u1", "ENG-1", "One")];
+        sync_issues(&store, &cfg, &issues, no_state).unwrap();
+        let t = store.get_task_by_key("ENG-1").unwrap().unwrap();
+        assert_eq!(t.cycle.as_deref(), Some("active"));
+        assert_eq!(t.cycle_number, Some(7));
+
+        // The cycle rolls over: same number, now past.
+        issues[0].cycle = Some(CycleInfo { number: 7, name: None, status: CycleStatus::Past });
+        let report = sync_issues(&store, &cfg, &issues, no_state).unwrap();
+        assert_eq!(report.updated.len(), 1);
+        let t = store.get_task_by_key("ENG-1").unwrap().unwrap();
+        assert_eq!(t.cycle.as_deref(), Some("past"));
+        let events = store.events_for_task(t.id, 10).unwrap();
+        assert!(events.iter().any(|e| e.kind == "task.updated" && e.message.contains("cycle")), "{events:?}");
+
+        // Removed from the cycle entirely.
+        issues[0].cycle = None;
+        sync_issues(&store, &cfg, &issues, no_state).unwrap();
+        let t = store.get_task_by_key("ENG-1").unwrap().unwrap();
+        assert_eq!((t.cycle, t.cycle_number), (None, None));
+        let mut t = store.get_task_by_key("ENG-1").unwrap().unwrap();
+        assert!(apply_issue(&mut t, &issues[0]).is_empty(), "no change means no update");
     }
 
     fn no_state(_: &str) -> Option<String> {

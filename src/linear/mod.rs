@@ -7,5 +7,5 @@
 pub mod client;
 pub mod sync;
 
-pub use client::{IssueFilter, LinearClient, LinearIssue, Team, Viewer, WorkflowState};
+pub use client::{CycleInfo, CycleScope, CycleStatus, IssueFilter, LinearClient, LinearIssue, Team, Viewer, WorkflowState};
 pub use sync::{SyncReport, sync_issues};

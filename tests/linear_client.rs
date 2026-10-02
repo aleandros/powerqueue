@@ -1,6 +1,6 @@
 //! `LinearClient` against a wiremock GraphQL server.
 
-use powerqueue::linear::{IssueFilter, LinearClient};
+use powerqueue::linear::{CycleInfo, CycleScope, CycleStatus, IssueFilter, LinearClient};
 use serde_json::{Value, json};
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -286,4 +286,69 @@ async fn comment_and_missing_issue() {
     let requests = server.received_requests().await.unwrap();
     let body: Value = requests[0].body_json().unwrap();
     assert_eq!(body["variables"]["body"], "hello **world**");
+}
+
+#[tokio::test]
+async fn fetch_issues_sends_cycle_and_project_filters_and_parses_cycles() {
+    let server = server().await;
+    let mut in_cycle = issue("u1", "ENG-1", &[]);
+    in_cycle["cycle"] =
+        json!({ "number": 14, "name": "Sprint 14", "isActive": true, "isNext": false, "isPast": false, "isFuture": false });
+    let mut no_cycle = issue("u2", "ENG-2", &[]);
+    no_cycle["cycle"] = Value::Null;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "issues": {
+                "nodes": [in_cycle, no_cycle],
+                "pageInfo": { "hasNextPage": false, "endCursor": null }
+            } }
+        })))
+        .mount(&server)
+        .await;
+
+    let filter = IssueFilter {
+        team_keys: vec!["ENG".into()],
+        state_names: vec!["Todo".into()],
+        cycle: CycleScope::ActiveOrNext,
+        projects: vec!["Launch".into()],
+        ..Default::default()
+    };
+    let issues = client(&server).fetch_issues(&filter).await.unwrap();
+    assert_eq!(issues.len(), 2);
+    assert_eq!(issues[0].cycle, Some(CycleInfo { number: 14, name: Some("Sprint 14".into()), status: CycleStatus::Active }));
+    assert_eq!(issues[0].cycle_status(), Some("active"));
+    assert_eq!(issues[1].cycle, None);
+
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = requests[0].body_json().unwrap();
+    let query = body["query"].as_str().unwrap();
+    assert!(query.contains("cycle { number name isActive isNext isPast isFuture }"), "{query}");
+    assert_eq!(
+        body["variables"]["filter"],
+        json!({
+            "team": { "key": { "in": ["ENG"] } },
+            "state": { "name": { "in": ["Todo"] } },
+            "project": { "name": { "in": ["Launch"] } },
+            "or": [ { "cycle": { "isActive": { "eq": true } } }, { "cycle": { "isNext": { "eq": true } } } ]
+        })
+    );
+
+    // Single-cycle scopes send one `cycle` filter.
+    for (scope, expected) in [
+        (CycleScope::Active, json!({ "isActive": { "eq": true } })),
+        (CycleScope::Next, json!({ "isNext": { "eq": true } })),
+        (CycleScope::None, json!({ "null": true })),
+    ] {
+        let filter = IssueFilter { cycle: scope, ..Default::default() };
+        client(&server).fetch_issues(&filter).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = requests.last().unwrap().body_json().unwrap();
+        assert_eq!(body["variables"]["filter"], json!({ "cycle": expected }), "{scope:?}");
+    }
+
+    // The default (`any`) sends no cycle or project filter at all.
+    client(&server).fetch_issues(&IssueFilter::default()).await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = requests.last().unwrap().body_json().unwrap();
+    assert_eq!(body["variables"]["filter"], json!({}));
 }

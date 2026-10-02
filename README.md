@@ -225,6 +225,7 @@ Global flags work on every command.
 | `task retry <task>` | re-queue a failed, cancelled or completed task (also crashed, throttled, paused, needs-attention) |
 | `task explain <task>` | current score and model decision, with reasons |
 | `task model <task> <model\|auto>` | force (or clear) the model for the next attempt (`fable`, `opus`, `sonnet`, `haiku`, or another provider's model such as `gpt-6.1-sol`, `gemini-3-pro`, `codex:<name>`); the policy may still downgrade it within the same provider when the model is out of budget |
+| `task prompt <task>` | print the prompt the next attempt would receive (renders `prompt.template` with attempt = attempts + 1, the task's last error and its forced/last model); nothing is launched. `--json` prints `{"task", "template", "prompt", "warnings"}` |
 | `task output <task> [-n LINES]` | last screen of the task's tmux pane (default 60 lines) |
 | `task send <task> "message"` | type a message into the running session |
 | `attach [<task>] [--print]` | open the task's tmux window; no task = the powerqueue session |
@@ -315,7 +316,10 @@ state machine allows it. `complete` and `block` always write directly.
 
 The prompt (`src/session/launcher.rs::build_prompt`) contains the key and
 title, the description, the Linear link, the working rules (stay on the
-branch, commit as you go, do not push) and the completion protocol:
+branch, commit as you go, do not push), the completion protocol and, when
+set, `prompt.instructions`. A `[prompt] template` replaces the whole text
+with your own Markdown (see [`[prompt]`](#prompt)); `powerqueue task prompt
+<task>` shows what a task would receive. The protocol itself:
 
 - **Done**: run `powerqueue task complete <id> --summary "..."` and print
   `[[POWERQUEUE:DONE]]` as the last line of the final message. Either one on
@@ -404,9 +408,12 @@ anything else uses the explicit `codex:<name>` form.
 | `queued_states` | `["Todo"]` | workflow state names that mean "ready for the agent" |
 | `required_labels` | `[]` | issues must carry one of these labels |
 | `excluded_labels` | `["no-agent"]` | issues with any of these are ignored |
-| `in_progress_state` | `"In Progress"` | state set when a session starts |
-| `done_state` | `"In Review"` | state set on completion |
+| `cycle` | `"any"` | which cycles to pull from, filtered server-side: `any`, `active` (alias `current`), `next`, `active-or-next`, or `none` (issues outside any cycle). The issue's cycle is also exposed to `PRIORITY.md` as `cycle` / `cycle_number` |
+| `projects` | `[]` | only issues in these projects (matched by project name, server-side); empty = any project |
+| `in_progress_state` | `"In Progress"` | state set when a session starts; `""` = leave the state alone for this transition |
+| `done_state` | `"In Review"` | state set on completion; `""` = no change |
 | `blocked_state` | none | state set when a task fails permanently or is blocked |
+| `manage_states` | `true` | let powerqueue move issues between workflow states at all. Set it to `false` when your own Claude skills or CI move issues: the daemon then never changes an issue's state, while comments still follow `post_comments` |
 | `post_comments` | `true` | post progress comments on the issue |
 | `poll_interval_secs` | `60` | how often to poll |
 | `max_issues` | `100` | cap per poll |
@@ -424,6 +431,40 @@ anything else uses the explicit `codex:<name>` form.
 | `jev.model` | `"jev-latest"` | model name |
 | `jev.rescore_on_change` | `true` | re-score when title/description/labels change, else cache |
 | `jev.weight` | `300.0` | points added for a normalised Jev score of 1.0 |
+
+### `[prompt]`
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `template` | none | path to a Markdown template for the first message of every session; `~` is expanded, a relative path resolves against the config directory. Unset = the built-in prompt |
+| `instructions` | none | extra instructions appended to every prompt under a `## Instructions` heading (also `{{instructions}}` in templates) |
+
+A template is plain Markdown with `{{placeholders}}`. Unknown placeholders
+are left as written and reported once per launch as a `prompt.template_error`
+event; a template that cannot be read is reported the same way and the
+built-in prompt is used, so a typo never blocks scheduling. A repository can
+point to its own template with `prompt_template` in `.powerqueue.toml`
+(relative to the repo root; it wins over the global one). Preview the result
+for any task with `powerqueue task prompt <task>` and start from
+[docs/examples/prompt-template.md](docs/examples/prompt-template.md), which
+reproduces the built-in prompt.
+
+| Placeholder | Value |
+|-------------|-------|
+| `{{key}}`, `{{title}}`, `{{description}}` | task key, title and (trimmed) description |
+| `{{url}}`, `{{source}}`, `{{team}}` | Linear issue URL (empty for manual tasks), `linear` or `manual`, team key |
+| `{{labels}}`, `{{project}}`, `{{priority}}`, `{{estimate}}`, `{{cycle}}`, `{{cycle_number}}` | labels (comma-joined), project name, priority word (`urgent`, `high`, ...), estimate, cycle status (`active`, `next`, `past`, `future`) and number; empty when unknown |
+| `{{branch}}`, `{{worktree}}` | the branch and worktree the session works in |
+| `{{task_id}}`, `{{attempt}}`, `{{max_attempts}}`, `{{previous_error}}` | task id (as used by `powerqueue task complete`), attempt number, attempt cap, how the previous attempt ended (empty on the first) |
+| `{{model}}`, `{{provider}}` | the model and provider of this session |
+| `{{working_rules}}` | the `## Working rules` block (branch rule, commit rule for the provider's sandbox, no pushing) |
+| `{{completion_protocol}}` | the `## Completion protocol` block with the `powerqueue task complete <id>` / `task block <id>` commands and the `[[POWERQUEUE:DONE]]` / `[[POWERQUEUE:BLOCKED]]` markers |
+| `{{attempt_notes}}` | the `## Attempt N` block; empty on the first attempt |
+| `{{instructions}}` | `prompt.instructions` |
+| `{{default_prompt}}` | the whole built-in prompt, so a template can wrap it |
+
+Keep `{{completion_protocol}}` (or its commands and markers) in your template:
+without it the session has no way to tell powerqueue it is done.
 
 ### `[scheduler]`
 
@@ -653,13 +694,15 @@ run = ["[ \"$POWERQUEUE_SUCCEEDED\" = 1 ] && claude -p --permission-mode acceptE
 
 A `.powerqueue.toml` in the repository root overrides a subset of the global
 config for that repo. Lists replace; `instructions` and
-`claude.append_system_prompt` are appended to the global value.
+`claude.append_system_prompt` are appended to the global value;
+`prompt_template` (relative to the repo root) replaces `prompt.template`.
 
 ```toml
 setup = ["npm ci"]
 default_branch = "develop"
 branch_template = "agent/{key}"
 instructions = "Run `npm test` before you finish. Never touch migrations."
+prompt_template = "docs/agent-prompt.md"   # see [prompt] above
 
 [cleanup]
 remove_worktree = false     # also: push_branch, delete_branch, keep_failed, run, close_tmux_window
@@ -694,6 +737,8 @@ headings; rules are bullets. A ticket's criticality is the first section
 ## Scoring
 - +40 if label: customer
 - -30 if estimate > 8
+- +150 if cycle: active
+- -100 if cycle: future
 
 ## Overrides
 - ENG-123: critical
@@ -713,8 +758,11 @@ first; alternatives may belong to other enabled providers); the policy tries
 each one through its provider's downgrade chain and falls back to
 `budget.provider_order` when none fits. Only `task model` and `add --model`
 set a hard override, and even that is downgraded (within its provider) when
-the model is out of budget. Full grammar, evaluation order and idioms:
-[docs/priority.md](docs/priority.md).
+the model is out of budget. Conditions can use `label`, `priority`,
+`estimate`, `project`, `cycle` (`active`, `next`, `past`, `future`),
+`cycle_number`, `team`, `title`, `description`, `source` and `key`; the two
+`cycle` lines above are the "prefer the current cycle" idiom. Full grammar,
+evaluation order and idioms: [docs/priority.md](docs/priority.md).
 
 ## Budget pacing
 

@@ -423,6 +423,49 @@ fn check_priority_file(cfg: &Config, paths: &Paths) -> CheckResult {
     }
 }
 
+/// `prompt.template` (or the repo's `prompt_template`) must be readable, or
+/// every session silently gets the built-in prompt.
+fn check_prompt_template(cfg: &Config) -> CheckResult {
+    let Some(path) = cfg.prompt.template_path() else {
+        return CheckResult::ok(CONF, "prompt template", "built-in prompt (no prompt.template configured)");
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let vars: std::collections::BTreeSet<&str> = crate::session::PROMPT_PLACEHOLDERS.into_iter().collect();
+            let (_, unknown) = crate::session::render_template(
+                &text,
+                &vars.iter().map(|v| (*v, String::new())).collect::<std::collections::BTreeMap<&'static str, String>>(),
+            );
+            let mentions_protocol = text.contains("{{completion_protocol}}")
+                || text.contains("{{default_prompt}}")
+                || text.contains("powerqueue task complete");
+            if !unknown.is_empty() {
+                CheckResult::warn(
+                    CONF,
+                    "prompt template",
+                    format!("{} uses unknown placeholders: {}", path.display(), unknown.join(", ")),
+                    "they are left as-is in the prompt; see the placeholder table under [prompt] in the README",
+                )
+            } else if !mentions_protocol {
+                CheckResult::warn(
+                    CONF,
+                    "prompt template",
+                    format!("{} has no {{{{completion_protocol}}}}; sessions cannot report completion", path.display()),
+                    "add {{completion_protocol}} (or the `powerqueue task complete` command) to the template",
+                )
+            } else {
+                CheckResult::ok(CONF, "prompt template", format!("{} renders cleanly", path.display()))
+            }
+        }
+        Err(e) => CheckResult::fail(
+            CONF,
+            "prompt template",
+            format!("cannot read {}: {e}; sessions get the built-in prompt (event prompt.template_error)", path.display()),
+            "fix prompt.template in config.toml (or prompt_template in .powerqueue.toml), or remove it",
+        ),
+    }
+}
+
 fn check_repo_overrides(cfg: &Config) -> CheckResult {
     let file = cfg.repo_path().join(REPO_CONFIG_FILE);
     if !file.exists() {
@@ -1190,6 +1233,7 @@ pub async fn run_all(
     results.push(check_worktree_root(cfg, paths));
     results.push(check_priority_file(cfg, paths));
     results.push(check_repo_overrides(cfg));
+    results.push(check_prompt_template(cfg));
     results.extend(check_provider_models(cfg));
     results.extend(check_period_anchors(cfg, store));
     results.extend(check_providers(cfg));
@@ -1420,5 +1464,27 @@ mod tests {
         assert_eq!(check_repo_overrides(&cfg).status, Status::Fail);
         assert_eq!(check_priority_file(&cfg, &paths).status, Status::Warn);
         assert!(process_alive(std::process::id()));
+    }
+
+    #[test]
+    fn prompt_template_check_covers_missing_unknown_and_protocol() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        assert_eq!(check_prompt_template(&cfg).status, Status::Ok);
+        let tpl = dir.path().join("prompt.md");
+        cfg.prompt.template = Some(tpl.to_string_lossy().to_string());
+        let r = check_prompt_template(&cfg);
+        assert_eq!(r.status, Status::Fail);
+        assert!(r.detail.contains("cannot read"), "{r:?}");
+        std::fs::write(&tpl, "# {{key}}\n{{bogus}}\n{{completion_protocol}}\n").unwrap();
+        let r = check_prompt_template(&cfg);
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("bogus"), "{r:?}");
+        std::fs::write(&tpl, "# {{key}}\n").unwrap();
+        let r = check_prompt_template(&cfg);
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("completion_protocol"), "{r:?}");
+        std::fs::write(&tpl, "{{default_prompt}}\n").unwrap();
+        assert_eq!(check_prompt_template(&cfg).status, Status::Ok);
     }
 }

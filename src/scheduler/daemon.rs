@@ -754,15 +754,7 @@ impl Daemon {
         self.rt.force_sync = false;
         self.rt.last_linear_poll = Some(now);
 
-        let lc = &self.cfg.linear;
-        let filter = IssueFilter {
-            team_keys: lc.team_keys.clone(),
-            assignee: lc.assignee.clone(),
-            state_names: lc.queued_states.clone(),
-            required_labels: lc.required_labels.clone(),
-            excluded_labels: lc.excluded_labels.clone(),
-            max: lc.max_issues,
-        };
+        let filter = IssueFilter::from_config(&self.cfg.linear);
         let issues = match client.fetch_issues(&filter).await {
             Ok(issues) => issues,
             Err(e) => {
@@ -846,8 +838,9 @@ impl Daemon {
         );
     }
 
-    /// Best-effort Linear update: move the issue (when a state is configured
-    /// for `target`) and post `comment` (when comments are enabled).
+    /// Best-effort Linear update: move the issue (when `linear.manage_states`
+    /// is on and a state is configured for `target`) and post `comment`
+    /// (when comments are enabled).
     async fn update_linear(&mut self, task: &Task, target: LinearTarget, comment: Option<String>) {
         let Some(issue_id) = task.linear_issue_id().map(str::to_string) else { return };
         let Some(client) = self.linear_client() else { return };
@@ -855,8 +848,13 @@ impl Daemon {
             LinearTarget::InProgress => self.cfg.linear.in_progress_state.clone(),
             LinearTarget::Done => self.cfg.linear.done_state.clone(),
             LinearTarget::Blocked => self.cfg.linear.blocked_state.clone(),
-        };
-        if let Some(name) = state {
+        }
+        .filter(|s| !s.trim().is_empty());
+        if !self.cfg.linear.manage_states {
+            if let Some(name) = &state {
+                tracing::debug!(task = %task.key, state = %name, "linear.manage_states is off; leaving the issue state alone");
+            }
+        } else if let Some(name) = state {
             match client.set_state(&issue_id, &name).await {
                 Ok(()) => self.log(
                     Some(task.id),
@@ -1509,20 +1507,32 @@ impl Daemon {
             previous = Some(if p.state == SessionState::Crashed { self.discover_agent_session(p)? } else { p });
         }
         let (session_id, resume, resume_id) = resume_plan(previous.as_ref(), &model);
-        let launched = self
-            .rt
-            .launcher
-            .prepare_with_resume_id(
-                &self.cfg,
-                &task,
-                session_id,
-                &model,
-                attempt,
-                resume,
-                resume_id.as_deref(),
-                task.last_error.as_deref(),
-            )
-            .and_then(|plan| self.rt.launcher.launch(&self.cfg, &task, &plan, session_id, &model, attempt));
+        let prepared = self.rt.launcher.prepare_with_resume_id(
+            &self.cfg,
+            &task,
+            session_id,
+            &model,
+            attempt,
+            resume,
+            resume_id.as_deref(),
+            task.last_error.as_deref(),
+        );
+        let launched = match prepared {
+            Ok(plan) => {
+                for warning in &plan.prompt_warnings {
+                    self.log(
+                        Some(task.id),
+                        Some(session_id),
+                        EventLevel::Warn,
+                        "prompt.template_error",
+                        warning,
+                        serde_json::json!({ "template": plan.prompt_template, "configured": self.cfg.prompt.template_path() }),
+                    );
+                }
+                self.rt.launcher.launch(&self.cfg, &task, &plan, session_id, &model, attempt)
+            }
+            Err(e) => Err(e),
+        };
         let mut session = match launched {
             Ok(s) => s,
             Err(e) => {
