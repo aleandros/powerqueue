@@ -136,7 +136,7 @@ fn budget_show_reports_spend_and_json() {
     let ledger: serde_json::Value = serde_json::from_slice(&out).expect("ledger json");
     // 1000 output tokens = 5000 weighted × opus weight 3.
     assert_eq!(ledger["total_period_weighted"].as_f64(), Some(15_000.0));
-    assert_eq!(ledger["period_budget"].as_f64(), Some(60_000_000.0));
+    assert_eq!(ledger["period_budget"].as_f64(), Some(80_000_000.0));
 }
 
 #[test]
