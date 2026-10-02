@@ -16,7 +16,6 @@ use chrono::Utc;
 use crate::budget::probes::claude::STATUS_LINE_EVENT;
 use crate::cli::{Context, HookArgs};
 use crate::domain::{Provider, TaskId};
-use crate::session::agent_for;
 
 pub fn run(ctx: &mut Context, args: HookArgs) -> Result<i32> {
     if args.provider == Provider::Claude && args.event.trim().eq_ignore_ascii_case(STATUS_LINE_EVENT) {
@@ -58,16 +57,15 @@ fn run_inner(ctx: &mut Context, args: &HookArgs) -> Result<i32> {
         Ok(id) => id,
         Err(_) => store.find_task(&args.task)?.map(|t| t.id).ok_or_else(|| anyhow::anyhow!("no task matches `{}`", args.task))?,
     };
-    let payload = match &args.payload {
-        Some(raw) => crate::hook::parse_payload(raw),
-        None => crate::hook::read_payload(&mut std::io::stdin().lock()),
-    };
-    let Some((event, payload)) = agent_for(args.provider).normalize_hook(args.event.trim(), payload) else {
-        if args.provider == Provider::Claude {
-            anyhow::bail!("unknown hook event `{}`", args.event);
+    let raw = match &args.payload {
+        Some(p) => p.clone(),
+        None => {
+            let mut raw = String::new();
+            if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut raw) {
+                tracing::warn!(error = %e, "hook: cannot read stdin; storing an empty payload");
+            }
+            raw
         }
-        tracing::debug!(provider = %args.provider, event = %args.event, "hook event ignored");
-        return Ok(0);
     };
-    crate::hook::handle_payload(&store, task_id, session_id, event, payload)
+    crate::hook::handle_provider(&store, args.provider, task_id, session_id, &args.event, &raw)
 }

@@ -198,18 +198,24 @@ fn status_line_hook_feeds_observed_usage_into_budget_show() {
 }
 
 #[test]
-fn hook_from_other_providers_is_ignored_until_normalised() {
+fn hook_from_other_providers_is_normalised() {
     let home = Home::new();
     let store = home.store();
     let task = running_task(&store, "ENG-10");
+    // Codex `notify` payload as the trailing argument becomes a Claude-shaped Stop row.
     home.cmd()
         .args(["hook", "--provider", "codex", "--task", &task.id.to_string(), "--event", "Notify"])
-        .arg(r#"{"type":"agent-turn-complete","last-assistant-message":"ok"}"#)
+        .arg(r#"{"type":"agent-turn-complete","thread-id":"01a0","input-messages":["go"],"last-assistant-message":"ok"}"#)
         .assert()
         .success()
         .stdout(predicate::str::is_empty());
+    let events = store.drain_hook_events().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event, powerqueue::domain::HookEvent::Stop);
+    assert_eq!(events[0].payload["last_assistant_message"], "ok");
+    // Events a provider does not map are ignored without failing the hook.
     home.cmd()
-        .args(["hook", "--provider", "gemini", "--task", &task.id.to_string(), "--event", "Stop"])
+        .args(["hook", "--provider", "gemini", "--task", &task.id.to_string(), "--event", "PreToolUse"])
         .write_stdin("{}")
         .assert()
         .success();

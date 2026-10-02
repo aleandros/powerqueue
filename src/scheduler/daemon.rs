@@ -26,7 +26,8 @@ use crate::paths::Paths;
 use crate::priority::{PriorityRules, RulesWatcher};
 use crate::secrets::{SecretKind, Secrets};
 use crate::session::{
-    Launcher, TranscriptReader, interpret_hook, probe_session, sample_resources, transcript::claude_home, transcript_path_for,
+    Launcher, TranscriptReader, agent_for, interpret_hook, probe_session, sample_resources, transcript::claude_home,
+    transcript_path_for,
 };
 use crate::store::{JevCached, PendingHookEvent, Store};
 use crate::tmux::Tmux;
@@ -1013,6 +1014,9 @@ impl Daemon {
     // ---------------------------------------------------------- transcripts
 
     fn tail_transcripts(&mut self, now: DateTime<Utc>) -> Result<()> {
+        if let Err(e) = self.discover_agent_sessions(now) {
+            tracing::warn!(error = %format!("{e:#}"), "agent session discovery failed");
+        }
         // Sessions that ended within the grace window are swept too: the final
         // turn's usage lands in the transcript right before the Stop hook fires,
         // and the hook phase (which runs first) may already have closed the session.
@@ -1034,8 +1038,10 @@ impl Daemon {
                     guess
                 }
             };
-            let reader =
-                self.rt.readers.entry(session.id).or_insert_with(|| TranscriptReader::new(path, session.id, session.task_id));
+            let reader = self.rt.readers.entry(session.id).or_insert_with(|| {
+                TranscriptReader::for_provider(path, session.id, session.task_id, session.model.provider(), session.model.clone())
+            });
+            let offset_before = reader.offset;
             let records = match reader.read_new() {
                 Ok(r) => r,
                 Err(e) => {
@@ -1043,7 +1049,30 @@ impl Daemon {
                     continue;
                 }
             };
-            if records.is_empty() {
+            // New lines without usage (e.g. Antigravity transcripts) still count as activity.
+            let advanced = reader.offset != offset_before;
+            let newest_line = reader.last_line_at;
+            // A Codex rollout carries a rate-limit snapshot in every
+            // `token_count`; treat it like a probe result so live sessions
+            // keep the observed usage fresh between probe runs.
+            if let Some(snapshot) = reader.state.rate_limits.take()
+                && let Some(observed) = crate::budget::probes::codex::parse_rate_limits(&snapshot)
+            {
+                let provider = reader.provider;
+                if let Err(e) = crate::budget::save_observed(&self.store, provider, &observed) {
+                    tracing::warn!(session = %session.id, error = %format!("{e:#}"), "cannot store observed usage from the transcript");
+                } else {
+                    tracing::debug!(session = %session.id, %provider, "observed usage refreshed from the transcript");
+                }
+            }
+            let rate_limit_errors = reader.state.take_rate_limit_errors();
+            let polled = if agent_for(reader.provider).polls_transcript_for_completion() {
+                reader.state.take_pending_message()
+            } else {
+                None
+            };
+            self.forward_transcript_signals(&session, rate_limit_errors, polled)?;
+            if records.is_empty() && !advanced {
                 continue;
             }
             let mut inserted = 0usize;
@@ -1054,7 +1083,7 @@ impl Daemon {
                     weighted += rec.usage.weighted() * tier_weight(&self.cfg.budget, &rec.tier);
                 }
             }
-            let newest = reader.last_line_at.unwrap_or(now).min(now);
+            let newest = newest_line.unwrap_or(now).min(now);
             if session.state.is_live() {
                 session.last_activity_at = session.last_activity_at.max(newest);
                 if session.state == SessionState::Launching {
@@ -1063,6 +1092,94 @@ impl Daemon {
                 self.store.update_session(&session)?;
             }
             tracing::debug!(session = %session.id, inserted, weighted, "recorded transcript usage");
+        }
+        Ok(())
+    }
+
+    /// For sessions of CLIs that generate their own session id (Codex
+    /// thread, Antigravity conversation) that are live or ended within the
+    /// transcript grace period, ask the provider to find the id and record
+    /// it with its transcript path (`session.discovered`). Usage of a session
+    /// that finished between two ticks is then still read, and crash
+    /// restarts resume that id.
+    fn discover_agent_sessions(&mut self, now: DateTime<Utc>) -> Result<()> {
+        for session in self.store.list_sessions_active_since(now - TRANSCRIPT_GRACE)? {
+            self.discover_agent_session(session)?;
+        }
+        Ok(())
+    }
+
+    /// Discovery for one session; returns the session as stored afterwards.
+    fn discover_agent_session(&mut self, mut session: Session) -> Result<Session> {
+        let agent = agent_for(session.model.provider());
+        if session.agent_session_id.is_some() || agent.accepts_session_id() {
+            return Ok(session);
+        }
+        let Some(task) = self.store.get_task(session.task_id)? else { return Ok(session) };
+        let Some(wt) = task.worktree_path.as_deref() else { return Ok(session) };
+        match agent.discover_session(&self.cfg, Path::new(wt), session.started_at) {
+            Ok(Some((id, path))) => {
+                session.agent_session_id = Some(id.clone());
+                session.transcript_path = Some(path.display().to_string());
+                self.store.update_session(&session)?;
+                self.log(
+                    Some(task.id),
+                    Some(session.id),
+                    EventLevel::Info,
+                    "session.discovered",
+                    &format!("{} session {id} found", session.model.provider()),
+                    serde_json::json!({ "agent_session_id": id, "transcript_path": path, "provider": session.model.provider() }),
+                );
+            }
+            Ok(None) => {}
+            Err(e) => tracing::debug!(task = %task.key, error = %format!("{e:#}"), "session discovery failed"),
+        }
+        Ok(session)
+    }
+
+    /// Turn what a transcript says into hook events the hook phase handles
+    /// on the next tick: throttling errors (Codex `event_msg/error`) become a
+    /// `StopFailure{rate_limit}`, and for CLIs without a reliable `Stop` hook
+    /// a final message carrying the DONE / BLOCKED marker becomes a `Stop`.
+    fn forward_transcript_signals(
+        &self,
+        session: &Session,
+        rate_limit_errors: Vec<String>,
+        polled_message: Option<String>,
+    ) -> Result<()> {
+        if !session.state.is_live() {
+            return Ok(());
+        }
+        for message in rate_limit_errors {
+            let payload = serde_json::json!({
+                "error_type": "rate_limit",
+                "error": "rate_limit",
+                "error_message": message,
+                "source": "transcript",
+            });
+            self.store.insert_hook_event(session.task_id, Some(session.id), crate::domain::HookEvent::StopFailure, &payload)?;
+            self.log(
+                Some(session.task_id),
+                Some(session.id),
+                EventLevel::Warn,
+                "session.rate_limit_detected",
+                &format!("transcript reports a rate limit: {message}"),
+                serde_json::json!({ "provider": session.model.provider(), "message": message }),
+            );
+        }
+        if let Some(message) =
+            polled_message.filter(|m| m.contains(crate::domain::DONE_MARKER) || m.contains(crate::domain::BLOCKED_MARKER))
+        {
+            let payload = serde_json::json!({ "last_assistant_message": message, "source": "transcript" });
+            self.store.insert_hook_event(session.task_id, Some(session.id), crate::domain::HookEvent::Stop, &payload)?;
+            self.log(
+                Some(session.task_id),
+                Some(session.id),
+                EventLevel::Info,
+                "session.marker_polled",
+                "completion marker found in the transcript",
+                serde_json::json!({ "provider": session.model.provider() }),
+            );
         }
         Ok(())
     }
@@ -1365,17 +1482,27 @@ impl Daemon {
             return Ok(());
         }
 
-        let previous = self.store.latest_session(task.id)?;
-        let (session_id, resume) = match &previous {
-            Some(p) if p.state == SessionState::Crashed => (p.id, true),
-            _ => (uuid::Uuid::new_v4(), false),
-        };
+        let mut previous = self.store.latest_session(task.id)?;
+        if let Some(p) = previous.take() {
+            // Last chance to learn the id of a crashed session before resuming it.
+            previous = Some(if p.state == SessionState::Crashed { self.discover_agent_session(p)? } else { p });
+        }
+        let (session_id, resume, resume_id) = resume_plan(previous.as_ref(), &model);
         let launched = self
             .rt
             .launcher
-            .prepare(&self.cfg, &task, session_id, &model, attempt, resume, task.last_error.as_deref())
+            .prepare_with_resume_id(
+                &self.cfg,
+                &task,
+                session_id,
+                &model,
+                attempt,
+                resume,
+                resume_id.as_deref(),
+                task.last_error.as_deref(),
+            )
             .and_then(|plan| self.rt.launcher.launch(&self.cfg, &task, &plan, session_id, &model, attempt));
-        let session = match launched {
+        let mut session = match launched {
             Ok(s) => s,
             Err(e) => {
                 let effects = transitions::on_crash(
@@ -1393,7 +1520,12 @@ impl Daemon {
                 return Ok(());
             }
         };
-        if resume && previous.as_ref().is_some_and(|p| p.id == session.id) {
+        if resume && let Some(p) = previous.as_ref().filter(|p| p.id == session.id) {
+            // The provider keeps writing the same transcript under the same id.
+            session.agent_session_id = resume_id.clone();
+            if session.transcript_path.is_none() {
+                session.transcript_path = p.transcript_path.clone();
+            }
             self.store.update_session(&session)?;
         } else {
             self.store.insert_session(&session)?;
@@ -1458,6 +1590,26 @@ impl Daemon {
             serde_json::json!({ "path": worktree, "branch": branch, "base": base }),
         );
         Ok(())
+    }
+}
+
+/// How to start the next attempt: `(session id, resume?, provider session id)`.
+///
+/// A crashed previous session is resumed when it ran on the same provider
+/// and, for CLIs that generate their own ids, its id was discovered;
+/// otherwise the attempt starts fresh with a new session id.
+fn resume_plan(previous: Option<&Session>, model: &ModelTier) -> (uuid::Uuid, bool, Option<String>) {
+    match previous {
+        Some(p) if p.state == SessionState::Crashed && p.model.provider() == model.provider() => {
+            if agent_for(model.provider()).accepts_session_id() {
+                (p.id, true, None)
+            } else if let Some(id) = &p.agent_session_id {
+                (p.id, true, Some(id.clone()))
+            } else {
+                (uuid::Uuid::new_v4(), false, None)
+            }
+        }
+        _ => (uuid::Uuid::new_v4(), false, None),
     }
 }
 
@@ -1530,6 +1682,42 @@ mod tests {
         assert_eq!(ledger.tier(&ModelTier::opus()).window_weighted, 30.0);
         assert_eq!(ledger.total_period_weighted, 35.0);
         assert_eq!(ledger.total_window_weighted, 35.0, "another provider's model never lands in claude's ledger");
+    }
+
+    #[test]
+    fn resume_plan_needs_same_provider_and_a_known_id() {
+        let crashed = |model: ModelTier, agent: Option<&str>| Session {
+            id: uuid::Uuid::new_v4(),
+            task_id: TaskId::new(),
+            attempt: 1,
+            model,
+            state: SessionState::Crashed,
+            tmux_session: "pq".into(),
+            tmux_window: "@1".into(),
+            pane_id: None,
+            pid: None,
+            transcript_path: None,
+            exit_code: Some(1),
+            started_at: Utc::now(),
+            ended_at: None,
+            last_activity_at: Utc::now(),
+            error: None,
+            agent_session_id: agent.map(str::to_string),
+        };
+        let claude = crashed(ModelTier::opus(), None);
+        assert_eq!(resume_plan(Some(&claude), &ModelTier::sonnet()), (claude.id, true, None));
+        let codex = ModelTier::new("gpt-6-astra");
+        let (id, resume, _) = resume_plan(Some(&claude), &codex);
+        assert!(!resume && id != claude.id, "never resume across providers");
+        let found = crashed(codex.clone(), Some("thread-1"));
+        assert_eq!(resume_plan(Some(&found), &codex), (found.id, true, Some("thread-1".into())));
+        let unknown = crashed(codex.clone(), None);
+        let (id, resume, _) = resume_plan(Some(&unknown), &codex);
+        assert!(!resume && id != unknown.id, "no discovered id: start fresh");
+        let mut exited = found.clone();
+        exited.state = SessionState::Exited;
+        assert!(!resume_plan(Some(&exited), &codex).1);
+        assert!(!resume_plan(None, &codex).1);
     }
 
     #[test]

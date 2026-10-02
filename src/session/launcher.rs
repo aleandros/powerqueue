@@ -24,6 +24,7 @@ use crate::domain::{
     BLOCKED_MARKER, DONE_MARKER, HookEvent, ModelTier, Provider, Session, SessionState, Task, TaskId, TaskSource,
 };
 use crate::paths::Paths;
+pub use crate::session::agent::prompt_arg;
 use crate::session::agent::{LaunchContext, agent_for};
 use crate::tmux::{Tmux, shell_quote};
 use crate::worktree::branch_name;
@@ -160,7 +161,7 @@ impl Launcher {
     /// reuse the session id (after a crash) instead of starting fresh; for
     /// CLIs with their own ids the previous session's `agent_session_id` is
     /// passed through `resume_id`. Fails when the task has no worktree yet
-    /// or the model's provider cannot launch sessions in this version.
+    /// or the provider cannot describe the launch (e.g. an invalid mode).
     #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &self,
@@ -205,6 +206,7 @@ impl Launcher {
         let resume_ref = if resume { Some(resume_id.unwrap_or(own_id.as_str())) } else { None };
         let ctx = LaunchContext {
             cfg,
+            paths: &self.paths,
             task,
             session_id,
             model,
@@ -217,6 +219,9 @@ impl Launcher {
         };
         let launch = agent.prepare(&ctx).with_context(|| format!("prepare {provider} launch for {}", task.key))?;
         for (path, contents, mode) in &launch.files {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).with_context(|| format!("cannot create {}", parent.display()))?;
+            }
             std::fs::write(path, contents).with_context(|| format!("cannot write {}", path.display()))?;
             #[cfg(unix)]
             {
@@ -262,7 +267,8 @@ impl Launcher {
         })
     }
 
-    /// Run the provider's pre-launch step (trust seeding for Claude Code),
+    /// Run the provider's pre-launch step (trust seeding for Claude Code,
+    /// the info/exclude entry for Antigravity's hook file),
     /// create the tmux window and return the new [`Session`] record.
     pub fn launch(
         &self,
@@ -290,7 +296,8 @@ impl Launcher {
             window = %window.window_id,
             pane = %window.pane_id,
             pid = window.pane_pid,
-            "launched Claude Code session"
+            provider = %plan.provider,
+            "launched agent session"
         );
         Ok(Session {
             id: session_id,
@@ -356,30 +363,11 @@ impl Launcher {
     }
 }
 
-/// `$(cat '<path>')`: how the prompt is passed on the command line.
-pub fn prompt_arg(prompt_path: &Path) -> String {
-    format!("$(cat {})", shell_quote(&prompt_path.to_string_lossy()))
-}
-
 fn worktree_of(task: &Task) -> Result<&Path> {
     match task.worktree_path.as_deref() {
         Some(p) if !p.trim().is_empty() => Ok(Path::new(p)),
         _ => bail!("task {} has no worktree yet; create it before launching a session", task.key),
     }
-}
-
-/// Environment exported to a Claude session: `claude.env` plus powerqueue's
-/// own variables (so `powerqueue task complete` inside the session finds the
-/// same home as the daemon).
-pub(crate) fn session_env(cfg: &Config, task: &Task, session_id: uuid::Uuid) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = cfg.claude.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    env.push(("POWERQUEUE_TASK_ID".to_string(), task.id.to_string()));
-    env.push(("POWERQUEUE_TASK_KEY".to_string(), task.key.clone()));
-    env.push(("POWERQUEUE_SESSION_ID".to_string(), session_id.to_string()));
-    if let Some(home) = std::env::var_os("POWERQUEUE_HOME") {
-        env.push(("POWERQUEUE_HOME".to_string(), home.to_string_lossy().to_string()));
-    }
-    env
 }
 
 /// Render `launch.sh`.
@@ -650,14 +638,39 @@ mod tests {
     }
 
     #[test]
-    fn prepare_refuses_providers_without_a_launcher() {
+    fn prepare_launches_other_providers() {
         let dir = tempfile::tempdir().unwrap();
         let launcher =
             Launcher { paths: Paths::rooted(dir.path()), tmux: Tmux::new("tmux", None), self_bin: PathBuf::from("/bin/pq") };
         let mut t = task();
-        t.worktree_path = Some(dir.path().join("wt").to_string_lossy().to_string());
-        let err =
-            launcher.prepare(&config(), &t, uuid::Uuid::new_v4(), &ModelTier::new("gpt-6.1-sol"), 1, false, None).unwrap_err();
-        assert!(format!("{err:#}").contains("session branch"), "{err:#}");
+        let wt = dir.path().join("wt");
+        t.worktree_path = Some(wt.to_string_lossy().to_string());
+        let mut cfg = config();
+        cfg.codex.env.insert("CODEX_HOME".into(), "/x/codex".into());
+        let sid = uuid::Uuid::new_v4();
+        let plan = launcher.prepare(&cfg, &t, sid, &ModelTier::new("gpt-6.1-sol"), 1, false, None).unwrap();
+        assert_eq!(plan.provider, Provider::Codex);
+        assert_eq!(plan.transcript_path, None);
+        let script = std::fs::read_to_string(&plan.script_path).unwrap();
+        assert!(script.contains("export CODEX_HOME=/x/codex\n"), "{script}");
+        let exec_line = script.lines().last().unwrap();
+        assert!(exec_line.starts_with("exec codex -C "), "{exec_line}");
+        assert!(exec_line.contains("-m gpt-6.1-sol"), "{exec_line}");
+
+        // A crash resume passes the provider's own session id.
+        let plan = launcher
+            .prepare_with_resume_id(&cfg, &t, sid, &ModelTier::new("gpt-6.1-sol"), 2, true, Some("thread-1"), Some("crashed"))
+            .unwrap();
+        let script = std::fs::read_to_string(&plan.script_path).unwrap();
+        assert!(script.lines().last().unwrap().starts_with("exec codex resume thread-1 -C "), "{script}");
+
+        // Antigravity writes its hook file into the worktree (creating `.agents/`).
+        let plan = launcher.prepare(&cfg, &t, sid, &ModelTier::new("gemini-3-pro"), 1, false, None).unwrap();
+        assert_eq!(plan.provider, Provider::Gemini);
+        assert!(plan.poll_transcript_for_completion);
+        let hooks = std::fs::read_to_string(wt.join(".agents/hooks.json")).unwrap();
+        assert!(hooks.contains("hook --provider gemini"), "{hooks}");
+        let script = std::fs::read_to_string(&plan.script_path).unwrap();
+        assert!(script.lines().last().unwrap().starts_with("exec agy --model gemini-3-pro"), "{script}");
     }
 }

@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `doctor` / `config validate` note it and `config set` rewrites the file).
   Models carry a `rank` (capability order) and any model name can be added in
   config; `[codex]` and `[gemini]` sections hold the launch settings of the
-  (experimental, not yet launching) Codex CLI and Antigravity CLI providers.
+  Codex CLI and (experimental) Antigravity CLI providers.
 - `budget set-reset`, `budget set-observed` and `budget clear-limits` take
   `--provider <claude|codex|gemini>` (default `claude`); `hook` takes
   `--provider` too. `task model` and `add --model` accept any provider's model.
@@ -47,6 +47,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `run` lists the enabled providers and the probe interval at start; `hook`
   routes `--provider` payloads through the provider's normaliser and accepts
   the payload as a trailing argument (Codex `notify`).
+- Codex CLI sessions: tasks on a Codex model run `codex -C <worktree> -m
+  <model> ...` with completion through `notify` (`powerqueue hook --provider
+  codex`), trust seeded per session, the data/state dirs writable through
+  `--add-dir`, the thread id discovered from the rollout, usage from
+  `token_count`, rate-limit errors in the rollout putting Codex on cooldown,
+  and crash restarts via `codex resume <thread>`.
+- Antigravity CLI (`agy`) sessions, experimental and unverified: `agy
+  --model ... -i "<prompt>"` with a `Stop` hook in `<worktree>/.agents/hooks.json`
+  (excluded from git), conversation discovery from `last_conversations.json`
+  and completion-marker polling of its transcript.
+- `powerqueue hook` accepts the payload as a trailing argument (Codex
+  `notify`) and normalises other providers' payloads to the Claude shape.
+- Session code split into `session/{agent,claude,codex,gemini}.rs`.
 
 - `dashboard --once` renders one frame as plain text and exits (works without
   a TTY; `--json` prints the snapshot), and `dashboard --ascii` draws with
