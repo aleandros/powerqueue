@@ -222,6 +222,10 @@ pub struct ClaudeConfig {
     pub append_system_prompt: Option<String>,
     /// Fallback model chain passed as `--fallback-model`.
     pub fallback_models: Vec<String>,
+    /// Mark the repository and each worktree as trusted in Claude Code's
+    /// `~/.claude.json` before launching, so sessions never stop at the
+    /// workspace-trust dialog. Disable if you manage trust yourself.
+    pub trust_workspace: bool,
     /// Environment variables for the session.
     pub env: BTreeMap<String, String>,
 }
@@ -236,6 +240,7 @@ impl Default for ClaudeConfig {
             allowed_tools: Vec::new(),
             append_system_prompt: None,
             fallback_models: Vec::new(),
+            trust_workspace: true,
             env: BTreeMap::new(),
         }
     }

@@ -22,6 +22,10 @@ use crate::paths::Paths;
 use crate::tmux::{Tmux, shell_quote};
 use crate::worktree::branch_name;
 
+/// Tool rules every session gets so the completion protocol never waits on a
+/// permission prompt. Users extend the list with `claude.allowed_tools`.
+pub const ALWAYS_ALLOWED_TOOLS: [&str; 1] = ["Bash(powerqueue task *)"];
+
 /// Files written for a launch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchPlan {
@@ -201,6 +205,20 @@ impl Launcher {
         attempt: u32,
     ) -> Result<Session> {
         let worktree = worktree_of(task)?;
+        if cfg.claude.trust_workspace {
+            let file = crate::session::trust::claude_json_path();
+            let targets = crate::session::trust::trust_targets(&cfg.repo_path(), worktree);
+            let refs: Vec<&Path> = targets.iter().map(|p| p.as_path()).collect();
+            match crate::session::trust::ensure_trusted(&file, &refs) {
+                Ok(newly) if !newly.is_empty() => {
+                    tracing::info!(task = %task.key, file = %file.display(), paths = ?newly, "marked workspace as trusted for Claude Code")
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(task = %task.key, error = %format!("{e:#}"), "could not pre-trust workspace; the session may wait on the trust dialog")
+                }
+            }
+        }
         let tmux_session = cfg.tmux.session_name.clone();
         self.tmux.ensure_session(&tmux_session, &cfg.repo_path())?;
         let window = self.tmux.new_window(&tmux_session, &task.slug(), worktree, &plan.shell_command, cfg.tmux.remain_on_exit)?;
@@ -267,9 +285,13 @@ impl Launcher {
         if !c.fallback_models.is_empty() {
             argv.extend(["--fallback-model".to_string(), c.fallback_models.join(",")]);
         }
-        if !c.allowed_tools.is_empty() {
-            argv.extend(["--allowedTools".to_string(), c.allowed_tools.join(",")]);
+        let mut allowed: Vec<String> = c.allowed_tools.clone();
+        for always in ALWAYS_ALLOWED_TOOLS {
+            if !allowed.iter().any(|a| a == always) {
+                allowed.push(always.to_string());
+            }
         }
+        argv.extend(["--allowedTools".to_string(), allowed.join(",")]);
         if let Some(text) = c.append_system_prompt.as_deref().filter(|t| !t.trim().is_empty()) {
             argv.extend(["--append-system-prompt".to_string(), text.to_string()]);
         }
@@ -458,7 +480,7 @@ mod tests {
             "--fallback-model",
             "sonnet,haiku",
             "--allowedTools",
-            "Bash(git:*),Read",
+            "Bash(git:*),Read,Bash(powerqueue task *)",
             "--append-system-prompt",
             "Be terse.",
             "--add-dir",
@@ -479,12 +501,10 @@ mod tests {
         );
         assert_eq!(argv[1], "--resume");
         assert_eq!(argv[2], sid.to_string());
-        assert_eq!(argv.len(), 12, "{argv:?}");
-        assert!(
-            !argv
-                .iter()
-                .any(|a| a == "--effort" || a == "--fallback-model" || a == "--allowedTools" || a == "--append-system-prompt")
-        );
+        assert_eq!(argv.len(), 14, "{argv:?}");
+        assert!(!argv.iter().any(|a| a == "--effort" || a == "--fallback-model" || a == "--append-system-prompt"));
+        let allowed = argv.iter().position(|a| a == "--allowedTools").expect("completion commands are always allowed");
+        assert_eq!(argv[allowed + 1], "Bash(powerqueue task *)");
     }
 
     #[test]

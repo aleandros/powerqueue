@@ -118,21 +118,21 @@ Global flags work on every command.
 | `-v`, `-vv` | debug / trace logging on stderr |
 | `-q`, `--quiet` | only print errors |
 | `--home DIR` | base directory for config/data/state (env `POWERQUEUE_HOME`) |
-| `--json` | machine-readable output where supported (status, task, budget, doctor) |
+| `--json` | machine-readable output where supported (status, add, task, priority, budget, linear, doctor, config, `logs --events`) |
 | `--no-color` | disable colours (env `NO_COLOR`) |
 
 ### Setup and daemon
 
 | Command | What it does |
 |---------|--------------|
-| `init [--repo PATH] [--team KEY]... [--linear-key K] [--jev-key K] [--non-interactive] [--force]` | guided first-time setup; writes `config.toml` and `PRIORITY.md`, stores keys |
+| `init [--repo PATH] [--team KEY]... [--linear-key K] [--jev-key K] [--no-linear] [--non-interactive] [--force]` | guided first-time setup; writes `config.toml` and `PRIORITY.md`, stores keys; `--no-linear` sets `linear.enabled = false` (manual tasks only) |
 | `run [--once] [--offline]` | run the scheduler in the foreground; `--once` does one pass; `--offline` skips Linear |
 | `stop` | ask the running daemon to exit (sessions keep running in tmux) |
 | `dashboard` (`ui`, `top`) | live TUI |
 | `status [-a]` (`ls`) | one-shot table; `-a` includes completed/failed/cancelled |
 | `doctor [--fix] [--offline]` | diagnostics and tuning advice; `--fix` applies safe repairs |
-| `logs [-f] [-n N] [--task T] [--level L] [--events]` | read the daemon log; `--events` shows the DB timeline instead |
-| `completions <shell>` | shell completions (bash, zsh, fish, ...) |
+| `logs [-f] [-n N] [-t TASK] [-l LEVEL] [--events]` | read the daemon log (default 200 lines); `--events` shows the DB timeline instead; `-f` follows either |
+| `completions <shell>` | shell completions (bash, elvish, fish, powershell, zsh) |
 
 ### Tasks
 
@@ -146,14 +146,17 @@ Global flags work on every command.
 | `task cancel <task>` | cancel and release resources |
 | `task pause <task>` | do not schedule; a running session stops after its turn |
 | `task resume <task>` | resume a paused or needs-attention task |
-| `task retry <task>` | re-queue a failed, cancelled or completed task |
+| `task retry <task>` | re-queue a failed, cancelled or completed task (also crashed, throttled, paused, needs-attention) |
 | `task explain <task>` | current score and model decision, with reasons |
-| `task model <task> <fable\|opus\|sonnet\|haiku\|auto>` | force (or clear) the model for the next attempt |
-| `task output <task> [-n LINES]` | last screen of the task's tmux pane |
+| `task model <task> <fable\|opus\|sonnet\|haiku\|auto>` | force (or clear) the model for the next attempt; the policy may still downgrade it when the tier is out of budget |
+| `task output <task> [-n LINES]` | last screen of the task's tmux pane (default 60 lines) |
 | `task send <task> "message"` | type a message into the running session |
 | `attach [<task>] [--print]` | open the task's tmux window; no task = the powerqueue session |
 
 `<task>` is a key (`ENG-123`, `manual-1a2b3c4d`), a full id, or an id prefix.
+`pause`, `resume`, `cancel` and `retry` are queued for the daemon; with no
+daemon running (no heartbeat for 30 s) they are applied directly when the
+state machine allows it. `complete` and `block` always write directly.
 
 ### Priority rules
 
@@ -195,7 +198,7 @@ Global flags work on every command.
 | `secrets set <linear\|jev> [value]` | store a key (prompts if omitted) |
 | `secrets unset <name>` | remove a key |
 | `secrets list` | which keys are configured and where they come from |
-| `hook --task ID --session SID --event EVENT` | internal; called by Claude Code hooks (hidden) |
+| `hook --task ID [--session SID] --event EVENT` | internal; called by Claude Code hooks (hidden) |
 
 ## How a task is run
 
@@ -209,35 +212,47 @@ Global flags work on every command.
    |------|---------|
    | `prompt.md` | the brief Claude receives as its first message |
    | `settings.json` | Claude Code hooks pointing back at `powerqueue hook` |
-   | `launch.sh` | the exact command line; re-run it by hand to reproduce |
-   | `env` | environment for the session (mode 0600) |
+   | `launch.sh` | the exact command line (mode 0700); re-run it by hand to reproduce |
+   | `env` | environment for the session (mode 0600): `claude.env` plus `POWERQUEUE_TASK_ID`, `POWERQUEUE_TASK_KEY`, `POWERQUEUE_SESSION_ID` |
 
-4. A tmux window named after the task runs `launch.sh`, which starts
-   `claude --session-id <uuid> --model <tier> --permission-mode <mode> --settings settings.json --name <key> …`
-   with the prompt as the first message. The session is interactive, so
-   `powerqueue attach` drops you into it at any time.
-5. Hooks (`SessionStart`, `Stop`, `StopFailure`, `SessionEnd`, `Notification`,
+4. Unless `claude.trust_workspace = false`, the repository root and the worktree
+   are marked trusted in Claude Code's `~/.claude.json` (the key the official
+   docs say to set by hand), so the interactive session starts straight away.
+5. A tmux window named after the task's slug (`eng-123`) runs `sh launch.sh`, which
+   `exec`s `claude --session-id <uuid> --model <tier> --permission-mode <mode> --settings settings.json --name <key> …`
+   with the prompt (read from `prompt.md`) as the last argument, so it is the
+   first message. The session is interactive, so `powerqueue attach` drops
+   you into it at any time.
+6. Hooks (`SessionStart`, `Stop`, `StopFailure`, `SessionEnd`, `Notification`,
    `PreCompact`, `UserPromptSubmit`) call `powerqueue hook`, which stores the
    payload in SQLite. The daemon drains these, tails the transcript JSONL for
    token usage (deduplicated by message id), and samples CPU/RSS.
 
 ### The prompt protocol
 
-The prompt tells Claude how to finish:
+The prompt (`src/session/launcher.rs::build_prompt`) contains the key and
+title, the description, the Linear link, the working rules (stay on the
+branch, commit as you go, do not push) and the completion protocol:
 
-- **Done**: run `powerqueue task complete <id> --summary "..."`, or end the final
-  message with `[[POWERQUEUE:DONE]]`.
-- **Blocked**: run `powerqueue task block <id> --reason "..."`, or print
+- **Done**: run `powerqueue task complete <id> --summary "..."` and print
+  `[[POWERQUEUE:DONE]]` as the last line of the final message. Either one on
+  its own completes the task; text after the marker becomes the summary.
+- **Blocked**: run `powerqueue task block <id> --reason "..."` and print
   `[[POWERQUEUE:BLOCKED]]`. The task moves to `needs_attention` and waits for a
-  human (`powerqueue attach`, then `task resume`).
+  human (`powerqueue attach`, then `task resume`). A final message that reads
+  like a question (ends with `?`, or says "should I", "let me know", ...) is
+  treated the same way.
+- Attempts after the first add an `## Attempt N` section saying how the
+  previous one ended.
 - A turn that ends without a marker leaves the task `idle`. After
-  `scheduler.idle_timeout_secs` it is nudged once, then marked `needs_attention`.
+  `scheduler.idle_timeout_secs` it is nudged once; after another timeout it is
+  marked `needs_attention`.
 - A dead tmux pane without a completion marker means `crashed`. The daemon waits
   `scheduler.restart_backoff_secs[attempt]` and relaunches with
   `claude --resume <same session id>`, so context is kept. After
   `scheduler.max_attempts` the task is `failed`.
-- A `StopFailure` with `rate_limit` puts the tier on cooldown and the task in
-  `throttled`.
+- A `StopFailure` with `rate_limit`, `overloaded`, `usage_limit` or `quota`
+  puts the tier on cooldown and the task in `throttled`.
 
 ### Cleanup
 
@@ -289,7 +304,7 @@ problems in plain language.
 |-----|---------|---------|
 | `file` | `<config>/PRIORITY.md` | rules file |
 | `live_reload` | `true` | watch the file and re-score tasks on change |
-| `age_boost_per_hour` | `2.0` | points a waiting task gains per hour so nothing starves |
+| `age_boost_per_hour` | `2.0` | points a waiting task gains per hour so nothing starves (capped at 200) |
 | `jev.enabled` | `false` | score tickets with Jev |
 | `jev.endpoint` | `https://api.typesafe.ai/v1/systemone` | API endpoint |
 | `jev.model` | `"jev-latest"` | model name |
@@ -320,10 +335,19 @@ problems in plain language.
 | `allowed_tools` | `[]` | extra `--allowedTools` patterns |
 | `append_system_prompt` | none | appended to the system prompt for every task |
 | `fallback_models` | `[]` | passed as `--fallback-model` |
+| `trust_workspace` | `true` | mark the repository and each worktree as trusted in Claude Code's `~/.claude.json` before launching, so sessions never wait on the workspace-trust dialog |
 | `env` | `{}` | environment variables for the session |
 
 Allowed permission modes: `default`, `manual`, `acceptEdits`, `plan`, `auto`,
 `dontAsk`, `bypassPermissions`.
+
+Every session also gets `--allowedTools "Bash(powerqueue task *)"` so the
+completion protocol never waits on a permission prompt. In `acceptEdits` mode
+other shell commands (tests, `git commit`, package installs) still prompt and
+leave the task in `needs_attention` until you attach and answer. For truly
+unattended runs pick `auto` (Claude's classifier decides) or
+`bypassPermissions`, and/or pre-approve what your repo needs in
+`allowed_tools`, for example `["Bash(git *)", "Bash(cargo *)", "Bash(npm test*)"]`.
 
 ### `[budget]` and `[budget.models.<tier>]`
 
@@ -332,13 +356,13 @@ Allowed permission modes: `default`, `manual`, `acceptEdits`, `plan`, `auto`,
 | `period_hours` | `168` | usage period length (subscriptions reset weekly) |
 | `period_anchor` | none | RFC 3339 start of a period; set with `budget set-reset` |
 | `window_hours` | `5` | rolling short window |
-| `period_weighted_tokens` | `60000000` | weighted tokens the period may consume |
-| `window_weighted_tokens` | `4000000` | weighted tokens the window may consume |
+| `period_weighted_tokens` | `80000000` | weighted tokens the period may consume |
+| `window_weighted_tokens` | `12000000` | weighted tokens the window may consume |
 | `default_model` | `"sonnet"` | model when nothing else applies |
 | `low_model` | `"sonnet"` | model for `low` tasks |
-| `safety_margin` | `0.05` | fraction of the period budget kept unspent |
+| `safety_margin` | `0.05` | fraction of the remaining budget kept unspent (0 to 0.5) |
 | `endgame_fraction` | `0.8` | after this fraction of the period, reserved capacity is released |
-| `rate_limit_cooldown_mins` | `30` | pause a tier after a `rate_limit` error |
+| `rate_limit_cooldown_mins` | `30` | pause a tier after a `rate_limit` error (never past the period end) |
 
 Per tier (`[budget.models.fable]`, `.opus`, `.sonnet`, `.haiku`):
 
@@ -429,8 +453,11 @@ headings; rules are bullets. A ticket's criticality is the first section
 - low: sonnet
 ```
 
-The file is re-read whenever it changes. Full grammar, evaluation order and
-idioms: [docs/priority.md](docs/priority.md).
+The file is re-read whenever it changes. `## Models` and `KEY: model = x` are
+preferences handed to the budget policy; only `task model` and `add --model`
+set a hard override, and even that is downgraded when the tier is out of
+budget. Full grammar, evaluation order and idioms:
+[docs/priority.md](docs/priority.md).
 
 ## Budget pacing
 
@@ -439,7 +466,9 @@ multiplied by the tier weight, and charged against a period budget and a
 rolling window. Each tier has a share of the period and a minimum criticality.
 Early in the period Fable only serves `critical` tasks; if a tier is under-spent
 past `relax_after_fraction`, one level lower qualifies; in the end game two
-levels. If nothing is eligible the task is `throttled` with a retry time.
+levels. The predicted cost must also fit the tier's remaining share, the
+overall period budget and the window. If nothing is eligible the task is
+`throttled` with a retry time.
 Calibrate with `budget set-reset` and `budget set-observed`; `doctor` tells you
 when to. Details and worked examples: [docs/budget.md](docs/budget.md).
 

@@ -6,6 +6,7 @@ pub mod hooks;
 pub mod launcher;
 pub mod monitor;
 pub mod transcript;
+pub mod trust;
 
 pub use hooks::{HookOutcome, interpret_hook};
 pub use launcher::{LaunchPlan, Launcher, build_prompt, hook_settings};

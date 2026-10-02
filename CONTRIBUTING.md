@@ -23,15 +23,15 @@ just test
 | Recipe | What it runs |
 |--------|--------------|
 | `just build` | `cargo build` |
-| `just test` | `cargo test --all-features` with `POWERQUEUE_SECRETS=file` |
-| `just lint` | `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings` |
-| `just fmt` | `cargo fmt` |
-| `just doc` | `cargo doc --no-deps` with warnings as errors |
+| `just test` | `cargo test --all-features` with `POWERQUEUE_SECRETS=file` and `NO_COLOR=1` |
+| `just lint` | `cargo fmt --all --check` and `cargo clippy --all-targets --all-features -- -D warnings` |
+| `just fmt` | `cargo fmt --all` |
+| `just doc` | `cargo doc --no-deps --all-features` with warnings as errors |
 | `just ci` | everything CI runs, in order |
 | `just run <args>` | `cargo run -- <args>` against your real config |
 | `just dev <args>` | same, but with `POWERQUEUE_HOME` pointing at `target/dev-home` |
 | `just dash`, `just doctor` | shortcuts for `run dashboard` / `run doctor` |
-| `just install` | `cargo install --path .` |
+| `just install` | `cargo install --path . --locked` |
 | `just clean-state` | removes `target/dev-home` only, never your real state |
 
 ## Tests
@@ -39,20 +39,50 @@ just test
 - Unit tests sit next to the code (`#[cfg(test)] mod tests`). Keep pure
   functions pure so they can be tested without I/O (`pick_next`,
   `interpret_hook`, `PriorityRules::parse`, `Policy::decide`).
-- Integration tests live in `tests/` and drive the binary with `assert_cmd`.
-  Every test gets its own temp dir and sets `POWERQUEUE_HOME` to it, plus
-  `POWERQUEUE_SECRETS=file` so the OS keychain is never touched.
-- Network is mocked with `wiremock`; point `linear.endpoint` and
-  `priority.jev.endpoint` at the mock server.
-- tmux tests use a private socket (`tmux.socket_name = "pq-test-<pid>"`) so
-  they never see the developer's sessions, and kill that server when done.
-  They are skipped when `tmux` is not on `PATH` (`tests/common.rs::tmux_available()`).
-- Git tests create a throwaway repo in the temp dir with one commit and a
-  local bare "remote".
+- Integration tests live in `tests/`. `cli_smoke.rs` and `budget_cli.rs`
+  drive the binary with `assert_cmd`; `priority_rules.rs`, `linear_client.rs`,
+  `jev_client.rs`, `tmux_integration.rs` and `worktree_integration.rs` use the
+  library API directly. Every CLI test gets its own temp dir and sets
+  `POWERQUEUE_HOME` to it, plus `POWERQUEUE_SECRETS=file` so the OS keychain
+  is never touched, and removes `NO_COLOR`, `LINEAR_API_KEY` and
+  `JEV_API_KEY` from the environment.
+- Network is mocked with `wiremock`; the client tests build `LinearClient`
+  / `JevClient` with the mock server's URI (the same values you would put in
+  `linear.endpoint` and `priority.jev.endpoint`).
+- tmux tests use a private socket (`Tmux::new("tmux", Some("powerqueue-test-<pid>-<random>"))`,
+  i.e. `tmux -L ...`) so they never see the developer's sessions, and a drop
+  guard kills that server (and removes the socket file) when done. They skip
+  themselves with `which::which("tmux")` when tmux is not on `PATH`; there is
+  no shared `tests/common.rs`.
+- Git tests create a throwaway repo in the temp dir with one commit and, where
+  pushing matters, a local bare `origin`. They skip when `git` is missing.
 - Prefer table-driven tests for parsers and the state machine.
 
 Run one test with `cargo test name_of_test -- --nocapture`. Set
 `RUST_LOG=powerqueue=debug` for stderr logging in tests.
+
+### End-to-end test
+
+`tests/fixtures/fake-claude.sh` stands in for Claude Code. It accepts the
+flags the launcher passes, fires the command hooks declared in the
+`--settings` file with realistic JSON payloads, appends assistant lines with
+`message.usage` to the transcript JSONL under `$CLAUDE_CONFIG_DIR`, commits a
+file in the worktree and calls `powerqueue task complete` through
+`$POWERQUEUE_BIN`. `FAKE_CLAUDE_MODE` selects the behaviour: `complete`
+(default), `crash-once` (exit 1 on the first run, finish on the resumed run),
+`idle` (end the turn without a marker and wait) or `ratelimit` (report a
+`StopFailure` with `rate_limit`). `FAKE_CLAUDE_STATE_DIR` holds its run
+counters; the script needs `python3`.
+
+`tests/e2e_daemon.rs` writes a `config.toml` that points `claude.binary` at
+the fixture, passes the mode through `[claude.env]`, uses a private tmux
+socket (`pq-e2e-<pid>-<random>`), `tick_secs = 1` and
+`restart_backoff_secs = [1]`, then runs the real `powerqueue run` daemon
+against a throwaway git repo and polls `status --json` / `task show --json`
+until the task reaches the expected state. It covers completion with usage
+and cleanup, crash + `--resume`, and a blocked session reaching
+`needs_attention`. It skips itself when `tmux`, `git` or `python3` is
+missing.
 
 ## Pull requests
 

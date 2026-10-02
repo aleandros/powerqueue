@@ -736,8 +736,10 @@ fn check_rates(cfg: &Config, store: &Store) -> Vec<CheckResult> {
     let since = Utc::now() - Duration::days(7);
     let launches = store.count_events_of_kind("session.launched", since).unwrap_or(0);
     let crashes = store.count_events_of_kind("session.crashed", since).unwrap_or(0);
-    let idle = store.count_events_of_kind("task.idle", since).unwrap_or(0)
-        + store.count_events_of_kind("task.needs_attention", since).unwrap_or(0);
+    let idle = store.count_events_of_kind("session.nudged", since).unwrap_or(0)
+        + store.count_events_of_kind("task.needs_attention", since).unwrap_or(0)
+        + store.count_events_of_kind("task.blocked", since).unwrap_or(0)
+        + store.count_events_of_kind("session.permission_prompt", since).unwrap_or(0);
     let mut out = Vec::new();
 
     let (status, rate) = rate_status(crashes, launches, MAX_CRASH_RATE);

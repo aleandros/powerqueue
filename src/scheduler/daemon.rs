@@ -593,14 +593,7 @@ impl Daemon {
         }
         let client = self.rt.jev.clone()?;
         let question = JevQuestion { instructions: self.rt.rules.jev.question.clone(), levels: self.rt.rules.jev.levels.clone() };
-        let state = serde_json::json!({
-            "title": task.title,
-            "description": task.description,
-            "labels": task.labels,
-            "priority": task.criticality.as_str(),
-            "linear_priority": task.linear_priority,
-            "project": task.project,
-        });
+        let state = crate::jev::task_state(task);
         match client.score(&state, &question).await {
             Ok(score) => {
                 let cached = JevCached {

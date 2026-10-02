@@ -23,7 +23,7 @@ src/
   paths.rs           XDG directories; POWERQUEUE_HOME override
   secrets.rs         keychain (keyring) with 0600-file fallback; env wins
   logging.rs         tracing: stderr + rotating JSON file
-  store/             SQLite (rusqlite, WAL): tasks, sessions, usage, events, commands, hook_events, kv
+  store/             SQLite (rusqlite, WAL): tasks, sessions, usage, resource_samples, events, commands, hook_events, kv, jev_scores
   linear/            GraphQL client + issue→task sync
   priority/          PRIORITY.md parser/evaluator + live reload
   jev.rs             TypeSafe Jev "score" client (optional scoring)
@@ -31,25 +31,26 @@ src/
   worktree.rs        git worktree ops (shell out to git)
   tmux.rs            tmux ops (shell out to tmux)
   session/           launcher (prompt, hooks, launch.sh), transcript tailing, probes
-  scheduler/         daemon loop + task lifecycle
+  scheduler/         daemon loop (daemon.rs), pure transitions (transitions.rs), pick_next + cleanup (lifecycle.rs)
   hook.rs            `powerqueue hook` (called by Claude Code hooks)
   dashboard/         ratatui TUI
   doctor.rs          diagnostics + tuning advice
   cli/               clap definitions, context, output helpers, command handlers
-tests/               integration tests (assert_cmd, wiremock, temp git repos)
+tests/               integration tests (assert_cmd, wiremock, temp git repos, private tmux sockets);
+                     fixtures/fake-claude.sh + e2e_daemon.rs drive the real daemon end to end
 docs/                user docs (priority grammar, budget algorithm, troubleshooting)
 ```
 
 ## How a task flows
 
 1. `linear::sync_issues` creates a `Task` (state `queued`) for each queued issue; `powerqueue add` does the same for manual tasks.
-2. `priority::PriorityRules::evaluate` sets `criticality`, `score`, optional model, `skip`.
-3. `scheduler` picks the best task (`pick_next`), asks `budget::Policy::decide` for a model (or a `retry_at` when throttled).
+2. `priority::PriorityRules::evaluate` sets `criticality`, `score`, an optional *preferred* model, `skip` (→ `paused`).
+3. `scheduler` picks the best task (`pick_next`), asks `budget::Policy::decide` for a model (or a `retry_at` when throttled). `task.model_override` (CLI only) and the rules' model are both preferences the policy may downgrade.
 4. `worktree::Repo::add_worktree` creates `<worktree_root>/<slug>` on branch `pq/<slug>`; `repo.setup` commands run.
 5. `session::Launcher::prepare` writes `<state>/tasks/<id>/{prompt.md,settings.json,launch.sh,env}`; `launch` opens a tmux window running `launch.sh`.
 6. Claude Code hooks (`SessionStart`, `Stop`, `StopFailure`, `SessionEnd`, `Notification`, ...) call `powerqueue hook`, which stores the payload in `hook_events`.
 7. The daemon drains hook events + tails the transcript JSONL for usage (dedupe by `message.id`), samples CPU/RSS via sysinfo, probes tmux panes.
-8. Completion: Claude runs `powerqueue task complete <id> --summary ...` or prints `[[POWERQUEUE:DONE]]`. Dead pane without completion ⇒ `crashed` ⇒ backoff ⇒ relaunch with `--resume <same session id>`.
+8. Completion: Claude runs `powerqueue task complete <id> --summary ...` and/or prints `[[POWERQUEUE:DONE]]` (either suffices). Dead pane without completion ⇒ `crashed` ⇒ backoff ⇒ relaunch with `--resume <same session id>`.
 9. `cleanup_task`: push branch, remove worktree, close window (per config + repo overrides), update Linear state, post comment.
 
 ## Conventions
@@ -62,7 +63,7 @@ docs/                user docs (priority grammar, budget algorithm, troubleshoot
 - Config: every field has a default; `deny_unknown_fields`; `Config::validate` reports problems in plain language.
 - No `unwrap()` outside tests; `expect()` only for invariants with a message.
 - Public functions get a doc comment stating behaviour and failure modes.
-- Tests: unit tests next to the code; integration tests in `tests/` using `POWERQUEUE_HOME` + `POWERQUEUE_SECRETS=file` in a tempdir. Network via `wiremock`. tmux tests are skipped unless `tmux` is on PATH (`tests/common.rs::tmux_available()`).
+- Tests: unit tests next to the code; integration tests in `tests/` using `POWERQUEUE_HOME` + `POWERQUEUE_SECRETS=file` in a tempdir. Network via `wiremock`. tmux/git tests skip themselves with `which::which(...)` when the tool is not on PATH and use a private tmux socket (`-L powerqueue-test-<pid>-<random>`); see CONTRIBUTING.md.
 - UX: output goes through `cli::output` helpers; colours respect `--no-color`/`NO_COLOR`; `--json` prints machine-readable output for status/task/budget/doctor.
 - Keep the CLI surface in `cli/mod.rs` in sync with README.md.
 

@@ -24,7 +24,8 @@ src/
   tmux.rs            tmux ops (shell out to tmux)
   session/           launcher (prompt, hooks, launch.sh), hook interpretation,
                      transcript tailing, liveness + resource probes
-  scheduler/         Daemon (tick loop), pick_next, cleanup_task
+  scheduler/         daemon.rs (Daemon, tick loop, effects), transitions.rs (pure
+                     state logic → Effect list), lifecycle.rs (pick_next, cleanup_task)
   hook.rs            `powerqueue hook` entry (called by Claude Code)
   dashboard/         ratatui TUI: Snapshot (data) / ui (render)
   doctor.rs          checks + fix hints
@@ -75,14 +76,16 @@ connections. Timestamps are RFC 3339 UTC strings so they sort as text.
 | `tasks` | `linear::sync` (create/update/cancel), `add`, scheduler (state, attempts, model, worktree, branch, not_before, summary), `priority` re-score (score, criticality, reasons), `task *` commands via `commands` | everything |
 | `sessions` | `Launcher::launch` (insert), scheduler probes and hook drain (state, pid, pane, transcript_path, exit_code, last_activity_at) | scheduler, `task show`, dashboard, `attach`, `task output` |
 | `usage` | scheduler from `TranscriptReader::read_new` (one row per `message_id`; duplicates ignored) | `Ledger::load` (per tier, period/window), `Estimator` via `task_usage_summaries`, `task show`, dashboard |
-| `resource_samples` | scheduler every `resource_sample_secs` (CPU%, RSS, process count per session) | dashboard, `task show`; pruned by age |
+| `resource_samples` | scheduler every `resource_sample_secs` (CPU%, RSS, process count per session) | dashboard, `task show`; pruned hourly to 7 days |
 | `events` | `store.log_event` on every state change, hook, crash, cleanup, error | `task show`, `logs --events`, dashboard, `doctor` (crash/idle/throttle rates by `kind`) |
-| `commands` | `task pause/resume/cancel/retry/model`, `stop`, dashboard keys (`DaemonCommand` as JSON) | daemon `drain_commands` at the start of each tick (marks `consumed_at`) |
-| `hook_events` | `powerqueue hook` (raw stdin JSON + event name) | daemon `drain_hook_events`; `task show` (`hook_events_for_task`) |
-| `kv` | daemon heartbeat (`daemon.heartbeat` = pid + time), budget calibration (`budget.calibration`), rate-limit cooldowns (`budget.rate_limits`), estimator state | `doctor`, dashboard header, `budget show`, policy |
+| `commands` | `task pause/resume/cancel/retry/model`, `stop`, dashboard keys (`DaemonCommand` as JSON: `Pause`, `Resume`, `Cancel`, `Retry`, `SetModel`, `SyncNow`, `Reload`, `Shutdown`) | daemon `drain_commands` at the start of each tick (marks `consumed_at`) |
+| `hook_events` | `powerqueue hook` (raw stdin JSON + event name) | daemon `drain_hook_events` (marks `consumed_at`) |
+| `kv` | daemon heartbeat (`daemon.heartbeat` = pid + time, every tick), budget calibration (`budget.calibration`, `CALIBRATION_KEY`), rate-limit cooldowns (`budget.rate_limits`, `RATE_LIMITS_KEY`) | `status`/`doctor`/dashboard header (heartbeat older than 30 s = daemon down), `budget show`, ledger, policy |
 | `jev_scores` | priority re-score when Jev is enabled (keyed by task, with content hash) | priority re-score (cache hit unless the hash changed) |
 
-The schema is applied idempotently and versioned with `PRAGMA user_version`.
+The estimator keeps no state of its own; it is rebuilt from
+`task_usage_summaries` (tasks + usage) on every launch pass. The schema is
+applied idempotently and versioned with `PRAGMA user_version` (currently 1).
 Foreign keys are on; deleting a task cascades to its sessions.
 
 ## State machines
@@ -99,7 +102,7 @@ transition to itself.
 | running | | | | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | idle | | | ✓ | | ✓ | | ✓ | ✓ | ✓ | ✓ | ✓ |
 | crashed | ✓ | ✓ | | | | ✓ | ✓ | | | ✓ | ✓ |
-| throttled | ✓ | ✓ | | | | | ✓ | | | | ✓ |
+| throttled | ✓ | ✓ | ✓ | | | | ✓ | | | | ✓ |
 | paused | ✓ | | | | | | | | | | ✓ |
 | needs_attention | | | ✓ | ✓ | ✓ | | ✓ | | ✓ | ✓ | ✓ |
 | completed | ✓ | | | | | | | | | | |
@@ -111,22 +114,22 @@ stateDiagram-v2
     [*] --> queued
     queued --> starting: slot + model
     queued --> throttled: no eligible tier
-    queued --> paused: task pause
-    starting --> running: SessionStart hook
-    starting --> crashed: launch failed
-    starting --> queued: setup aborted
+    queued --> paused: task pause / PRIORITY.md skip
+    starting --> running: launched (SessionStart hook confirms)
+    starting --> crashed: worktree, setup or launch failed
     running --> idle: Stop without marker
-    running --> needs_attention: BLOCKED / question / permission prompt
+    running --> needs_attention: BLOCKED / question / permission prompt / auth failure
     running --> completed: DONE / task complete
-    running --> crashed: pane died
+    running --> crashed: pane died / stale / max_session_secs
     running --> throttled: StopFailure rate_limit
-    idle --> running: nudge / task send
-    idle --> needs_attention: idle_timeout
+    idle --> running: UserPromptSubmit (nudge, task send, attach)
+    idle --> needs_attention: idle_timeout after a nudge
     crashed --> starting: backoff elapsed (resume)
     crashed --> failed: max_attempts
-    throttled --> queued: retry_at reached
-    paused --> queued: task resume
-    needs_attention --> running: task resume
+    throttled --> starting: retry_at reached
+    throttled --> running: cooldown passed, session still alive
+    paused --> queued: task resume / skip line removed
+    needs_attention --> running: task resume (session alive)
     completed --> queued: task retry
     failed --> queued: task retry
     cancelled --> queued: task retry
@@ -136,14 +139,18 @@ stateDiagram-v2
 
 Helper predicates: `is_terminal` (completed, failed, cancelled),
 `has_live_session` (starting, running, idle, needs_attention),
-`is_schedulable` (queued, crashed, throttled).
+`is_schedulable` (queued, crashed, throttled). The table is enforced by the
+CLI's direct writes (`task complete/block` and offline `pause/resume/cancel/
+retry`); the daemon's transitions are written as computed.
 
 ### SessionState
 
 One session is one attempt. `launching → running → idle ↔ running → exited |
-crashed | killed`. `is_live` is true for launching, running and idle. A new
-attempt after a crash is a new `Session` row with the same Claude session id
-(so `--resume` works) and `attempt + 1`.
+crashed | killed`. `is_live` is true for launching, running and idle. The
+`sessions` primary key is the Claude session id. A relaunch after a crash
+reuses that id with `--resume`, so the daemon overwrites the same row with
+`attempt + 1`; a fresh attempt (after cancel + retry, or a non-crash end)
+gets a new id and a new row.
 
 ## The daemon tick
 
@@ -152,22 +159,39 @@ then loops `tick().await` followed by a sleep of `scheduler.tick_secs`, writing
 a heartbeat to `kv` each tick. `run --once` performs one tick. SIGINT/SIGTERM
 or a `Shutdown` command ends the loop; sessions keep running in tmux.
 
-Each tick, in order (`scheduler/mod.rs`):
+Each tick, in order (`Daemon::tick` in `scheduler/daemon.rs`; every phase is
+isolated, a failure is logged as a `daemon.error` event and the next phase
+still runs):
 
-1. drain `commands` (pause, resume, cancel, retry, set model, sync now, reload, shutdown);
-2. reload `PRIORITY.md` if the watcher flagged a change; re-score open tasks;
-3. poll Linear when `poll_interval_secs` has elapsed; `sync_issues` creates,
-   updates and cancels tasks (running tasks are never cancelled by sync);
-4. drain `hook_events` and read new transcript lines for live sessions;
-   update session and task state (`interpret_hook` maps payloads to outcomes);
-5. probe tmux panes: a dead pane without completion ⇒ `crashed`, set
-   `not_before` from `backoff_for_attempt`, next launch uses `--resume`;
-6. detect stale (`stale_session_secs`) and idle (`idle_timeout_secs`)
-   sessions: nudge once with `tmux send-keys`, then `needs_attention`;
-7. finish completed and failed tasks with `cleanup_task`; update Linear state
-   and post a comment;
-8. while `running + starting < max_concurrent`: `pick_next`, `Policy::decide`,
-   create the worktree, run setup, `Launcher::prepare` + `launch`.
+1. write the heartbeat; drain `commands` (pause, resume, cancel, retry, set
+   model, sync now, reload, shutdown);
+2. reload `PRIORITY.md` if the watcher flagged a change (parse errors keep the
+   previous rules); re-score open tasks that have no live session, applying
+   `skip` overrides as `paused`;
+3. poll Linear when `poll_interval_secs` has elapsed (exponential backoff up
+   to 10 minutes after failures); `sync_issues` creates, updates and cancels
+   tasks (running tasks are never cancelled by sync);
+4. drain `hook_events`; `interpret_hook` maps each payload to an outcome and
+   `transitions::on_hook_outcome` to state changes plus effects (cleanup,
+   Linear update, rate-limit cooldown);
+5. read new transcript lines for live sessions (and those ended within the
+   last 5 minutes) into `usage`;
+6. probe tmux panes (`transitions::on_probe`): a dead pane without completion
+   ⇒ `crashed` with `not_before` from `backoff_for_attempt` (next launch uses
+   `--resume`); no activity for `stale_session_secs` or an attempt older than
+   `max_session_secs` ⇒ window killed, treated as a crash; an idle task past
+   `idle_timeout_secs` is nudged once with `tmux send-keys`, then
+   `needs_attention`; a throttled task whose cooldown passed while its
+   session stayed alive goes back to `running`;
+7. release sessions of tasks that became terminal outside the hook path
+   (`task complete` on the CLI, cancelled by sync): `cleanup_task`, then the
+   Linear update and comment;
+8. sample CPU/RSS every `resource_sample_secs`; prune samples older than 7
+   days once an hour;
+9. while live sessions `< max_concurrent`: `pick_next`, `Estimator::predict`,
+   `Policy::decide` (throttle or start), `git fetch`, create the worktree,
+   run `repo.setup`, `Launcher::prepare` + `launch`, move the Linear issue to
+   `in_progress_state`.
 
 Every transition goes through `store.log_event` so `task show` replays the
 story.

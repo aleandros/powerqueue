@@ -604,7 +604,8 @@ mod tests {
         assert_eq!(store.get_task(id).unwrap().unwrap().state, TaskState::Queued);
         let mut na = stored(&store, "NA", TaskState::NeedsAttention);
         let na_id = na.id;
-        assert!(!apply_offline(&store, &mut na, &DaemonCommand::Resume { task_id: na_id }).unwrap());
+        assert!(apply_offline(&store, &mut na, &DaemonCommand::Resume { task_id: na_id }).unwrap());
+        assert_eq!(na.state, TaskState::Queued, "a human may re-queue a task that needed attention");
         assert!(!apply_offline(&store, &mut na, &DaemonCommand::SyncNow).unwrap());
     }
 
