@@ -213,12 +213,12 @@ mod tests {
         assert_eq!(ledger.total_period_weighted, 0.0);
         assert_eq!(ledger.period_fraction(), 0.0);
         assert_eq!(ledger.window_fraction(), 0.0);
-        assert_eq!(ledger.period_budget, 60_000_000.0);
-        assert_eq!(ledger.window_budget, 4_000_000.0);
-        assert!((ledger.tier(ModelTier::Fable).period_budget - 15_000_000.0).abs() < 1e-6);
-        assert!((ledger.tier(ModelTier::Haiku).period_budget - 3_000_000.0).abs() < 1e-6);
+        assert_eq!(ledger.period_budget, 80_000_000.0);
+        assert_eq!(ledger.window_budget, 12_000_000.0);
+        assert!((ledger.tier(ModelTier::Fable).period_budget - 20_000_000.0).abs() < 1e-6);
+        assert!((ledger.tier(ModelTier::Haiku).period_budget - 4_000_000.0).abs() < 1e-6);
         assert!(ledger.calibration.is_none());
-        assert_eq!(ledger.tier(ModelTier::Fable).period_remaining(), 15_000_000.0);
+        assert_eq!(ledger.tier(ModelTier::Fable).period_remaining(), 20_000_000.0);
     }
 
     #[test]
@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(ledger.tier(ModelTier::Opus).period_weighted, 0.0);
         assert_eq!(ledger.total_period_weighted, 3500.0);
         assert_eq!(ledger.total_window_weighted, 2500.0);
-        assert!((ledger.period_fraction() - 3500.0 / 60_000_000.0).abs() < 1e-12);
+        assert!((ledger.period_fraction() - 3500.0 / 80_000_000.0).abs() < 1e-12);
     }
 
     #[test]
@@ -270,7 +270,7 @@ mod tests {
         let now = at("2026-10-01T12:00:00Z");
         let cfg = cfg();
         let clock = PeriodClock::from_config(&cfg, now);
-        usage(&store, task, "m1", ModelTier::Sonnet, 1_200_000, now - Duration::hours(1)); // 6M weighted = 10%
+        usage(&store, task, "m1", ModelTier::Sonnet, 1_600_000, now - Duration::hours(1)); // 8M weighted = 10%
         store
             .kv_set(
                 CALIBRATION_KEY,

@@ -2,7 +2,7 @@
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
-use owo_colors::OwoColorize;
+use owo_colors::{OwoColorize, Stream};
 
 use crate::budget::{
     CALIBRATION_KEY, Calibration, Estimator, Ledger, PeriodClock, Policy, RATE_LIMITS_KEY, RateLimitState, TierLedger,
@@ -62,20 +62,20 @@ fn show(ctx: &mut Context) -> Result<i32> {
     let elapsed = ledger.elapsed_fraction();
     println!(
         "{} {} → {}  ({:.0}% elapsed, {} left){}",
-        "period".bold(),
+        "period".if_supports_color(Stream::Stdout, |t| t.bold()),
         ledger.period.start.format("%Y-%m-%d %H:%M UTC"),
         ledger.period.end.format("%Y-%m-%d %H:%M UTC"),
         elapsed * 100.0,
         human_duration(ledger.period.remaining(now).num_seconds()),
         if cfg.budget.period_anchor.is_none() {
-            "  [anchor not set: run `powerqueue budget set-reset`]".yellow().to_string()
+            "  [anchor not set: run `powerqueue budget set-reset`]".if_supports_color(Stream::Stdout, |t| t.yellow()).to_string()
         } else {
             String::new()
         }
     );
     println!(
         "{} {} of {} weighted tokens ({:.0}% measured{}); window {} of {} ({:.0}%)",
-        "spent ".bold(),
+        "spent ".if_supports_color(Stream::Stdout, |t| t.bold()),
         human_f64(ledger.total_period_weighted),
         human_f64(ledger.period_budget),
         ledger.measured_period_fraction() * 100.0,
@@ -90,7 +90,7 @@ fn show(ctx: &mut Context) -> Result<i32> {
     match ledger.calibration {
         Some(c) => println!(
             "{} observed {:.0}% at {} when we measured {:.0}% (offset {:+.0} points)",
-            "calibration".bold(),
+            "calibration".if_supports_color(Stream::Stdout, |t| t.bold()),
             c.observed_fraction * 100.0,
             c.at.format("%Y-%m-%d %H:%M UTC"),
             c.measured_fraction * 100.0,
@@ -98,7 +98,7 @@ fn show(ctx: &mut Context) -> Result<i32> {
         ),
         None => println!(
             "{} none this period (use `powerqueue budget set-observed <percent>` after checking /usage)",
-            "calibration".bold()
+            "calibration".if_supports_color(Stream::Stdout, |t| t.bold())
         ),
     }
 
@@ -107,11 +107,11 @@ fn show(ctx: &mut Context) -> Result<i32> {
     for tier in &ledger.tiers {
         let status = tier_status(tier, elapsed, &limits, now);
         let status = match status {
-            "ok" => status.green().to_string(),
-            "under-paced" => status.cyan().to_string(),
-            "over-paced" | "rate-limited" => status.yellow().to_string(),
-            "exhausted" => status.red().to_string(),
-            other => other.dimmed().to_string(),
+            "ok" => status.if_supports_color(Stream::Stdout, |t| t.green()).to_string(),
+            "under-paced" => status.if_supports_color(Stream::Stdout, |t| t.cyan()).to_string(),
+            "over-paced" | "rate-limited" => status.if_supports_color(Stream::Stdout, |t| t.yellow()).to_string(),
+            "exhausted" => status.if_supports_color(Stream::Stdout, |t| t.red()).to_string(),
+            other => other.if_supports_color(Stream::Stdout, |t| t.dimmed()).to_string(),
         };
         let until = limits.until(tier.tier, now).map(|u| format!(" until {}", u.format("%H:%M UTC"))).unwrap_or_default();
         t.add_row([
@@ -128,10 +128,11 @@ fn show(ctx: &mut Context) -> Result<i32> {
     println!("{t}");
     println!(
         "{}",
-        "pace = spent% − elapsed%; negative means the tier is under-spent and will relax to lower criticalities".dimmed()
+        "pace = spent% − elapsed%; negative means the tier is under-spent and will relax to lower criticalities"
+            .if_supports_color(Stream::Stdout, |t| t.dimmed())
     );
 
-    println!("\n{} (default-cost task, no overrides)", "what would run now".bold());
+    println!("\n{} (default-cost task, no overrides)", "what would run now".if_supports_color(Stream::Stdout, |t| t.bold()));
     let policy = Policy::new(&cfg.budget, &ledger, &limits);
     let mut t = table();
     t.set_header(["criticality", "model", "why"]);
@@ -235,7 +236,7 @@ fn estimate(ctx: &mut Context, task: Option<&str>) -> Result<i32> {
             if ctx.json {
                 println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "task": task.key, "prediction": p }))?);
             } else {
-                println!("{} {} ({})", "task".bold(), task.key, task.title);
+                println!("{} {} ({})", "task".if_supports_color(Stream::Stdout, |t| t.bold()), task.key, task.title);
                 println!(
                     "  weighted tokens: {} (≈ {} on sonnet, {} on fable)",
                     human_f64(p.weighted_tokens),
@@ -251,12 +252,23 @@ fn estimate(ctx: &mut Context, task: Option<&str>) -> Result<i32> {
             if ctx.json {
                 println!("{}", serde_json::json!({ "samples": estimator.sample_count(), "mape": accuracy }));
             } else {
-                println!("{} {} task(s) with usage history", "samples".bold(), estimator.sample_count());
+                println!(
+                    "{} {} task(s) with usage history",
+                    "samples".if_supports_color(Stream::Stdout, |t| t.bold()),
+                    estimator.sample_count()
+                );
                 match accuracy {
                     Some(m) => {
-                        println!("{} leave-one-out predictions are off by {:.0}% on average", "accuracy".bold(), m * 100.0)
+                        println!(
+                            "{} leave-one-out predictions are off by {:.0}% on average",
+                            "accuracy".if_supports_color(Stream::Stdout, |t| t.bold()),
+                            m * 100.0
+                        )
                     }
-                    None => println!("{} not enough completed tasks yet (need 4)", "accuracy".bold()),
+                    None => println!(
+                        "{} not enough completed tasks yet (need 4)",
+                        "accuracy".if_supports_color(Stream::Stdout, |t| t.bold())
+                    ),
                 }
             }
         }

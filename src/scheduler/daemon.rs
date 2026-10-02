@@ -39,6 +39,8 @@ pub const SKIP_REASON: &str = "skipped by PRIORITY.md";
 const LINEAR_MAX_BACKOFF: Duration = Duration::minutes(10);
 /// How long resource samples are kept.
 const RESOURCE_RETENTION: Duration = Duration::days(7);
+/// Ended sessions keep having their transcript tailed for this long.
+const TRANSCRIPT_GRACE: Duration = Duration::minutes(5);
 
 /// Shared stop flag.
 #[derive(Debug, Clone, Default)]
@@ -489,12 +491,6 @@ impl Daemon {
             }
             if changed {
                 task.score_reasons = eval.reasons.clone();
-            }
-            if let Some(m) = eval.model
-                && task.model_override != Some(m)
-            {
-                task.model_override = Some(m);
-                changed = true;
             }
             if eval.skip && task.state != TaskState::Paused && !task.state.is_terminal() {
                 task.state = TaskState::Paused;
@@ -955,14 +951,21 @@ impl Daemon {
     }
 
     fn forget_session(&mut self, id: uuid::Uuid) {
-        self.rt.readers.remove(&id);
+        // Readers are kept until the transcript grace period ends (see
+        // `tail_transcripts`), so a session's final usage is never lost.
         self.rt.nudged.remove(&id);
     }
 
     // ---------------------------------------------------------- transcripts
 
     fn tail_transcripts(&mut self, now: DateTime<Utc>) -> Result<()> {
-        for mut session in self.store.list_live_sessions()? {
+        // Sessions that ended within the grace window are swept too: the final
+        // turn's usage lands in the transcript right before the Stop hook fires,
+        // and the hook phase (which runs first) may already have closed the session.
+        let active = self.store.list_sessions_active_since(now - TRANSCRIPT_GRACE)?;
+        let keep: HashSet<uuid::Uuid> = active.iter().map(|s| s.id).collect();
+        self.rt.readers.retain(|id, _| keep.contains(id));
+        for mut session in active {
             let path = match &session.transcript_path {
                 Some(p) => PathBuf::from(p),
                 None => {
@@ -998,11 +1001,13 @@ impl Daemon {
                 }
             }
             let newest = reader.last_line_at.unwrap_or(now).min(now);
-            session.last_activity_at = session.last_activity_at.max(newest);
-            if session.state == SessionState::Launching {
-                session.state = SessionState::Running;
+            if session.state.is_live() {
+                session.last_activity_at = session.last_activity_at.max(newest);
+                if session.state == SessionState::Launching {
+                    session.state = SessionState::Running;
+                }
+                self.store.update_session(&session)?;
             }
-            self.store.update_session(&session)?;
             tracing::debug!(session = %session.id, inserted, weighted, "recorded transcript usage");
         }
         Ok(())
@@ -1146,7 +1151,12 @@ impl Daemon {
             let Some(task) = pick_next(&candidates, now).cloned() else { break };
             considered.insert(task.id);
             let prediction = estimator.predict(&task);
-            let preferred = task.model_override.or_else(|| self.rt.rules.model_for(task.criticality));
+            // Rules express a *preference* (`## Models`, `KEY: model = x`); only
+            // `task model <tier>` on the CLI is a hard override. Either way the
+            // policy may still downgrade when the tier is out of budget.
+            let rule_model =
+                self.rt.rules.evaluate(&task, now, None, 0.0, 0.0).model.or_else(|| self.rt.rules.model_for(task.criticality));
+            let preferred = task.model_override.or(rule_model);
             let decision = Policy::new(&self.cfg.budget, &ledger, &self.rt.rate_limits).decide(&task, prediction, preferred);
             match decision.model {
                 None => self.throttle(task, &decision, now)?,

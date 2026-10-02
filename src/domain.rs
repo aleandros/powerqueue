@@ -285,7 +285,7 @@ impl TaskState {
             Running => matches!(next, Idle | Crashed | Throttled | NeedsAttention | Completed | Failed | Cancelled | Paused),
             Idle => matches!(next, Running | Crashed | NeedsAttention | Completed | Failed | Cancelled | Paused),
             Crashed => matches!(next, Starting | Queued | Failed | Cancelled | Paused | Throttled),
-            Throttled => matches!(next, Queued | Starting | Cancelled | Paused),
+            Throttled => matches!(next, Queued | Starting | Running | Cancelled | Paused),
             Paused => matches!(next, Queued | Cancelled),
             NeedsAttention => matches!(next, Running | Idle | Completed | Failed | Cancelled | Paused | Crashed),
             Completed | Failed | Cancelled => matches!(next, Queued),

@@ -1,7 +1,7 @@
 //! `powerqueue run` / `powerqueue stop`.
 
 use anyhow::{Context as _, Result};
-use owo_colors::OwoColorize;
+use owo_colors::{OwoColorize, Stream};
 
 use crate::cli::commands::runtime;
 use crate::cli::output::ago;
@@ -23,7 +23,7 @@ pub fn run(ctx: &mut Context, args: RunArgs) -> Result<i32> {
         let linear = if args.offline || !cfg.linear.enabled { "offline".to_string() } else { team };
         eprintln!(
             "{} repo {} | linear {} | max {} concurrent | tmux session {} | log {}",
-            "powerqueue".bold(),
+            "powerqueue".if_supports_color(Stream::Stdout, |t| t.bold()),
             cfg.repo.path,
             linear,
             cfg.scheduler.max_concurrent,

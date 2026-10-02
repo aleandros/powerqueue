@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use anyhow::{Context as _, Result};
-use owo_colors::OwoColorize;
+use owo_colors::{OwoColorize, Stream};
 use tracing::warn;
 
 use crate::cli::output::{table, truncate};
@@ -91,7 +91,7 @@ fn test(ctx: &mut Context) -> Result<i32> {
     } else {
         println!(
             "{} authenticated as {} <{}> (key from {origin}, endpoint {endpoint})",
-            "ok:".green().bold(),
+            "ok:".if_supports_color(Stream::Stdout, |t| t.style(owo_colors::Style::new().green().bold())),
             viewer.name,
             viewer.email
         );
@@ -151,9 +151,9 @@ fn sync(ctx: &mut Context, apply: bool) -> Result<i32> {
         println!(
             "Fetched {} issue(s); created {}, updated {}, cancelled {}, unchanged {}.",
             issues.len(),
-            created.len().green(),
-            updated.len().yellow(),
-            cancelled.len().red(),
+            created.len().if_supports_color(Stream::Stdout, |t| t.green()),
+            updated.len().if_supports_color(Stream::Stdout, |t| t.yellow()),
+            cancelled.len().if_supports_color(Stream::Stdout, |t| t.red()),
             report.unchanged
         );
         for (what, list) in [("created", &created), ("updated", &updated), ("cancelled", &cancelled)] {
@@ -183,9 +183,9 @@ fn sync(ctx: &mut Context, apply: bool) -> Result<i32> {
     t.set_header(["ACTION", "KEY", "TITLE", "DETAILS"]);
     for p in &planned {
         let action = match p.action {
-            "create" => p.action.green().to_string(),
-            "update" => p.action.yellow().to_string(),
-            "cancel" => p.action.red().to_string(),
+            "create" => p.action.if_supports_color(Stream::Stdout, |t| t.green()).to_string(),
+            "update" => p.action.if_supports_color(Stream::Stdout, |t| t.yellow()).to_string(),
+            "cancel" => p.action.if_supports_color(Stream::Stdout, |t| t.red()).to_string(),
             other => other.to_string(),
         };
         t.add_row([action, p.key.clone(), truncate(&p.title, 60), p.detail.clone()]);

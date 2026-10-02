@@ -345,7 +345,7 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let task = find_task(&store, &task_ref.task)?;
     let events = store.events_for_task(task.id, 500)?;
     let throttled = events.iter().rev().find(|e| e.kind == "task.throttled");
-    let chosen = events.iter().rev().find(|e| e.kind == "task.model_chosen");
+    let chosen = events.iter().rev().find(|e| e.kind == "task.model_chosen" || e.kind == "task.starting");
     if ctx.json {
         let out = serde_json::json!({
             "key": task.key,

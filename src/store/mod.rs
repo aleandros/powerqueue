@@ -469,6 +469,19 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Sessions that are live *or* ended at/after `since` — the set whose
+    /// transcripts may still have unread usage lines.
+    pub fn list_sessions_active_since(&self, since: DateTime<Utc>) -> Result<Vec<Session>> {
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {} FROM sessions WHERE state IN ('launching','running','idle') OR ended_at >= ?1 ORDER BY started_at ASC",
+            Self::SESSION_COLS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![ts(&since)], Self::row_to_session)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
         let conn = self.lock();
         let sql = format!("SELECT {} FROM sessions ORDER BY started_at ASC", Self::SESSION_COLS);

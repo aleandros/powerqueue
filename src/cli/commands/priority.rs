@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use owo_colors::OwoColorize;
+use owo_colors::{OwoColorize, Stream};
 
 use crate::cli::output::{criticality_colored, model_colored};
 use crate::cli::{Context, PriorityCommand, TaskRef};
@@ -42,7 +42,11 @@ fn parse_file(ctx: &mut Context, path: &Path) -> Result<Option<PriorityRules>> {
         if ctx.json {
             println!("{}", serde_json::json!({ "ok": false, "path": path, "error": "missing", "hint": "run `powerqueue init`" }));
         } else {
-            println!("{} {}", "missing:".yellow().bold(), missing_message(path));
+            println!(
+                "{} {}",
+                "missing:".if_supports_color(Stream::Stdout, |t| t.style(owo_colors::Style::new().yellow().bold())),
+                missing_message(path)
+            );
         }
         return Ok(None);
     }
@@ -63,7 +67,11 @@ fn parse_file(ctx: &mut Context, path: &Path) -> Result<Option<PriorityRules>> {
 fn print_problems(problems: &[RuleError], level: &str) {
     for p in problems {
         let tag = format!("{level}:");
-        let tag = if level == "error" { tag.red().bold().to_string() } else { tag.yellow().bold().to_string() };
+        let tag = if level == "error" {
+            tag.red().if_supports_color(Stream::Stdout, |t| t.bold()).to_string()
+        } else {
+            tag.yellow().if_supports_color(Stream::Stdout, |t| t.bold()).to_string()
+        };
         println!("{tag} line {}: {}", p.line, p.message);
     }
 }
@@ -77,7 +85,7 @@ fn show(ctx: &mut Context) -> Result<i32> {
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "ok": true, "path": path, "rules": rules }))?);
         return Ok(0);
     }
-    println!("{} {}", "Rules from".bold(), path.display());
+    println!("{} {}", "Rules from".if_supports_color(Stream::Stdout, |t| t.bold()), path.display());
     print!("{}", rules.describe());
     Ok(0)
 }
@@ -100,7 +108,7 @@ fn check(ctx: &mut Context) -> Result<i32> {
     print_problems(&rules.warnings, "warning");
     println!(
         "{} {}: {} rule(s), {} scoring rule(s), {} override(s), {} warning(s)",
-        "ok:".green().bold(),
+        "ok:".if_supports_color(Stream::Stdout, |t| t.style(owo_colors::Style::new().green().bold())),
         path.display(),
         rules.rule_count(),
         rules.scoring.len(),
@@ -145,7 +153,11 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let rules = if path.exists() {
         PriorityRules::load(&path)?
     } else {
-        println!("{} {}", "note:".yellow().bold(), missing_message(&path));
+        println!(
+            "{} {}",
+            "note:".if_supports_color(Stream::Stdout, |t| t.style(owo_colors::Style::new().yellow().bold())),
+            missing_message(&path)
+        );
         PriorityRules::default()
     };
     let jev_normalized = if rules.jev.enabled && cfg.jev.enabled {
@@ -167,13 +179,13 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
         );
         return Ok(0);
     }
-    println!("{} {} — {}", "Task".bold(), task.key, task.title);
+    println!("{} {} — {}", "Task".if_supports_color(Stream::Stdout, |t| t.bold()), task.key, task.title);
     println!("  rules:       {}", path.display());
     println!("  criticality: {}", criticality_colored(eval.criticality));
     println!("  score:       {:.1}", eval.score);
     println!("  model:       {}", model_colored(eval.model));
     if eval.skip {
-        println!("  skip:        {}", "yes (override)".red());
+        println!("  skip:        {}", "yes (override)".if_supports_color(Stream::Stdout, |t| t.red()));
     }
     println!("  reasons:");
     for r in &eval.reasons {
@@ -182,7 +194,7 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     if (task.score - eval.score).abs() > 0.5 || task.criticality != eval.criticality {
         println!(
             "  {} stored score is {:.1} ({}); the daemon re-scores on its next tick.",
-            "note:".dimmed(),
+            "note:".if_supports_color(Stream::Stdout, |t| t.dimmed()),
             task.score,
             task.criticality
         );

@@ -52,8 +52,8 @@ pub fn handle(
         session_id,
         EventLevel::Debug,
         &kind,
-        &preview,
-        serde_json::json!({ "event": event.as_str() }),
+        &format!("{} hook received", event.as_str()),
+        serde_json::json!({ "event": event.as_str(), "payload": preview }),
     ) {
         tracing::warn!(error = %e, "hook: cannot log event");
     }
@@ -141,7 +141,8 @@ mod tests {
         let log = store.events_for_task(id, 10).unwrap();
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].kind, "hook.sessionstart");
-        assert!(log[0].message.contains("transcript_path"));
+        assert!(log[0].message.contains("SessionStart hook received"));
+        assert!(log[0].data["payload"].as_str().unwrap_or("").contains("transcript_path"));
         assert_eq!(store.get_task(id).unwrap().unwrap().state, TaskState::Running);
     }
 

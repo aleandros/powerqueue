@@ -75,8 +75,9 @@ struct Features<'a> {
 }
 
 impl Estimator {
-    /// Default guess when there is no history (≈ one focused Sonnet session).
-    pub const DEFAULT_WEIGHTED_TOKENS: f64 = 1_500_000.0;
+    /// Default guess when there is no history (≈ one focused half-hour session,
+    /// before the tier weight is applied).
+    pub const DEFAULT_WEIGHTED_TOKENS: f64 = 500_000.0;
     pub const DEFAULT_WALL_SECS: f64 = 1_800.0;
     /// Multiplier applied to failed attempts (they wasted budget).
     pub const FAILED_PENALTY: f64 = 1.5;
