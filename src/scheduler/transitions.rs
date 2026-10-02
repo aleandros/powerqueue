@@ -164,7 +164,17 @@ pub fn on_hook_outcome(
             task.state = TaskState::Throttled;
             task.not_before = Some(until);
             task.last_error = Some(format!("{error_type}: {message}"));
-            effects.push(Effect::RateLimit { tier: session.model, until });
+            // Subscription limits (5-hour window, weekly cap) are account-wide,
+            // so a `rate_limit` pauses every tier; `overloaded` is specific to
+            // the model that reported it.
+            let account_wide = error_type != "overloaded";
+            if account_wide {
+                for tier in ModelTier::ALL {
+                    effects.push(Effect::RateLimit { tier, until });
+                }
+            } else {
+                effects.push(Effect::RateLimit { tier: session.model, until });
+            }
             effects.push(Effect::log(
                 EventLevel::Warn,
                 "budget.rate_limited",
@@ -581,13 +591,21 @@ mod tests {
         assert_eq!(t.state, TaskState::Throttled);
         assert_eq!(t.not_before, Some(now() + Duration::minutes(30)));
         assert_eq!(s.state, SessionState::Running, "the session stays alive; Claude retries by itself");
-        assert_eq!(fx[0], Effect::RateLimit { tier: ModelTier::Opus, until: now() + Duration::minutes(30) });
-        assert_eq!(kinds(&fx), vec!["ratelimit", "budget.rate_limited"]);
+        for tier in ModelTier::ALL {
+            assert!(fx.contains(&Effect::RateLimit { tier, until: now() + Duration::minutes(30) }), "rate_limit is account-wide");
+        }
+        assert_eq!(kinds(&fx), vec!["ratelimit", "ratelimit", "ratelimit", "ratelimit", "budget.rate_limited"]);
 
         let mut t = task(TaskState::Running, 1);
         let fx = on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), now() + Duration::minutes(5));
         assert_eq!(t.not_before, Some(now() + Duration::minutes(5)), "capped at the period end");
         assert!(matches!(fx[0], Effect::RateLimit { until, .. } if until == now() + Duration::minutes(5)));
+
+        let mut t = task(TaskState::Running, 1);
+        let out = HookOutcome::RateLimited { error_type: "overloaded".into(), message: "busy".into() };
+        let fx = on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), period_end());
+        assert_eq!(fx[0], Effect::RateLimit { tier: ModelTier::Opus, until: now() + Duration::minutes(30) });
+        assert_eq!(kinds(&fx), vec!["ratelimit", "budget.rate_limited"], "overloaded only affects the reporting tier");
     }
 
     #[test]
