@@ -297,6 +297,7 @@ Options:
 | Flag | Effect |
 |------|--------|
 | `--file PATH` | try a draft file instead of the live one; the daemon keeps using the live file until you copy the draft over it |
+| `--config PATH` | try a draft `config.toml` too (budget shares, concurrency); the repo's `.powerqueue.toml` still applies |
 | `--linear` | also fetch the queued issues from Linear and rank the ones not in the queue yet (nothing is stored) |
 | `-a`, `--all` | include completed/failed/cancelled tasks, to check rules against history |
 | `--reasons` | print every rule that fired for each task, plus the policy's reason |
@@ -308,6 +309,30 @@ Typical loop: copy `PRIORITY.md` to a draft, edit, `priority simulate --file
 draft.md`, repeat until the order looks right, then move the draft over the
 live file. With `priority.live_reload = true` (the default) the daemon
 re-scores every task without a live session on its next tick.
+
+## Tuning with `powerqueue tune`
+
+`powerqueue tune "<what you expect>"` runs that loop for you with a headless
+Claude Code session. It copies `PRIORITY.md` and `config.toml` into
+`<state>/tune/<id>/`, writes a `CONTEXT.md` with the current simulation
+(`--reasons`), every open task's matchable fields and the budget state, and
+sends Claude the request together with this document and the config
+reference. Claude edits the drafts and verifies them with `priority check
+--file`, `priority simulate --file --config` and `config validate --file`
+(the only commands it may run). powerqueue then parses both drafts, refuses
+anything that does not validate, shows Claude's summary, the diff and the
+simulated queue with the drafts, and asks before replacing the live files
+(`-y` skips the question, `--dry-run` never applies, `--apply` applies a kept
+proposal later, `--undo` restores the previous files). Requests the rules
+cannot decide, such as an order set by the budget policy, come back as an
+explanation and no change.
+
+Good requests name what you saw and what you expected: "ENG-12 should rank
+above ENG-40 because customer bugs come first", "anything labelled `chore` is
+low and runs on sonnet", "skip ENG-77, someone else took it", "tasks from the
+active cycle before everything else". `--scope priority` keeps Claude out of
+`config.toml`; `--scope config` is for "run three tasks at once" or "give
+fable 40% of the week".
 
 ## Idioms
 

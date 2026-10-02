@@ -35,6 +35,7 @@ src/
   hook.rs            `powerqueue hook` (called by Claude Code hooks)
   dashboard/         ratatui TUI
   doctor.rs          diagnostics + tuning advice
+  tune.rs            `powerqueue tune`: drafts dir, prompt, headless `claude -p` run, validate/diff/apply/undo
   cli/               clap definitions, context, output helpers, command handlers
 tests/               integration tests (assert_cmd, wiremock, temp git repos, private tmux sockets);
                      fixtures/fake-claude.sh + e2e_daemon.rs drive the real daemon end to end
@@ -76,7 +77,7 @@ Module ownership is coarse so agents can work on branches without conflicts:
 | linear + priority + jev | `src/linear/**`, `src/priority/**`, `src/jev.rs`, `src/cli/commands/{linear,priority}.rs` |
 | runtime | `src/tmux.rs`, `src/worktree.rs`, `src/session/**` (incl. `session/{agent,claude,codex,gemini}.rs`, the provider trait and its CLIs), `src/cli/commands/attach.rs` |
 | budget + scheduler | `src/budget/**` (incl. `budget/probe.rs`, observed usage), `src/scheduler/**`, `src/hook.rs`, `src/cli/commands/{run,budget,hook}.rs` |
-| ux | `src/dashboard/**`, `src/doctor.rs`, `src/cli/commands/{init,status,add,task,logs,config,secrets,doctor}.rs` |
+| ux | `src/dashboard/**`, `src/doctor.rs`, `src/tune.rs`, `src/cli/commands/{init,status,add,task,logs,config,secrets,doctor,tune}.rs` |
 
 Shared files (`domain.rs`, `config.rs`, `store/**`, `cli/mod.rs`, `Cargo.toml`) may be
 extended but not reshaped; add, don't rename. If you must change a public

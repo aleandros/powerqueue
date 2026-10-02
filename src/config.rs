@@ -38,6 +38,7 @@ pub struct Config {
     pub cleanup: CleanupConfig,
     pub tmux: TmuxConfig,
     pub logging: LoggingConfig,
+    pub tune: TuneConfig,
 }
 
 /// The repository tasks are worked on.
@@ -972,6 +973,29 @@ impl Default for LoggingConfig {
     }
 }
 
+/// `powerqueue tune`: a headless Claude Code session that edits drafts of
+/// `PRIORITY.md` and `config.toml` from a plain-language request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TuneConfig {
+    /// Claude model alias for the tuning session (`sonnet`, `opus`, `fable`, `haiku`).
+    pub model: String,
+    /// Kill the session after this many seconds (the draft is kept).
+    pub timeout_secs: u64,
+    /// Extra flags appended to the `claude -p` command line.
+    pub extra_args: Vec<String>,
+    /// Keep at most this many drafts under `<state>/tune/`; older applied,
+    /// failed or unchanged drafts are pruned after each run (proposed drafts
+    /// are never pruned).
+    pub keep_drafts: usize,
+}
+
+impl Default for TuneConfig {
+    fn default() -> Self {
+        Self { model: "sonnet".to_string(), timeout_secs: 600, extra_args: Vec::new(), keep_drafts: 20 }
+    }
+}
+
 /// Per-repository overrides (`.powerqueue.toml` in the repo root).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -1039,6 +1063,22 @@ impl Config {
             .with_context(|| format!("cannot read {} (run `powerqueue init` first)", file.display()))?;
         let mut cfg = Self::from_toml(&text).with_context(|| format!("invalid config {}", file.display()))?;
         cfg.prompt.base_dir = Some(paths.config_dir.clone());
+        Ok(cfg)
+    }
+
+    /// Load a draft `config.toml` from `file` as if it were the live one:
+    /// same parsing and legacy-key migration as [`Config::load`], the prompt
+    /// base directory set to the live config directory, and the repository's
+    /// `.powerqueue.toml` overrides applied when the repo exists. Fails when
+    /// the file cannot be read or parsed; [`Config::validate`] is *not* run.
+    pub fn load_draft(paths: &Paths, file: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(file).with_context(|| format!("cannot read {}", file.display()))?;
+        let mut cfg = Self::from_toml(&text).with_context(|| format!("invalid config {}", file.display()))?;
+        cfg.prompt.base_dir = Some(paths.config_dir.clone());
+        let repo = cfg.repo_path();
+        if !cfg.repo.path.trim().is_empty() && repo.exists() {
+            cfg.apply_repo_overrides(&repo)?;
+        }
         Ok(cfg)
     }
 
@@ -1280,6 +1320,19 @@ impl Config {
         }
         for conflict in &self.budget.migration_conflicts {
             problems.push(format!("legacy budget key {conflict}"));
+        }
+        match self.tune.model.parse::<ModelTier>() {
+            Ok(m) if m.provider() != Provider::Claude => {
+                problems.push(format!("tune.model `{}` is not a Claude model (tune runs on Claude Code)", self.tune.model))
+            }
+            Ok(_) => {}
+            Err(e) => problems.push(format!("tune.model: {e}")),
+        }
+        if self.tune.timeout_secs == 0 {
+            problems.push("tune.timeout_secs must be >= 1".to_string());
+        }
+        if self.tune.keep_drafts == 0 {
+            problems.push("tune.keep_drafts must be >= 1".to_string());
         }
         let b = &self.budget;
         for (p, pb) in b.providers.iter() {

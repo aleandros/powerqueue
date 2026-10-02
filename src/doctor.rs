@@ -8,7 +8,8 @@
 //! * environment: git, tmux, the CLI of every enabled provider (binary,
 //!   version, logged in: `claude auth status`, `codex login status`, ...)
 //! * configuration: config.toml validity, PRIORITY.md parse, repo path, worktree root writable,
-//!   per provider: model shares, period anchor known (config / observed / default)
+//!   per provider: model shares, period anchor known (config / observed / default),
+//!   `powerqueue tune` drafts waiting to be applied or left behind by a failed run
 //! * secrets: keychain backend, Linear key works (`viewer`), Jev key (if enabled)
 //! * state: database integrity, daemon heartbeat, orphaned worktrees / tmux windows,
 //!   tasks stuck in `starting`/`running` with no live session
@@ -481,6 +482,51 @@ fn check_repo_overrides(cfg: &Config) -> CheckResult {
 }
 
 /// How to learn a provider's period reset when nothing is known yet.
+/// `powerqueue tune` drafts: a proposal nobody applied, or a run that failed
+/// or produced invalid files, is worth a look (the directory explains why).
+fn check_tune_drafts(paths: &Paths) -> CheckResult {
+    let drafts = match crate::tune::Draft::list(paths) {
+        Ok(d) => d,
+        Err(e) => {
+            return CheckResult::warn(CONF, "tune drafts", format!("{e:#}"), "fix or remove the unreadable draft directory");
+        }
+    };
+    tune_drafts_status(&drafts)
+}
+
+/// The verdict for a list of drafts (newest last), separated for tests.
+pub fn tune_drafts_status(drafts: &[crate::tune::Draft]) -> CheckResult {
+    use crate::tune::DraftStatus;
+    let proposed: Vec<&crate::tune::Draft> = drafts.iter().filter(|d| d.meta.status == DraftStatus::Proposed).collect();
+    let broken: Vec<&crate::tune::Draft> = drafts
+        .iter()
+        .filter(|d| matches!(d.meta.status, DraftStatus::Failed | DraftStatus::Invalid | DraftStatus::Running))
+        .collect();
+    if let Some(latest) = proposed.last() {
+        return CheckResult::warn(
+            CONF,
+            "tune drafts",
+            format!(
+                "{} proposal(s) not applied; newest: {} (\"{}\")",
+                proposed.len(),
+                latest.dir.display(),
+                crate::cli::output::truncate(&latest.meta.instruction, 50)
+            ),
+            "review with `powerqueue tune --apply` (or `--apply <dir>`), or delete the draft directory",
+        );
+    }
+    if let Some(latest) = broken.last() {
+        let why = latest.meta.problems.first().cloned().unwrap_or_else(|| latest.meta.status.to_string());
+        return CheckResult::warn(
+            CONF,
+            "tune drafts",
+            format!("{} draft(s) {} ; newest: {} ({why})", broken.len(), "failed or invalid", latest.dir.display()),
+            "read result.json / stderr.log in the draft directory, then delete it; `powerqueue tune` prunes old finished drafts itself",
+        );
+    }
+    CheckResult::ok(CONF, "tune drafts", format!("{} draft(s), none pending", drafts.len()))
+}
+
 fn anchor_hint(p: Provider) -> String {
     match p {
         Provider::Claude => {
@@ -1234,6 +1280,7 @@ pub async fn run_all(
     results.push(check_priority_file(cfg, paths));
     results.push(check_repo_overrides(cfg));
     results.push(check_prompt_template(cfg));
+    results.push(check_tune_drafts(paths));
     results.extend(check_provider_models(cfg));
     results.extend(check_period_anchors(cfg, store));
     results.extend(check_providers(cfg));
@@ -1464,6 +1511,43 @@ mod tests {
         assert_eq!(check_repo_overrides(&cfg).status, Status::Fail);
         assert_eq!(check_priority_file(&cfg, &paths).status, Status::Warn);
         assert!(process_alive(std::process::id()));
+    }
+
+    #[test]
+    fn tune_draft_checks() {
+        use crate::cli::TuneScope;
+        use crate::tune::{Draft, DraftStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        assert_eq!(check_tune_drafts(&paths).status, Status::Ok, "no tune/ directory yet");
+        let mk = |id: &str, status: DraftStatus| {
+            let mut d = Draft::create(
+                &paths,
+                id,
+                "make INC-1 critical and urgent",
+                TuneScope::All,
+                "sonnet",
+                &paths.priority_file(),
+                None,
+                &paths.config_file(),
+                "[repo]\npath = \"/r\"\n",
+            )
+            .unwrap();
+            d.set_status(status, vec!["timed out".into()]).unwrap();
+            d
+        };
+        mk("20260101T000000Z-a00000", DraftStatus::Applied);
+        assert_eq!(check_tune_drafts(&paths).status, Status::Ok);
+        mk("20260101T000001Z-a00001", DraftStatus::Failed);
+        let r = check_tune_drafts(&paths);
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("timed out"), "{r:?}");
+        mk("20260101T000002Z-a00002", DraftStatus::Proposed);
+        let r = check_tune_drafts(&paths);
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("1 proposal(s) not applied"), "{r:?}");
+        assert!(r.fix_hint.as_deref().unwrap_or("").contains("tune --apply"));
     }
 
     #[test]

@@ -79,6 +79,10 @@ impl Paths {
     pub fn task_dir(&self, task_id: &str) -> PathBuf {
         self.tasks_dir().join(task_id)
     }
+    /// `<state>/tune`: one directory per `powerqueue tune` draft.
+    pub fn tune_dir(&self) -> PathBuf {
+        self.state_dir.join("tune")
+    }
     pub fn daemon_lock(&self) -> PathBuf {
         self.state_dir.join("daemon.lock")
     }

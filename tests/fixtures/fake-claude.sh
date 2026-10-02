@@ -21,6 +21,62 @@ mode="${FAKE_CLAUDE_MODE:-complete}"
 state_dir="${FAKE_CLAUDE_STATE_DIR:-${TMPDIR:-/tmp}}"
 mkdir -p "$state_dir"
 
+# ---------------------------------------------------------------- headless
+# `powerqueue tune` runs `claude -p ... --output-format json` with the prompt
+# on stdin and the draft directory as cwd. FAKE_TUNE_MODE selects what the
+# "agent" does to the drafts:
+#   edit     (default) add an override to PRIORITY.md and set
+#            scheduler.max_concurrent = 3 in config.toml (appended; the test
+#            configs have no [scheduler] table)
+#   priority only edit PRIORITY.md
+#   noop     change nothing
+#   invalid  write an unparsable rule and an invalid config value
+#   fail     exit 1 with a message on stderr
+#   hang     sleep (for the timeout path)
+# The prompt is saved to $FAKE_CLAUDE_STATE_DIR/tune-prompt.md and the
+# argv to tune-argv.txt; `powerqueue priority check --file PRIORITY.md` is run
+# through PATH and its exit code saved to tune-check-exit.txt, so tests can
+# verify that the session sees the right binary and home.
+headless=0
+for arg in "$@"; do
+  case "$arg" in -p|--print) headless=1 ;; esac
+done
+if [ "$headless" = 1 ]; then
+  tune_mode="${FAKE_TUNE_MODE:-edit}"
+  printf '%s\n' "$@" > "$state_dir/tune-argv.txt"
+  cat > "$state_dir/tune-prompt.md"
+  echo "fake-claude: headless mode=$tune_mode cwd=$(pwd) prompt bytes=$(wc -c < "$state_dir/tune-prompt.md")" >&2
+  if command -v powerqueue >/dev/null 2>&1; then
+    powerqueue priority check --file PRIORITY.md >/dev/null 2>&1
+    echo "$?" > "$state_dir/tune-check-exit.txt"
+    powerqueue config validate --file config.toml >/dev/null 2>&1
+    echo "$?" > "$state_dir/tune-validate-exit.txt"
+  fi
+  case "$tune_mode" in
+    edit)
+      printf '\n## Overrides\n- FAKE-1: critical\n' >> PRIORITY.md
+      printf '\n[scheduler]\nmax_concurrent = 3\n' >> config.toml
+      ;;
+    priority)
+      printf '\n## Overrides\n- FAKE-1: critical\n' >> PRIORITY.md
+      ;;
+    noop) ;;
+    invalid)
+      printf '\n## Critical\n- bogus: nonsense\n' >> PRIORITY.md
+      printf '\n[scheduler]\nmax_concurrent = 0\n' >> config.toml
+      ;;
+    fail)
+      echo "fake-claude: simulated failure" >&2
+      exit 1
+      ;;
+    hang)
+      sleep "${FAKE_CLAUDE_IDLE_SECS:-120}"
+      ;;
+  esac
+  printf '{"type":"result","subtype":"success","is_error":false,"duration_ms":1500,"num_turns":2,"result":"fake-tune (%s): made FAKE-1 critical.\\nSimulation now ranks it first.","session_id":"fake-%s","total_cost_usd":0.01}\n' "$tune_mode" "$$"
+  exit 0
+fi
+
 session=""
 resume=0
 settings=""
@@ -32,7 +88,7 @@ while [ $# -gt 0 ]; do
     --resume) session="$2"; resume=1; shift 2 ;;
     --settings) settings="$2"; shift 2 ;;
     --model) model="$2"; shift 2 ;;
-    --permission-mode|--name|--effort|--fallback-model|--allowedTools|--append-system-prompt) shift 2 ;;
+    --permission-mode|--name|--effort|--fallback-model|--allowedTools|--append-system-prompt|--output-format) shift 2 ;;
     --*) shift ;;
     *) prompt="$1"; shift ;;
   esac

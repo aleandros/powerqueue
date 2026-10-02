@@ -424,19 +424,37 @@ pub fn run(ctx: &mut Context, cmd: ConfigCommand) -> Result<i32> {
                 }
             }
         }
-        ConfigCommand::Validate => {
-            super::status::ensure_initialised(ctx)?;
-            let cfg = Config::load(&ctx.paths)?;
+        ConfigCommand::Validate { file } => {
+            let (cfg, shown) = match file {
+                Some(file) => {
+                    if !file.exists() {
+                        bail!("{} does not exist", file.display());
+                    }
+                    let text = std::fs::read_to_string(&file).with_context(|| format!("cannot read {}", file.display()))?;
+                    match Config::from_toml(&text) {
+                        Ok(cfg) => (cfg, file),
+                        Err(e) => {
+                            let problem = format!("{}: {e:#}", file.display());
+                            if ctx.json {
+                                println!("{}", serde_json::json!({ "ok": false, "problems": [problem] }));
+                            } else {
+                                print_problems(std::slice::from_ref(&problem));
+                            }
+                            return Ok(1);
+                        }
+                    }
+                }
+                None => {
+                    super::status::ensure_initialised(ctx)?;
+                    (Config::load(&ctx.paths)?, ctx.paths.config_file())
+                }
+            };
             let override_file = cfg.repo_path().join(REPO_CONFIG_FILE);
             let problems = validation_problems(&cfg, Some(&override_file));
             if ctx.json {
-                println!("{}", serde_json::json!({ "ok": problems.is_empty(), "problems": problems }));
+                println!("{}", serde_json::json!({ "ok": problems.is_empty(), "file": shown, "problems": problems }));
             } else if problems.is_empty() {
-                println!(
-                    "{} {} is valid",
-                    "ok".if_supports_color(Stream::Stdout, |t| t.green()),
-                    ctx.paths.config_file().display()
-                );
+                println!("{} {} is valid", "ok".if_supports_color(Stream::Stdout, |t| t.green()), shown.display());
                 if override_file.exists() {
                     println!("{} {} is valid", "ok".if_supports_color(Stream::Stdout, |t| t.green()), override_file.display());
                 }

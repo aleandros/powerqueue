@@ -18,6 +18,7 @@
 //! | [`scheduler`] | the daemon loop |
 //! | [`dashboard`] | live terminal UI |
 //! | [`doctor`] | diagnostics and tuning advice |
+//! | [`tune`] | `powerqueue tune`: plain-language config changes drafted by a headless Claude Code session |
 //! | [`cli`] | clap definitions and command handlers |
 
 pub mod budget;
@@ -37,6 +38,7 @@ pub mod secrets;
 pub mod session;
 pub mod store;
 pub mod tmux;
+pub mod tune;
 pub mod worktree;
 
 /// Crate version, injected by Cargo.

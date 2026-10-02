@@ -326,6 +326,35 @@ Fixes:
   `budget.providers.codex.window_hours = 0` so the window estimate never
   blocks it.
 
+## `powerqueue tune` did not apply anything
+
+**Symptoms**: `tune` prints `failed:`, `invalid:` or `proposed:`; `doctor`
+warns about tune drafts.
+
+**Checks**
+
+- `failed: ... exited with N` or `timed out`: read `stderr.log` and
+  `result.json` in the draft directory it names (`<state>/tune/<id>/`).
+  Common causes: `claude` not logged in (`claude auth status`), the model in
+  `tune.model` / `-m` not available on your plan, a nested session refusing to
+  start, or a slow run hitting `tune.timeout_secs` (default 600 s).
+- `invalid:`: Claude wrote something `PRIORITY.md` or `config.toml` cannot
+  parse; the problems are listed with line numbers. The live files were not
+  touched. Fix the draft by hand and `powerqueue tune --apply <dir>`, or
+  re-run with a more specific request.
+- `proposed:` (exit 3): there was no terminal to ask on and no `-y`. Review
+  with `powerqueue tune --apply` (it shows the diff and the simulation again)
+  or pass `-y` from scripts.
+- Claude "changed nothing": its summary explains why, usually because the
+  request is decided by the budget policy, not the rules (try `powerqueue
+  budget show`), or because the ticket is not in the queue yet (`powerqueue
+  linear sync`).
+
+**Fix**: a wrong apply is reverted with `powerqueue tune --undo` (the
+`original/` copies are restored and a running daemon reloads). Finished
+drafts beyond `tune.keep_drafts` are pruned automatically; delete a draft
+directory to silence `doctor`.
+
 ## Where things are
 
 | What | Path |

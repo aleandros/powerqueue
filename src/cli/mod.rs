@@ -10,6 +10,7 @@
 //! powerqueue task <show|list|complete|block|cancel|pause|resume|retry|explain|model|prompt|output|send>
 //! powerqueue attach <task>        open the task's tmux window
 //! powerqueue priority <show|check|edit|explain|simulate|path>
+//! powerqueue tune "what you expect" [-y] [--dry-run] [--scope priority|config|all]   let Claude edit PRIORITY.md / config.toml for you; --apply [DIR], --undo
 //! powerqueue budget <show|set-reset|set-observed|clear-limits|estimate> [--provider <p>]
 //! powerqueue linear <teams|states|test|sync>
 //! powerqueue doctor [--fix]       diagnostics + tuning advice
@@ -81,6 +82,10 @@ pub enum Command {
     /// Priority rules (PRIORITY.md).
     #[command(subcommand)]
     Priority(PriorityCommand),
+    /// Describe a change in plain words ("ENG-12 should run before ENG-40", "use sonnet for
+    /// chores") and let Claude Code edit drafts of PRIORITY.md and config.toml; review the
+    /// diff and the simulated queue, then apply.
+    Tune(TuneArgs),
     /// Model budget and pacing.
     #[command(subcommand)]
     Budget(BudgetCommand),
@@ -270,8 +275,8 @@ pub struct AttachArgs {
 pub enum PriorityCommand {
     /// Print the parsed rules.
     Show,
-    /// Validate the file and report problems.
-    Check,
+    /// Validate the file (or a draft `--file`) and report problems.
+    Check(CheckArgs),
     /// Open PRIORITY.md in $EDITOR.
     Edit,
     /// Show how the rules score one task.
@@ -283,10 +288,21 @@ pub enum PriorityCommand {
 }
 
 #[derive(Debug, Args, Default)]
+pub struct CheckArgs {
+    /// Rules file to validate instead of the live one.
+    #[arg(long, value_name = "PATH")]
+    pub file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Default, Clone)]
 pub struct SimulateArgs {
     /// Rules file to try instead of the live one (edit a copy, simulate, then replace).
     #[arg(long, value_name = "PATH")]
     pub file: Option<PathBuf>,
+    /// config.toml to try instead of the live one (budget, concurrency); the repo's
+    /// `.powerqueue.toml` overrides still apply.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
     /// Include finished tasks (completed/failed/cancelled) in the ranking.
     #[arg(short, long)]
     pub all: bool,
@@ -417,8 +433,80 @@ pub enum ConfigCommand {
     Path,
     /// Open config.toml in $EDITOR.
     Edit,
-    /// Validate config.toml and the repo's .powerqueue.toml.
-    Validate,
+    /// Validate config.toml (or a draft `--file`) and the repo's .powerqueue.toml.
+    Validate {
+        /// config.toml to validate instead of the live one.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+    },
+}
+
+/// Which files `powerqueue tune` may change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TuneScope {
+    /// Only PRIORITY.md.
+    Priority,
+    /// Only config.toml.
+    Config,
+    /// Both files (default).
+    #[default]
+    All,
+}
+
+impl TuneScope {
+    pub fn includes_priority(self) -> bool {
+        matches!(self, TuneScope::Priority | TuneScope::All)
+    }
+    pub fn includes_config(self) -> bool {
+        matches!(self, TuneScope::Config | TuneScope::All)
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TuneScope::Priority => "priority",
+            TuneScope::Config => "config",
+            TuneScope::All => "all",
+        }
+    }
+}
+
+impl std::fmt::Display for TuneScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Args, Default)]
+pub struct TuneArgs {
+    /// What you expect, in plain words: "ENG-12 should run before ENG-40", "tasks labelled
+    /// `chore` are low and use sonnet", "run three tasks at once". `-` reads stdin.
+    #[arg(value_name = "INSTRUCTION", conflicts_with_all = ["apply", "undo"])]
+    pub instruction: Option<String>,
+    /// Which files Claude may change.
+    #[arg(long, value_enum, default_value_t = TuneScope::All)]
+    pub scope: TuneScope,
+    /// Claude model for the tuning session (default: `tune.model`).
+    #[arg(short, long, value_name = "MODEL")]
+    pub model: Option<String>,
+    /// Apply the proposed change without asking (implied by a non-interactive `--apply`).
+    #[arg(short, long)]
+    pub yes: bool,
+    /// Produce and show the proposal but never apply it; `--apply` can apply it later.
+    #[arg(long, conflicts_with_all = ["yes", "apply", "undo"])]
+    pub dry_run: bool,
+    /// Apply an existing proposal instead of running Claude: the most recent one, or the
+    /// draft directory DIR (see `<state>/tune/`).
+    #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "latest", conflicts_with = "undo")]
+    pub apply: Option<String>,
+    /// Restore the files the most recent apply replaced.
+    #[arg(long)]
+    pub undo: bool,
+    /// Skip the budget policy in the simulations (rank only; faster).
+    #[arg(long)]
+    pub no_budget: bool,
+    /// Kill the Claude session after this many seconds (default: `tune.timeout_secs`).
+    #[arg(long, value_name = "SECS")]
+    pub timeout: Option<u64>,
 }
 
 #[derive(Debug, Subcommand)]

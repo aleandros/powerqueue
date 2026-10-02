@@ -1,4 +1,7 @@
-//! `powerqueue priority ...`: show, check, edit and explain `PRIORITY.md`.
+//! `powerqueue priority ...`: show, check, edit, explain and simulate `PRIORITY.md`.
+//!
+//! [`simulate_with`] and [`render_simulation`] are shared with `powerqueue
+//! tune`, which simulates a draft rules file against a draft config.
 
 use std::path::{Path, PathBuf};
 
@@ -9,7 +12,7 @@ use chrono::{DateTime, Utc};
 
 use crate::budget::{Estimator, Ledgers, Policy, RATE_LIMITS_KEY, RateLimitState, tier_weight};
 use crate::cli::output::{criticality_colored, model_colored, model_list_colored, table, truncate};
-use crate::cli::{Context, PriorityCommand, SimulateArgs, TaskRef};
+use crate::cli::{CheckArgs, Context, PriorityCommand, SimulateArgs, TaskRef};
 use crate::config::Config;
 use crate::domain::{Criticality, ModelTier, Task, TaskState};
 use crate::priority::{Evaluation, PriorityRules, RuleError};
@@ -20,7 +23,7 @@ use crate::store::Store;
 pub fn run(ctx: &mut Context, cmd: PriorityCommand) -> Result<i32> {
     match cmd {
         PriorityCommand::Show => show(ctx),
-        PriorityCommand::Check => check(ctx),
+        PriorityCommand::Check(args) => check(ctx, &args),
         PriorityCommand::Edit => edit(ctx),
         PriorityCommand::Explain(task) => explain(ctx, &task),
         PriorityCommand::Simulate(args) => simulate(ctx, args),
@@ -98,8 +101,14 @@ fn show(ctx: &mut Context) -> Result<i32> {
     Ok(0)
 }
 
-fn check(ctx: &mut Context) -> Result<i32> {
-    let path = rules_path(ctx)?;
+fn check(ctx: &mut Context, args: &CheckArgs) -> Result<i32> {
+    let path = match &args.file {
+        Some(p) => p.clone(),
+        None => rules_path(ctx)?,
+    };
+    if args.file.is_some() && !path.exists() {
+        bail!("{} does not exist", path.display());
+    }
     let Some(rules) = parse_file(ctx, &path)? else {
         return Ok(1);
     };
@@ -161,7 +170,7 @@ fn edit(ctx: &mut Context) -> Result<i32> {
     if !status.success() {
         bail!("editor `{editor}` exited with {status}");
     }
-    check(ctx)
+    check(ctx, &CheckArgs::default())
 }
 
 fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
@@ -223,29 +232,43 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
 
 /// One row of `priority simulate`.
 #[derive(Debug, Clone, serde::Serialize)]
-struct SimRow {
-    rank: usize,
-    key: String,
-    title: String,
-    state: TaskState,
+pub struct SimRow {
+    pub rank: usize,
+    pub key: String,
+    pub title: String,
+    pub state: TaskState,
     /// True when the task is not in the queue yet (`--linear` only).
-    new: bool,
-    schedulable: bool,
+    pub new: bool,
+    pub schedulable: bool,
     /// The task's position with the stored scores (None when it is new or not schedulable).
-    stored_rank: Option<usize>,
-    stored_criticality: Criticality,
-    stored_score: f64,
-    criticality: Criticality,
-    score: f64,
-    skip: bool,
-    preferred_models: Vec<ModelTier>,
+    pub stored_rank: Option<usize>,
+    pub stored_criticality: Criticality,
+    pub stored_score: f64,
+    pub criticality: Criticality,
+    pub score: f64,
+    pub skip: bool,
+    pub preferred_models: Vec<ModelTier>,
     /// What the budget policy would run (None = throttled or `--no-budget`).
-    model: Option<ModelTier>,
+    pub model: Option<ModelTier>,
     /// Why the policy chose (or refused) a model; empty with `--no-budget`.
-    policy: String,
+    pub policy: String,
     /// `true` for the first `scheduler.max_concurrent` schedulable rows.
-    would_start_now: bool,
-    reasons: Vec<String>,
+    pub would_start_now: bool,
+    pub reasons: Vec<String>,
+}
+
+/// The outcome of one simulation: what [`render_simulation`] prints and
+/// what `--json` serialises.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Simulation {
+    /// The rules file that was used.
+    pub rules: PathBuf,
+    pub warnings: Vec<RuleError>,
+    pub max_concurrent: u32,
+    /// True when a draft rules file or a draft config was used (the daemon
+    /// keeps using the live files).
+    pub draft: bool,
+    pub rows: Vec<SimRow>,
 }
 
 /// Dry-run the rules against the queue: every task is re-scored with the
@@ -257,9 +280,17 @@ fn simulate(ctx: &mut Context, args: SimulateArgs) -> Result<i32> {
         Some(p) => p.clone(),
         None => rules_path(ctx)?,
     };
-    let cfg = ctx.config_or_default()?.clone();
-    let store = ctx.store()?.clone();
-    let now = Utc::now();
+    let cfg = match &args.config {
+        Some(file) => {
+            let cfg = Config::load_draft(&ctx.paths, file)?;
+            let problems = cfg.validate();
+            if !problems.is_empty() {
+                bail!("{} is not valid:\n  - {}", file.display(), problems.join("\n  - "));
+            }
+            cfg
+        }
+        None => ctx.config_or_default()?.clone(),
+    };
 
     let rules = if path.exists() {
         match parse_file(ctx, &path)? {
@@ -280,15 +311,8 @@ fn simulate(ctx: &mut Context, args: SimulateArgs) -> Result<i32> {
         print_problems(&rules.warnings, "warning");
     }
 
-    let mut tasks = if args.all { store.list_tasks()? } else { store.list_open_tasks()? };
-    let mut new_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if args.linear {
-        for task in fetch_unqueued_linear_tasks(ctx, &cfg, &store)? {
-            new_keys.insert(task.key.clone());
-            tasks.push(task);
-        }
-    }
-    if tasks.is_empty() {
+    let sim = simulate_with(ctx, &args, &cfg, &rules, &path)?;
+    if sim.rows.is_empty() {
         if ctx.json {
             println!("{}", serde_json::json!({ "rules": path, "rows": [] }));
         } else {
@@ -299,6 +323,46 @@ fn simulate(ctx: &mut Context, args: SimulateArgs) -> Result<i32> {
             );
         }
         return Ok(0);
+    }
+    if ctx.json {
+        println!("{}", serde_json::to_string_pretty(&sim)?);
+        return Ok(0);
+    }
+    print!("{}", render_simulation(&sim, &args));
+    Ok(0)
+}
+
+/// Score and rank the queue with `rules` under `cfg`, exactly as
+/// `priority simulate` does, and return the rows (already truncated to
+/// `args.limit`). `path` is only recorded for display. Reads tasks, ledgers
+/// and cooldowns from the store; with `args.linear` it also fetches the
+/// queued Linear issues that have no task yet. Writes nothing.
+pub fn simulate_with(
+    ctx: &mut Context,
+    args: &SimulateArgs,
+    cfg: &Config,
+    rules: &PriorityRules,
+    path: &Path,
+) -> Result<Simulation> {
+    let store = ctx.store()?.clone();
+    let now = Utc::now();
+    let mut tasks = if args.all { store.list_tasks()? } else { store.list_open_tasks()? };
+    let mut new_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if args.linear {
+        for task in fetch_unqueued_linear_tasks(ctx, cfg, &store)? {
+            new_keys.insert(task.key.clone());
+            tasks.push(task);
+        }
+    }
+    let draft = args.file.is_some() || args.config.is_some();
+    if tasks.is_empty() {
+        return Ok(Simulation {
+            rules: path.to_path_buf(),
+            warnings: rules.warnings.clone(),
+            max_concurrent: cfg.scheduler.max_concurrent,
+            draft,
+            rows: Vec::new(),
+        });
     }
 
     // Rank with the stored scores first, to show what moves.
@@ -330,7 +394,7 @@ fn simulate(ctx: &mut Context, args: SimulateArgs) -> Result<i32> {
     let order = ranked(&simulated_tasks, now);
 
     // Budget policy, with the same reservation the daemon applies between starts.
-    let mut policy_input = if args.no_budget { None } else { Some(load_policy_input(&cfg, &store, now)?) };
+    let mut policy_input = if args.no_budget { None } else { Some(load_policy_input(cfg, &store, now)?) };
     let mut slots = cfg.scheduler.max_concurrent;
     let mut rows = Vec::with_capacity(order.len());
     for (rank, idx) in order.iter().enumerate() {
@@ -390,21 +454,13 @@ fn simulate(ctx: &mut Context, args: SimulateArgs) -> Result<i32> {
     if args.limit > 0 {
         rows.truncate(args.limit);
     }
-
-    if ctx.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "rules": path,
-                "warnings": rules.warnings,
-                "max_concurrent": cfg.scheduler.max_concurrent,
-                "rows": rows,
-            }))?
-        );
-        return Ok(0);
-    }
-    print_simulation(&path, &rows, &args, &cfg);
-    Ok(0)
+    Ok(Simulation {
+        rules: path.to_path_buf(),
+        warnings: rules.warnings.clone(),
+        max_concurrent: cfg.scheduler.max_concurrent,
+        draft,
+        rows,
+    })
 }
 
 /// Indices of `tasks` in the order the scheduler would consider them: the
@@ -479,13 +535,18 @@ fn fetch_unqueued_linear_tasks(ctx: &mut Context, cfg: &Config, store: &Store) -
     Ok(out)
 }
 
-fn print_simulation(path: &Path, rows: &[SimRow], args: &SimulateArgs, cfg: &Config) {
-    println!(
+/// The table `priority simulate` prints, plus the `--reasons` detail and the
+/// summary line, as text (colours follow the stdout colour setting).
+pub fn render_simulation(sim: &Simulation, args: &SimulateArgs) -> String {
+    use std::fmt::Write as _;
+    let (path, rows) = (&sim.rules, &sim.rows);
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
         "{} {} {}",
         "Simulated queue with".if_supports_color(Stream::Stdout, |t| t.bold()),
         path.display(),
-        format!("(max {} concurrent; nothing was written)", cfg.scheduler.max_concurrent)
-            .if_supports_color(Stream::Stdout, |t| t.dimmed())
+        format!("(max {} concurrent; nothing was written)", sim.max_concurrent).if_supports_color(Stream::Stdout, |t| t.dimmed())
     );
     let mut t = table();
     let mut header = vec!["#", "was", "task", "state", "criticality", "score", "prefers"];
@@ -530,15 +591,15 @@ fn print_simulation(path: &Path, rows: &[SimRow], args: &SimulateArgs, cfg: &Con
         row.push(truncate(&r.title, 40));
         t.add_row(row);
     }
-    println!("{t}");
+    let _ = writeln!(out, "{t}");
     if args.reasons {
         for r in rows {
-            println!("\n{} {}", r.key.if_supports_color(Stream::Stdout, |t| t.bold()), truncate(&r.title, 60));
+            let _ = writeln!(out, "\n{} {}", r.key.if_supports_color(Stream::Stdout, |t| t.bold()), truncate(&r.title, 60));
             for reason in &r.reasons {
-                println!("    · {reason}");
+                let _ = writeln!(out, "    · {reason}");
             }
             if !r.policy.is_empty() {
-                println!("    · policy: {}", r.policy);
+                let _ = writeln!(out, "    · policy: {}", r.policy);
             }
         }
     }
@@ -546,18 +607,20 @@ fn print_simulation(path: &Path, rows: &[SimRow], args: &SimulateArgs, cfg: &Con
     let recrit = rows.iter().filter(|r| !r.new && r.stored_criticality != r.criticality).count();
     let skipped = rows.iter().filter(|r| r.skip).count();
     let starting = rows.iter().filter(|r| r.would_start_now).count();
-    println!(
+    let _ = writeln!(
+        out,
         "{}",
         format!(
             "{} task(s); {starting} would start now (▶); {moved} change rank; {recrit} change criticality; {skipped} skipped. \
              `was` = rank with the stored scores; ↑/↓ = moved up/down from that rank.{}",
             rows.len(),
-            if args.file.is_some() {
-                " The daemon still uses the live file."
+            if sim.draft {
+                " The daemon still uses the live files."
             } else {
                 " The daemon applies the live file on its next tick."
             }
         )
         .if_supports_color(Stream::Stdout, |t| t.dimmed())
     );
+    out
 }

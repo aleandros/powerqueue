@@ -17,6 +17,7 @@ pub mod run;
 pub mod secrets;
 pub mod status;
 pub mod task;
+pub mod tune;
 pub mod update;
 
 use anyhow::Result;
@@ -57,6 +58,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 Command::Task(cmd) => task::run(&mut ctx, cmd),
                 Command::Attach(args) => attach::run(&mut ctx, args),
                 Command::Priority(cmd) => priority::run(&mut ctx, cmd),
+                Command::Tune(args) => tune::run(&mut ctx, args),
                 Command::Budget(cmd) => budget::run(&mut ctx, cmd),
                 Command::Linear(cmd) => linear::run(&mut ctx, cmd),
                 Command::Doctor(args) => doctor::run(&mut ctx, args),
