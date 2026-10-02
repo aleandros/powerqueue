@@ -267,7 +267,7 @@ rules.
 - normal: sonnet
 ```
 
-Pair with `budget.models.fable.min_criticality = "critical"` (the default) so
+Pair with `budget.providers.claude.models.fable.min_criticality = "critical"` (the default) so
 only critical tasks touch Fable early in the period.
 
 **Deprioritise chores without blocking them**

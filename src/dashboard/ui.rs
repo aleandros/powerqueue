@@ -13,7 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap};
 
 use crate::cli::output::human_duration;
-use crate::domain::{Criticality, ModelTier, TaskState};
+use crate::domain::{Criticality, ModelTier, Provider, TaskState};
 
 use super::app::DashboardApp;
 
@@ -145,14 +145,18 @@ pub fn criticality_style(c: Criticality) -> Style {
     }
 }
 
-/// Colour of a model tier; mirrors `cli::output::model_colored`.
-pub fn model_style(m: Option<ModelTier>) -> Style {
-    match m {
-        Some(ModelTier::Fable) => Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-        Some(ModelTier::Opus) => Style::default().fg(Color::Blue),
-        Some(ModelTier::Sonnet) => Style::default().fg(Color::Cyan),
-        Some(ModelTier::Haiku) => Style::default().fg(Color::DarkGray),
-        None => Style::default().fg(Color::DarkGray),
+/// Colour of a model; mirrors `cli::output::model_colored` (Claude tiers by
+/// alias, Codex green, Gemini yellow).
+pub fn model_style(m: Option<&ModelTier>) -> Style {
+    let Some(m) = m else { return Style::default().fg(Color::DarkGray) };
+    match (m.provider(), m.alias()) {
+        (Provider::Claude, "fable") => Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        (Provider::Claude, "opus") => Style::default().fg(Color::Blue),
+        (Provider::Claude, "sonnet") => Style::default().fg(Color::Cyan),
+        (Provider::Claude, "haiku") => Style::default().fg(Color::DarkGray),
+        (Provider::Claude, _) => Style::default(),
+        (Provider::Codex, _) => Style::default().fg(Color::Green),
+        (Provider::Gemini, _) => Style::default().fg(Color::Yellow),
     }
 }
 
@@ -183,7 +187,7 @@ pub fn draw(frame: &mut Frame, app: &DashboardApp) {
         .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
         .split(chunks[1]);
     draw_table(frame, app, main[0], &sym);
-    let tiers = app.snapshot.ledger.as_ref().map(|l| l.tiers.len()).unwrap_or(ModelTier::ALL.len()) as u16;
+    let tiers = app.snapshot.ledger.as_ref().map(|l| l.tiers.len()).unwrap_or(app.snapshot.shares.len().max(1)) as u16;
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(tiers + 2), Constraint::Min(5)])
@@ -256,7 +260,7 @@ fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) 
             Cell::from(r.key.clone()),
             Cell::from(r.state.as_str()).style(state_style(r.state)),
             Cell::from(r.criticality.as_str()).style(criticality_style(r.criticality)),
-            Cell::from(r.model.map(|m| m.alias()).unwrap_or("-")).style(model_style(r.model)),
+            Cell::from(r.model.as_ref().map(|m| m.as_str()).unwrap_or("-")).style(model_style(r.model.as_ref())),
             Cell::from(r.tokens.clone()),
             Cell::from(r.cpu.clone()),
             Cell::from(r.rss.clone()),
@@ -309,7 +313,7 @@ fn draw_budget(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols)
         return;
     };
     let elapsed = ledger.elapsed_fraction();
-    let tiers: Vec<_> = ModelTier::ALL.iter().map(|t| ledger.tier(*t)).collect();
+    let tiers: Vec<_> = ledger.tiers.clone();
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(tiers.iter().map(|_| Constraint::Length(1)).collect::<Vec<_>>())
@@ -369,7 +373,7 @@ fn draw_detail(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols)
             let started = s.started_at.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string();
             lines.push(Line::from(vec![
                 Span::raw(format!("session #{} ", s.attempt)),
-                Span::styled(s.model.alias(), model_style(Some(s.model))),
+                Span::styled(s.model.as_str(), model_style(Some(&s.model))),
                 Span::raw(format!(" {} started {started}", s.state)),
                 Span::raw(s.pane_id.as_ref().map(|p| format!(" pane {p}")).unwrap_or_default()),
             ]));

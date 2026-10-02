@@ -8,16 +8,53 @@ the remaining allowance, so powerqueue measures what it spends, lets you
 calibrate against `/usage`, and treats rate-limit errors as a hard signal.
 
 The code lives in `src/budget/`: `period.rs` (where we are in the period),
-`ledger.rs` (what was spent), `estimator.rs` (what a task will cost) and
-`policy.rs` (the decision). Config keys are in `[budget]` of `config.toml`.
+`ledger.rs` (what was spent; one `Ledger` per enabled provider in `Ledgers`),
+`probe.rs` (what a provider reports about its own allowance), `estimator.rs`
+(what a task will cost) and `policy.rs` (the decision). Budgets are per
+provider: the shared knobs live in `[budget]` of `config.toml`, everything
+about one subscription in `[budget.providers.<provider>]`. This page
+describes the Claude provider; Codex and Gemini have the same shape with
+their own defaults (see the README) and are experimental.
+
+```toml
+[budget]
+provider_order = ["claude", "codex", "gemini"]
+default_model = "sonnet"
+low_model = "sonnet"
+safety_margin = 0.05
+endgame_fraction = 0.8
+probe_interval_mins = 15
+
+[budget.providers.claude]
+enabled = true
+period_hours = 168
+period_anchor = "2026-10-05T14:00:00Z"   # optional; `budget set-reset`
+window_hours = 5                         # 0 = no window
+period_weighted_tokens = 80000000
+window_weighted_tokens = 12000000
+rate_limit_cooldown_mins = 30
+
+[budget.providers.claude.models.fable]
+rank = 10
+share = 0.25
+min_criticality = "critical"
+relax_after_fraction = 0.5
+weight = 5.0
+enabled = true
+# opus (rank 20), sonnet (30), haiku (40) likewise
+```
+
+Files from before this layout (`budget.period_hours`, `[budget.models.fable]`)
+still load: the keys are moved under `budget.providers.claude` on read and
+`doctor` notes the move.
 
 ## Periods and windows
 
-| Concept | Config | Default |
+| Concept | Config (`[budget.providers.claude]`) | Default |
 |---------|--------|---------|
 | period length | `period_hours` | 168 (one week) |
-| period start | `period_anchor` | none; set with `budget set-reset` |
-| rolling window | `window_hours` | 5 |
+| period start | `period_anchor` | none; set with `budget set-reset` or learned by a probe |
+| rolling window | `window_hours` | 5 (`0` = no window: window checks always pass) |
 | period budget | `period_weighted_tokens` | 80,000,000 weighted tokens |
 | window budget | `window_weighted_tokens` | 12,000,000 weighted tokens |
 
@@ -46,8 +83,9 @@ weighted = input_tokens
          + 5.00 × output_tokens
 ```
 
-Each tier then has a cost **weight** relative to Sonnet
-(`budget.models.<tier>.weight`; defaults Fable 5, Opus 3, Sonnet 1, Haiku 0.2):
+Each model then has a cost **weight** relative to Sonnet
+(`budget.providers.claude.models.<model>.weight`; defaults Fable 5, Opus 3,
+Sonnet 1, Haiku 0.2; a model that is not in the config counts with weight 1):
 
 ```text
 tier_weighted = weighted × tier.weight
@@ -65,14 +103,16 @@ current period and window and reports:
 
 ## Shares and minimum criticality
 
-Each tier gets a slice of the period and a floor on who may use it:
+Each model gets a slice of the period, a floor on who may use it and a
+`rank` that orders the provider's models from most to least capable (the
+downgrade chain is "next higher rank of the same provider"):
 
-| tier | `share` | `min_criticality` | `relax_after_fraction` | `weight` |
-|------|--------:|-------------------|-----------------------:|---------:|
-| fable | 0.25 | critical | 0.5 | 5.0 |
-| opus | 0.35 | high | 0.3 | 3.0 |
-| sonnet | 0.35 | low | 0.0 | 1.0 |
-| haiku | 0.05 | low | 0.0 | 0.2 |
+| model | `rank` | `share` | `min_criticality` | `relax_after_fraction` | `weight` |
+|------|-------:|--------:|-------------------|-----------------------:|---------:|
+| fable | 10 | 0.25 | critical | 0.5 | 5.0 |
+| opus | 20 | 0.35 | high | 0.3 | 3.0 |
+| sonnet | 30 | 0.35 | low | 0.0 | 1.0 |
+| haiku | 40 | 0.05 | low | 0.0 | 0.2 |
 
 With the defaults Fable may spend 20M weighted tokens per week, and only
 `critical` tasks may use it early on. Shares of enabled tiers must sum to at
@@ -161,7 +201,8 @@ also drains the same allowance. Two commands feed outside knowledge in:
   right.
 - `budget set-observed 43%` records what `/usage` shows. The ledger stores the
   observed fraction, the time, and powerqueue's own measured fraction at that
-  moment (`kv` key `budget.calibration`, `CALIBRATION_KEY`). From then on the
+  moment (`kv` key `budget.calibration.claude`, `CALIBRATION_KEY`;
+  `calibration_key(provider)` for the others). From then on the
   period fraction used by the policy's overall-budget gate is
   `measured + (observed - measured)`, clamped to 0..2, so pacing accounts for
   usage it cannot see. A calibration taken in an earlier period is ignored;
@@ -247,7 +288,7 @@ reason `preferred fable not eligible; downgraded to opus`.
 - `low` is still outside. The chore stays on Sonnet.
 
 To let chores soak up leftover Fable on weekends, set
-`budget.models.fable.min_criticality = "high"` or add a scoring rule that
+`budget.providers.claude.models.fable.min_criticality = "high"` or add a scoring rule that
 raises the chore to `normal` on Fridays (edit PRIORITY.md; it reloads live).
 
 ## Tuning with `doctor`
@@ -258,7 +299,9 @@ raises the chore to `normal` on Fridays (edit PRIORITY.md; it reloads live).
 
 | Check | Warns when | Hint |
 |-------|------------|------|
-| budget anchor | `period_anchor` not set | `budget set-reset <time from /usage>` |
+| `<provider>` budget anchor | `period_anchor` not set for an enabled provider | `budget set-reset <time from /usage> --provider <p>` |
+| config.toml | old flat `[budget]` keys found | move them under `[budget.providers.claude]` (`config set` does it) |
+| `codex` / `gemini` | enabled but binary missing, not logged in, or (always) experimental | install / log in, or keep the provider disabled |
 | cost estimator | fewer than 5 samples, or leave-one-out error above 60% | let tasks finish; add Linear estimates and consistent labels so buckets form |
 | fable reservation | under-used: > 70% of the period gone with < 30% of Fable's share spent | lower `models.fable.relax_after_fraction` or `min_criticality` |
 | fable reservation | over-paced: spent fraction more than 25 points ahead of elapsed | raise `models.fable.min_criticality` or lower its share |

@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     started_at       TEXT NOT NULL,
     ended_at         TEXT,
     last_activity_at TEXT NOT NULL,
-    error            TEXT
+    error            TEXT,
+    agent_session_id TEXT                      -- the CLI's own id (Codex thread, agy conversation); NULL for Claude
 );
 CREATE INDEX IF NOT EXISTS sessions_task_idx ON sessions(task_id);
 CREATE INDEX IF NOT EXISTS sessions_state_idx ON sessions(state);
@@ -115,7 +116,7 @@ CREATE TABLE IF NOT EXISTS hook_events (
 );
 CREATE INDEX IF NOT EXISTS hook_events_pending_idx ON hook_events(consumed_at, id);
 
--- Free-form key/value: daemon heartbeat, budget calibration, estimator state.
+-- Free-form key/value: daemon heartbeat, budget calibration/observed usage per provider, estimator state.
 CREATE TABLE IF NOT EXISTS kv (
     key        TEXT PRIMARY KEY,
     value      TEXT NOT NULL,

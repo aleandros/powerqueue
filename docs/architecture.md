@@ -80,7 +80,7 @@ connections. Timestamps are RFC 3339 UTC strings so they sort as text.
 | `events` | `store.log_event` on every state change, hook, crash, cleanup, error | `task show`, `logs --events`, dashboard, `doctor` (crash/idle/throttle rates by `kind`) |
 | `commands` | `task pause/resume/cancel/retry/model`, `stop`, dashboard keys (`DaemonCommand` as JSON: `Pause`, `Resume`, `Cancel`, `Retry`, `SetModel`, `SyncNow`, `Reload`, `Shutdown`) | daemon `drain_commands` at the start of each tick (marks `consumed_at`) |
 | `hook_events` | `powerqueue hook` (raw stdin JSON + event name) | daemon `drain_hook_events` (marks `consumed_at`) |
-| `kv` | daemon heartbeat (`daemon.heartbeat` = pid + time, every tick), budget calibration (`budget.calibration`, `CALIBRATION_KEY`), rate-limit cooldowns (`budget.rate_limits`, `RATE_LIMITS_KEY`) | `status`/`doctor`/dashboard header (heartbeat older than 30 s = daemon down), `budget show`, ledger, policy |
+| `kv` | daemon heartbeat (`daemon.heartbeat` = pid + time, every tick), budget calibration per provider (`budget.calibration.<provider>`, `CALIBRATION_KEY` for Claude), observed usage per provider (`budget.observed.<provider>`), rate-limit cooldowns (`budget.rate_limits`, `RATE_LIMITS_KEY`) | `status`/`doctor`/dashboard header (heartbeat older than 30 s = daemon down), `budget show`, ledger, policy |
 | `jev_scores` | priority re-score when Jev is enabled (keyed by task, with content hash) | priority re-score (cache hit unless the hash changed) |
 
 The estimator keeps no state of its own; it is rebuilt from

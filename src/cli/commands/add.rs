@@ -38,7 +38,7 @@ pub fn build_task(req: &NewTask) -> Result<Task> {
     task.description = req.description.trim().to_string();
     task.criticality = req.criticality.unwrap_or(Criticality::Normal);
     task.score = task.criticality.base_score();
-    task.model_override = req.model_override;
+    task.model_override = req.model_override.clone();
     task.labels = req.labels.iter().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
     if req.paused {
         task.state = TaskState::Paused;
@@ -159,7 +159,7 @@ mod tests {
             title: "x".into(),
             key: Some("MY-KEY".into()),
             criticality: Some(Criticality::High),
-            model_override: Some(ModelTier::Opus),
+            model_override: Some(ModelTier::opus()),
             labels: vec!["a".into(), " ".into()],
             paused: true,
             description: " body ".into(),
@@ -168,7 +168,7 @@ mod tests {
         assert_eq!(t.key, "MY-KEY");
         assert_eq!(t.state, TaskState::Paused);
         assert_eq!(t.labels, vec!["a".to_string()]);
-        assert_eq!(t.model_override, Some(ModelTier::Opus));
+        assert_eq!(t.model_override, Some(ModelTier::opus()));
         assert_eq!(t.description, "body");
         assert_eq!(t.score, Criticality::High.base_score());
     }

@@ -247,8 +247,8 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
             }
         );
     }
-    let model_line = match (task.model, task.model_override) {
-        (m, Some(o)) => format!("{} (forced: {})", m.map(|m| m.to_string()).unwrap_or("-".into()), o),
+    let model_line = match (&task.model, &task.model_override) {
+        (m, Some(o)) => format!("{} (forced: {})", m.as_ref().map(|m| m.to_string()).unwrap_or("-".into()), o),
         (Some(m), None) => m.to_string(),
         (None, None) => "auto".to_string(),
     };
@@ -306,7 +306,7 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
         for (s, u, stats) in &session_rows {
             table.add_row(vec![
                 Cell::new(s.attempt),
-                Cell::new(paint(color, output::model_colored(Some(s.model)), s.model.alias())),
+                Cell::new(paint(color, output::model_colored(Some(&s.model)), s.model.as_str())),
                 Cell::new(s.state.to_string()),
                 Cell::new(s.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())),
                 Cell::new(s.started_at.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string()),
@@ -378,12 +378,12 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     for r in &task.score_reasons {
         println!("    · {r}");
     }
-    if let Some(o) = task.model_override {
+    if let Some(o) = &task.model_override {
         println!("  model        forced to {o}");
     } else {
         println!(
             "  model        {} (chosen by the budget policy)",
-            task.model.map(|m| m.to_string()).unwrap_or("not chosen yet".into())
+            task.model.as_ref().map(|m| m.to_string()).unwrap_or("not chosen yet".into())
         );
     }
     if let Some(nb) = task.not_before {
@@ -481,15 +481,15 @@ pub fn run(ctx: &mut Context, cmd: TaskCommand) -> Result<i32> {
             let tier = parse_model_arg(&model)?;
             let store = ctx.store()?.clone();
             let mut t = find_task(&store, &task.task)?;
-            store.enqueue_command(&DaemonCommand::SetModel { task_id: t.id, model: tier })?;
-            t.model_override = tier;
+            store.enqueue_command(&DaemonCommand::SetModel { task_id: t.id, model: tier.clone() })?;
+            t.model_override = tier.clone();
             store.update_task(&t)?;
             store.log_event(
                 Some(t.id),
                 None,
                 EventLevel::Info,
                 "task.model_set",
-                &match tier {
+                &match &tier {
                     Some(m) => format!("model forced to {m} for the next attempt"),
                     None => "model override cleared (auto)".to_string(),
                 },
@@ -612,7 +612,9 @@ mod tests {
     #[test]
     fn model_arg_parsing() {
         assert_eq!(parse_model_arg("auto").unwrap(), None);
-        assert_eq!(parse_model_arg("Opus").unwrap(), Some(ModelTier::Opus));
+        assert_eq!(parse_model_arg("Opus").unwrap(), Some(ModelTier::opus()));
+        assert_eq!(parse_model_arg("gpt-6.1-sol").unwrap(), Some(ModelTier::new("gpt-6.1-sol")));
+        assert!(parse_model_arg("turbo").is_err());
         assert!(parse_model_arg("gpt").is_err());
     }
 }

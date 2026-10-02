@@ -337,7 +337,7 @@ impl PriorityRules {
                         reasons.push(format!("{} override for {}", fmt_delta(*d), task.key));
                     }
                     Override::Model(m) => {
-                        model = Some(*m);
+                        model = Some(m.clone());
                         reasons.push(format!("model {m} from ## Overrides"));
                     }
                 }
@@ -394,7 +394,7 @@ impl PriorityRules {
         if model.is_none()
             && let Some(m) = self.models.get(&criticality)
         {
-            model = Some(*m);
+            model = Some(m.clone());
             reasons.push(format!("model {m} from ## Models"));
         }
 
@@ -403,7 +403,7 @@ impl PriorityRules {
 
     /// Model the rules assign to a criticality, if any.
     pub fn model_for(&self, criticality: Criticality) -> Option<ModelTier> {
-        self.models.get(&criticality).copied()
+        self.models.get(&criticality).cloned()
     }
 
     /// Number of rules under the criticality sections.
@@ -881,7 +881,7 @@ mod tests {
         assert_eq!(rules.default_criticality, Criticality::Normal);
         assert_eq!(rules.scoring.len(), 4);
         assert!(rules.overrides.is_empty());
-        assert_eq!(rules.models[&Criticality::Critical], ModelTier::Fable);
+        assert_eq!(rules.models[&Criticality::Critical], ModelTier::fable());
         assert!(!rules.jev.enabled);
         assert_eq!(rules.jev.levels.len(), 4);
         assert!(rules.warnings.is_empty(), "{:?}", rules.warnings);
@@ -997,7 +997,7 @@ mod tests {
         let e = eval(&rules, &t);
         assert_eq!(e.criticality, Criticality::Low, "{:?}", e.reasons);
         assert_eq!(e.score, Criticality::Low.base_score() + 100.0);
-        assert_eq!(e.model, Some(ModelTier::Haiku));
+        assert_eq!(e.model, Some(ModelTier::haiku()));
         assert!(e.reasons.contains(&"low: override for ENG-1".to_string()));
         assert!(e.reasons.contains(&"+100 override for ENG-1".to_string()));
 
@@ -1005,7 +1005,7 @@ mod tests {
         t2.labels = vec!["incident".into()];
         let e2 = eval(&rules, &t2);
         assert_eq!(e2.criticality, Criticality::Critical);
-        assert_eq!(e2.model, Some(ModelTier::Opus));
+        assert_eq!(e2.model, Some(ModelTier::opus()));
         assert!(e2.reasons.contains(&"model opus from ## Overrides".to_string()));
 
         let e3 = eval(&rules, &linear_task("ENG-3"));
@@ -1022,10 +1022,10 @@ mod tests {
         let mut t = linear_task("ENG-1");
         t.linear_priority = Some(2);
         let e = eval(&rules, &t);
-        assert_eq!(e.model, Some(ModelTier::Opus));
+        assert_eq!(e.model, Some(ModelTier::opus()));
         assert!(e.reasons.contains(&"model opus from ## Models".to_string()));
         t.linear_priority = Some(3);
-        assert_eq!(eval(&rules, &t).model, Some(ModelTier::Sonnet));
+        assert_eq!(eval(&rules, &t).model, Some(ModelTier::sonnet()));
         let no_models = parse_ok("## High\n- priority: high\n");
         assert_eq!(eval(&no_models, &t).model, None);
         assert_eq!(rules.model_for(Criticality::Low), None);

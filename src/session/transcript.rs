@@ -214,7 +214,7 @@ mod tests {
         let rec = parse_line(&assistant_line("msg_1", r#"{"type":"text","text":"hi"}"#, TS), sid, tid).unwrap();
         assert_eq!(rec.message_id, "msg_1");
         assert_eq!(rec.model_id, "claude-fable-5-1");
-        assert_eq!(rec.tier, ModelTier::Fable);
+        assert_eq!(rec.tier, ModelTier::fable());
         assert_eq!(rec.usage.output_tokens, 100);
         assert_eq!(rec.usage.cache_creation_input_tokens, 500);
         assert_eq!(rec.usage.cache_read_input_tokens, 1000);
@@ -240,7 +240,7 @@ mod tests {
         let line = r#"{"type":"assistant","message":{"id":"m","model":"claude-sonnet-5-5","usage":{"output_tokens":1}}}"#;
         let rec = parse_line(line, sid, tid).unwrap();
         assert!((Utc::now() - rec.timestamp).num_seconds() < 5);
-        assert_eq!(rec.tier, ModelTier::Sonnet);
+        assert_eq!(rec.tier, ModelTier::sonnet());
     }
 
     #[test]

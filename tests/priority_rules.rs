@@ -31,8 +31,8 @@ fn template_parses_cleanly() {
     let r = rules();
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     assert_eq!(r.default_criticality, Criticality::Normal);
-    assert_eq!(r.models[&Criticality::Critical], ModelTier::Fable);
-    assert_eq!(r.models[&Criticality::High], ModelTier::Opus);
+    assert_eq!(r.models[&Criticality::Critical], ModelTier::fable());
+    assert_eq!(r.models[&Criticality::High], ModelTier::opus());
     assert!(!r.jev.enabled);
     assert_eq!(r.jev.levels.len(), 4);
 }
@@ -44,7 +44,7 @@ fn incident_label_is_critical_on_fable() {
     t.labels = vec!["Incident".into()];
     let e = r.evaluate(&t, t.created_at, None, 300.0, 2.0);
     assert_eq!(e.criticality, Criticality::Critical);
-    assert_eq!(e.model, Some(ModelTier::Fable));
+    assert_eq!(e.model, Some(ModelTier::fable()));
     assert!(!e.skip);
     assert_eq!(e.score, Criticality::Critical.base_score());
     assert!(e.reasons.iter().any(|r| r.starts_with("critical: matched rule at line")), "{:?}", e.reasons);
@@ -61,7 +61,7 @@ fn customer_high_priority_adds_scoring_bonuses() {
     assert_eq!(e.criticality, Criticality::High);
     // base 500 + 40 (customer) + 20 (priority high) - 30 (estimate > 8)
     assert_eq!(e.score, 530.0);
-    assert_eq!(e.model, Some(ModelTier::Opus));
+    assert_eq!(e.model, Some(ModelTier::opus()));
 }
 
 #[test]
@@ -73,7 +73,7 @@ fn manual_task_without_matches_is_normal_with_bonus_and_age() {
     assert_eq!(e.criticality, Criticality::Normal);
     // base 100 + 10 (source manual) + 150 (jev) + 6 (age)
     assert!((e.score - 266.0).abs() < 1e-6, "{}", e.score);
-    assert_eq!(e.model, Some(ModelTier::Sonnet));
+    assert_eq!(e.model, Some(ModelTier::sonnet()));
     assert!(e.reasons.iter().any(|x| x.starts_with("jev 0.50 × 300 = +150")), "{:?}", e.reasons);
     assert!(e.reasons.iter().any(|x| x.starts_with("age +6.0 (3.0h)")), "{:?}", e.reasons);
 }
@@ -98,7 +98,7 @@ fn overrides_pin_tickets() {
     assert!(e.skip);
     let e = r.evaluate(&linear_task("ENG-8", "x"), Utc::now(), None, 0.0, 0.0);
     assert_eq!(e.criticality, Criticality::Critical);
-    assert_eq!(e.model, Some(ModelTier::Haiku));
+    assert_eq!(e.model, Some(ModelTier::haiku()));
 }
 
 #[test]

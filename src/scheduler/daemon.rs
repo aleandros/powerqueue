@@ -15,9 +15,9 @@ use anyhow::{Context as _, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::Notify;
 
-use crate::budget::{Decision, Estimator, Ledger, PeriodClock, Policy, RATE_LIMITS_KEY, RateLimitState, tier_weight};
+use crate::budget::{Decision, Estimator, Ledgers, PeriodClock, Policy, RATE_LIMITS_KEY, RateLimitState, tier_weight};
 use crate::config::Config;
-use crate::domain::{DaemonCommand, EventLevel, ModelTier, Session, SessionState, Task, TaskId, TaskState};
+use crate::domain::{DaemonCommand, EventLevel, ModelTier, Provider, Session, SessionState, Task, TaskId, TaskState};
 use crate::jev::{JevClient, JevQuestion, content_hash};
 use crate::linear::{IssueFilter, LinearClient, sync_issues};
 use crate::paths::Paths;
@@ -292,8 +292,9 @@ impl Daemon {
         }
     }
 
+    /// Claude's period clock (hook cooldowns are capped at its period end).
     fn clock(&self, now: DateTime<Utc>) -> PeriodClock {
-        PeriodClock::from_config(&self.cfg.budget, now)
+        PeriodClock::from_provider(self.cfg.budget.provider(Provider::Claude), now)
     }
 
     // ------------------------------------------------------------ commands
@@ -397,7 +398,7 @@ impl Daemon {
             }
             DaemonCommand::SetModel { task_id, model } => {
                 let mut task = self.require_task(*task_id)?;
-                task.model_override = *model;
+                task.model_override = model.clone();
                 self.store.update_task(&task)?;
                 let msg = match model {
                     Some(m) => format!("model forced to {m} for the next attempt"),
@@ -990,7 +991,7 @@ impl Daemon {
             for rec in &records {
                 if self.store.record_usage(rec)? {
                     inserted += 1;
-                    weighted += rec.usage.weighted() * tier_weight(&self.cfg.budget, rec.tier);
+                    weighted += rec.usage.weighted() * tier_weight(&self.cfg.budget, &rec.tier);
                 }
             }
             let newest = reader.last_line_at.unwrap_or(now).min(now);
@@ -1134,8 +1135,7 @@ impl Daemon {
             return Ok(());
         }
         let estimator = Estimator::from_summaries(&self.store.task_usage_summaries()?);
-        let clock = self.clock(now);
-        let mut ledger = Ledger::load(&self.store, &self.cfg.budget, &clock, now)?;
+        let mut ledgers = Ledgers::load(&self.store, &self.cfg.budget, now)?;
         self.rt.rate_limits.clear_expired(now);
 
         let mut considered: HashSet<TaskId> = HashSet::new();
@@ -1149,18 +1149,18 @@ impl Daemon {
             // policy may still downgrade when the tier is out of budget.
             let rule_model =
                 self.rt.rules.evaluate(&task, now, None, 0.0, 0.0).model.or_else(|| self.rt.rules.model_for(task.criticality));
-            let preferred = task.model_override.or(rule_model);
-            let decision = Policy::new(&self.cfg.budget, &ledger, &self.rt.rate_limits).decide(&task, prediction, preferred);
-            match decision.model {
+            let preferred = task.model_override.clone().or(rule_model);
+            let decision = Policy::new(&self.cfg.budget, &ledgers, &self.rt.rate_limits).decide(&task, prediction, preferred);
+            match decision.model.clone() {
                 None => self.throttle(task, &decision, now)?,
                 Some(model) => {
-                    let cost = decision.prediction.weighted_tokens * tier_weight(&self.cfg.budget, model);
+                    let cost = decision.prediction.weighted_tokens * tier_weight(&self.cfg.budget, &model);
                     let key = task.key.clone();
                     let id = task.id;
-                    match self.start_task(task, model, &decision, now).await {
+                    match self.start_task(task, model.clone(), &decision, now).await {
                         Ok(()) => {
                             slots -= 1;
-                            reserve(&mut ledger, model, cost);
+                            reserve(&mut ledgers, &model, cost);
                         }
                         Err(e) => {
                             tracing::error!(task = %key, error = %format!("{e:#}"), "start failed");
@@ -1205,7 +1205,7 @@ impl Daemon {
     async fn start_task(&mut self, mut task: Task, model: ModelTier, decision: &Decision, now: DateTime<Utc>) -> Result<()> {
         let attempt = task.attempts + 1;
         task.state = TaskState::Starting;
-        task.model = Some(model);
+        task.model = Some(model.clone());
         self.store.update_task(&task)?;
         self.log(
             Some(task.id),
@@ -1260,8 +1260,8 @@ impl Daemon {
         let launched = self
             .rt
             .launcher
-            .prepare(&self.cfg, &task, session_id, model, attempt, resume, task.last_error.as_deref())
-            .and_then(|plan| self.rt.launcher.launch(&self.cfg, &task, &plan, session_id, model, attempt));
+            .prepare(&self.cfg, &task, session_id, &model, attempt, resume, task.last_error.as_deref())
+            .and_then(|plan| self.rt.launcher.launch(&self.cfg, &task, &plan, session_id, &model, attempt));
         let session = match launched {
             Ok(s) => s,
             Err(e) => {
@@ -1348,10 +1348,12 @@ impl Daemon {
     }
 }
 
-/// Count a predicted cost against the in-memory ledger so several launches in
-/// one tick do not each think they are the only one.
-fn reserve(ledger: &mut Ledger, tier: ModelTier, weighted_cost: f64) {
-    if let Some(t) = ledger.tiers.iter_mut().find(|t| t.tier == tier) {
+/// Count a predicted cost against the in-memory ledger of the model's
+/// provider so several launches in one tick do not each think they are the
+/// only one. A model whose provider has no ledger is ignored.
+fn reserve(ledgers: &mut Ledgers, tier: &ModelTier, weighted_cost: f64) {
+    let Some(ledger) = ledgers.for_model_mut(tier) else { return };
+    if let Some(t) = ledger.tiers.iter_mut().find(|t| t.tier == *tier) {
         t.period_weighted += weighted_cost;
         t.window_weighted += weighted_cost;
     }
@@ -1387,28 +1389,34 @@ async fn wait_for_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::budget::{Period, TierLedger};
+    use crate::budget::{AnchorSource, Ledger, Period, TierLedger};
 
     #[test]
     fn reserve_counts_against_tier_and_totals() {
         let now = Utc::now();
-        let mut ledger = Ledger {
+        let mut ledgers = Ledgers::single(Ledger {
+            provider: Provider::Claude,
             now,
             period: Period { start: now, end: now + Duration::days(7) },
             window: Period { start: now - Duration::hours(5), end: now },
-            tiers: vec![TierLedger { tier: ModelTier::Opus, period_budget: 100.0, ..Default::default() }],
+            tiers: vec![TierLedger { tier: ModelTier::opus(), period_budget: 100.0, ..Default::default() }],
             total_period_weighted: 0.0,
             total_window_weighted: 0.0,
             period_budget: 100.0,
             window_budget: 50.0,
+            window_enabled: true,
             calibration: None,
-        };
-        reserve(&mut ledger, ModelTier::Opus, 30.0);
-        reserve(&mut ledger, ModelTier::Haiku, 5.0);
-        assert_eq!(ledger.tier(ModelTier::Opus).period_weighted, 30.0);
-        assert_eq!(ledger.tier(ModelTier::Opus).window_weighted, 30.0);
+            observed: None,
+            anchor_source: AnchorSource::Default,
+        });
+        reserve(&mut ledgers, &ModelTier::opus(), 30.0);
+        reserve(&mut ledgers, &ModelTier::haiku(), 5.0);
+        reserve(&mut ledgers, &ModelTier::new("gpt-6-luna"), 7.0);
+        let ledger = ledgers.get(Provider::Claude).unwrap();
+        assert_eq!(ledger.tier(&ModelTier::opus()).period_weighted, 30.0);
+        assert_eq!(ledger.tier(&ModelTier::opus()).window_weighted, 30.0);
         assert_eq!(ledger.total_period_weighted, 35.0);
-        assert_eq!(ledger.total_window_weighted, 35.0);
+        assert_eq!(ledger.total_window_weighted, 35.0, "another provider's model never lands in claude's ledger");
     }
 
     #[test]

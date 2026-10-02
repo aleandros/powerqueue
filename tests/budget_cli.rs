@@ -23,7 +23,7 @@ impl Home {
         paths.ensure().expect("create layout");
         let mut cfg = Config::default();
         cfg.repo.path = dir.path().join("repo").display().to_string();
-        cfg.budget.period_anchor = Some("2026-09-28T00:00:00Z".to_string());
+        cfg.budget.providers.claude.period_anchor = Some("2026-09-28T00:00:00Z".to_string());
         cfg.save(&paths).expect("save config");
         Self { dir }
     }
@@ -113,7 +113,7 @@ fn budget_show_reports_spend_and_json() {
             task_id: task.id,
             message_id: "msg_1".into(),
             model_id: "claude-opus-5-5".into(),
-            tier: ModelTier::Opus,
+            tier: ModelTier::opus(),
             usage: TokenUsage {
                 input_tokens: 0,
                 output_tokens: 1000,
@@ -148,7 +148,7 @@ fn budget_set_reset_and_observed_and_clear_limits() {
         .success()
         .stdout(predicate::str::contains("2026-10-06 07:00 UTC"));
     let cfg = Config::load(&home.paths()).unwrap();
-    assert_eq!(cfg.budget.period_anchor.as_deref(), Some("2026-10-06T07:00:00Z"));
+    assert_eq!(cfg.budget.providers.claude.period_anchor.as_deref(), Some("2026-10-06T07:00:00Z"));
     home.cmd().args(["budget", "set-reset", "in 2d"]).assert().success();
     home.cmd().args(["budget", "set-reset", "whenever"]).assert().failure().stderr(predicate::str::contains("RFC 3339"));
 
@@ -160,9 +160,75 @@ fn budget_set_reset_and_observed_and_clear_limits() {
     home.cmd().args(["budget", "set-observed", "300"]).assert().failure();
 
     let mut limits = RateLimitState::default();
-    limits.mark(ModelTier::Fable, Utc::now() + chrono::Duration::hours(1));
+    limits.mark(ModelTier::fable(), Utc::now() + chrono::Duration::hours(1));
     store.kv_set(RATE_LIMITS_KEY, &limits).unwrap();
     home.cmd().args(["budget", "show"]).assert().success().stdout(predicate::str::contains("rate-limited"));
+    home.cmd().args(["budget", "clear-limits"]).assert().success();
+    assert!(store.kv_get::<RateLimitState>(RATE_LIMITS_KEY).unwrap().is_none());
+}
+
+#[test]
+fn budget_provider_flags_and_legacy_config_keep_working() {
+    let home = Home::new();
+    // A pre-multi-provider config.toml: flat [budget] keys and [budget.models.*].
+    let legacy = format!(
+        "[repo]\npath = \"{}\"\n[budget]\nperiod_anchor = \"2026-09-28T00:00:00Z\"\nperiod_weighted_tokens = 1000000\n\n[budget.models.fable]\nshare = 0.1\n",
+        home.path().join("repo").display()
+    );
+    std::fs::write(home.paths().config_file(), &legacy).unwrap();
+
+    let out = home.cmd().args(["--json", "budget", "show"]).assert().success().get_output().stdout.clone();
+    let ledger: serde_json::Value = serde_json::from_slice(&out).expect("ledger json");
+    assert_eq!(ledger["provider"], "claude");
+    assert_eq!(ledger["period_budget"].as_f64(), Some(1_000_000.0));
+    assert_eq!(ledger["period"]["start"], "2026-09-28T00:00:00Z");
+    let fable = ledger["tiers"].as_array().unwrap().iter().find(|t| t["tier"] == "fable").expect("fable tier");
+    assert_eq!(fable["period_budget"].as_f64(), Some(100_000.0), "legacy [budget.models.fable] share applies");
+
+    home.cmd().args(["config", "validate"]).assert().success().stdout(predicate::str::contains("is valid"));
+    home.cmd().args(["doctor", "--offline", "--json"]).assert().stdout(predicate::str::contains("old budget keys"));
+
+    // `config set` on the legacy key rewrites the file into the new shape.
+    home.cmd()
+        .args(["config", "set", "budget.models.fable.share", "0.2"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("budget.providers.claude.models.fable.share = 0.2"))
+        .stderr(predicate::str::contains("now lives at"));
+    let text = std::fs::read_to_string(home.paths().config_file()).unwrap();
+    assert!(!text.contains("[budget.models.fable]"), "{text}");
+    assert!(text.contains("[budget.providers.claude.models.fable]"), "{text}");
+    let cfg = Config::load(&home.paths()).unwrap();
+    assert!(cfg.deprecations().is_empty(), "{:?}", cfg.deprecations());
+    assert_eq!(cfg.budget.providers.claude.period_weighted_tokens, 1_000_000);
+    assert_eq!(cfg.budget.providers.claude.models[&ModelTier::fable()].share, 0.2);
+
+    // --provider on the write commands; a disabled provider is refused for set-observed.
+    home.cmd()
+        .args(["budget", "set-reset", "2026-10-06T07:00:00Z", "--provider", "codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("codex period anchor set"));
+    let cfg = Config::load(&home.paths()).unwrap();
+    assert_eq!(cfg.budget.providers.codex.period_anchor.as_deref(), Some("2026-10-06T07:00:00Z"));
+    assert_eq!(cfg.budget.providers.claude.period_anchor.as_deref(), Some("2026-09-28T00:00:00Z"));
+    home.cmd()
+        .args(["budget", "set-observed", "20%", "--provider", "codex"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not enabled"));
+    home.cmd().args(["budget", "set-observed", "20%", "--provider", "antigravity"]).assert().failure();
+    home.cmd().args(["budget", "set-observed", "20%", "--provider", "bard"]).assert().failure();
+
+    let store = home.store();
+    let mut limits = RateLimitState::default();
+    limits.mark(ModelTier::fable(), Utc::now() + chrono::Duration::hours(1));
+    limits.mark(ModelTier::new("gpt-6.1-sol"), Utc::now() + chrono::Duration::hours(1));
+    store.kv_set(RATE_LIMITS_KEY, &limits).unwrap();
+    home.cmd().args(["budget", "clear-limits", "--provider", "codex"]).assert().success();
+    let left: RateLimitState = store.kv_get(RATE_LIMITS_KEY).unwrap().expect("claude cooldown remains");
+    assert!(left.exhausted_until.contains_key(&ModelTier::fable()));
+    assert_eq!(left.exhausted_until.len(), 1);
     home.cmd().args(["budget", "clear-limits"]).assert().success();
     assert!(store.kv_get::<RateLimitState>(RATE_LIMITS_KEY).unwrap().is_none());
 }

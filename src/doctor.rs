@@ -19,9 +19,9 @@ use anyhow::{Context as _, Result, anyhow};
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::budget::{Estimator, Ledger, PeriodClock};
+use crate::budget::{Estimator, Ledgers};
 use crate::config::{Config, REPO_CONFIG_FILE, RepoOverrides};
-use crate::domain::{EventLevel, ModelTier, SessionState, TaskState};
+use crate::domain::{EventLevel, ModelTier, Provider, SessionState, TaskState};
 use crate::jev::JevClient;
 use crate::linear::client::LinearClient;
 use crate::paths::Paths;
@@ -113,14 +113,15 @@ pub fn fable_pacing(elapsed: f64, spent: f64) -> Option<(Status, String, String)
         return Some((
             Status::Warn,
             format!("Fable under-used: {:.0}% of its share spent with {:.0}% of the period gone", spent * 100.0, elapsed * 100.0),
-            "lower budget.models.fable.relax_after_fraction or min_criticality so more tasks may use Fable".to_string(),
+            "lower budget.providers.claude.models.fable.relax_after_fraction or min_criticality so more tasks may use Fable"
+                .to_string(),
         ));
     }
     if spent > elapsed + 0.25 {
         return Some((
             Status::Warn,
             format!("Fable over-paced: {:.0}% of its share spent after {:.0}% of the period", spent * 100.0, elapsed * 100.0),
-            "raise budget.models.fable.min_criticality or lower its share".to_string(),
+            "raise budget.providers.claude.models.fable.min_criticality or lower its share".to_string(),
         ));
     }
     None
@@ -314,7 +315,15 @@ fn check_config(cfg: &Config, paths: &Paths) -> CheckResult {
         return CheckResult::fail(CONF, "config.toml", format!("{} does not exist", file.display()), "run `powerqueue init`");
     }
     let problems = cfg.validate();
-    if problems.is_empty() {
+    let deprecations = cfg.deprecations();
+    if problems.is_empty() && !deprecations.is_empty() {
+        CheckResult::warn(
+            CONF,
+            "config.toml",
+            format!("{} uses old budget keys: {}", file.display(), deprecations.join("; ")),
+            "budgets are per provider now: move the flat [budget] keys and [budget.models.*] under [budget.providers.claude] (`powerqueue config set` rewrites them for you)",
+        )
+    } else if problems.is_empty() {
         CheckResult::ok(CONF, "config.toml", format!("{} is valid", file.display()))
     } else {
         CheckResult::fail(
@@ -413,16 +422,78 @@ fn check_repo_overrides(cfg: &Config) -> CheckResult {
     }
 }
 
-fn check_period_anchor(cfg: &Config) -> CheckResult {
-    match &cfg.budget.period_anchor {
-        Some(a) => CheckResult::ok(CONF, "budget anchor", format!("period resets anchored at {a}")),
-        None => CheckResult::warn(
+/// One anchor check per enabled provider.
+fn check_period_anchors(cfg: &Config) -> Vec<CheckResult> {
+    cfg.budget
+        .enabled_providers_in_order()
+        .into_iter()
+        .map(|p| {
+            let name = format!("{p} budget anchor");
+            match &cfg.budget.provider(p).period_anchor {
+                Some(a) => CheckResult::ok(CONF, &name, format!("period resets anchored at {a}")),
+                None => CheckResult::warn(
+                    CONF,
+                    &name,
+                    format!("budget.providers.{p}.period_anchor is not set; pacing assumes Monday 00:00 UTC"),
+                    format!("run `powerqueue budget set-reset <time> --provider {p}` with the reset the provider shows"),
+                ),
+            }
+        })
+        .collect()
+}
+
+/// Enabled non-Claude providers: binary on PATH, login state, and a note that
+/// sessions for them are not launched by this version.
+fn check_providers(cfg: &Config) -> Vec<CheckResult> {
+    let mut out = Vec::new();
+    for p in cfg.budget.enabled_providers_in_order() {
+        if p == Provider::Claude {
+            continue;
+        }
+        let settings = cfg.launch_settings(p);
+        let agent = crate::session::agent_for(p);
+        let name = p.as_str();
+        match which::which(&settings.binary) {
+            Err(_) => out.push(CheckResult::fail(
+                ENV,
+                name,
+                format!("budget.providers.{p}.enabled is true but `{}` is not on PATH", settings.binary),
+                format!("install the {} or set budget.providers.{p}.enabled = false", p.display_name()),
+            )),
+            Ok(path) => {
+                match agent.auth_status(&settings.binary) {
+                    Ok(a) if a.logged_in => out.push(CheckResult::ok(ENV, name, format!("{} ({})", a.detail, path.display()))),
+                    Ok(a) => out.push(CheckResult::warn(
+                        ENV,
+                        name,
+                        format!("`{}` is not logged in ({})", settings.binary, a.detail),
+                        format!("log in to the {} before enabling it", p.display_name()),
+                    )),
+                    Err(e) => out.push(CheckResult::warn(ENV, name, format!("{e:#}"), "reinstall the CLI")),
+                }
+                if !agent.allowed_modes().contains(&settings.mode.as_str()) {
+                    out.push(CheckResult::fail(
+                        CONF,
+                        name,
+                        format!("{name} mode `{}` is not one of {}", settings.mode, agent.allowed_modes().join("|")),
+                        "fix it in config.toml",
+                    ));
+                }
+            }
+        }
+        out.push(CheckResult::warn(
             CONF,
-            "budget anchor",
-            "budget.period_anchor is not set; pacing assumes Monday 00:00 UTC",
-            "run `powerqueue budget set-reset <time>` with the reset shown by /usage in Claude Code",
-        ),
+            name,
+            format!(
+                "{} support is experimental: its budget is tracked but this version does not launch {name} sessions",
+                p.display_name()
+            ),
+            format!(
+                "keep budget.providers.{p}.enabled = false until the {name} launcher ships, or accept that tasks stay on Claude"
+            ),
+        ));
     }
+    out
 }
 
 /// Interactive Claude Code blocks on a trust dialog in untrusted folders.
@@ -860,7 +931,7 @@ fn check_rates(cfg: &Config, store: &Store) -> Vec<CheckResult> {
     let throttles = store.count_events_of_kind("task.throttled", Utc::now() - Duration::hours(24)).unwrap_or(0);
     let status = if throttles > MAX_THROTTLES_PER_DAY { Status::Warn } else { Status::Ok };
     out.push(CheckResult::new(ALGO, "throttling", status, format!("{throttles} throttle event(s) in 24 h")).hint(if status == Status::Warn {
-        "tasks wait on budget often: raise budget.period_weighted_tokens / window_weighted_tokens or lower the shares of expensive tiers"
+        "tasks wait on budget often: raise budget.providers.claude.period_weighted_tokens / window_weighted_tokens or lower the shares of expensive tiers"
     } else {
         ""
     }));
@@ -869,16 +940,23 @@ fn check_rates(cfg: &Config, store: &Store) -> Vec<CheckResult> {
 
 fn check_ledger(cfg: &Config, store: &Store) -> Vec<CheckResult> {
     let now = Utc::now();
-    let clock = PeriodClock::from_config(&cfg.budget, now);
-    let ledger = match Ledger::load(store, &cfg.budget, &clock, now) {
+    let ledgers = match Ledgers::load(store, &cfg.budget, now) {
         Ok(l) => l,
         Err(e) => {
             return vec![CheckResult::warn(ALGO, "budget ledger", format!("cannot load ledger: {e:#}"), "check the usage table")];
         }
     };
+    let Some(ledger) = ledgers.get(Provider::Claude) else {
+        return vec![CheckResult::warn(
+            ALGO,
+            "budget ledger",
+            "the claude provider is disabled; no tasks can run in this version",
+            "set budget.providers.claude.enabled = true",
+        )];
+    };
     let mut out = Vec::new();
     let elapsed = ledger.elapsed_fraction();
-    let fable = ledger.tier(ModelTier::Fable);
+    let fable = ledger.tier(&ModelTier::fable());
     let spent = fable.period_spent_fraction();
     match fable_pacing(elapsed, spent) {
         Some((status, detail, hint)) => out.push(CheckResult::new(ALGO, "fable reservation", status, detail).hint(hint)),
@@ -889,18 +967,21 @@ fn check_ledger(cfg: &Config, store: &Store) -> Vec<CheckResult> {
         )),
     }
     let window = ledger.window_fraction();
-    if window > MAX_WINDOW_FRACTION {
+    let window_hours = cfg.budget.providers.claude.window_hours;
+    if !ledger.window_enabled {
+        out.push(CheckResult::ok(ALGO, "window pressure", "no rolling window configured (window_hours = 0)"));
+    } else if window > MAX_WINDOW_FRACTION {
         out.push(CheckResult::warn(
             ALGO,
             "window pressure",
-            format!("{:.0}% of the {}h window budget is spent", window * 100.0, cfg.budget.window_hours),
-            "lower scheduler.max_concurrent or raise budget.window_weighted_tokens if /usage shows headroom",
+            format!("{:.0}% of the {window_hours}h window budget is spent", window * 100.0),
+            "lower scheduler.max_concurrent or raise budget.providers.claude.window_weighted_tokens if /usage shows headroom",
         ));
     } else {
         out.push(CheckResult::ok(
             ALGO,
             "window pressure",
-            format!("{:.0}% of the {}h window budget spent", window * 100.0, cfg.budget.window_hours),
+            format!("{:.0}% of the {window_hours}h window budget spent", window * 100.0),
         ));
     }
     out
@@ -926,7 +1007,8 @@ pub async fn run_all(
     results.push(check_worktree_root(cfg, paths));
     results.push(check_priority_file(cfg, paths));
     results.push(check_repo_overrides(cfg));
-    results.push(check_period_anchor(cfg));
+    results.extend(check_period_anchors(cfg));
+    results.extend(check_providers(cfg));
     results.push(check_workspace_trust(cfg, fix));
 
     results.extend(check_secrets(cfg, secrets, online).await);
@@ -1053,9 +1135,16 @@ mod tests {
         cfg.repo.path = dir.path().display().to_string();
         cfg.save(&paths).unwrap();
         assert_eq!(check_config(&cfg, &paths).status, Status::Ok);
-        assert_eq!(check_period_anchor(&cfg).status, Status::Warn);
-        cfg.budget.period_anchor = Some("2026-03-02T09:00:00Z".into());
-        assert_eq!(check_period_anchor(&cfg).status, Status::Ok);
+        let anchors = check_period_anchors(&cfg);
+        assert_eq!(anchors.len(), 1, "one check per enabled provider: {anchors:?}");
+        assert_eq!(anchors[0].status, Status::Warn);
+        cfg.budget.providers.claude.period_anchor = Some("2026-03-02T09:00:00Z".into());
+        assert_eq!(check_period_anchors(&cfg)[0].status, Status::Ok);
+        cfg.budget.providers.codex.enabled = true;
+        let anchors = check_period_anchors(&cfg);
+        assert_eq!(anchors.len(), 2);
+        assert!(anchors[1].name.contains("codex"), "{anchors:?}");
+        assert_eq!(anchors[1].status, Status::Warn);
         assert_eq!(check_worktree_root(&cfg, &paths).status, Status::Ok);
         assert_eq!(check_repo_overrides(&cfg).status, Status::Ok);
         std::fs::write(dir.path().join(REPO_CONFIG_FILE), "nope = 1").unwrap();

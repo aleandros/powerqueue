@@ -107,7 +107,7 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             task_id: TaskId::new(),
             attempt: 1,
-            model: ModelTier::Sonnet,
+            model: ModelTier::sonnet(),
             state: SessionState::Running,
             tmux_session: "powerqueue-test-none".into(),
             tmux_window: "@1".into(),
@@ -119,6 +119,7 @@ mod tests {
             ended_at: None,
             last_activity_at: now,
             error: None,
+            agent_session_id: None,
         }
     }
 

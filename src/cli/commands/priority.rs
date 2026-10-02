@@ -183,7 +183,7 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     println!("  rules:       {}", path.display());
     println!("  criticality: {}", criticality_colored(eval.criticality));
     println!("  score:       {:.1}", eval.score);
-    println!("  model:       {}", model_colored(eval.model));
+    println!("  model:       {}", model_colored(eval.model.as_ref()));
     if eval.skip {
         println!("  skip:        {}", "yes (override)".if_supports_color(Stream::Stdout, |t| t.red()));
     }

@@ -62,7 +62,7 @@ impl Default for Answers {
             jev_enabled: false,
             max_concurrent: crate::config::SchedulerConfig::default().max_concurrent,
             permission_mode: crate::config::ClaudeConfig::default().permission_mode,
-            period_weighted_tokens: budget.period_weighted_tokens,
+            period_weighted_tokens: budget.providers.claude.period_weighted_tokens,
             period_anchor: None,
         }
     }
@@ -83,9 +83,11 @@ impl Answers {
             jev_enabled: cfg.priority.jev.enabled,
             max_concurrent: cfg.scheduler.max_concurrent,
             permission_mode: cfg.claude.permission_mode.clone(),
-            period_weighted_tokens: cfg.budget.period_weighted_tokens,
+            period_weighted_tokens: cfg.budget.providers.claude.period_weighted_tokens,
             period_anchor: cfg
                 .budget
+                .providers
+                .claude
                 .period_anchor
                 .as_deref()
                 .and_then(|a| DateTime::parse_from_rfc3339(a).ok())
@@ -107,8 +109,9 @@ impl Answers {
         cfg.priority.jev.enabled = self.jev_enabled;
         cfg.scheduler.max_concurrent = self.max_concurrent;
         cfg.claude.permission_mode = self.permission_mode.clone();
-        cfg.budget.period_weighted_tokens = self.period_weighted_tokens;
-        cfg.budget.period_anchor = self.period_anchor.map(|a| a.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        cfg.budget.providers.claude.period_weighted_tokens = self.period_weighted_tokens;
+        cfg.budget.providers.claude.period_anchor =
+            self.period_anchor.map(|a| a.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
     }
 }
 
@@ -1048,7 +1051,7 @@ mod tests {
         assert!(cfg.priority.jev.enabled);
         assert_eq!(cfg.scheduler.max_concurrent, 3);
         assert_eq!(cfg.claude.permission_mode, "bypassPermissions");
-        assert_eq!(cfg.budget.period_anchor.as_deref(), Some("2026-03-02T09:00:00Z"));
+        assert_eq!(cfg.budget.providers.claude.period_anchor.as_deref(), Some("2026-03-02T09:00:00Z"));
         assert!(cfg.validate().is_empty());
     }
 
@@ -1097,7 +1100,7 @@ mod tests {
         cfg.claude.permission_mode = "manual".into();
         cfg.claude.allowed_tools = vec!["Bash(git *)".into()];
         cfg.scheduler.max_concurrent = 4;
-        cfg.budget.period_anchor = Some("2026-03-02T09:00:00Z".into());
+        cfg.budget.providers.claude.period_anchor = Some("2026-03-02T09:00:00Z".into());
 
         let mut answers = Answers::from_config(&cfg);
         assert_eq!(answers.repo_path, PathBuf::from("/tmp/repo"));

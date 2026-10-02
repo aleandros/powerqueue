@@ -10,13 +10,13 @@
 //! powerqueue task <show|list|complete|block|cancel|pause|resume|retry|explain|model>
 //! powerqueue attach <task>        open the task's tmux window
 //! powerqueue priority <show|check|edit|explain>
-//! powerqueue budget <show|set-reset|set-observed|clear-limits>
+//! powerqueue budget <show|set-reset|set-observed|clear-limits|estimate> [--provider <p>]
 //! powerqueue linear <teams|states|test|sync>
 //! powerqueue doctor [--fix]       diagnostics + tuning advice
 //! powerqueue logs [-f] [--task]   read the daemon log
 //! powerqueue config <show|get|set|unset|path|edit|validate>
 //! powerqueue secrets <set|unset|list>
-//! powerqueue hook ...             (internal) called by Claude Code hooks
+//! powerqueue hook ...             (internal) called by agent CLI hooks (--provider claude|codex|gemini)
 //! powerqueue completions <shell>
 //! ```
 
@@ -28,7 +28,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::domain::{Criticality, ModelTier};
+use crate::domain::{Criticality, ModelTier, Provider};
 
 pub use context::Context;
 
@@ -170,7 +170,7 @@ pub struct AddArgs {
     /// critical | high | normal | low.
     #[arg(short, long, value_parser = parse_criticality)]
     pub criticality: Option<Criticality>,
-    /// Force a model tier: fable | opus | sonnet | haiku.
+    /// Force a model: fable | opus | sonnet | haiku, or another provider's model (gpt-6.1-sol, gemini-3-pro, codex:<name>).
     #[arg(short, long, value_parser = parse_model)]
     pub model: Option<ModelTier>,
     /// Explicit key (default: `manual-<id>`).
@@ -218,7 +218,7 @@ pub enum TaskCommand {
     Model {
         #[command(flatten)]
         task: TaskRef,
-        /// fable | opus | sonnet | haiku | auto
+        /// fable | opus | sonnet | haiku | auto, or another provider's model (gpt-6.1-sol, gemini-3-pro)
         model: String,
     },
     /// Print the last screen of the task's tmux pane.
@@ -267,14 +267,28 @@ pub enum PriorityCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum BudgetCommand {
-    /// Show period/window spend per tier and what the policy would allow.
+    /// Show period/window spend per model and what the policy would allow.
     Show,
-    /// Record the period reset instant shown by `/usage` in Claude Code (RFC 3339 or "in 3d4h").
-    SetReset { when: String },
-    /// Calibrate pacing with the usage percentage shown by `/usage` (e.g. `43%`).
-    SetObserved { percent: String },
-    /// Forget rate-limit cooldowns.
-    ClearLimits,
+    /// Record a provider's period reset instant (from `/usage` in Claude Code; RFC 3339 or "in 3d4h").
+    SetReset {
+        when: String,
+        /// Which provider's budget to set.
+        #[arg(long, value_enum, default_value_t = Provider::Claude)]
+        provider: Provider,
+    },
+    /// Calibrate a provider's pacing with the usage percentage it shows (e.g. `43%`).
+    SetObserved {
+        percent: String,
+        /// Which provider's budget to calibrate.
+        #[arg(long, value_enum, default_value_t = Provider::Claude)]
+        provider: Provider,
+    },
+    /// Forget a provider's rate-limit cooldowns.
+    ClearLimits {
+        /// Which provider's cooldowns to forget.
+        #[arg(long, value_enum, default_value_t = Provider::Claude)]
+        provider: Provider,
+    },
     /// Show the cost estimator's view of a task (or all history).
     Estimate { task: Option<String> },
 }
@@ -360,6 +374,9 @@ pub struct HookArgs {
     pub session: Option<String>,
     #[arg(long)]
     pub event: String,
+    /// Which agent CLI sent the hook; payloads of other providers are normalised to the Claude shape.
+    #[arg(long, value_enum, default_value_t = Provider::Claude)]
+    pub provider: Provider,
 }
 
 fn parse_criticality(s: &str) -> Result<Criticality, String> {
@@ -375,6 +392,19 @@ impl ValueEnum for Criticality {
     }
     fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
         Some(clap::builder::PossibleValue::new(self.as_str()))
+    }
+}
+
+impl ValueEnum for Provider {
+    fn value_variants<'a>() -> &'a [Self] {
+        &Provider::ALL
+    }
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        let v = clap::builder::PossibleValue::new(self.as_str());
+        Some(match self {
+            Provider::Gemini => v.aliases(["antigravity", "agy"]),
+            _ => v,
+        })
     }
 }
 

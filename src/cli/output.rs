@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use owo_colors::OwoColorize;
 
-use crate::domain::{Criticality, ModelTier, TaskState};
+use crate::domain::{Criticality, ModelTier, Provider, TaskState};
 
 static COLOR: AtomicBool = AtomicBool::new(true);
 
@@ -111,16 +111,23 @@ pub fn criticality_colored(c: Criticality) -> String {
     }
 }
 
-pub fn model_colored(m: Option<ModelTier>) -> String {
+/// A model name coloured by provider and capability: Claude's tiers keep
+/// their colours (fable magenta, opus blue, sonnet cyan, haiku dim), Codex
+/// models are green and Gemini models yellow.
+pub fn model_colored(m: Option<&ModelTier>) -> String {
     if !color_enabled() {
-        return m.map(|m| m.alias().to_string()).unwrap_or_else(|| "-".to_string());
+        return m.map(|m| m.as_str().to_string()).unwrap_or_else(|| "-".to_string());
     }
-    match m {
-        Some(ModelTier::Fable) => "fable".magenta().bold().to_string(),
-        Some(ModelTier::Opus) => "opus".blue().to_string(),
-        Some(ModelTier::Sonnet) => "sonnet".cyan().to_string(),
-        Some(ModelTier::Haiku) => "haiku".dimmed().to_string(),
-        None => "-".dimmed().to_string(),
+    let Some(m) = m else { return "-".dimmed().to_string() };
+    let name = m.as_str();
+    match (m.provider(), m.alias()) {
+        (Provider::Claude, "fable") => name.magenta().bold().to_string(),
+        (Provider::Claude, "opus") => name.blue().to_string(),
+        (Provider::Claude, "sonnet") => name.cyan().to_string(),
+        (Provider::Claude, "haiku") => name.dimmed().to_string(),
+        (Provider::Claude, _) => name.to_string(),
+        (Provider::Codex, _) => name.green().to_string(),
+        (Provider::Gemini, _) => name.yellow().to_string(),
     }
 }
 

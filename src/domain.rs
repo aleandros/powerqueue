@@ -117,86 +117,308 @@ impl FromStr for Criticality {
     }
 }
 
-/// Claude model tiers that the scheduler can pick between.
-/// `weight` orders by cost: Fable is the most capable and the scarcest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default)]
+/// A coding-agent CLI that can run tasks and has its own subscription budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ModelTier {
-    Fable,
-    Opus,
-    #[default]
-    Sonnet,
-    Haiku,
+pub enum Provider {
+    /// Claude Code (`claude`).
+    Claude,
+    /// OpenAI Codex CLI (`codex`).
+    Codex,
+    /// Google Antigravity CLI (`agy`), the CLI behind Google AI Pro/Ultra.
+    Gemini,
 }
 
+impl Provider {
+    pub const ALL: [Provider; 3] = [Provider::Claude, Provider::Codex, Provider::Gemini];
+
+    /// Canonical lower-case name used in config keys, CLI flags and kv keys.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Provider::Claude => "claude",
+            Provider::Codex => "codex",
+            Provider::Gemini => "gemini",
+        }
+    }
+
+    /// Human name of the product behind the provider.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Provider::Claude => "Claude Code",
+            Provider::Codex => "Codex CLI",
+            Provider::Gemini => "Antigravity CLI",
+        }
+    }
+
+    /// The model unknown ids of this provider are accounted as: a mid-range
+    /// model so pacing stays conservative without inventing a new one.
+    pub fn default_model(&self) -> ModelTier {
+        match self {
+            Provider::Claude => ModelTier::sonnet(),
+            Provider::Codex => ModelTier::new("gpt-6-astra"),
+            Provider::Gemini => ModelTier::new("gemini-3-pro"),
+        }
+    }
+}
+
+impl fmt::Display for Provider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Provider {
+    type Err = String;
+    /// Accepts the canonical names plus `antigravity` / `agy` for `gemini`
+    /// and `claude-code` / `codex-cli` spellings.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "claude" | "claude-code" | "anthropic" => Ok(Provider::Claude),
+            "codex" | "codex-cli" | "openai" => Ok(Provider::Codex),
+            "gemini" | "antigravity" | "agy" | "google" => Ok(Provider::Gemini),
+            other => {
+                Err(format!("unknown provider `{other}` (expected claude|codex|gemini; `antigravity`/`agy` also mean gemini)"))
+            }
+        }
+    }
+}
+
+/// A model the scheduler can pick: the canonical alias the provider's CLI
+/// accepts (`fable`, `opus`, `sonnet`, `haiku`, `gpt-6.1-sol`, `gemini-3-pro`,
+/// ...). String-backed so users can add models in config without a release.
+///
+/// The provider is inferred from the name (see [`ModelTier::provider`]); a
+/// name that does not follow the known patterns can be given with an explicit
+/// `provider:name` prefix (`codex:custom-slug`), which is kept in the
+/// canonical form. Serialises as a plain string. Orders alphabetically, which
+/// is only used for stable map keys; capability order lives in
+/// `budget.providers.<p>.models.<m>.rank`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ModelTier(String);
+
+/// Claude aliases that stand on their own.
+const CLAUDE_ALIASES: [&str; 5] = ["fable", "mythos", "opus", "sonnet", "haiku"];
+
 impl ModelTier {
-    pub const ALL: [ModelTier; 4] = [ModelTier::Fable, ModelTier::Opus, ModelTier::Sonnet, ModelTier::Haiku];
+    /// Normalise `name`: trim, lower-case, map Claude ids (`claude-opus-5-5`)
+    /// and `mythos` to their alias, and drop a redundant `provider:` prefix
+    /// when the bare name already infers that provider. Never fails; use
+    /// [`FromStr`] to reject names no provider claims.
+    pub fn new(name: &str) -> ModelTier {
+        let lower = name.trim().to_ascii_lowercase();
+        if let Some((prefix, rest)) = lower.split_once(':')
+            && let Ok(p) = prefix.parse::<Provider>()
+        {
+            let rest = rest.trim();
+            let canonical = if p == Provider::Claude { claude_alias(rest).unwrap_or(rest.to_string()) } else { rest.to_string() };
+            return if infer_provider(&canonical) == Some(p) {
+                ModelTier(canonical)
+            } else {
+                ModelTier(format!("{}:{canonical}", p.as_str()))
+            };
+        }
+        if let Some(alias) = claude_alias(&lower) {
+            return ModelTier(alias);
+        }
+        if lower.starts_with("claude-")
+            && let Some(alias) = claude_alias_in(&lower)
+        {
+            return ModelTier(alias);
+        }
+        ModelTier(lower)
+    }
 
-    /// Alias accepted by `claude --model`.
-    pub fn alias(&self) -> &'static str {
-        match self {
-            ModelTier::Fable => "fable",
-            ModelTier::Opus => "opus",
-            ModelTier::Sonnet => "sonnet",
-            ModelTier::Haiku => "haiku",
+    pub fn fable() -> ModelTier {
+        ModelTier("fable".to_string())
+    }
+    pub fn opus() -> ModelTier {
+        ModelTier("opus".to_string())
+    }
+    pub fn sonnet() -> ModelTier {
+        ModelTier("sonnet".to_string())
+    }
+    pub fn haiku() -> ModelTier {
+        ModelTier("haiku".to_string())
+    }
+
+    /// Canonical form: the alias, or `provider:alias` for names whose provider
+    /// cannot be inferred. This is what is serialised and displayed.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The model name passed to the provider's CLI (`--model <alias>`): the
+    /// canonical form without any `provider:` prefix.
+    pub fn alias(&self) -> &str {
+        match self.0.split_once(':') {
+            Some((prefix, rest)) if prefix.parse::<Provider>().is_ok() => rest,
+            _ => &self.0,
         }
     }
 
-    /// Next cheaper tier, if any.
-    pub fn downgrade(&self) -> Option<ModelTier> {
-        match self {
-            ModelTier::Fable => Some(ModelTier::Opus),
-            ModelTier::Opus => Some(ModelTier::Sonnet),
-            ModelTier::Sonnet => Some(ModelTier::Haiku),
-            ModelTier::Haiku => None,
-        }
+    /// Which CLI runs this model. Inferred from the name: `fable`, `mythos`,
+    /// `opus`, `sonnet`, `haiku` and `claude-*` are Claude; `gpt-*`, `o1*`,
+    /// `o3*`, `o4*` and `codex*` are Codex; `gemini-*` is Gemini; an explicit
+    /// `provider:` prefix wins. A bare name no rule matches (which
+    /// [`FromStr`] rejects, but [`ModelTier::new`] and deserialisation allow
+    /// for old rows) is attributed to Claude.
+    pub fn provider(&self) -> Provider {
+        self.known_provider().unwrap_or(Provider::Claude)
     }
 
-    /// Map a full model id reported by Claude Code (`claude-fable-5-1`,
-    /// `claude-sonnet-5-5`, ...) back to a tier. Unknown ids default to Sonnet,
-    /// which keeps accounting conservative without inventing a new tier.
+    /// The provider when the name follows a known pattern or carries an
+    /// explicit prefix; `None` for bare names no provider claims.
+    pub fn known_provider(&self) -> Option<Provider> {
+        if let Some((prefix, _)) = self.0.split_once(':')
+            && let Ok(p) = prefix.parse::<Provider>()
+        {
+            return Some(p);
+        }
+        infer_provider(&self.0)
+    }
+
+    /// True when the name can be attributed to a provider (see [`ModelTier::known_provider`]).
+    pub fn is_known(&self) -> bool {
+        self.known_provider().is_some()
+    }
+
+    /// Map a full model id reported by a CLI back to a tier. Claude ids
+    /// (`claude-fable-5-1`, `claude-sonnet-5-5`, ...) map to their alias as
+    /// before, and anything that does not look like a Claude id or another
+    /// provider's model defaults to Sonnet, which keeps accounting
+    /// conservative without inventing a new tier. Ids of other providers
+    /// (`gpt-6.1-sol`, `gemini-3-pro`, `codex:custom`) pass through.
     pub fn from_model_id(id: &str) -> ModelTier {
-        let id = id.to_ascii_lowercase();
-        if id.contains("fable") || id.contains("mythos") {
-            ModelTier::Fable
-        } else if id.contains("opus") {
-            ModelTier::Opus
-        } else if id.contains("haiku") {
-            ModelTier::Haiku
-        } else {
-            ModelTier::Sonnet
+        let lower = id.trim().to_ascii_lowercase();
+        if let Some(alias) = claude_alias_in(&lower) {
+            return ModelTier(alias);
+        }
+        let candidate = ModelTier::new(&lower);
+        match candidate.known_provider() {
+            Some(Provider::Claude) | None => ModelTier::sonnet(),
+            Some(_) => candidate,
         }
     }
 
-    /// Relative cost weight used for budget pacing when the user has not set
-    /// explicit weights. Roughly tracks list price per output token.
-    pub fn default_weight(&self) -> f64 {
-        match self {
-            ModelTier::Fable => 5.0,
-            ModelTier::Opus => 3.0,
-            ModelTier::Sonnet => 1.0,
-            ModelTier::Haiku => 0.2,
+    /// Like [`ModelTier::from_model_id`] but for a known provider: ids that
+    /// contain a Claude alias map to it for Claude; otherwise the id is used
+    /// as is when it infers `provider`, else `provider.default_model()`.
+    pub fn from_model_id_for(provider: Provider, id: &str) -> ModelTier {
+        let lower = id.trim().to_ascii_lowercase();
+        if lower.is_empty() {
+            return provider.default_model();
         }
+        if provider == Provider::Claude {
+            return ModelTier::from_model_id(&lower);
+        }
+        let candidate = ModelTier::new(&lower);
+        if candidate.known_provider() == Some(provider) { candidate } else { provider.default_model() }
+    }
+}
+
+/// The Claude alias for a bare name (`mythos` is an alias of `fable`).
+fn claude_alias(name: &str) -> Option<String> {
+    match name {
+        "fable" | "mythos" => Some("fable".to_string()),
+        "opus" => Some("opus".to_string()),
+        "sonnet" => Some("sonnet".to_string()),
+        "haiku" => Some("haiku".to_string()),
+        _ => None,
+    }
+}
+
+/// The Claude alias contained in a full id (`claude-opus-5-5` → `opus`);
+/// `claude-*` ids without a known family default to Sonnet.
+fn claude_alias_in(id: &str) -> Option<String> {
+    if id.contains("fable") || id.contains("mythos") {
+        Some("fable".to_string())
+    } else if id.contains("opus") {
+        Some("opus".to_string())
+    } else if id.contains("haiku") {
+        Some("haiku".to_string())
+    } else if id.contains("sonnet") || id.starts_with("claude-") {
+        Some("sonnet".to_string())
+    } else {
+        None
+    }
+}
+
+/// Provider inferred from a bare, lower-cased name.
+fn infer_provider(name: &str) -> Option<Provider> {
+    if CLAUDE_ALIASES.contains(&name) || name.starts_with("claude-") {
+        Some(Provider::Claude)
+    } else if name.starts_with("gpt-")
+        || name.starts_with("o1")
+        || name.starts_with("o3")
+        || name.starts_with("o4")
+        || name.starts_with("codex")
+    {
+        Some(Provider::Codex)
+    } else if name.starts_with("gemini-") {
+        Some(Provider::Gemini)
+    } else {
+        None
+    }
+}
+
+impl Default for ModelTier {
+    /// Sonnet: the model unknown Claude usage is attributed to.
+    fn default() -> Self {
+        ModelTier::sonnet()
     }
 }
 
 impl fmt::Display for ModelTier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.alias())
+        f.write_str(&self.0)
     }
 }
 
 impl FromStr for ModelTier {
     type Err = String;
+    /// Strict parse for user input: bare names must follow a known pattern or
+    /// use the explicit `provider:name` form.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "fable" | "mythos" => Ok(ModelTier::Fable),
-            "opus" => Ok(ModelTier::Opus),
-            "sonnet" => Ok(ModelTier::Sonnet),
-            "haiku" => Ok(ModelTier::Haiku),
-            other if other.starts_with("claude-") => Ok(ModelTier::from_model_id(other)),
-            other => Err(format!("unknown model `{other}` (expected fable|opus|sonnet|haiku)")),
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Err("empty model name".to_string());
         }
+        if let Some((prefix, rest)) = trimmed.split_once(':') {
+            if prefix.trim().parse::<Provider>().is_err() {
+                return Err(format!(
+                    "unknown provider `{}` in `{trimmed}` (expected claude:|codex:|gemini: before the model name)",
+                    prefix.trim()
+                ));
+            }
+            if rest.trim().is_empty() {
+                return Err(format!("`{trimmed}` has no model name after the provider"));
+            }
+            return Ok(ModelTier::new(trimmed));
+        }
+        let tier = ModelTier::new(trimmed);
+        if tier.is_known() {
+            Ok(tier)
+        } else {
+            Err(format!(
+                "unknown model `{}` (expected fable|opus|sonnet|haiku or claude-*, gpt-*/o1*/o3*/o4*/codex* for Codex, gemini-* for Gemini, or an explicit `codex:<name>` / `gemini:<name>` / `claude:<name>`)",
+                tier.as_str()
+            ))
+        }
+    }
+}
+
+impl Serialize for ModelTier {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelTier {
+    /// Lenient: any string is accepted (normalised through [`ModelTier::new`])
+    /// so rows written by older versions keep loading.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(ModelTier::new(&s))
     }
 }
 
@@ -473,10 +695,12 @@ impl FromStr for SessionState {
     }
 }
 
-/// One attempt at a task: a Claude Code process inside a tmux window.
+/// One attempt at a task: an agent CLI process inside a tmux window.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Session {
-    /// Claude Code session id (UUID) – passed as `--session-id` and reused for `--resume`.
+    /// powerqueue's session id (UUID). For Claude Code it is passed as
+    /// `--session-id` and reused for `--resume`; other CLIs get their own id
+    /// in `agent_session_id`.
     pub id: uuid::Uuid,
     pub task_id: TaskId,
     pub attempt: u32,
@@ -493,6 +717,11 @@ pub struct Session {
     /// Last time we saw activity (hook event or transcript growth).
     pub last_activity_at: DateTime<Utc>,
     pub error: Option<String>,
+    /// The CLI's own session id when it generates one (Codex thread uuid,
+    /// Antigravity conversation id); `None` for Claude Code, where `id` is
+    /// passed as `--session-id`. Discovered after launch, used for resume.
+    #[serde(default)]
+    pub agent_session_id: Option<String>,
 }
 
 /// Token usage attributed to one session and model, summed over the session.
@@ -544,7 +773,8 @@ impl std::ops::Add for TokenUsage {
 pub struct UsageRecord {
     pub session_id: uuid::Uuid,
     pub task_id: TaskId,
-    /// Claude API message id (`msg_...`); used to deduplicate transcript lines.
+    /// API message id (`msg_...` for Claude, `<thread>-<ordinal>` for Codex);
+    /// used to deduplicate transcript lines.
     pub message_id: String,
     pub model_id: String,
     pub tier: ModelTier,
@@ -706,15 +936,88 @@ mod tests {
 
     #[test]
     fn model_tier_round_trips() {
-        for tier in ModelTier::ALL {
+        for tier in [ModelTier::fable(), ModelTier::opus(), ModelTier::sonnet(), ModelTier::haiku()] {
             assert_eq!(tier.alias().parse::<ModelTier>().unwrap(), tier);
+            assert_eq!(tier.provider(), Provider::Claude);
+            assert_eq!(tier.as_str(), tier.alias());
+            let json = serde_json::to_string(&tier).unwrap();
+            assert_eq!(json, format!("\"{}\"", tier.alias()));
+            assert_eq!(serde_json::from_str::<ModelTier>(&json).unwrap(), tier);
         }
-        assert_eq!(ModelTier::from_model_id("claude-fable-5-1"), ModelTier::Fable);
-        assert_eq!(ModelTier::from_model_id("claude-opus-5-5"), ModelTier::Opus);
-        assert_eq!(ModelTier::from_model_id("claude-haiku-4-5-20251001"), ModelTier::Haiku);
-        assert_eq!(ModelTier::from_model_id("claude-sonnet-5-5"), ModelTier::Sonnet);
-        assert_eq!(ModelTier::Fable.downgrade(), Some(ModelTier::Opus));
-        assert_eq!(ModelTier::Haiku.downgrade(), None);
+        assert_eq!("Mythos".parse::<ModelTier>().unwrap(), ModelTier::fable());
+        assert_eq!(" OPUS ".parse::<ModelTier>().unwrap(), ModelTier::opus());
+        assert_eq!(ModelTier::from_model_id("claude-fable-5-1"), ModelTier::fable());
+        assert_eq!(ModelTier::from_model_id("claude-opus-5-5"), ModelTier::opus());
+        assert_eq!(ModelTier::from_model_id("claude-haiku-4-5-20251001"), ModelTier::haiku());
+        assert_eq!(ModelTier::from_model_id("claude-sonnet-5-5"), ModelTier::sonnet());
+        assert_eq!(ModelTier::from_model_id("claude-unknown-9"), ModelTier::sonnet());
+        assert_eq!(ModelTier::from_model_id(""), ModelTier::sonnet(), "unknown ids stay on sonnet as before");
+        assert_eq!(ModelTier::from_model_id("gpt-6.1-sol"), ModelTier::new("gpt-6.1-sol"));
+        assert_eq!(ModelTier::from_model_id("gemini-3-flash").provider(), Provider::Gemini);
+        assert_eq!(ModelTier::default(), ModelTier::sonnet());
+    }
+
+    #[test]
+    fn model_tier_infers_providers() {
+        let gpt: ModelTier = "gpt-6.1-sol".parse().unwrap();
+        assert_eq!(gpt.provider(), Provider::Codex);
+        assert_eq!(gpt.alias(), "gpt-6.1-sol");
+        assert_eq!("o3-pro".parse::<ModelTier>().unwrap().provider(), Provider::Codex);
+        assert_eq!("codex-mini".parse::<ModelTier>().unwrap().provider(), Provider::Codex);
+        assert_eq!("gemini-3-pro".parse::<ModelTier>().unwrap().provider(), Provider::Gemini);
+        assert_eq!("claude-opus-5-5".parse::<ModelTier>().unwrap(), ModelTier::opus());
+
+        let custom: ModelTier = "codex:custom".parse().unwrap();
+        assert_eq!(custom.provider(), Provider::Codex);
+        assert_eq!(custom.alias(), "custom");
+        assert_eq!(custom.as_str(), "codex:custom");
+        assert_eq!(custom.to_string(), "codex:custom");
+        assert_eq!(serde_json::from_str::<ModelTier>("\"codex:custom\"").unwrap(), custom);
+        // Redundant prefixes are dropped; aliases of the prefix are accepted.
+        assert_eq!("claude:opus".parse::<ModelTier>().unwrap(), ModelTier::opus());
+        assert_eq!("agy:gemini-3-pro".parse::<ModelTier>().unwrap().as_str(), "gemini-3-pro");
+        assert_eq!("antigravity:flash".parse::<ModelTier>().unwrap().as_str(), "gemini:flash");
+        // A prefix that contradicts the name is honoured as written.
+        let odd: ModelTier = "codex:opus".parse().unwrap();
+        assert_eq!(odd.provider(), Provider::Codex);
+        assert_eq!(odd.alias(), "opus");
+
+        assert_eq!(ModelTier::from_model_id_for(Provider::Codex, "gpt-6-luna").as_str(), "gpt-6-luna");
+        assert_eq!(ModelTier::from_model_id_for(Provider::Codex, "mystery"), ModelTier::new("gpt-6-astra"));
+        assert_eq!(ModelTier::from_model_id_for(Provider::Codex, ""), Provider::Codex.default_model());
+        assert_eq!(ModelTier::from_model_id_for(Provider::Gemini, "gemini-3-flash").as_str(), "gemini-3-flash");
+        assert_eq!(ModelTier::from_model_id_for(Provider::Gemini, "gpt-6-luna"), ModelTier::new("gemini-3-pro"));
+        assert_eq!(ModelTier::from_model_id_for(Provider::Claude, "claude-opus-5-5"), ModelTier::opus());
+        assert_eq!(ModelTier::from_model_id_for(Provider::Claude, "nope"), ModelTier::sonnet());
+    }
+
+    #[test]
+    fn model_tier_rejects_unknown_bare_names_with_help() {
+        let err = "turbo".parse::<ModelTier>().unwrap_err();
+        assert!(err.contains("unknown model `turbo`"), "{err}");
+        assert!(err.contains("codex:<name>"), "{err}");
+        assert!("".parse::<ModelTier>().is_err());
+        assert!("codex:".parse::<ModelTier>().is_err());
+        let err = "bogus:thing".parse::<ModelTier>().unwrap_err();
+        assert!(err.contains("unknown provider `bogus`"), "{err}");
+        // Lenient paths still accept them (old rows), attributed to Claude.
+        let lenient = ModelTier::new("turbo");
+        assert!(!lenient.is_known());
+        assert_eq!(lenient.provider(), Provider::Claude);
+        assert_eq!(serde_json::from_str::<ModelTier>("\"turbo\"").unwrap(), lenient);
+    }
+
+    #[test]
+    fn provider_parsing_and_names() {
+        for p in Provider::ALL {
+            assert_eq!(p.as_str().parse::<Provider>().unwrap(), p);
+            assert_eq!(p.to_string(), p.as_str());
+            assert_eq!(p.default_model().provider(), p);
+            assert_eq!(serde_json::to_string(&p).unwrap(), format!("\"{}\"", p.as_str()));
+        }
+        assert_eq!("antigravity".parse::<Provider>().unwrap(), Provider::Gemini);
+        assert_eq!("AGY".parse::<Provider>().unwrap(), Provider::Gemini);
+        assert!("bard".parse::<Provider>().unwrap_err().contains("expected claude|codex|gemini"));
     }
 
     #[test]

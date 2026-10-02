@@ -17,7 +17,17 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::domain::*;
 
 const SCHEMA: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: i64 = 1;
+/// Current schema version (`PRAGMA user_version`).
+///
+/// * v1: initial schema.
+/// * v2: `sessions.agent_session_id`; kv `budget.calibration` renamed to
+///   `budget.calibration.claude` (budgets are per provider).
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// kv key of the Claude calibration before schema v2.
+const LEGACY_CALIBRATION_KEY: &str = "budget.calibration";
+/// kv key of the Claude calibration from schema v2 on.
+const CLAUDE_CALIBRATION_KEY: &str = "budget.calibration.claude";
 
 /// Handle to the database. Cheap to clone.
 #[derive(Clone)]
@@ -32,7 +42,7 @@ impl std::fmt::Debug for Store {
 }
 
 /// Aggregated usage for a tier over a time range.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct TierUsage {
     pub tier: ModelTier,
     pub usage: TokenUsage,
@@ -110,14 +120,50 @@ impl Store {
         Ok(store)
     }
 
+    /// Create missing tables and bring an older database up to
+    /// [`SCHEMA_VERSION`]. Every step is idempotent (checked against the
+    /// actual schema, not just `user_version`), so an interrupted migration
+    /// is simply finished on the next open.
     fn migrate(&self) -> Result<()> {
         let conn = self.lock();
-        conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(SCHEMA).context("apply schema")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 2 {
+            let has_column = conn
+                .prepare("PRAGMA table_info(sessions)")?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<String>>>()?
+                .iter()
+                .any(|c| c == "agent_session_id");
+            if !has_column {
+                conn.execute("ALTER TABLE sessions ADD COLUMN agent_session_id TEXT", [])
+                    .context("add sessions.agent_session_id")?;
+            }
+            let renamed = conn.execute(
+                "UPDATE OR IGNORE kv SET key = ?2 WHERE key = ?1",
+                params![LEGACY_CALIBRATION_KEY, CLAUDE_CALIBRATION_KEY],
+            )?;
+            // If the new key already existed the update was ignored; drop the stale legacy row.
+            let dropped = conn.execute("DELETE FROM kv WHERE key = ?1", params![LEGACY_CALIBRATION_KEY])?;
+            tracing::info!(
+                from = version,
+                to = SCHEMA_VERSION,
+                column_added = !has_column,
+                calibration_renamed = renamed > 0,
+                legacy_dropped = dropped > 0,
+                "migrated database schema"
+            );
+        }
         if version < SCHEMA_VERSION {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         Ok(())
+    }
+
+    /// `PRAGMA user_version` of the open database.
+    pub fn schema_version(&self) -> Result<i64> {
+        let conn = self.lock();
+        Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
@@ -155,8 +201,8 @@ impl Store {
                 task.linear_priority,
                 task.estimate,
                 task.project,
-                task.model_override.map(|m| m.alias()),
-                task.model.map(|m| m.alias()),
+                task.model_override.as_ref().map(|m| m.alias()),
+                task.model.as_ref().map(|m| m.alias()),
                 task.worktree_path,
                 task.branch,
                 task.attempts,
@@ -199,8 +245,8 @@ impl Store {
                 task.linear_priority,
                 task.estimate,
                 task.project,
-                task.model_override.map(|m| m.alias()),
-                task.model.map(|m| m.alias()),
+                task.model_override.as_ref().map(|m| m.alias()),
+                task.model.as_ref().map(|m| m.alias()),
                 task.worktree_path,
                 task.branch,
                 task.attempts,
@@ -356,8 +402,8 @@ impl Store {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO sessions (id, task_id, attempt, model, state, tmux_session, tmux_window, pane_id, pid, transcript_path,
-                exit_code, started_at, ended_at, last_activity_at, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                exit_code, started_at, ended_at, last_activity_at, error, agent_session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 s.id.to_string(),
                 s.task_id.to_string(),
@@ -374,6 +420,7 @@ impl Store {
                 s.ended_at.as_ref().map(ts),
                 ts(&s.last_activity_at),
                 s.error,
+                s.agent_session_id,
             ],
         )?;
         Ok(())
@@ -383,7 +430,8 @@ impl Store {
         let conn = self.lock();
         let n = conn.execute(
             "UPDATE sessions SET task_id=?2, attempt=?3, model=?4, state=?5, tmux_session=?6, tmux_window=?7, pane_id=?8, pid=?9,
-                transcript_path=?10, exit_code=?11, started_at=?12, ended_at=?13, last_activity_at=?14, error=?15 WHERE id=?1",
+                transcript_path=?10, exit_code=?11, started_at=?12, ended_at=?13, last_activity_at=?14, error=?15,
+                agent_session_id=?16 WHERE id=?1",
             params![
                 s.id.to_string(),
                 s.task_id.to_string(),
@@ -400,10 +448,23 @@ impl Store {
                 s.ended_at.as_ref().map(ts),
                 ts(&s.last_activity_at),
                 s.error,
+                s.agent_session_id,
             ],
         )?;
         if n == 0 {
             return Err(anyhow!("session {} not found", s.id));
+        }
+        Ok(())
+    }
+
+    /// Record the CLI's own session id for a session (Codex thread uuid,
+    /// Antigravity conversation id). Fails when the session does not exist.
+    pub fn set_agent_session_id(&self, id: uuid::Uuid, agent_session_id: &str) -> Result<()> {
+        let conn = self.lock();
+        let n =
+            conn.execute("UPDATE sessions SET agent_session_id = ?2 WHERE id = ?1", params![id.to_string(), agent_session_id])?;
+        if n == 0 {
+            return Err(anyhow!("session {id} not found"));
         }
         Ok(())
     }
@@ -432,12 +493,13 @@ impl Store {
             ended_at: opt_ts(row.get("ended_at")?).map_err(conv)?,
             last_activity_at: parse_ts(&last_activity_at).map_err(conv)?,
             error: row.get("error")?,
+            agent_session_id: row.get("agent_session_id")?,
         })
     }
 
     const SESSION_COLS: &'static str =
         "id, task_id, attempt, model, state, tmux_session, tmux_window, pane_id, pid, transcript_path,
-        exit_code, started_at, ended_at, last_activity_at, error";
+        exit_code, started_at, ended_at, last_activity_at, error, agent_session_id";
 
     pub fn get_session(&self, id: uuid::Uuid) -> Result<Option<Session>> {
         let conn = self.lock();
@@ -522,7 +584,9 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Usage per tier between two instants.
+    /// Usage per tier between two instants. Rows whose `tier` is not a
+    /// model name any provider claims are skipped with a warning rather than
+    /// being attributed to Sonnet.
     pub fn usage_by_tier(&self, since: DateTime<Utc>, until: DateTime<Utc>) -> Result<Vec<TierUsage>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -545,8 +609,10 @@ impl Store {
         let mut out = Vec::new();
         for row in rows {
             let (tier, usage, messages) = row?;
-            let tier = ModelTier::from_str(&tier).unwrap_or(ModelTier::Sonnet);
-            out.push(TierUsage { tier, usage, messages });
+            match ModelTier::from_str(&tier) {
+                Ok(tier) => out.push(TierUsage { tier, usage, messages }),
+                Err(e) => tracing::warn!(tier = %tier, messages, error = %e, "skipping usage rows with an unknown model alias"),
+            }
         }
         Ok(out)
     }
@@ -1044,11 +1110,11 @@ mod tests {
         assert_eq!(got.source, t.source);
 
         t.state = TaskState::Running;
-        t.model = Some(ModelTier::Opus);
+        t.model = Some(ModelTier::opus());
         store.update_task(&t).unwrap();
         let got = store.get_task_by_key("eng-1").unwrap().unwrap();
         assert_eq!(got.state, TaskState::Running);
-        assert_eq!(got.model, Some(ModelTier::Opus));
+        assert_eq!(got.model, Some(ModelTier::opus()));
         assert!(store.get_task_by_linear_issue("uuid-ENG-1").unwrap().is_some());
 
         let found = store.find_task(&t.id.short()).unwrap().unwrap();
@@ -1073,7 +1139,7 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             task_id: t.id,
             attempt: 1,
-            model: ModelTier::Sonnet,
+            model: ModelTier::sonnet(),
             state: SessionState::Running,
             tmux_session: "powerqueue".into(),
             tmux_window: "eng-2".into(),
@@ -1085,15 +1151,19 @@ mod tests {
             ended_at: None,
             last_activity_at: now,
             error: None,
+            agent_session_id: None,
         };
         store.insert_session(&s).unwrap();
         assert_eq!(store.list_live_sessions().unwrap().len(), 1);
+        store.set_agent_session_id(s.id, "thread-123").unwrap();
+        assert_eq!(store.get_session(s.id).unwrap().unwrap().agent_session_id.as_deref(), Some("thread-123"));
+        assert!(store.set_agent_session_id(uuid::Uuid::new_v4(), "x").is_err());
         let rec = UsageRecord {
             session_id: s.id,
             task_id: t.id,
             message_id: "msg_1".into(),
             model_id: "claude-sonnet-5-5".into(),
-            tier: ModelTier::Sonnet,
+            tier: ModelTier::sonnet(),
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 20,
@@ -1108,8 +1178,22 @@ mod tests {
         assert_eq!(u.total(), 100);
         let by_tier = store.usage_by_tier(now - Duration::hours(1), now + Duration::hours(1)).unwrap();
         assert_eq!(by_tier.len(), 1);
-        assert_eq!(by_tier[0].tier, ModelTier::Sonnet);
+        assert_eq!(by_tier[0].tier, ModelTier::sonnet());
         assert_eq!(by_tier[0].messages, 1);
+        // Rows with an alias no provider claims are skipped, not counted as sonnet.
+        store.record_usage(&UsageRecord { message_id: "msg_odd".into(), tier: ModelTier::new("turbo"), ..rec.clone() }).unwrap();
+        store
+            .record_usage(&UsageRecord {
+                message_id: "msg_gpt".into(),
+                model_id: "gpt-6.1-sol".into(),
+                tier: ModelTier::new("gpt-6.1-sol"),
+                ..rec.clone()
+            })
+            .unwrap();
+        let by_tier = store.usage_by_tier(now - Duration::hours(1), now + Duration::hours(1)).unwrap();
+        assert_eq!(by_tier.len(), 2, "{by_tier:?}");
+        assert!(by_tier.iter().any(|u| u.tier == ModelTier::new("gpt-6.1-sol")));
+        assert!(by_tier.iter().all(|u| u.messages == 1));
         assert_eq!(store.last_usage_at(s.id).unwrap().unwrap().timestamp_millis(), now.timestamp_millis());
 
         let mut s2 = s.clone();
@@ -1120,7 +1204,7 @@ mod tests {
         assert!(store.list_live_sessions().unwrap().is_empty());
         let summaries = store.task_usage_summaries().unwrap();
         assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].usage.total(), 100);
+        assert_eq!(summaries[0].usage.total(), 300, "per-task totals count every row, whatever the alias");
     }
 
     #[test]
@@ -1177,5 +1261,62 @@ mod tests {
         let c = store.counts().unwrap();
         assert_eq!((c.queued, c.running, c.completed), (1, 1, 1));
         assert_eq!(store.list_open_tasks().unwrap().len(), 2);
+    }
+
+    /// The v1 schema as `powerqueue` 0.1.0 created it (no `agent_session_id`,
+    /// calibration under `budget.calibration`).
+    const V1_SCHEMA: &str = "
+        CREATE TABLE tasks (id TEXT PRIMARY KEY, key TEXT NOT NULL UNIQUE, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL, source_kind TEXT NOT NULL, linear_issue_id TEXT, state TEXT NOT NULL, criticality TEXT NOT NULL,
+            score REAL NOT NULL DEFAULT 0, labels TEXT NOT NULL DEFAULT '[]', linear_priority INTEGER, estimate REAL, project TEXT,
+            model_override TEXT, model TEXT, worktree_path TEXT, branch TEXT, attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER,
+            not_before TEXT, last_error TEXT, summary TEXT, score_reasons TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL, started_at TEXT, completed_at TEXT);
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, attempt INTEGER NOT NULL,
+            model TEXT NOT NULL, state TEXT NOT NULL, tmux_session TEXT NOT NULL, tmux_window TEXT NOT NULL, pane_id TEXT, pid INTEGER,
+            transcript_path TEXT, exit_code INTEGER, started_at TEXT NOT NULL, ended_at TEXT, last_activity_at TEXT NOT NULL, error TEXT);
+        CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+        INSERT INTO kv (key, value, updated_at) VALUES ('budget.calibration', '{\"observed_fraction\":0.4,\"at\":\"2026-09-29T00:00:00Z\",\"measured_fraction\":0.1}', '2026-09-29T00:00:00Z');
+        INSERT INTO tasks (id, key, title, source, source_kind, state, criticality, created_at, updated_at)
+            VALUES ('0199a000-0000-7000-8000-000000000001', 'ENG-1', 't', '{\"kind\":\"manual\"}', 'manual', 'running', 'normal', '2026-09-29T00:00:00Z', '2026-09-29T00:00:00Z');
+        INSERT INTO sessions (id, task_id, attempt, model, state, tmux_session, tmux_window, started_at, last_activity_at)
+            VALUES ('6d1f0a4e-9d2d-4b57-9d2d-5c1c9b2b6c01', '0199a000-0000-7000-8000-000000000001', 1, 'opus', 'running', 'pq', '@1', '2026-09-29T00:00:00Z', '2026-09-29T00:00:00Z');
+        PRAGMA user_version = 1;
+    ";
+
+    #[test]
+    fn migrates_a_v1_database_file_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pq.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V1_SCHEMA).unwrap();
+        }
+        for pass in 0..2 {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+            let session =
+                store.get_session(uuid::Uuid::parse_str("6d1f0a4e-9d2d-4b57-9d2d-5c1c9b2b6c01").unwrap()).unwrap().unwrap();
+            assert_eq!(session.model, ModelTier::opus());
+            let expected = if pass == 0 { None } else { Some("thread-1".to_string()) };
+            assert_eq!(session.agent_session_id, expected, "pass {pass}: the column survives reopening");
+            let cal: serde_json::Value = store.kv_get("budget.calibration.claude").unwrap().expect("renamed calibration");
+            assert_eq!(cal["observed_fraction"].as_f64(), Some(0.4));
+            assert!(store.kv_get::<serde_json::Value>("budget.calibration").unwrap().is_none());
+            store.set_agent_session_id(session.id, "thread-1").unwrap();
+        }
+        // A legacy row that reappears next to the new key is dropped, never overwrites it.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO kv VALUES ('budget.calibration', '{\"observed_fraction\":0.9}', 'x'); PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let cal: serde_json::Value = store.kv_get("budget.calibration.claude").unwrap().unwrap();
+        assert_eq!(cal["observed_fraction"].as_f64(), Some(0.4));
+        assert!(store.kv_get::<serde_json::Value>("budget.calibration").unwrap().is_none());
+        assert_eq!(store.integrity_check().unwrap(), "ok");
     }
 }
