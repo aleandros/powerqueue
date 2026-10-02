@@ -12,6 +12,7 @@ pub mod init;
 pub mod linear;
 pub mod logs;
 pub mod priority;
+pub mod reset;
 pub mod run;
 pub mod secrets;
 pub mod status;
@@ -61,6 +62,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 Command::Logs(args) => logs::run(&mut ctx, args),
                 Command::Config(cmd) => config::run(&mut ctx, cmd),
                 Command::Secrets(cmd) => secrets::run(&mut ctx, cmd),
+                Command::Reset(args) => reset::run(&mut ctx, args),
                 Command::Completions { .. } | Command::Hook(_) | Command::Init(_) | Command::Dashboard(_) => unreachable!(),
             }
         }

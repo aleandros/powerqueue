@@ -16,6 +16,7 @@
 //! powerqueue logs [-f] [--task]   read the daemon log
 //! powerqueue config <show|get|set|unset|path|edit|validate>
 //! powerqueue secrets <set|unset|list>
+//! powerqueue reset [--dry-run] [-y] start over: wipe tasks, worktrees, tmux windows, task dirs and the DB
 //! powerqueue hook ...             (internal) called by agent CLI hooks (--provider claude|codex|gemini)
 //! powerqueue completions <shell>
 //! ```
@@ -95,6 +96,9 @@ pub enum Command {
     /// Manage stored API keys.
     #[command(subcommand)]
     Secrets(SecretsCommand),
+    /// Start over: stop the daemon, kill the tmux session, remove worktrees and task
+    /// state, and empty the database (config, secrets, PRIORITY.md and logs are kept).
+    Reset(ResetArgs),
     /// Internal: receive a Claude Code hook event.
     #[command(hide = true)]
     Hook(HookArgs),
@@ -376,6 +380,30 @@ pub enum SecretsCommand {
     Unset { name: String },
     /// Show which keys are configured and where they come from.
     List,
+}
+
+#[derive(Debug, Args, Default)]
+pub struct ResetArgs {
+    /// Do not ask for confirmation (required when stdin is not a terminal).
+    #[arg(short, long)]
+    pub yes: bool,
+    /// Print what would be removed and exit without changing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Also delete the local task branches (`pq/*`); remote branches are never touched.
+    #[arg(long)]
+    pub delete_branches: bool,
+    /// Also clear the `kv` table: budget calibration, rate-limit cooldowns, probe results and
+    /// learned period anchors. Without it that pacing state survives the reset.
+    #[arg(long)]
+    pub everything: bool,
+    /// Move every open Linear-backed task's issue back to the first `linear.queued_states` entry.
+    #[arg(long)]
+    pub revert_linear: bool,
+    /// Remove worktrees even when they hold uncommitted changes or unpushed commits
+    /// (default: such worktrees are kept and reported).
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]
