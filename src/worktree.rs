@@ -223,6 +223,25 @@ impl Repo {
         out.trim().parse::<u32>().with_context(|| format!("unexpected `git rev-list --count {range}` output `{}`", out.trim()))
     }
 
+    /// `git add -A && git commit -m <message>` in `worktree`. When the
+    /// repository has no committer identity, a `powerqueue` identity is used
+    /// for this commit only. Fails when there is nothing to commit.
+    pub fn commit_all(&self, worktree: &Path, message: &str) -> Result<String> {
+        self.git(Some(worktree), &["add", "-A"])?;
+        let committed = match self.git(Some(worktree), &["commit", "-q", "-m", message]) {
+            Ok(out) => out,
+            Err(e) if format!("{e:#}").contains("Please tell me who you are") || format!("{e:#}").contains("empty ident") => self
+                .git(
+                    Some(worktree),
+                    &["-c", "user.name=powerqueue", "-c", "user.email=powerqueue@localhost", "commit", "-q", "-m", message],
+                )?,
+            Err(e) => return Err(e),
+        };
+        let sha = self.head_sha(worktree)?;
+        tracing::info!(worktree = %worktree.display(), sha, "committed uncommitted changes");
+        Ok(if committed.trim().is_empty() { sha } else { committed })
+    }
+
     /// `git push -u origin <branch>`.
     pub fn push_branch(&self, worktree: &Path, branch: &str) -> Result<()> {
         if !self.has_remote()? {

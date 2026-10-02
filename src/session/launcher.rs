@@ -75,7 +75,7 @@ const HOOK_TIMEOUT_SECS: u64 = 10;
 /// lines). Attempts after the first also say how the previous one ended.
 /// `cfg.claude.append_system_prompt` is deliberately *not* included here; it
 /// goes to `--append-system-prompt`.
-pub fn build_prompt(task: &Task, cfg: &Config, attempt: u32, previous_error: Option<&str>) -> String {
+pub fn build_prompt(task: &Task, cfg: &Config, provider: Provider, attempt: u32, previous_error: Option<&str>) -> String {
     let branch = task.branch.clone().unwrap_or_else(|| branch_name(&cfg.repo.branch_template, &task.slug(), &task.id.short()));
     let mut p = String::new();
     let _ = writeln!(p, "# {}: {}", task.key, task.title.trim());
@@ -88,11 +88,17 @@ pub fn build_prompt(task: &Task, cfg: &Config, attempt: u32, previous_error: Opt
     {
         let _ = write!(p, "\nSource: {identifier} <{url}>\n");
     }
+    let commit_rule = if agent_for(provider).commits_in_session(cfg) {
+        "- Commit as you go with clear messages.\n"
+    } else {
+        "- Do not run `git commit` or other git write commands: this session's sandbox keeps git metadata read-only. \
+         Leave your changes in the working tree; powerqueue commits and pushes them when you complete the task.\n"
+    };
     let _ = write!(
         p,
         "\n## Working rules\n\n\
          - You are working in a dedicated git worktree on branch `{branch}`: never switch branches and never touch other worktrees.\n\
-         - Commit as you go with clear messages.\n\
+         {commit_rule}\
          - Do not push unless asked; powerqueue pushes on completion.\n"
     );
     let _ = write!(
@@ -199,7 +205,7 @@ impl Launcher {
         let env_path = task_dir.join("env");
         let script_path = task_dir.join("launch.sh");
 
-        std::fs::write(&prompt_path, build_prompt(task, cfg, attempt, previous_error))
+        std::fs::write(&prompt_path, build_prompt(task, cfg, provider, attempt, previous_error))
             .with_context(|| format!("cannot write {}", prompt_path.display()))?;
 
         let own_id = session_id.to_string();
@@ -427,10 +433,24 @@ mod tests {
     }
 
     #[test]
+    fn sandboxed_codex_sessions_are_told_not_to_commit() {
+        let t = task();
+        let mut cfg = config();
+        let p = build_prompt(&t, &cfg, Provider::Codex, 1, None);
+        assert!(p.contains("Do not run `git commit`"), "{p}");
+        assert!(!p.contains("Commit as you go"), "{p}");
+        cfg.codex.approval = "yolo".into();
+        let p = build_prompt(&t, &cfg, Provider::Codex, 1, None);
+        assert!(p.contains("Commit as you go"), "{p}");
+        let p = build_prompt(&t, &cfg, Provider::Claude, 1, None);
+        assert!(p.contains("Commit as you go"), "{p}");
+    }
+
+    #[test]
     fn prompt_contains_the_essentials() {
         let t = task();
         let cfg = config();
-        let p = build_prompt(&t, &cfg, 1, None);
+        let p = build_prompt(&t, &cfg, Provider::Claude, 1, None);
         assert!(p.starts_with("# ENG-123: Fix the flaky login test\n"), "{p}");
         assert!(p.contains("The test fails every third run."));
         assert!(p.contains("https://linear.app/acme/issue/ENG-123"));
@@ -450,13 +470,13 @@ mod tests {
         t.description = String::new();
         let mut cfg = config();
         cfg.claude.append_system_prompt = Some("SECRET SYSTEM PROMPT".into());
-        let p = build_prompt(&t, &cfg, 3, Some("pane died with exit 137"));
+        let p = build_prompt(&t, &cfg, Provider::Claude, 3, Some("pane died with exit 137"));
         assert!(p.contains("This is attempt 3; the previous attempt ended with: pane died with exit 137"), "{p}");
         assert!(p.contains("branch `pq/eng-123`"));
         assert!(p.contains("(no description provided)"));
         assert!(!p.contains("linear.app"));
         assert!(!p.contains("SECRET SYSTEM PROMPT"));
-        let p = build_prompt(&t, &cfg, 2, None);
+        let p = build_prompt(&t, &cfg, Provider::Claude, 2, None);
         assert!(p.contains("This is attempt 2. The previous attempt did not finish"), "{p}");
     }
 

@@ -458,6 +458,13 @@ impl AgentCli for CodexCli {
     fn probe(&self, cfg: &Config, _store: &Store) -> Result<Option<ObservedUsage>> {
         crate::budget::UsageProbe::probe(&crate::budget::probes::codex::CodexProbe::new(&cfg.codex.binary))
     }
+
+    /// Every sandboxed mode keeps `.git` read-only (verified with
+    /// `codex sandbox`: even `git commit` in a plain repo fails with
+    /// "Operation not permitted"), so only `yolo` sessions can commit.
+    fn commits_in_session(&self, cfg: &Config) -> bool {
+        cfg.codex.approval.trim() == "yolo"
+    }
 }
 
 #[cfg(test)]

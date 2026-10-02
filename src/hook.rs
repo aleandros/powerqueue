@@ -167,7 +167,7 @@ fn apply_markers(store: &Store, task_id: TaskId, message: &str) -> Result<()> {
         )?;
     } else if let Some(reason) = text_after(message, BLOCKED_MARKER) {
         task.state = TaskState::NeedsAttention;
-        task.last_error = Some(if reason.is_empty() { "Claude reported a blocker".to_string() } else { reason });
+        task.last_error = Some(if reason.is_empty() { "the agent reported a blocker".to_string() } else { reason });
         store.update_task(&task)?;
         store.log_event(
             Some(task_id),
@@ -261,7 +261,7 @@ mod tests {
         let payload = serde_json::json!({ "last_assistant_message": BLOCKED_MARKER });
         let (store, id) = store_with_task();
         handle(&store, id, None, HookEvent::Stop, &mut Cursor::new(payload.to_string())).unwrap();
-        assert_eq!(store.get_task(id).unwrap().unwrap().last_error.as_deref(), Some("Claude reported a blocker"));
+        assert_eq!(store.get_task(id).unwrap().unwrap().last_error.as_deref(), Some("the agent reported a blocker"));
     }
 
     #[test]

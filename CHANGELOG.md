@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Cleanup commits changes a session left uncommitted
+  (`cleanup.commit_uncommitted`, default on; event `cleanup.autocommit`)
+  before pushing or removing the worktree, so sandboxed or interrupted
+  sessions never lose work. Sandboxed Codex sessions are told not to commit
+  (Codex keeps `.git` read-only in every sandboxed mode; only `yolo` commits).
+- `task retry` on a task whose session is still alive ends that session first
+  (`session.ended`), so the retry actually relaunches instead of waiting on a
+  slot the old session kept.
 - Config: per-provider budgets (`[budget.providers.<p>]` for `claude`, `codex`
   and `gemini`, each with its own period, window and model table; shared
   knobs stay in `[budget]`); old keys still load (`budget.period_hours`,

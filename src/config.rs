@@ -805,6 +805,10 @@ pub struct CleanupConfig {
     pub run: Vec<String>,
     /// Kill the tmux window after completion (otherwise it stays with the final output).
     pub close_tmux_window: bool,
+    /// Commit changes the agent left uncommitted before pushing or removing
+    /// the worktree (`powerqueue: uncommitted changes from <key>`), so a
+    /// sandboxed or interrupted session never loses work.
+    pub commit_uncommitted: bool,
 }
 
 impl Default for CleanupConfig {
@@ -816,6 +820,7 @@ impl Default for CleanupConfig {
             keep_failed: true,
             run: Vec::new(),
             close_tmux_window: true,
+            commit_uncommitted: true,
         }
     }
 }

@@ -446,6 +446,27 @@ impl Daemon {
                 ) {
                     return Ok(());
                 }
+                // A retry is a fresh attempt: a session that is still alive
+                // (e.g. the agent reported a blocker and is waiting) is ended
+                // first, otherwise it would keep the slot and the task could
+                // never relaunch.
+                if let Some(mut session) = self.store.latest_session(task.id)?.filter(|s| s.state.is_live()) {
+                    if let Err(e) = self.rt.tmux.kill_window(&session.tmux_window) {
+                        tracing::debug!(task = %task.key, error = %format!("{e:#}"), "kill window on retry");
+                    }
+                    session.state = SessionState::Killed;
+                    session.ended_at = Some(now);
+                    self.store.update_session(&session)?;
+                    self.forget_session(session.id);
+                    self.log(
+                        Some(task.id),
+                        Some(session.id),
+                        EventLevel::Info,
+                        "session.ended",
+                        "live session ended by retry",
+                        serde_json::json!({ "attempt": session.attempt }),
+                    );
+                }
                 task.state = TaskState::Queued;
                 task.not_before = None;
                 self.store.update_task(&task)?;

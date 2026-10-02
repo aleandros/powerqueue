@@ -134,6 +134,13 @@ pub trait AgentCli: Send + Sync {
     fn allowed_modes(&self) -> &'static [&'static str];
     /// Ask the provider how much allowance is left. `Ok(None)` = unknown.
     fn probe(&self, cfg: &Config, store: &Store) -> Result<Option<ObservedUsage>>;
+    /// Whether a session launched with the current settings can run `git
+    /// commit` itself. When false, the prompt tells the agent to leave its
+    /// changes in the working tree and cleanup commits them
+    /// (`cleanup.commit_uncommitted`).
+    fn commits_in_session(&self, _cfg: &Config) -> bool {
+        true
+    }
 }
 
 static CLAUDE: ClaudeCli = ClaudeCli;

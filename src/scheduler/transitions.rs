@@ -110,7 +110,7 @@ pub fn on_hook_outcome(
             effects.push(Effect::log(
                 EventLevel::Info,
                 "session.started",
-                format!("Claude Code session started ({source})"),
+                format!("agent session started ({source})"),
                 serde_json::json!({ "source": source, "transcript_path": transcript_path, "attempt": session.attempt }),
             ));
         }
@@ -158,7 +158,7 @@ pub fn on_hook_outcome(
             effects.push(Effect::log(
                 EventLevel::Warn,
                 "task.blocked",
-                format!("Claude reports a blocker: {reason}"),
+                format!("the agent reports a blocker: {reason}"),
                 serde_json::json!({ "reason": reason }),
             ));
             effects.push(Effect::Linear {
@@ -259,7 +259,7 @@ pub fn on_hook_outcome(
                 effects.push(Effect::log(
                     EventLevel::Warn,
                     "session.permission_prompt",
-                    format!("Claude is waiting for a permission decision: {message}"),
+                    format!("the agent is waiting for a permission decision: {message}"),
                     serde_json::json!({ "message": message }),
                 ));
             }
@@ -271,7 +271,7 @@ pub fn on_hook_outcome(
                 effects.push(Effect::log(
                     EventLevel::Debug,
                     "session.idle_prompt",
-                    "Claude is waiting for input",
+                    "the agent is waiting for input",
                     serde_json::json!({ "message": message }),
                 ));
             }

@@ -483,9 +483,15 @@ its rate-limit cooldown.
 
 The `workspace-write` sandbox only lets the session write inside the
 worktree, so powerqueue adds its data and state directories (for `powerqueue
-task complete`) and the main checkout's `.git` (for commits) with `--add-dir`.
-The `[[POWERQUEUE:DONE]]` marker in the final message completes the task even
-if the completion command fails.
+task complete`) with `--add-dir`. Codex keeps every `.git` directory read-only
+in all sandboxed modes (verified with `codex sandbox`: even `git commit` in a
+plain repository fails with "Operation not permitted"), so in `workspace-write`,
+`approve-for-me` and `on-request` the prompt tells the session **not** to
+commit; the changes stay in the working tree and cleanup commits them
+(`cleanup.commit_uncommitted`, message `powerqueue: uncommitted changes from
+<key>`) before pushing. Only `yolo` sessions commit themselves. The
+`[[POWERQUEUE:DONE]]` marker in the final message completes the task even if
+the completion command fails.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
@@ -604,6 +610,7 @@ and `default_model` / `low_model` must belong to an enabled provider.
 | `keep_failed` | `true` | keep worktrees of failed tasks |
 | `run` | `[]` | commands run (`sh -c`) in the worktree before removal |
 | `close_tmux_window` | `true` | kill the window; otherwise it stays with the final output |
+| `commit_uncommitted` | `true` | commit changes the session left uncommitted (`powerqueue: uncommitted changes from <key>`) before pushing or removing the worktree; a failure keeps the worktree |
 
 ### `[tmux]`
 

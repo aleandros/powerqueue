@@ -115,6 +115,36 @@ pub fn cleanup_task(cfg: &Config, store: &Store, repo: &Repo, tmux: &Tmux, task:
             }
         }
 
+        if cfg.cleanup.commit_uncommitted {
+            match repo.is_dirty(wt) {
+                Ok(true) => {
+                    let message = format!("powerqueue: uncommitted changes from {}", task.key);
+                    match repo.commit_all(wt, &message) {
+                        Ok(_) => log(
+                            EventLevel::Warn,
+                            "cleanup.autocommit",
+                            "the session left uncommitted changes; committed them so they are not lost",
+                            serde_json::json!({ "message": message }),
+                        )?,
+                        Err(e) => {
+                            commands_ok = false;
+                            tracing::warn!(task = %task.key, error = %format!("{e:#}"), "cannot commit leftover changes");
+                            log(
+                                EventLevel::Error,
+                                "cleanup.autocommit_failed",
+                                &format!("could not commit leftover changes; keeping the worktree: {e:#}"),
+                                serde_json::json!({}),
+                            )?;
+                        }
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(task = %task.key, error = %format!("{e:#}"), "cannot check whether the worktree is dirty")
+                }
+            }
+        }
+
         let has_remote = match repo.has_remote() {
             Ok(v) => v,
             Err(e) => {
