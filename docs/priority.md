@@ -8,7 +8,8 @@ and reviewed like code. `powerqueue init` writes the reference template
 the live file is.
 
 Check a file with `powerqueue priority check`. See what it does to one task
-with `powerqueue priority explain ENG-123`.
+with `powerqueue priority explain ENG-123`, or to the whole queue with
+`powerqueue priority simulate` (see [Tuning](#tuning-with-priority-simulate)).
 
 ## Document structure
 
@@ -260,6 +261,51 @@ empties the queue (`scheduler/daemon.rs::load_rules`). A missing file logs
 `normal`, no scoring, no models). Editing with `powerqueue priority edit` or
 any editor works the same way. `powerqueue stop` is never needed to apply
 rules.
+
+## Tuning with `priority simulate`
+
+`powerqueue priority simulate` is a dry run of the whole pipeline for every
+open task: it re-scores each task with the rules, ranks them exactly as
+`scheduler::pick_next` does (score, then criticality, then age), runs the
+first `scheduler.max_concurrent` schedulable tasks through the budget policy
+with the current ledgers, and prints the result. Nothing is written: the
+stored scores, the tasks and the ledgers are untouched.
+
+```text
+$ powerqueue priority simulate
+Simulated queue with ~/.config/powerqueue/PRIORITY.md (max 2 concurrent; nothing was written)
+ #    was  task    state   criticality        score       prefers  policy would run  title
+ 1 ▶  =    INC-1   queued  normal → critical  100 → 1000  fable    fable             Fix outage
+ 2 ▶  ↑3   CUS-3   queued  normal             100 → 140   opus     opus              Customer ask
+ 3    ↓2   CH-2    queued  normal → low       100 → 10    sonnet   sonnet            Tidy docs
+ 4    =    ENG-77  skip    normal             100         opus     –                 Already taken
+```
+
+- `was` is the task's rank with the scores stored by the daemon; `↑3` means
+  it moved up from third place, `=` that it stays, `new` that it is not in
+  the queue yet (`--linear`).
+- `criticality` and `score` show `stored → simulated` when the rules change
+  them.
+- `prefers` is the model list the rules hand to the policy; `policy would
+  run` is what the budget policy picks for that task right now (or why it is
+  throttled). `▶` marks the rows that would start on the next tick.
+
+Options:
+
+| Flag | Effect |
+|------|--------|
+| `--file PATH` | try a draft file instead of the live one; the daemon keeps using the live file until you copy the draft over it |
+| `--linear` | also fetch the queued issues from Linear and rank the ones not in the queue yet (nothing is stored) |
+| `-a`, `--all` | include completed/failed/cancelled tasks, to check rules against history |
+| `--reasons` | print every rule that fired for each task, plus the policy's reason |
+| `--no-budget` | skip the budget policy (rank only) |
+| `-n N` | show only the first N rows |
+| `--json` | the rows as JSON (`rank`, `stored_rank`, `criticality`, `score`, `preferred_models`, `model`, `policy`, `would_start_now`, `reasons`, ...) |
+
+Typical loop: copy `PRIORITY.md` to a draft, edit, `priority simulate --file
+draft.md`, repeat until the order looks right, then move the draft over the
+live file. With `priority.live_reload = true` (the default) the daemon
+re-scores every task without a live session on its next tick.
 
 ## Idioms
 

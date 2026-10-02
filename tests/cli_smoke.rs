@@ -256,3 +256,63 @@ fn logs_without_files_and_events() {
     // have an (empty) file or none at all, both of which must not crash.
     pq(home.path()).args(["logs", "-n", "5"]).assert().code(predicate::in_iter([0, 1]));
 }
+
+#[test]
+fn priority_simulate_ranks_without_writing() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    write_minimal_config(home.path(), repo.path());
+    std::fs::write(
+        home.path().join("config").join("PRIORITY.md"),
+        "## Critical\n- label: incident\n\n## Low\n- label: chore\n\n## Overrides\n- manual-skip: skip\n\n## Models\n- critical: fable\n- low: sonnet\n",
+    )
+    .unwrap();
+    for (title, key, label) in
+        [("Fix outage", "INC-1", "incident"), ("Tidy docs", "CH-2", "chore"), ("skip me", "manual-skip", "x")]
+    {
+        pq(home.path()).args(["add", title, "-k", key, "-l", label]).assert().success();
+    }
+
+    // Table: the incident is first and would start, the chore is low, the override skips.
+    pq(home.path())
+        .args(["priority", "simulate", "--reasons"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("nothing was written"))
+        .stdout(predicate::str::contains("normal → critical"))
+        .stdout(predicate::str::contains("normal → low"))
+        .stdout(predicate::str::contains("skip"))
+        .stdout(predicate::str::contains("matched rule at line 2 (label: incident)"));
+
+    // JSON: ranking order and the policy's model.
+    let out = pq(home.path()).args(["--json", "priority", "simulate"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = v["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["key"], "INC-1");
+    assert_eq!(rows[0]["criticality"], "critical");
+    assert_eq!(rows[0]["model"], "fable");
+    assert_eq!(rows[0]["would_start_now"], true);
+    assert_eq!(rows[1]["key"], "CH-2");
+    assert_eq!(rows[2]["key"], "manual-skip");
+    assert_eq!(rows[2]["skip"], true);
+    assert_eq!(rows[2]["model"], serde_json::Value::Null);
+
+    // Nothing was stored: the tasks keep their default criticality until the daemon scores them.
+    let out = pq(home.path()).args(["--json", "status"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("\"critical\""), "{text}");
+
+    // A draft file is used instead of the live one, and a missing draft is an error.
+    let draft = home.path().join("draft.md");
+    std::fs::write(&draft, "## High\n- label: chore\n").unwrap();
+    pq(home.path())
+        .args(["priority", "simulate", "--file", draft.to_str().unwrap(), "--no-budget", "-n", "1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CH-2"))
+        .stdout(predicate::str::contains("normal → high"))
+        .stdout(predicate::str::contains("The daemon still uses the live file"));
+    pq(home.path()).args(["priority", "simulate", "--file", "/nonexistent/rules.md"]).assert().code(1);
+}

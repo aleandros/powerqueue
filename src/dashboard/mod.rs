@@ -148,6 +148,11 @@ pub fn run(cfg: &Config, paths: &Paths, store: &Store, options: Options) -> Resu
         previous_hook(info);
     }));
     let mut terminal = ratatui::try_init().context("initialise terminal (raw mode + alternate screen)")?;
+    // The first frame only writes cells that differ from an empty buffer, so
+    // whatever the terminal showed before (shell history, a tmux pane that
+    // ignores the alternate screen) would stay visible behind the dashboard.
+    // Clearing forces a full redraw of the very first frame.
+    terminal.clear().context("clear terminal")?;
     let result = event_loop(&mut terminal, &mut app, cfg, store);
     ratatui::restore();
     let _ = std::panic::take_hook();
@@ -201,6 +206,8 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut DashboardApp, c
                         }
                     }
                 }
+                // A resize leaves stale cells outside the new layout; redraw from scratch.
+                Event::Resize(_, _) => terminal.clear()?,
                 _ => {}
             }
         }
@@ -254,7 +261,11 @@ fn attach(app: &mut DashboardApp, cfg: &Config, terminal: &mut ratatui::DefaultT
     // On unix this replaces the process and never returns on success.
     let outcome = tmux.attach(&session.tmux_session, Some(&session.tmux_window));
     match ratatui::try_init() {
-        Ok(t) => *terminal = t,
+        Ok(t) => {
+            *terminal = t;
+            // Coming back from tmux the screen holds its last frame.
+            let _ = terminal.clear();
+        }
         Err(e) => {
             // Without a terminal there is nothing left to draw on.
             ratatui::restore();

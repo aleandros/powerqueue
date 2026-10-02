@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `priority simulate [--file PATH] [--linear] [-a] [--reasons] [--no-budget] [-n N]`:
+  dry-run the rules against every open task, rank them the way the scheduler
+  does, and show what the budget policy would run for each, without writing
+  anything. `--file` tries a draft before it replaces the live file.
+
+### Fixed
+
+- `dashboard` clears the terminal when it starts, after a resize and when it
+  comes back from `attach`, so the previous shell contents no longer show
+  through the first frame.
+
 ## [0.2.0] - 2026-10-02
 
 ### Added

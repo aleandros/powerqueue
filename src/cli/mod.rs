@@ -9,7 +9,7 @@
 //! powerqueue add "title" [...]    enqueue a manual task
 //! powerqueue task <show|list|complete|block|cancel|pause|resume|retry|explain|model>
 //! powerqueue attach <task>        open the task's tmux window
-//! powerqueue priority <show|check|edit|explain>
+//! powerqueue priority <show|check|edit|explain|simulate|path>
 //! powerqueue budget <show|set-reset|set-observed|clear-limits|estimate> [--provider <p>]
 //! powerqueue linear <teams|states|test|sync>
 //! powerqueue doctor [--fix]       diagnostics + tuning advice
@@ -267,8 +267,32 @@ pub enum PriorityCommand {
     Edit,
     /// Show how the rules score one task.
     Explain(TaskRef),
+    /// Dry-run: score every task with the rules (or a draft file) and show the resulting queue order.
+    Simulate(SimulateArgs),
     /// Print the path of the rules file.
     Path,
+}
+
+#[derive(Debug, Args, Default)]
+pub struct SimulateArgs {
+    /// Rules file to try instead of the live one (edit a copy, simulate, then replace).
+    #[arg(long, value_name = "PATH")]
+    pub file: Option<PathBuf>,
+    /// Include finished tasks (completed/failed/cancelled) in the ranking.
+    #[arg(short, long)]
+    pub all: bool,
+    /// Also fetch the queued issues from Linear now and rank the ones not yet in the queue (nothing is stored).
+    #[arg(long)]
+    pub linear: bool,
+    /// Print every rule that fired for each task.
+    #[arg(long)]
+    pub reasons: bool,
+    /// Skip the budget policy (rank only; faster, no model column).
+    #[arg(long)]
+    pub no_budget: bool,
+    /// Show at most this many rows (0 = all).
+    #[arg(short = 'n', long, default_value_t = 0)]
+    pub limit: usize,
 }
 
 #[derive(Debug, Subcommand)]

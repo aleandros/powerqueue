@@ -236,6 +236,7 @@ state machine allows it. `complete` and `block` always write directly.
 | `priority check` | validate `PRIORITY.md`, report problems with line numbers and print the `## Models` lists |
 | `priority edit` | open `PRIORITY.md` in `$EDITOR` |
 | `priority explain <task>` | show how the rules score one task |
+| `priority simulate [--file PATH] [-a] [--linear] [--reasons] [--no-budget] [-n N]` | dry-run: re-score every open task with the live rules (or a draft `--file`), rank them the way the scheduler would, and show what the budget policy would run for each (`▶` = would start now); nothing is written. `--linear` also ranks queued issues not yet in the queue, `-a` includes finished tasks, `--reasons` prints every rule that fired |
 | `priority path` | print the path of the rules file |
 
 ### Budget
@@ -656,7 +657,10 @@ mode = "accept-edits"       # also: effort, extra_args
 
 ## Priority rules (PRIORITY.md)
 
-Rules live in a Markdown file so they stay readable anywhere. Sections are `##`
+Rules live in a Markdown file so they stay readable anywhere. The daemon
+watches the file and re-scores the queue when it changes, so edits apply
+without a restart; `powerqueue priority simulate` shows the effect of an edit
+(or of a draft file) before you save it. Sections are `##`
 headings; rules are bullets. A ticket's criticality is the first section
 (Critical → High → Normal → Low) with a matching rule.
 
