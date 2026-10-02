@@ -1,16 +1,19 @@
 //! `powerqueue budget ...`.
 //!
-//! `show` prints Claude's ledger as before (per-provider sections come with
-//! the UX work); `set-reset`, `set-observed` and `clear-limits` take
-//! `--provider <p>` (default `claude`).
+//! `show` prints one section per enabled provider (in `provider_order`):
+//! period, spend, calibration, observed usage with its age, anchor source,
+//! cooldowns and the model table, then what the policy would run now.
+//! `probe` asks providers for their remaining allowance. `set-reset`,
+//! `set-observed` and `clear-limits` take `--provider <p>` (default `claude`).
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
 use owo_colors::{OwoColorize, Stream};
 
+use crate::budget::probes::describe;
 use crate::budget::{
     Calibration, Estimator, Ledger, Ledgers, PeriodClock, Policy, RATE_LIMITS_KEY, RateLimitState, TierLedger, calibration_key,
-    tier_weight,
+    load_probe_status, probe_providers, tier_weight,
 };
 use crate::cli::output::{human_duration, human_f64, model_colored, table};
 use crate::cli::{BudgetCommand, Context};
@@ -22,9 +25,76 @@ pub fn run(ctx: &mut Context, cmd: BudgetCommand) -> Result<i32> {
         BudgetCommand::Show => show(ctx),
         BudgetCommand::SetReset { when, provider } => set_reset(ctx, &when, provider),
         BudgetCommand::SetObserved { percent, provider } => set_observed(ctx, &percent, provider),
+        BudgetCommand::Probe { provider } => probe(ctx, provider),
         BudgetCommand::ClearLimits { provider } => clear_limits(ctx, provider),
         BudgetCommand::Estimate { task } => estimate(ctx, task.as_deref()),
     }
+}
+
+/// `budget probe`: run the probes now (one provider, or every enabled one),
+/// store what they learn and print it. Exit code 1 when any probe failed.
+fn probe(ctx: &mut Context, provider: Option<Provider>) -> Result<i32> {
+    let cfg = ctx.config_cloned()?;
+    let store = ctx.store()?.clone();
+    let providers = match provider {
+        Some(p) => vec![p],
+        None => cfg.budget.enabled_providers_in_order(),
+    };
+    if providers.is_empty() {
+        bail!("no provider is enabled; set budget.providers.claude.enabled = true");
+    }
+    let now = Utc::now();
+    let results = probe_providers(&cfg, &store, &providers, now);
+    let failed = results.iter().any(|(_, r)| r.is_err());
+    if ctx.json {
+        let mut out = serde_json::Map::new();
+        for (p, r) in &results {
+            let v = match r {
+                Ok(obs) => serde_json::json!({ "ok": true, "observed": obs, "error": null }),
+                Err(e) => serde_json::json!({ "ok": false, "observed": null, "error": format!("{e:#}") }),
+            };
+            out.insert(p.to_string(), v);
+        }
+        println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(out))?);
+        return Ok(if failed { 1 } else { 0 });
+    }
+    let pct = |v: Option<f64>| v.map(|f| format!("{:.0}%", f * 100.0)).unwrap_or_else(|| "-".to_string());
+    let when =
+        |v: Option<DateTime<Utc>>| v.map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_else(|| "-".to_string());
+    let mut t = table();
+    t.set_header(["provider", "result", "window", "window resets", "period", "period resets", "note"]);
+    for (p, r) in &results {
+        let row = match r {
+            Ok(Some(obs)) => [
+                p.to_string(),
+                "ok".if_supports_color(Stream::Stdout, |t| t.green()).to_string(),
+                pct(obs.window_used),
+                when(obs.window_resets_at),
+                pct(obs.period_used),
+                when(obs.period_resets_at),
+                if obs.blocked { "blocked".to_string() } else { String::new() },
+            ],
+            Ok(None) => {
+                let note = match p {
+                    Provider::Claude => "nothing yet: a session's status line reports it after the first response",
+                    _ => "the provider reported nothing usable",
+                };
+                [p.to_string(), "unknown".into(), "-".into(), "-".into(), "-".into(), "-".into(), note.to_string()]
+            }
+            Err(e) => [
+                p.to_string(),
+                "failed".if_supports_color(Stream::Stdout, |t| t.red()).to_string(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+                format!("{e:#}"),
+            ],
+        };
+        t.add_row(row);
+    }
+    println!("{t}");
+    Ok(if failed { 1 } else { 0 })
 }
 
 fn load_ledgers(ctx: &mut Context, now: DateTime<Utc>) -> Result<(Config, Ledgers, RateLimitState)> {
@@ -34,15 +104,6 @@ fn load_ledgers(ctx: &mut Context, now: DateTime<Utc>) -> Result<(Config, Ledger
     let mut limits: RateLimitState = store.kv_get(RATE_LIMITS_KEY)?.unwrap_or_default();
     limits.clear_expired(now);
     Ok((cfg, ledgers, limits))
-}
-
-/// The ledger `show` prints: Claude's, or the first enabled provider's when
-/// Claude is disabled. Fails when no provider is enabled.
-fn primary_ledger<'a>(cfg: &Config, ledgers: &'a Ledgers) -> Result<&'a Ledger> {
-    ledgers
-        .get(Provider::Claude)
-        .or_else(|| ledgers.ordered(&cfg.budget.provider_order).into_iter().next())
-        .ok_or_else(|| anyhow!("no provider is enabled; set budget.providers.claude.enabled = true"))
 }
 
 /// Human status of one tier given the period pacing.
@@ -65,29 +126,136 @@ fn tier_status(t: &TierLedger, elapsed: f64, limits: &RateLimitState, now: DateT
     }
 }
 
+/// A normal-criticality, default-cost task: what `show` asks the policy about.
+fn probe_task(crit: Criticality) -> Task {
+    let mut task = Task::new("probe", "probe", TaskSource::Manual);
+    task.criticality = crit;
+    task
+}
+
+/// Until when a provider is cooling down: every enabled model rate-limited,
+/// or its observation says the allowance is exhausted (the later wins).
+fn provider_cooldown(cfg: &Config, ledger: &Ledger, limits: &RateLimitState, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let marks = limits.provider_blocked_until(&cfg.budget, ledger.provider, now);
+    let observed = ledger.observed.as_ref().and_then(|o| o.cooldown_until()).filter(|u| *u > now);
+    match (marks, observed) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Machine-readable view of one provider for `budget show --json`: the
+/// ledger plus the observation's age, the latest probe outcome and any
+/// cooldown.
+fn provider_json(
+    cfg: &Config,
+    store: &crate::store::Store,
+    ledger: &Ledger,
+    limits: &RateLimitState,
+    now: DateTime<Utc>,
+) -> Result<serde_json::Value> {
+    let mut v = serde_json::to_value(ledger)?;
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "observed_age_secs".into(),
+            serde_json::json!(ledger.observed.as_ref().map(|o| (now - o.observed_at).num_seconds().max(0))),
+        );
+        obj.insert("probe".into(), serde_json::to_value(load_probe_status(store, ledger.provider)?)?);
+        obj.insert("cooldown_until".into(), serde_json::json!(provider_cooldown(cfg, ledger, limits, now)));
+        let limited: serde_json::Map<String, serde_json::Value> = limits
+            .exhausted_until
+            .iter()
+            .filter(|(t, u)| t.provider() == ledger.provider && **u > now)
+            .map(|(t, u)| (t.to_string(), serde_json::json!(u)))
+            .collect();
+        obj.insert("rate_limited_until".into(), serde_json::Value::Object(limited));
+    }
+    Ok(v)
+}
+
 fn show(ctx: &mut Context) -> Result<i32> {
     let now = Utc::now();
     let (cfg, ledgers, limits) = load_ledgers(ctx, now)?;
-    let ledger = primary_ledger(&cfg, &ledgers)?;
+    if ledgers.is_empty() {
+        bail!("no provider is enabled; set budget.providers.claude.enabled = true");
+    }
+    let store = ctx.store()?.clone();
+    let ordered = ledgers.ordered(&cfg.budget.provider_order);
+    let policy = Policy::new(&cfg.budget, &ledgers, &limits);
     if ctx.json {
-        println!("{}", serde_json::to_string_pretty(ledger)?);
+        let mut providers = serde_json::Map::new();
+        for ledger in &ordered {
+            providers.insert(ledger.provider.to_string(), provider_json(&cfg, &store, ledger, &limits, now)?);
+        }
+        let next = policy.decide(&probe_task(Criticality::Normal), crate::budget::Prediction::default_guess(), &[]);
+        let out = serde_json::json!({
+            "providers": providers,
+            "provider_order": cfg.budget.enabled_providers_in_order(),
+            "next": next,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(0);
     }
+    for (i, ledger) in ordered.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        show_provider(&cfg, &store, ledger, &limits, now)?;
+    }
+    println!(
+        "{}",
+        "pace = spent% − elapsed%; negative means the model is under-spent and will relax to lower criticalities"
+            .if_supports_color(Stream::Stdout, |t| t.dimmed())
+    );
+    let disabled: Vec<String> = Provider::ALL.iter().filter(|p| ledgers.get(**p).is_none()).map(|p| p.to_string()).collect();
+    if !disabled.is_empty() {
+        println!(
+            "\n{}",
+            format!("disabled providers: {} (budget.providers.<name>.enabled)", disabled.join(", "))
+                .if_supports_color(Stream::Stdout, |t| t.dimmed())
+        );
+    }
+
+    println!("\n{} (default-cost task, no overrides)", "what would run now".if_supports_color(Stream::Stdout, |t| t.bold()));
+    let mut t = table();
+    t.set_header(["criticality", "model", "why"]);
+    for crit in Criticality::ALL {
+        let d = policy.decide(&probe_task(crit), crate::budget::Prediction::default_guess(), &[]);
+        let why = match d.model {
+            Some(_) => d.reasons.last().cloned().unwrap_or_default(),
+            None => {
+                format!("throttled until {}", d.retry_at.map(|r| r.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default())
+            }
+        };
+        t.add_row([crit.to_string(), model_colored(d.model.as_ref()), why]);
+    }
+    println!("{t}");
+    Ok(0)
+}
+
+/// Print one provider's section of `budget show`.
+fn show_provider(
+    cfg: &Config,
+    store: &crate::store::Store,
+    ledger: &Ledger,
+    limits: &RateLimitState,
+    now: DateTime<Utc>,
+) -> Result<()> {
     let provider = ledger.provider;
     let elapsed = ledger.elapsed_fraction();
     let anchor_note = match ledger.anchor_source {
         crate::budget::AnchorSource::Default => {
-            format!("  [anchor not set: run `powerqueue budget set-reset --provider {provider}`]")
+            format!("  [anchor not set: run `powerqueue budget set-reset --provider {provider}` or `budget probe`]")
                 .if_supports_color(Stream::Stdout, |t| t.yellow())
                 .to_string()
         }
         crate::budget::AnchorSource::Observed => "  [anchor learned from the provider]".to_string(),
-        crate::budget::AnchorSource::Config => String::new(),
+        crate::budget::AnchorSource::Config => "  [anchor from config]".to_string(),
     };
     println!(
         "{} {} {} → {}  ({:.0}% elapsed, {} left){}",
-        "period".if_supports_color(Stream::Stdout, |t| t.bold()),
-        provider.if_supports_color(Stream::Stdout, |t| t.dimmed()),
+        provider.if_supports_color(Stream::Stdout, |t| t.bold()),
+        "period".if_supports_color(Stream::Stdout, |t| t.dimmed()),
         ledger.period.start.format("%Y-%m-%d %H:%M UTC"),
         ledger.period.end.format("%Y-%m-%d %H:%M UTC"),
         elapsed * 100.0,
@@ -130,22 +298,40 @@ fn show(ctx: &mut Context) -> Result<i32> {
             "calibration".if_supports_color(Stream::Stdout, |t| t.bold())
         ),
     }
-    if let Some(obs) = &ledger.observed {
-        let age = human_duration((now - obs.observed_at).num_seconds().max(0));
-        let pct = |v: Option<f64>| v.map(|f| format!("{:.0}%", f * 100.0)).unwrap_or_else(|| "?".to_string());
+    match &ledger.observed {
+        Some(obs) => {
+            let age = human_duration((now - obs.observed_at).num_seconds().max(0));
+            println!("{} {} ({age} ago)", "observed".if_supports_color(Stream::Stdout, |t| t.bold()), describe(obs));
+        }
+        None => {
+            let how = match provider {
+                Provider::Claude => "a session's status line reports it after the first response",
+                _ => "run `powerqueue budget probe`",
+            };
+            println!("{} none yet; {how}", "observed".if_supports_color(Stream::Stdout, |t| t.bold()));
+        }
+    }
+    if let Some(status) = load_probe_status(store, provider)?
+        && let Some(err) = &status.error
+    {
         println!(
-            "{} window {} used, period {} used{} ({age} ago)",
-            "observed".if_supports_color(Stream::Stdout, |t| t.bold()),
-            pct(obs.window_used),
-            pct(obs.period_used),
-            if obs.blocked { ", blocked" } else { "" }
+            "{}",
+            format!("probe    last run {} failed: {err}", status.at.format("%Y-%m-%d %H:%M UTC"))
+                .if_supports_color(Stream::Stdout, |t| t.yellow())
+        );
+    }
+    if let Some(until) = provider_cooldown(cfg, ledger, limits, now) {
+        println!(
+            "{}",
+            format!("cooldown {provider} is not scheduled until {}", until.format("%Y-%m-%d %H:%M UTC"))
+                .if_supports_color(Stream::Stdout, |t| t.yellow())
         );
     }
 
     let mut t = table();
     t.set_header(["model", "budget", "spent", "%", "pace", "window", "msgs", "status"]);
     for tier in &ledger.tiers {
-        let status = tier_status(tier, elapsed, &limits, now);
+        let status = tier_status(tier, elapsed, limits, now);
         let status = match status {
             "ok" => status.if_supports_color(Stream::Stdout, |t| t.green()).to_string(),
             "under-paced" => status.if_supports_color(Stream::Stdout, |t| t.cyan()).to_string(),
@@ -166,41 +352,7 @@ fn show(ctx: &mut Context) -> Result<i32> {
         ]);
     }
     println!("{t}");
-    println!(
-        "{}",
-        "pace = spent% − elapsed%; negative means the model is under-spent and will relax to lower criticalities"
-            .if_supports_color(Stream::Stdout, |t| t.dimmed())
-    );
-    let others: Vec<String> = ledgers
-        .ordered(&cfg.budget.provider_order)
-        .iter()
-        .filter(|l| l.provider != provider)
-        .map(|l| {
-            format!("{} {:.0}% spent, {:.0}% elapsed", l.provider, l.period_fraction() * 100.0, l.elapsed_fraction() * 100.0)
-        })
-        .collect();
-    if !others.is_empty() {
-        println!("{} {}", "other providers".if_supports_color(Stream::Stdout, |t| t.bold()), others.join("; "));
-    }
-
-    println!("\n{} (default-cost task, no overrides)", "what would run now".if_supports_color(Stream::Stdout, |t| t.bold()));
-    let policy = Policy::new(&cfg.budget, &ledgers, &limits);
-    let mut t = table();
-    t.set_header(["criticality", "model", "why"]);
-    for crit in Criticality::ALL {
-        let mut task = Task::new("probe", "probe", TaskSource::Manual);
-        task.criticality = crit;
-        let d = policy.decide(&task, crate::budget::Prediction::default_guess(), None);
-        let why = match d.model {
-            Some(_) => d.reasons.last().cloned().unwrap_or_default(),
-            None => {
-                format!("throttled until {}", d.retry_at.map(|r| r.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default())
-            }
-        };
-        t.add_row([crit.to_string(), model_colored(d.model.as_ref()), why]);
-    }
-    println!("{t}");
-    Ok(0)
+    Ok(())
 }
 
 /// Parse `<when>`: RFC 3339, `in 3d4h`, or a bare duration like `90m`.

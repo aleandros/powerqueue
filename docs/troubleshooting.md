@@ -227,15 +227,58 @@ Precedence is environment (`LINEAR_API_KEY`, `JEV_API_KEY`) → keychain → fil
 
 ## Rate limit errors
 
-**Symptom**: `budget.rate_limited` events (`<tier> reported rate_limit;
-cooling down until ...`), tasks `throttled`.
+**Symptom**: `budget.rate_limited` events (`claude (opus) reported
+rate_limit; cooling down every claude model until ...`), tasks `throttled`.
 
-The tier goes on cooldown for `budget.providers.<provider>.rate_limit_cooldown_mins` (never past
-the period end) and the task is throttled; if its session is still alive when
-the cooldown passes it resumes as `running`. This is expected; it means the
-subscription window is full. Check `/usage` inside Claude Code, run
-`budget set-observed`, and consider lowering `scheduler.max_concurrent`.
-`budget clear-limits` lifts the cooldown early.
+The provider of the session's model goes on cooldown for
+`budget.providers.<provider>.rate_limit_cooldown_mins` (never past that
+provider's period end) and the task is throttled; if its session is still
+alive when the cooldown passes it resumes as `running`. Other enabled
+providers keep taking work. This is expected; it means the subscription
+window is full. Check `/usage` inside Claude Code (or `powerqueue budget
+probe`), run `budget set-observed`, and consider lowering
+`scheduler.max_concurrent`. `budget clear-limits [--provider P]` lifts the
+cooldown early.
+
+A Claude pane that shows `Usage limit reached · continuing automatically at
+…` is waiting for the reset, not hung: the daemon logs
+`session.waiting_for_reset` and leaves it alone until the cooldown ends.
+
+## A provider is never picked
+
+**Symptom**: you enabled Codex (or Gemini) but every task still runs on
+Claude, or tasks wait in `throttled` although another provider has room.
+
+Checks:
+
+```sh
+powerqueue config get budget.provider_order   # fallback order
+powerqueue budget show                        # one section per enabled provider
+powerqueue budget probe                       # what each provider reports now
+powerqueue task explain ENG-123               # per-model verdicts and the choice
+```
+
+Fixes:
+
+- The provider is not enabled: `budget.providers.codex.enabled = true`
+  (`budget show` lists disabled providers at the end).
+- It is enabled but comes later in `budget.provider_order`: a provider is
+  only a fallback for tasks whose preferences it does not match. Put it
+  first, or name its models in `PRIORITY.md` (`critical: gpt-6.1-sol | fable`).
+- The task has a hard override (`task model <task> opus`): it never crosses
+  providers. Clear it with `task model <task> auto`.
+- Every model of the provider is disabled or has `share = 0`, or its
+  `min_criticality` reserves it (the verdict says `reserved for critical`).
+- The provider is on cooldown: the verdict says `rate limited until …` or
+  `codex reports its allowance blocked; skipped until the reset at …`.
+  `budget probe --provider codex` re-reads the real state; `budget
+  clear-limits --provider codex` forgets a stale rate-limit mark.
+- The probe fails (`budget show` prints `probe last run … failed`): log in
+  (`codex login`), check `codex.binary`, or set `probe_interval_mins = 0` to
+  rely on measurements only.
+- Codex Pro-family plans have no 5-hour window: set
+  `budget.providers.codex.window_hours = 0` so the window estimate never
+  blocks it.
 
 ## Where things are
 

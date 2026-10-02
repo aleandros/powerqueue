@@ -1,30 +1,44 @@
-//! The decision: which model may a task use *now*?
+//! The decision: which model may a task use *now*, on which provider?
 //!
-//! This version decides over the Claude provider only (the multi-provider
-//! candidate walk lands on the budget-engine branch); the data model is
-//! already per provider: ledgers come from [`Ledgers`], capability order and
-//! downgrades from `BudgetConfig::downgrade_chain`.
+//! Candidates are every enabled model (positive share) of every enabled
+//! provider, providers walked in `budget.provider_order`; each provider has
+//! its own [`Ledger`] (period, window, calibration, observed usage) in
+//! [`Ledgers`]. Capability order and downgrades come from
+//! `BudgetConfig::downgrade_chain` and never cross providers.
 //!
-//! Rules, in order:
-//! 1. Hard overrides (`task.model_override`, PRIORITY.md `## Models`) pick a
-//!    preferred model; the policy may still downgrade when that model is out
-//!    of budget, and says so in `reasons`. It never silently upgrades above a
-//!    user-chosen model.
-//! 2. A model that reported `rate_limit` is unavailable until its cooldown ends.
-//! 3. The rolling window must have room for the predicted cost.
-//! 4. A model is *eligible* for a task when `task.criticality <= min_criticality`,
-//!    or when it is relaxed: after `relax_after_fraction` of the period, if the
-//!    model's spend fraction is below the period's elapsed fraction (it is
-//!    under-paced), one criticality level lower qualifies; in the end game
-//!    (`endgame_fraction`) two levels lower qualify as long as the predicted
-//!    cost fits the model's remaining budget with the safety margin.
-//! 5. Among eligible models prefer the preferred model, else the most capable
-//!    for critical/high work, the configured default for normal work and the
-//!    configured low model for low work.
-//! 6. If nothing is eligible, the task is throttled until the earliest instant
-//!    at which something could change: the window roll-over (approximated as
-//!    15 minutes, because we do not track when the oldest window usage expires),
-//!    a rate-limit expiry, the next relaxation boundary, or the period end.
+//! Per-model verdict, in order:
+//! 1. The provider must be enabled (have a ledger) and the model must be
+//!    enabled with a positive share.
+//! 2. The provider must not be on an observed cooldown: a probe reported the
+//!    allowance `blocked` or a window/period fully used
+//!    ([`super::ObservedUsage::cooldown_until`]).
+//! 3. A model that reported `rate_limit` is unavailable until its cooldown
+//!    ends (account-wide errors mark every model of the provider).
+//! 4. Criticality gate with relaxation: a model is *eligible* for a task when
+//!    `task.criticality <= min_criticality`, or when it is relaxed: after
+//!    `relax_after_fraction` of the period, if the model's spend fraction is
+//!    below the period's elapsed fraction (it is under-paced), one
+//!    criticality level lower qualifies; in the end game (`endgame_fraction`)
+//!    two levels lower qualify.
+//! 5. The predicted cost must fit the model's period share and the
+//!    provider's overall period budget (both with the safety margin) and,
+//!    when the provider has one, its rolling window.
+//!
+//! Choice: the preference list is the hard override (`task.model_override`)
+//! when set, else the rules' list (`PRIORITY.md`, in order), else the
+//! criticality default (`default_model` for normal, `low_model` for low,
+//! none for critical/high). Each preferred model is tried through its
+//! downgrade chain. When nothing in the list is eligible and the list was not
+//! a hard override, the first eligible candidate in provider order wins (for
+//! critical/high work without preferences: the most capable eligible model of
+//! the first provider that has one). A hard override never crosses to another
+//! provider and is never upgraded.
+//!
+//! If nothing is chosen, the task is throttled until the earliest instant at
+//! which something could change, across providers: a window roll-over
+//! (approximated as 15 minutes, because we do not track when the oldest
+//! window usage expires), a rate-limit or observed cooldown end, the next
+//! relaxation boundary, or a period end — capped by the earliest period end.
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -42,6 +56,10 @@ pub const RATE_LIMITS_KEY: &str = "budget.rate_limits";
 /// only knows the window total, not when its oldest row falls out, so this is
 /// a cheap approximation of the roll-over; re-evaluation is inexpensive.
 pub const WINDOW_RECHECK: Duration = Duration::minutes(15);
+
+/// How long an observation that says "exhausted" but carries no reset
+/// instant keeps its provider off the candidate list.
+pub const OBSERVED_EXHAUSTED_TTL: Duration = Duration::hours(1);
 
 /// Per-model cooldown after a rate-limit error, persisted in kv `budget.rate_limits`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -77,6 +95,21 @@ impl RateLimitState {
     /// The soonest cooldown end among `provider`'s models, if any is exhausted.
     pub fn provider_until(&self, provider: Provider, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         self.exhausted_until.iter().filter(|(t, until)| t.provider() == provider && **until > now).map(|(_, u)| *u).min()
+    }
+    /// When every enabled model of `provider` is cooling down (an
+    /// account-wide limit), the soonest of those cooldown ends; `None` when
+    /// at least one enabled model is usable or the provider has none.
+    pub fn provider_blocked_until(&self, cfg: &BudgetConfig, provider: Provider, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let models = cfg.provider(provider).enabled_models();
+        if models.is_empty() {
+            return None;
+        }
+        let mut soonest: Option<DateTime<Utc>> = None;
+        for m in &models {
+            let until = self.until(m, now)?;
+            soonest = Some(soonest.map_or(until, |s| s.min(until)));
+        }
+        soonest
     }
     pub fn is_empty(&self) -> bool {
         self.exhausted_until.is_empty()
@@ -116,99 +149,113 @@ impl<'a> Policy<'a> {
         Self { cfg, ledgers, rate_limits }
     }
 
-    /// The Claude ledger, which this version decides over.
-    fn ledger(&self) -> Option<&'a Ledger> {
-        self.ledgers.get(Provider::Claude)
+    /// Enabled providers that have a ledger, in `provider_order`.
+    pub fn providers(&self) -> Vec<Provider> {
+        self.cfg.enabled_providers_in_order().into_iter().filter(|p| self.ledgers.get(*p).is_some()).collect()
     }
 
     /// Models that can ever be chosen: enabled with a positive share on an
-    /// enabled provider, most capable first.
+    /// enabled provider; providers in `provider_order`, each provider's
+    /// models most capable first.
     pub fn candidates(&self) -> Vec<ModelTier> {
-        if self.ledger().is_none() {
-            return Vec::new();
-        }
-        self.cfg.models_for(Provider::Claude).into_iter().filter(|t| tier_share(self.cfg, t) > 0.0).collect()
+        self.providers().into_iter().flat_map(|p| self.cfg.models_for(p)).filter(|t| tier_share(self.cfg, t) > 0.0).collect()
     }
 
-    /// Decide for `task`, given its predicted cost and a preferred model.
-    /// `task.model_override` wins over `preferred` (which usually comes from
-    /// `PRIORITY.md`). Pure: the same inputs always give the same decision.
-    pub fn decide(&self, task: &Task, prediction: Prediction, preferred: Option<ModelTier>) -> Decision {
-        let Some(ledger) = self.ledger() else {
+    /// Decide for `task`, given its predicted cost and the rules' preference
+    /// list (`preferred`, most wanted first; empty = no preference).
+    /// `task.model_override` wins over `preferred` and never crosses to
+    /// another provider. Pure: the same inputs always give the same decision.
+    pub fn decide(&self, task: &Task, prediction: Prediction, preferred: &[ModelTier]) -> Decision {
+        let providers = self.providers();
+        let Some(now) = providers.first().and_then(|p| self.ledgers.get(*p)).map(|l| l.now) else {
             let now = self.ledgers.by_provider.values().next().map(|l| l.now).unwrap_or_else(Utc::now);
-            return Decision {
-                model: None,
-                retry_at: Some(now + WINDOW_RECHECK),
-                prediction,
-                reasons: vec!["claude provider is disabled (budget.providers.claude.enabled = false)".to_string()],
-            };
+            let mut reasons: Vec<String> = Provider::ALL
+                .iter()
+                .filter(|p| self.ledgers.get(**p).is_none() || !self.cfg.provider(**p).enabled)
+                .map(|p| format!("{p} provider is disabled (budget.providers.{p}.enabled = false)"))
+                .collect();
+            reasons.push("no provider is enabled; nothing can run".to_string());
+            return Decision { model: None, retry_at: Some(now + WINDOW_RECHECK), prediction, reasons };
         };
-        let now = ledger.now;
         let mut reasons = Vec::new();
-        reasons.push(format!(
-            "period {:.0}% elapsed, {:.0}% spent; window {:.0}% used; predicted cost {:.0} weighted tokens ({})",
-            ledger.elapsed_fraction() * 100.0,
-            ledger.period_fraction() * 100.0,
-            ledger.window_fraction() * 100.0,
-            prediction.weighted_tokens,
-            prediction.basis
-        ));
+        reasons.push(format!("predicted cost {:.0} weighted tokens ({})", prediction.weighted_tokens, prediction.basis));
+        for p in &providers {
+            if let Some(ledger) = self.ledgers.get(*p) {
+                let window = if ledger.window_enabled {
+                    format!("window {:.0}% used", ledger.window_fraction() * 100.0)
+                } else {
+                    "no window".to_string()
+                };
+                reasons.push(format!(
+                    "{p}: period {:.0}% elapsed, {:.0}% spent; {window}",
+                    ledger.elapsed_fraction() * 100.0,
+                    ledger.period_fraction() * 100.0,
+                ));
+            }
+        }
 
         let candidates = self.candidates();
         let mut eligible = Vec::new();
-        let mut retries = Vec::new();
+        let mut retries: Vec<(Provider, DateTime<Utc>)> = Vec::new();
         for tier in &candidates {
             let v = self.verdict(task, tier, prediction.weighted_tokens);
             reasons.push(format!("{tier}: {}", v.reason));
             if v.eligible {
                 eligible.push(tier.clone());
             } else if let Some(at) = v.retry_at {
-                retries.push(at);
+                retries.push((tier.provider(), at));
             }
         }
 
-        let preferred = match (task.model_override.clone(), preferred) {
-            (Some(t), _) => {
+        // The preference list, whether it is a hard override, and its label.
+        let (list, hard, label): (Vec<ModelTier>, bool, &str) = match &task.model_override {
+            Some(t) => {
                 reasons.push(format!("model override: {t}"));
-                Some(t)
+                (vec![t.clone()], true, "preferred")
             }
-            (None, Some(t)) => {
-                reasons.push(format!("preferred by rules: {t}"));
-                Some(t)
+            None if !preferred.is_empty() => {
+                let names: Vec<String> = preferred.iter().map(|m| m.to_string()).collect();
+                reasons.push(format!("preferred by rules: {}", names.join(" | ")));
+                (preferred.to_vec(), false, "preferred")
             }
-            (None, None) => None,
-        };
-
-        let model = match preferred {
-            Some(p) => self.pick_at_or_below(&eligible, &p, &mut reasons, &format!("preferred {p}")),
             None => match task.criticality {
-                Criticality::Critical | Criticality::High => {
-                    let best = eligible.first().cloned();
-                    if let Some(t) = &best {
-                        reasons.push(format!("{} task: most capable eligible tier is {t}", task.criticality));
-                    }
-                    best
-                }
-                Criticality::Normal => self.pick_at_or_below(
-                    &eligible,
-                    &self.cfg.default_model,
-                    &mut reasons,
-                    &format!("default model {}", self.cfg.default_model),
-                ),
-                Criticality::Low => self.pick_at_or_below(
-                    &eligible,
-                    &self.cfg.low_model,
-                    &mut reasons,
-                    &format!("low model {}", self.cfg.low_model),
-                ),
+                Criticality::Critical | Criticality::High => (Vec::new(), false, ""),
+                Criticality::Normal => (vec![self.cfg.default_model.clone()], false, "default model"),
+                Criticality::Low => (vec![self.cfg.low_model.clone()], false, "low model"),
             },
         };
+
+        let mut model = None;
+        for p in &list {
+            if let Some(t) = self.pick_at_or_below(&eligible, p, &mut reasons, &format!("{label} {p}")) {
+                model = Some(t);
+                break;
+            }
+        }
+        if model.is_none() && !hard {
+            model = eligible.first().cloned();
+            if let Some(t) = &model {
+                if list.is_empty() {
+                    reasons.push(format!("{} task: most capable eligible tier is {t}", task.criticality));
+                } else {
+                    reasons.push(format!(
+                        "nothing in the preference list is eligible; falling back to {t} (first eligible on {} in provider order)",
+                        t.provider()
+                    ));
+                }
+            }
+        }
 
         let retry_at = if model.is_some() {
             None
         } else {
-            let period_end = ledger.period.end;
-            let mut at = retries.into_iter().min().unwrap_or(period_end).min(period_end);
+            // A hard override can only ever run on its own provider.
+            let relevant = |p: &Provider| task.model_override.as_ref().is_none_or(|o| o.provider() == *p);
+            let mut at = retries.into_iter().filter(|(p, _)| relevant(p)).map(|(_, at)| at).min();
+            if let Some(end) = self.ledgers.earliest_period_end() {
+                at = Some(at.map_or(end, |a| a.min(end)));
+            }
+            let mut at = at.unwrap_or(now + WINDOW_RECHECK);
             if at <= now {
                 at = now + WINDOW_RECHECK;
             }
@@ -257,9 +304,17 @@ impl<'a> Policy<'a> {
         let Some(model) = self.cfg.model_budget(tier).filter(|m| m.enabled && m.share > 0.0) else {
             return blocked("disabled or no budget share".to_string(), None);
         };
+        if let Some((reason, retry_at)) = observed_block(ledger) {
+            return blocked(reason, retry_at);
+        }
         if let Some(until) = self.rate_limits.until(tier, now) {
+            let scope = if self.rate_limits.provider_blocked_until(self.cfg, tier.provider(), now).is_some() {
+                format!(" ({} account-wide)", tier.provider())
+            } else {
+                String::new()
+            };
             return blocked(
-                format!("rate limited until {}", until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+                format!("rate limited until {}{scope}", until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
                 Some(until),
             );
         }
@@ -339,6 +394,48 @@ impl<'a> Policy<'a> {
     }
 }
 
+/// Why a whole provider is unusable right now according to its latest
+/// observation (blocked, or a window/period fully used), with when that may
+/// change. An exhausted observation without a reset instant counts for
+/// [`OBSERVED_EXHAUSTED_TTL`] after it was taken; one whose reset has passed
+/// counts no more.
+fn observed_block(ledger: &Ledger) -> Option<(String, Option<DateTime<Utc>>)> {
+    let obs = ledger.observed.as_ref()?;
+    let now = ledger.now;
+    let window_out = obs.window_used.is_some_and(|u| u >= 1.0);
+    let period_out = obs.period_used.is_some_and(|u| u >= 1.0);
+    if !(obs.blocked || window_out || period_out) {
+        return None;
+    }
+    let what = if obs.blocked {
+        "reports its allowance blocked"
+    } else if window_out {
+        "reports its window fully used"
+    } else {
+        "reports its period allowance fully used"
+    };
+    match obs.cooldown_until() {
+        Some(until) if until > now => Some((
+            format!(
+                "{} {what}; skipped until the reset at {}",
+                ledger.provider,
+                until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ),
+            Some(until),
+        )),
+        Some(_) => None,
+        None if now - obs.observed_at < OBSERVED_EXHAUSTED_TTL => Some((
+            format!(
+                "{} {what} (no reset time known; observed {} min ago)",
+                ledger.provider,
+                (now - obs.observed_at).num_minutes()
+            ),
+            Some(now + WINDOW_RECHECK),
+        )),
+        None => None,
+    }
+}
+
 fn level_index(c: Criticality) -> usize {
     Criticality::ALL.iter().position(|x| *x == c).unwrap_or(0)
 }
@@ -358,6 +455,7 @@ mod tests {
     use super::*;
     use crate::budget::ledger::{Calibration, TierLedger};
     use crate::budget::period::{AnchorSource, Period};
+    use crate::budget::probe::ObservedUsage;
     use crate::domain::TaskSource;
 
     const PERIOD_HOURS: i64 = 24 * 7;
@@ -415,6 +513,51 @@ mod tests {
         })
     }
 
+    /// A ledger for any provider at `elapsed` of a 7-day period, nothing spent.
+    fn provider_ledger(cfg: &BudgetConfig, provider: Provider, elapsed: f64) -> Ledger {
+        let now = now();
+        let start = now - fraction_of(Duration::hours(PERIOD_HOURS), elapsed);
+        let budget = cfg.provider(provider);
+        let tiers: Vec<TierLedger> = cfg
+            .models_for(provider)
+            .into_iter()
+            .map(|tier| {
+                let b = budget.period_weighted_tokens as f64 * tier_share(cfg, &tier);
+                TierLedger { tier, period_budget: b, ..Default::default() }
+            })
+            .collect();
+        Ledger {
+            provider,
+            now,
+            period: Period { start, end: start + Duration::hours(PERIOD_HOURS) },
+            window: Period { start: now - Duration::hours(5), end: now },
+            total_period_weighted: 0.0,
+            total_window_weighted: 0.0,
+            tiers,
+            period_budget: budget.period_weighted_tokens as f64,
+            window_budget: budget.window_weighted_tokens as f64,
+            window_enabled: true,
+            calibration: None,
+            observed: None,
+            anchor_source: AnchorSource::Config,
+        }
+    }
+
+    /// Claude and Codex both enabled, both at 10% of their period.
+    fn two_providers() -> (BudgetConfig, Ledgers) {
+        let mut cfg = BudgetConfig::default();
+        cfg.providers.codex.enabled = true;
+        let mut ledgers = Ledgers::default();
+        for p in [Provider::Claude, Provider::Codex] {
+            ledgers.by_provider.insert(p, provider_ledger(&cfg, p, 0.1));
+        }
+        (cfg, ledgers)
+    }
+
+    fn m(name: &str) -> ModelTier {
+        ModelTier::new(name)
+    }
+
     fn claude(l: &Ledgers) -> &Ledger {
         l.get(Provider::Claude).unwrap()
     }
@@ -433,13 +576,7 @@ mod tests {
         Prediction { weighted_tokens: tokens, wall_secs: 600.0, confidence: 0.5, basis: "test".into() }
     }
 
-    fn decide(
-        cfg: &BudgetConfig,
-        ledgers: &Ledgers,
-        limits: &RateLimitState,
-        t: &Task,
-        preferred: Option<ModelTier>,
-    ) -> Decision {
+    fn decide(cfg: &BudgetConfig, ledgers: &Ledgers, limits: &RateLimitState, t: &Task, preferred: &[ModelTier]) -> Decision {
         Policy::new(cfg, ledgers, limits).decide(t, prediction(100_000.0), preferred)
     }
 
@@ -448,13 +585,13 @@ mod tests {
         let cfg = BudgetConfig::default();
         let l = ledger(&cfg, 0.1, &[]);
         let limits = RateLimitState::default();
-        let d = decide(&cfg, &l, &limits, &task(Criticality::Critical), None);
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Critical), &[]);
         assert_eq!(d.model, Some(fable()));
         assert!(d.retry_at.is_none());
-        let d = decide(&cfg, &l, &limits, &task(Criticality::High), None);
+        let d = decide(&cfg, &l, &limits, &task(Criticality::High), &[]);
         assert_eq!(d.model, Some(opus()), "high gets the most capable tier it is allowed: opus");
         assert!(d.reasons.iter().any(|r| r.starts_with("fable: reserved for critical")), "{:?}", d.reasons);
-        let d = decide(&cfg, &l, &limits, &task(Criticality::Normal), None);
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Normal), &[]);
         assert_eq!(d.model, Some(sonnet()));
     }
 
@@ -463,10 +600,10 @@ mod tests {
         let cfg = BudgetConfig::default();
         let l = ledger(&cfg, 0.6, &[(fable(), 0.2)]);
         let limits = RateLimitState::default();
-        let d = decide(&cfg, &l, &limits, &task(Criticality::High), None);
+        let d = decide(&cfg, &l, &limits, &task(Criticality::High), &[]);
         assert_eq!(d.model, Some(fable()));
         assert!(d.reasons.iter().any(|r| r.contains("fable: eligible (relaxed to high)")), "{:?}", d.reasons);
-        let d = decide(&cfg, &l, &limits, &task(Criticality::Normal), None);
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Normal), &[]);
         assert_eq!(d.model, Some(sonnet()), "one level of relaxation does not reach normal");
     }
 
@@ -474,7 +611,7 @@ mod tests {
     fn no_relaxation_when_tier_is_over_paced() {
         let cfg = BudgetConfig::default();
         let l = ledger(&cfg, 0.6, &[(fable(), 0.7)]);
-        let d = decide(&cfg, &l, &RateLimitState::default(), &task(Criticality::High), None);
+        let d = decide(&cfg, &l, &RateLimitState::default(), &task(Criticality::High), &[]);
         assert_eq!(d.model, Some(opus()));
         assert!(d.reasons.iter().any(|r| r.starts_with("fable: reserved for critical; task is high")), "{:?}", d.reasons);
     }
@@ -484,14 +621,14 @@ mod tests {
         let cfg = BudgetConfig::default();
         let l = ledger(&cfg, 0.85, &[(fable(), 0.9)]);
         let limits = RateLimitState::default();
-        let d = decide(&cfg, &l, &limits, &task(Criticality::Normal), None);
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Normal), &[]);
         // Normal prefers the default model (sonnet) even though fable is eligible.
         assert_eq!(d.model, Some(sonnet()));
         assert!(d.reasons.iter().any(|r| r.contains("fable: eligible (relaxed to normal)")), "{:?}", d.reasons);
         let (ok, _) = Policy::new(&cfg, &l, &limits).eligibility(&task(Criticality::Low), &fable(), 1.0);
         assert!(!ok, "two levels below critical is normal, not low");
         // With a preference for fable, normal work now gets it.
-        let d = decide(&cfg, &l, &limits, &task(Criticality::Normal), Some(fable()));
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Normal), &[fable()]);
         assert_eq!(d.model, Some(fable()));
     }
 
@@ -500,14 +637,14 @@ mod tests {
         let cfg = BudgetConfig::default();
         let mut l = ledger(&cfg, 0.1, &[]);
         claude_mut(&mut l).total_window_weighted = claude(&l).window_budget - 10.0;
-        let d = decide(&cfg, &l, &RateLimitState::default(), &task(Criticality::Critical), None);
+        let d = decide(&cfg, &l, &RateLimitState::default(), &task(Criticality::Critical), &[]);
         assert_eq!(d.model, None);
         assert_eq!(d.retry_at, Some(now() + WINDOW_RECHECK));
         assert!(d.reasons.iter().any(|r| r.starts_with("fable: window:")), "{:?}", d.reasons);
         assert!(d.reasons.iter().any(|r| r.starts_with("haiku: window:")), "{:?}", d.reasons);
         // Without a window the same spend is no blocker.
         claude_mut(&mut l).window_enabled = false;
-        let d = decide(&cfg, &l, &RateLimitState::default(), &task(Criticality::Critical), None);
+        let d = decide(&cfg, &l, &RateLimitState::default(), &task(Criticality::Critical), &[]);
         assert_eq!(d.model, Some(fable()));
     }
 
@@ -518,7 +655,7 @@ mod tests {
         let mut limits = RateLimitState::default();
         let until = now() + Duration::minutes(30);
         limits.mark(fable(), until);
-        let d = decide(&cfg, &l, &limits, &task(Criticality::Critical), None);
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Critical), &[]);
         assert_eq!(d.model, Some(opus()));
         assert!(d.reasons.iter().any(|r| r.starts_with("fable: rate limited until 2026-10-01T12:30:00Z")), "{:?}", d.reasons);
         limits.clear_expired(now() + Duration::hours(1));
@@ -555,7 +692,7 @@ mod tests {
         let mut limits = RateLimitState::default();
         let until = now() + Duration::minutes(7);
         limits.mark(fable(), until);
-        let d = decide(&cfg, &l, &limits, &task(Criticality::Critical), None);
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Critical), &[]);
         assert_eq!(d.model, None);
         assert_eq!(d.retry_at, Some(until));
     }
@@ -567,13 +704,13 @@ mod tests {
         let limits = RateLimitState::default();
         let mut t = task(Criticality::Normal);
         t.model_override = Some(fable());
-        let d = decide(&cfg, &l, &limits, &t, None);
+        let d = decide(&cfg, &l, &limits, &t, &[]);
         assert_eq!(d.model, Some(sonnet()), "fable and opus are reserved; next eligible below fable is sonnet");
         assert!(d.reasons.iter().any(|r| r.contains("preferred fable not eligible; downgraded to sonnet")), "{:?}", d.reasons);
 
         let mut t = task(Criticality::Critical);
         t.model_override = Some(sonnet());
-        let d = decide(&cfg, &l, &limits, &t, Some(fable()));
+        let d = decide(&cfg, &l, &limits, &t, &[fable()]);
         assert_eq!(d.model, Some(sonnet()), "task override beats the rules preference and is never upgraded");
         assert!(d.reasons.iter().any(|r| r == "model override: sonnet"), "{:?}", d.reasons);
     }
@@ -584,7 +721,7 @@ mod tests {
         let l = ledger(&cfg, 0.1, &[(haiku(), 1.0)]);
         let mut t = task(Criticality::Critical);
         t.model_override = Some(haiku());
-        let d = decide(&cfg, &l, &RateLimitState::default(), &t, None);
+        let d = decide(&cfg, &l, &RateLimitState::default(), &t, &[]);
         assert_eq!(d.model, None);
         assert_eq!(d.retry_at, Some(claude(&l).period.end));
         assert!(d.reasons.iter().any(|r| r.contains("no cheaper tier is")), "{:?}", d.reasons);
@@ -596,7 +733,7 @@ mod tests {
         let l = ledger(&cfg, 0.1, &[]);
         let mut t = task(Criticality::Critical);
         t.model_override = Some(ModelTier::new("gpt-6.1-sol"));
-        let d = decide(&cfg, &l, &RateLimitState::default(), &t, None);
+        let d = decide(&cfg, &l, &RateLimitState::default(), &t, &[]);
         assert_eq!(d.model, None, "codex is disabled and the chain never reaches claude models");
         assert!(
             d.reasons.iter().any(|r| r.contains("preferred gpt-6.1-sol not eligible and no cheaper tier is")),
@@ -609,7 +746,7 @@ mod tests {
     fn cheapest_tier_remains_when_expensive_ones_are_exhausted() {
         let cfg = BudgetConfig::default();
         let l = ledger(&cfg, 0.5, &[(fable(), 1.0), (opus(), 1.0), (sonnet(), 0.999)]);
-        let d = decide(&cfg, &l, &RateLimitState::default(), &task(Criticality::Normal), None);
+        let d = decide(&cfg, &l, &RateLimitState::default(), &task(Criticality::Normal), &[]);
         assert_eq!(d.model, Some(haiku()));
         assert!(d.reasons.iter().any(|r| r.starts_with("sonnet: period budget:")), "{:?}", d.reasons);
         assert!(
@@ -623,7 +760,7 @@ mod tests {
     fn everything_exhausted_waits_for_the_period_end() {
         let cfg = BudgetConfig::default();
         let l = ledger(&cfg, 0.5, &[(fable(), 1.0), (opus(), 1.0), (sonnet(), 1.0), (haiku(), 1.0)]);
-        let d = decide(&cfg, &l, &RateLimitState::default(), &task(Criticality::Critical), None);
+        let d = decide(&cfg, &l, &RateLimitState::default(), &task(Criticality::Critical), &[]);
         assert_eq!(d.model, None);
         assert_eq!(d.retry_at, Some(claude(&l).period.end));
     }
@@ -646,7 +783,7 @@ mod tests {
         let cfg = BudgetConfig::default();
         let mut l = ledger(&cfg, 0.5, &[]);
         claude_mut(&mut l).calibration = Some(Calibration { observed_fraction: 0.97, at: now(), measured_fraction: 0.0 });
-        let d = decide(&cfg, &l, &RateLimitState::default(), &task(Criticality::Critical), None);
+        let d = decide(&cfg, &l, &RateLimitState::default(), &task(Criticality::Critical), &[]);
         assert_eq!(d.model, None);
         assert!(d.reasons.iter().any(|r| r.contains("overall period budget")), "{:?}", d.reasons);
     }
@@ -656,9 +793,9 @@ mod tests {
         let cfg = BudgetConfig { low_model: haiku(), ..BudgetConfig::default() };
         let l = ledger(&cfg, 0.1, &[]);
         let limits = RateLimitState::default();
-        let d = decide(&cfg, &l, &limits, &task(Criticality::Low), None);
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Low), &[]);
         assert_eq!(d.model, Some(haiku()));
-        let d = decide(&cfg, &l, &limits, &task(Criticality::Low), Some(sonnet()));
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Low), &[sonnet()]);
         assert_eq!(d.model, Some(sonnet()));
         assert!(d.reasons.iter().any(|r| r == "preferred by rules: sonnet"), "{:?}", d.reasons);
     }
@@ -672,7 +809,7 @@ mod tests {
         let limits = RateLimitState::default();
         let policy = Policy::new(&cfg, &l, &limits);
         assert_eq!(policy.candidates(), vec![sonnet(), haiku()]);
-        let d = policy.decide(&task(Criticality::Critical), prediction(1.0), None);
+        let d = policy.decide(&task(Criticality::Critical), prediction(1.0), &[]);
         assert_eq!(d.model, Some(sonnet()));
         let (ok, why) = policy.eligibility(&task(Criticality::Critical), &fable(), 1.0);
         assert!(!ok);
@@ -686,7 +823,7 @@ mod tests {
         let limits = RateLimitState::default();
         let policy = Policy::new(&cfg, &ledgers, &limits);
         assert!(policy.candidates().is_empty());
-        let d = policy.decide(&task(Criticality::Critical), prediction(1.0), None);
+        let d = policy.decide(&task(Criticality::Critical), prediction(1.0), &[]);
         assert_eq!(d.model, None);
         assert!(d.retry_at.is_some());
         assert!(d.reasons[0].contains("claude provider is disabled"), "{:?}", d.reasons);
@@ -706,15 +843,214 @@ mod tests {
         let limits = RateLimitState::default();
         let period = claude(&l).period;
         // High needs one level: wait for relax_after_fraction (0.5).
-        let d = decide(&cfg, &l, &limits, &task(Criticality::High), None);
+        let d = decide(&cfg, &l, &limits, &task(Criticality::High), &[]);
         assert_eq!(d.model, None);
         assert_eq!(d.retry_at, Some(period.start + fraction_of(period.len(), 0.5)));
         // Normal needs two levels: wait for the end game (0.8).
-        let d = decide(&cfg, &l, &limits, &task(Criticality::Normal), None);
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Normal), &[]);
         assert_eq!(d.retry_at, Some(period.start + fraction_of(period.len(), 0.8)));
         // Low can never get fable: period end.
-        let d = decide(&cfg, &l, &limits, &task(Criticality::Low), None);
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Low), &[]);
         assert_eq!(d.retry_at, Some(period.end));
+    }
+
+    #[test]
+    fn second_provider_used_when_first_is_rate_limited() {
+        let (cfg, l) = two_providers();
+        let mut limits = RateLimitState::default();
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Critical), &[]);
+        assert_eq!(d.model, Some(fable()), "claude comes first in the default order");
+        limits.mark_provider(&cfg, Provider::Claude, now() + Duration::minutes(30));
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Critical), &[]);
+        assert_eq!(d.model, Some(m("gpt-6.1-sol")));
+        assert!(
+            d.reasons.iter().any(|r| r == "fable: rate limited until 2026-10-01T12:30:00Z (claude account-wide)"),
+            "{:?}",
+            d.reasons
+        );
+        assert!(d.reasons.iter().any(|r| r.starts_with("gpt-6.1-sol: eligible")), "{:?}", d.reasons);
+        // Normal work: the default model is out, so the first eligible codex model wins.
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Normal), &[]);
+        assert_eq!(d.model, Some(m("gpt-6-luna")), "{:?}", d.reasons);
+        assert!(d.reasons.iter().any(|r| r.contains("falling back to gpt-6-luna")), "{:?}", d.reasons);
+    }
+
+    #[test]
+    fn preference_list_is_tried_in_order() {
+        let (cfg, l) = two_providers();
+        let mut limits = RateLimitState::default();
+        let prefs = [m("gpt-6-astra"), opus()];
+        let d = decide(&cfg, &l, &limits, &task(Criticality::High), &prefs);
+        assert_eq!(d.model, Some(m("gpt-6-astra")));
+        assert!(d.reasons.iter().any(|r| r == "preferred by rules: gpt-6-astra | opus"), "{:?}", d.reasons);
+        let d = decide(&cfg, &l, &limits, &task(Criticality::High), &[opus(), m("gpt-6-astra")]);
+        assert_eq!(d.model, Some(opus()));
+        // The first preference's whole chain is out: the second preference wins.
+        limits.mark_provider(&cfg, Provider::Codex, now() + Duration::minutes(30));
+        let d = decide(&cfg, &l, &limits, &task(Criticality::High), &prefs);
+        assert_eq!(d.model, Some(opus()));
+        assert!(d.reasons.iter().any(|r| r == "preferred gpt-6-astra not eligible and no cheaper tier is"), "{:?}", d.reasons);
+        assert!(d.reasons.iter().any(|r| r == "preferred opus is eligible"), "{:?}", d.reasons);
+        // Only astra is out: its own chain (gpt-6-luna) comes before the next preference.
+        let mut limits = RateLimitState::default();
+        limits.mark(m("gpt-6-astra"), now() + Duration::minutes(30));
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Normal), &prefs);
+        assert_eq!(d.model, Some(m("gpt-6-luna")));
+    }
+
+    #[test]
+    fn override_never_crosses_provider() {
+        let (cfg, l) = two_providers();
+        let mut limits = RateLimitState::default();
+        let until = now() + Duration::minutes(20);
+        limits.mark_provider(&cfg, Provider::Codex, until);
+        limits.mark(fable(), now() + Duration::minutes(5));
+        let mut t = task(Criticality::Critical);
+        t.model_override = Some(m("gpt-6-astra"));
+        let d = decide(&cfg, &l, &limits, &t, &[fable()]);
+        assert_eq!(d.model, None, "claude is free but the override pins codex: {:?}", d.reasons);
+        assert_eq!(d.retry_at, Some(until), "only the override's provider decides when to look again");
+        assert!(d.reasons.iter().any(|r| r == "preferred gpt-6-astra not eligible and no cheaper tier is"), "{:?}", d.reasons);
+    }
+
+    #[test]
+    fn provider_order_drives_fallback() {
+        let (mut cfg, l) = two_providers();
+        let limits = RateLimitState::default();
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Critical), &[]);
+        assert_eq!(d.model, Some(fable()));
+        cfg.provider_order = vec![Provider::Codex, Provider::Claude];
+        let policy = Policy::new(&cfg, &l, &limits);
+        assert_eq!(policy.providers(), vec![Provider::Codex, Provider::Claude]);
+        assert_eq!(policy.candidates()[0], m("gpt-6.1-sol"));
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Critical), &[]);
+        assert_eq!(d.model, Some(m("gpt-6.1-sol")));
+        // A preference still beats the order.
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Critical), &[fable()]);
+        assert_eq!(d.model, Some(fable()));
+        // Order only lists codex: claude still follows as a fallback.
+        cfg.provider_order = vec![Provider::Codex];
+        assert_eq!(Policy::new(&cfg, &l, &limits).providers(), vec![Provider::Codex, Provider::Claude]);
+    }
+
+    #[test]
+    fn disabled_provider_is_never_a_candidate() {
+        let (mut cfg, l) = two_providers();
+        cfg.providers.codex.enabled = false;
+        let limits = RateLimitState::default();
+        let policy = Policy::new(&cfg, &l, &limits);
+        assert_eq!(policy.providers(), vec![Provider::Claude], "a stale codex ledger does not make codex a candidate");
+        assert!(policy.candidates().iter().all(|t| t.provider() == Provider::Claude));
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Critical), &[m("gpt-6.1-sol")]);
+        assert_eq!(d.model, Some(fable()), "a rules preference for a disabled provider falls back: {:?}", d.reasons);
+        assert!(d.reasons.iter().any(|r| r.contains("falling back to fable")), "{:?}", d.reasons);
+        assert!(!d.reasons.iter().any(|r| r.starts_with("gpt-6.1-sol:")), "{:?}", d.reasons);
+    }
+
+    #[test]
+    fn observed_blocked_provider_is_skipped_until_reset() {
+        let (cfg, mut l) = two_providers();
+        let reset = now() + Duration::hours(2);
+        let obs = ObservedUsage {
+            window_used: Some(0.4),
+            window_resets_at: Some(reset),
+            blocked: true,
+            ..ObservedUsage::empty(now() - Duration::minutes(3))
+        };
+        claude_mut(&mut l).observed = Some(obs.clone());
+        let limits = RateLimitState::default();
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Critical), &[]);
+        assert_eq!(d.model, Some(m("gpt-6.1-sol")));
+        assert!(
+            d.reasons
+                .iter()
+                .any(|r| r == "fable: claude reports its allowance blocked; skipped until the reset at 2026-10-01T14:00:00Z"),
+            "{:?}",
+            d.reasons
+        );
+
+        // Claude alone: throttled until the observed reset.
+        let mut only = Ledgers::single(claude(&l).clone());
+        let cfg_claude = BudgetConfig::default();
+        let d = decide(&cfg_claude, &only, &limits, &task(Criticality::Critical), &[]);
+        assert_eq!(d.model, None);
+        assert_eq!(d.retry_at, Some(reset));
+
+        // A full window without `blocked` behaves the same.
+        claude_mut(&mut only).observed = Some(ObservedUsage { blocked: false, window_used: Some(1.0), ..obs.clone() });
+        let d = decide(&cfg_claude, &only, &limits, &task(Criticality::Critical), &[]);
+        assert_eq!(d.retry_at, Some(reset));
+
+        // Once the reset has passed the observation no longer blocks.
+        claude_mut(&mut only).observed =
+            Some(ObservedUsage { window_resets_at: Some(now() - Duration::minutes(1)), ..obs.clone() });
+        let d = decide(&cfg_claude, &only, &limits, &task(Criticality::Critical), &[]);
+        assert_eq!(d.model, Some(fable()));
+
+        // Exhausted without a reset instant: blocked for a while after the observation.
+        claude_mut(&mut only).observed = Some(ObservedUsage { window_resets_at: None, ..obs.clone() });
+        let d = decide(&cfg_claude, &only, &limits, &task(Criticality::Critical), &[]);
+        assert_eq!(d.model, None);
+        assert_eq!(d.retry_at, Some(now() + WINDOW_RECHECK));
+        claude_mut(&mut only).observed =
+            Some(ObservedUsage { window_resets_at: None, observed_at: now() - Duration::hours(2), ..obs });
+        let d = decide(&cfg_claude, &only, &limits, &task(Criticality::Critical), &[]);
+        assert_eq!(d.model, Some(fable()), "an old exhausted observation without a reset expires");
+    }
+
+    #[test]
+    fn retry_at_uses_earliest_reset_across_providers() {
+        let (cfg, mut l) = two_providers();
+        let mut limits = RateLimitState::default();
+        limits.mark_provider(&cfg, Provider::Claude, now() + Duration::minutes(50));
+        limits.mark_provider(&cfg, Provider::Codex, now() + Duration::minutes(20));
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Critical), &[]);
+        assert_eq!(d.model, None);
+        assert_eq!(d.retry_at, Some(now() + Duration::minutes(20)));
+        // An observed reset that comes sooner wins.
+        let mut limits = RateLimitState::default();
+        limits.mark_provider(&cfg, Provider::Claude, now() + Duration::minutes(50));
+        let reset = now() + Duration::minutes(7);
+        l.get_mut(Provider::Codex).unwrap().observed =
+            Some(ObservedUsage { period_used: Some(1.0), period_resets_at: Some(reset), ..ObservedUsage::empty(now()) });
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Critical), &[]);
+        assert_eq!(d.retry_at, Some(reset));
+        // Capped by the earliest period end across providers.
+        let soon = now() + Duration::minutes(3);
+        l.get_mut(Provider::Codex).unwrap().observed = None;
+        limits.mark_provider(&cfg, Provider::Codex, now() + Duration::hours(3));
+        let codex = l.get_mut(Provider::Codex).unwrap();
+        codex.period = Period { start: soon - Duration::hours(PERIOD_HOURS), end: soon };
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Critical), &[]);
+        assert_eq!(d.retry_at, Some(soon));
+    }
+
+    #[test]
+    fn provider_without_window_ignores_window_budget() {
+        let (mut cfg, mut l) = two_providers();
+        cfg.provider_order = vec![Provider::Codex, Provider::Claude];
+        let codex = l.get_mut(Provider::Codex).unwrap();
+        codex.total_window_weighted = codex.window_budget * 10.0;
+        let limits = RateLimitState::default();
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Critical), &[]);
+        assert_eq!(d.model, Some(fable()), "codex's window is full, so claude runs it");
+        assert!(d.reasons.iter().any(|r| r.starts_with("gpt-6.1-sol: window:")), "{:?}", d.reasons);
+        l.get_mut(Provider::Codex).unwrap().window_enabled = false;
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Critical), &[]);
+        assert_eq!(d.model, Some(m("gpt-6.1-sol")), "{:?}", d.reasons);
+        assert!(d.reasons.iter().any(|r| r == "codex: period 10% elapsed, 0% spent; no window"), "{:?}", d.reasons);
+    }
+
+    #[test]
+    fn provider_blocked_until_needs_every_enabled_model() {
+        let cfg = BudgetConfig::default();
+        let mut limits = RateLimitState::default();
+        assert_eq!(limits.provider_blocked_until(&cfg, Provider::Claude, now()), None);
+        limits.mark(fable(), now() + Duration::minutes(5));
+        assert_eq!(limits.provider_blocked_until(&cfg, Provider::Claude, now()), None);
+        limits.mark_provider(&cfg, Provider::Claude, now() + Duration::minutes(10));
+        limits.mark(opus(), now() + Duration::minutes(3));
+        assert_eq!(limits.provider_blocked_until(&cfg, Provider::Claude, now()), Some(now() + Duration::minutes(3)));
     }
 
     #[test]

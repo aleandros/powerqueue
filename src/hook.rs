@@ -4,7 +4,11 @@
 //! from stdin, stores it in `hook_events` for the daemon, and exits 0. For
 //! `Stop` events carrying the done/blocked markers it additionally flips the
 //! task state immediately so the dashboard reflects completion even if the
-//! daemon is between ticks.
+//! daemon is between ticks. Payloads of other providers are normalised to
+//! the Claude shape by `agent_for(provider).normalize_hook` before they get
+//! here. The `StatusLine` pseudo-event ([`handle_status_line`]) is Claude
+//! Code's status-line command: it stores the reported rate limits as
+//! observed usage and prints a short status text.
 
 use std::io::Read;
 
@@ -29,15 +33,40 @@ pub fn handle(
     event: HookEvent,
     stdin: &mut dyn Read,
 ) -> Result<i32> {
+    let payload = read_payload(stdin);
+    handle_payload(store, task_id, session_id, event, payload)
+}
+
+/// Read a hook payload: stdin to the end, parsed as JSON. A JSON object is
+/// returned as is, another JSON value is wrapped as `{"value": …}`, and an
+/// empty, unreadable or non-JSON input becomes `{}`. Never fails.
+pub fn read_payload(stdin: &mut dyn Read) -> serde_json::Value {
     let mut raw = String::new();
     if let Err(e) = stdin.read_to_string(&mut raw) {
         tracing::warn!(error = %e, "hook: cannot read stdin; storing an empty payload");
     }
-    let payload: serde_json::Value = match serde_json::from_str(raw.trim()) {
+    parse_payload(&raw)
+}
+
+/// [`read_payload`] for a payload that is already in memory (Codex `notify`
+/// passes it as the last argument).
+pub fn parse_payload(raw: &str) -> serde_json::Value {
+    match serde_json::from_str(raw.trim()) {
         Ok(v @ serde_json::Value::Object(_)) => v,
         Ok(other) => serde_json::json!({ "value": other }),
         Err(_) => serde_json::json!({}),
-    };
+    }
+}
+
+/// Store an already-parsed (Claude-shaped) hook payload; see [`handle`].
+/// Always returns `Ok(0)`.
+pub fn handle_payload(
+    store: &Store,
+    task_id: TaskId,
+    session_id: Option<uuid::Uuid>,
+    event: HookEvent,
+    payload: serde_json::Value,
+) -> Result<i32> {
     let session_id =
         session_id.or_else(|| payload.get("session_id").and_then(|s| s.as_str()).and_then(|s| uuid::Uuid::parse_str(s).ok()));
 
@@ -65,6 +94,25 @@ pub fn handle(
         tracing::warn!(task = %task_id, error = %format!("{e:#}"), "hook: cannot apply completion marker");
     }
     Ok(0)
+}
+
+/// Handle Claude Code's status-line command (`--event StatusLine`): parse
+/// the JSON on stdin, store its `rate_limits` as Claude's observed usage
+/// (kv `budget.observed.claude`, latest wins; no `hook_events` row, no
+/// event — it runs after every response) and return the short text Claude
+/// Code displays (`pq sonnet 5h 75% · 7d 89%`). Never fails: unreadable
+/// input or a store error still yields a status text. `store` is `None`
+/// when the database could not be opened.
+pub fn handle_status_line(store: Option<&Store>, stdin: &mut dyn Read, now: chrono::DateTime<Utc>) -> String {
+    use crate::budget::probes::claude::{parse_status_line, status_line_text};
+    let payload = read_payload(stdin);
+    let observed = parse_status_line(&payload, now);
+    if let (Some(store), Some(obs)) = (store, &observed)
+        && let Err(e) = crate::budget::save_observed(store, crate::domain::Provider::Claude, obs)
+    {
+        tracing::warn!(error = %format!("{e:#}"), "status line: cannot store observed usage");
+    }
+    status_line_text(&payload, observed.as_ref())
 }
 
 /// Flip the task state when the final message carries a marker. The daemon
@@ -211,6 +259,32 @@ mod tests {
         let code = handle(&store, TaskId::new(), None, HookEvent::Stop, &mut Cursor::new(payload.to_string())).unwrap();
         assert_eq!(code, 0);
         assert_eq!(store.drain_hook_events().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn status_line_stores_observed_usage_without_a_hook_row() {
+        let (store, _) = store_with_task();
+        let payload = serde_json::json!({
+            "model": { "id": "claude-opus-5-5", "display_name": "Opus 5.5" },
+            "rate_limits": {
+                "five_hour": { "used_percentage": 75, "resets_at": 1790914200 },
+                "seven_day": { "used_percentage": 89, "resets_at": 1790920800 }
+            }
+        });
+        let now = Utc::now();
+        let text = handle_status_line(Some(&store), &mut Cursor::new(payload.to_string()), now);
+        assert_eq!(text, "pq opus 5h 75% · 7d 89%");
+        let obs = crate::budget::load_observed(&store, crate::domain::Provider::Claude).unwrap().unwrap();
+        assert_eq!(obs.window_used, Some(0.75));
+        assert_eq!(obs.period_used, Some(0.89));
+        assert_eq!(obs.observed_at, now);
+        assert!(store.drain_hook_events().unwrap().is_empty());
+
+        // Garbage in: still a status text, nothing stored over the last observation.
+        assert_eq!(handle_status_line(Some(&store), &mut Cursor::new("not json"), now), "pq");
+        assert!(crate::budget::load_observed(&store, crate::domain::Provider::Claude).unwrap().is_some());
+        assert_eq!(handle_status_line(None, &mut Cursor::new(payload.to_string()), now), "pq opus 5h 75% · 7d 89%");
+        assert_eq!(parse_payload("[1]"), serde_json::json!({ "value": [1] }));
     }
 
     #[test]

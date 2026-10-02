@@ -240,7 +240,8 @@ state machine allows it. `complete` and `block` always write directly.
 
 | Command | What it does |
 |---------|--------------|
-| `budget show` | period/window spend per model and what the policy would allow (Claude's ledger; other enabled providers are summarised in one line) |
+| `budget show` | per enabled provider: period/window spend per model, observed usage and its age, anchor source and cooldowns; then what the policy would run now (`--json`: `{"providers": {...}, "next": {...}}`) |
+| `budget probe [--provider P]` | ask providers for their remaining allowance now (Codex `app-server`, Claude's status line, `agy /usage`) and store it; exits 1 when a probe fails |
 | `budget set-reset <when> [--provider P]` | record a provider's period reset instant (from `/usage` in Claude Code; RFC 3339 or `in 3d4h`); default provider `claude` |
 | `budget set-observed <percent> [--provider P]` | calibrate a provider's pacing with the percentage it shows (e.g. `43%`) |
 | `budget clear-limits [--provider P]` | forget a provider's rate-limit cooldowns |
@@ -271,7 +272,7 @@ state machine allows it. `complete` and `block` always write directly.
 | `secrets set <linear\|jev> [value]` | store a key (prompts if omitted) |
 | `secrets unset <name>` | remove a key |
 | `secrets list` | which keys are configured and where they come from |
-| `hook --task ID [--session SID] --event EVENT` | internal; called by Claude Code hooks (hidden) |
+| `hook --task ID [--session SID] --event EVENT [--provider P] [PAYLOAD]` | internal; called by agent CLI hooks (hidden); `--event StatusLine` is the Claude status line (stores rate limits, prints a short status); `PAYLOAD` replaces stdin (Codex `notify`) |
 
 ## How a task is run
 
@@ -476,6 +477,17 @@ Shared keys in `[budget]`:
 | `endgame_fraction` | `0.8` | after this fraction of the period, reserved capacity is released |
 | `probe_interval_mins` | `15` | how often usage probes run (0 disables them) |
 
+Usage probes ask each enabled provider how much of its allowance is used,
+without spending any of it: Codex through `codex app-server`
+(`account/rateLimits/read`), Claude through the status line every task's
+`settings.json` configures (`powerqueue hook … --event StatusLine`, which
+also shows `pq <model> 5h 75% · 7d 89%` in the session), Antigravity through
+`agy -p /usage` (experimental). The daemon runs them at start and every
+`probe_interval_mins` in the background; `budget probe` runs them now. The
+reported weekly reset becomes the period anchor, the reported usage the
+calibration, and a provider that reports its allowance exhausted is skipped
+until the reset. Details: [docs/budget.md](docs/budget.md#usage-probes-and-observed-anchors).
+
 Per provider (`[budget.providers.claude]`, `.codex`, `.gemini`); keys you
 omit keep the provider's defaults:
 
@@ -608,10 +620,14 @@ budget and rolling window. Each model has a share of the period and a minimum cr
 Early in the period Fable only serves `critical` tasks; if a tier is under-spent
 past `relax_after_fraction`, one level lower qualifies; in the end game two
 levels. The predicted cost must also fit the tier's remaining share, the
-overall period budget and the window. If nothing is eligible the task is
-`throttled` with a retry time.
-Calibrate with `budget set-reset` and `budget set-observed`; `doctor` tells you
-when to. Details and worked examples: [docs/budget.md](docs/budget.md).
+overall period budget and the window. With several providers enabled, the
+task's preferred models are tried in order (each through its own provider's
+downgrade chain), then the first eligible model in `budget.provider_order`;
+a rate-limited or exhausted provider is skipped until its reset. If nothing
+is eligible the task is `throttled` with a retry time.
+Usage probes keep the period anchor and calibration current; `budget set-reset`
+and `budget set-observed` do it by hand, and `doctor` tells you when to.
+Details and worked examples: [docs/budget.md](docs/budget.md).
 
 ## Secrets
 

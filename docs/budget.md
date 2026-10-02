@@ -3,18 +3,20 @@
 A Claude subscription gives a weekly allowance plus a rolling 5-hour window.
 Both are shared by every model, and Fable is the most capable and the scarcest.
 powerqueue wants critical work on Fable immediately, routine work on cheaper
-tiers, and no Fable capacity wasted at the end of the week. There is no API for
-the remaining allowance, so powerqueue measures what it spends, lets you
-calibrate against `/usage`, and treats rate-limit errors as a hard signal.
+tiers, and no Fable capacity wasted at the end of the week. It measures what
+it spends, reads what the providers report about their own allowance
+(usage probes, below), lets you calibrate against `/usage`, and treats
+rate-limit errors as a hard signal.
 
 The code lives in `src/budget/`: `period.rs` (where we are in the period),
 `ledger.rs` (what was spent; one `Ledger` per enabled provider in `Ledgers`),
-`probe.rs` (what a provider reports about its own allowance), `estimator.rs`
-(what a task will cost) and `policy.rs` (the decision). Budgets are per
-provider: the shared knobs live in `[budget]` of `config.toml`, everything
-about one subscription in `[budget.providers.<provider>]`. This page
-describes the Claude provider; Codex and Gemini have the same shape with
-their own defaults (see the README) and are experimental.
+`probe.rs` (what a provider reports about its own allowance), `probes/` (the
+real probes per provider), `estimator.rs` (what a task will cost) and
+`policy.rs` (the decision). Budgets are per provider: the shared knobs live
+in `[budget]` of `config.toml`, everything about one subscription in
+`[budget.providers.<provider>]`. Most of this page uses the Claude provider
+as the example; Codex and Gemini have the same shape with their own defaults
+(see [Providers](#providers) and the README) and are experimental.
 
 ```toml
 [budget]
@@ -121,25 +123,110 @@ is never chosen. Tasks of criticality `low` with no preference go to
 `budget.low_model` (Sonnet), `normal` ones to `budget.default_model`, and
 `critical`/`high` ones to the most capable eligible tier.
 
+## Providers
+
+Each enabled provider (`budget.providers.<p>.enabled`) has its own ledger:
+its own period clock and anchor, window, calibration, observed usage and
+model table. Usage rows count against the provider that runs the model
+(`ModelTier::provider()`: `fable|opus|sonnet|haiku` → claude, `gpt-*` →
+codex, `gemini-*` → gemini).
+
+| provider | CLI | default models (rank) | window | probe |
+|----------|-----|-----------------------|--------|-------|
+| `claude` | `claude` | fable (10), opus (20), sonnet (30), haiku (40) | 5 h | the session's status line |
+| `codex` | `codex` | gpt-6.1-sol (10), gpt-6-astra (20), gpt-6-luna (30) | 5 h (Pro-family plans have none: set `window_hours = 0`) | `codex app-server` → `account/rateLimits/read` |
+| `gemini` | `agy` (Antigravity) | gemini-3-pro (10), gemini-3-flash (20) | 5 h | `agy -p /usage --output-format json` (experimental) |
+
+`budget.provider_order` (default `["claude", "codex", "gemini"]`) is the
+fallback order between enabled providers; enabled providers it does not list
+come after it. A provider with `window_hours = 0` has no window check at all.
+
+## Usage probes and observed anchors
+
+A probe asks a provider how much of its allowance is used, without spending
+any of it. The daemon runs the probes of every enabled provider once at
+start and then every `budget.probe_interval_mins` (default 15; `0` turns
+them off) on a background thread, so a slow CLI never delays scheduling
+(each probe is killed after 15 s). `powerqueue budget probe [--provider P]`
+runs them now and prints what came back.
+
+- **claude**: no extra call. Each task's `settings.json` sets a
+  `statusLine` command (`powerqueue hook … --event StatusLine`). Claude Code
+  runs it after responses with `rate_limits.five_hour` / `seven_day`
+  (`used_percentage`, `resets_at`) on stdin — only for claude.ai Pro/Max
+  logins and only after the first response. The hook stores them and prints
+  a short status line (`pq sonnet 5h 75% · 7d 89%`) that you see when you
+  attach. The probe reads back the latest one.
+- **codex**: spawns `codex -s read-only -a never app-server`, sends
+  `initialize`, `initialized` and `account/rateLimits/read`, and maps each
+  bucket by its length: at most 600 minutes is the window, longer is the
+  period. `ordinaryUsageAllowed: false` means blocked.
+- **gemini**: runs `agy -p "/usage" --output-format json` and reads the
+  `gemini-5h` / `gemini-weekly` buckets (`remaining_fraction`; `disabled`
+  means blocked). The output shape comes from community reports; anything
+  unexpected is ignored.
+
+What a probe learns is stored in kv `budget.observed.<provider>` and used in
+three ways:
+
+1. **Calibration.** The reported period usage becomes the provider's
+   calibration, exactly like `budget set-observed` (a newer manual
+   calibration wins).
+2. **Anchor.** The reported weekly reset (`period_resets_at`) moves the
+   period so it ends there; `budget show` then says `anchor learned from the
+   provider` and you never need `budget set-reset`.
+3. **Cooldown.** `blocked`, or a window or period at 100%, keeps the whole
+   provider off the candidate list until the matching reset (`claude reports
+   its allowance blocked; skipped until the reset at …`). An exhausted
+   reading without a reset time counts for an hour.
+
+`budget show` prints each provider's observed line with its age (`observed
+window 17% · period 40% (resets …) (3m ago)`), the anchor source (`config`,
+`learned from the provider`, or a warning when neither is known) and the
+last probe failure if there was one. Probe results are logged as
+`budget.probe` events: info when the reading changes, a warning when a probe
+fails (at most once an hour per provider).
+
 ## The decision
 
 `Policy::decide` runs for every task the scheduler wants to start. It is
-pure: the same ledger, prediction and preference always give the same answer.
+pure: the same ledgers, prediction and preferences always give the same
+answer.
 
-**Preference.** The scheduler passes one preferred tier: `task.model_override`
-(set only by `task model <tier>` and `add --model`) if present, else the
-PRIORITY.md model (`KEY: model = x` override, then `## Models` for the
-criticality). The reasons say which: `model override: fable` or
-`preferred by rules: fable`. Both are treated the same way below; the policy
-may downgrade either and never upgrades above it.
+**Candidates.** Every enabled model with a share > 0 of every enabled
+provider: providers in `provider_order`, each provider's models most capable
+(lowest `rank`) first.
 
-**Per-tier verdict.** Every enabled tier with a share > 0 is checked in
-order, most capable first (`Policy::verdict`); the first failing gate gives
-the reason:
+**Preferences.** In this order, the first that exists:
 
-1. **Rate limit.** A tier on cooldown is out until it ends
-   (`rate limited until <time>`).
-2. **Criticality gate.** The task must be at least `min_criticality`, or the
+1. `task.model_override` (set only by `task model <model>` and `add
+   --model`): a *hard* override. Reason: `model override: gpt-6-astra`.
+2. The PRIORITY.md preference list (`KEY: model = x` override, then `##
+   Models` for the criticality), most wanted first. Reason: `preferred by
+   rules: fable | gpt-6.1-sol`.
+3. The criticality default: `budget.default_model` for `normal`,
+   `budget.low_model` for `low`, none for `critical`/`high`.
+
+Each preferred model is tried through its own downgrade chain (the same
+provider's models with a higher rank), in list order; the first eligible
+model wins (`preferred fable not eligible; downgraded to opus`). When nothing
+in the list is eligible and it was not a hard override, the first eligible
+candidate in provider order wins (`nothing in the preference list is
+eligible; falling back to gpt-6-luna (first eligible on codex in provider
+order)`); without any preference (critical/high) that is simply the most
+capable eligible model of the first provider that has one. A hard override
+never crosses to another provider and is never upgraded: if its chain is out,
+the task waits.
+
+**Per-model verdict.** Every candidate is checked (`Policy::verdict`); the
+first failing gate gives the reason:
+
+1. **Observed cooldown.** The provider's latest observation says blocked or
+   fully used (see above).
+2. **Rate limit.** A model on cooldown is out until it ends
+   (`rate limited until <time>`, with `(claude account-wide)` when every
+   model of the provider is cooling down).
+3. **Criticality gate.** The task must be at least `min_criticality`, or the
    tier must be *relaxed*:
    - after `relax_after_fraction` of the period, if the tier's spend fraction
      (`period_weighted / period_budget`) is below the period's elapsed
@@ -149,27 +236,23 @@ the reason:
      levels lower qualify regardless of pacing.
    Reason when blocked: `reserved for critical (relaxed to high); task is low
    (20% of its budget spent at 68% of the period)`.
-3. **Tier budget.** `predicted × weight` must fit the tier's remaining share
+4. **Tier budget.** `predicted × weight` must fit the tier's remaining share
    times `1 - safety_margin` (default 5% of what is left stays unspent).
-4. **Overall period budget.** The calibrated period fraction plus this task's
-   cost must stay below `1 - safety_margin`.
-5. **Window.** `total_window_weighted + cost` must fit
-   `window_weighted_tokens` (`window: 10000000 of 12000000 weighted tokens
-   used, needs 3000000 more`).
+5. **Overall period budget.** The provider's calibrated period fraction plus
+   this task's cost must stay below `1 - safety_margin`.
+6. **Window** (only when the provider has one). `total_window_weighted +
+   cost` must fit `window_weighted_tokens` (`window: 10000000 of 12000000
+   weighted tokens used, needs 3000000 more`).
 
 An eligible tier reads `eligible; 20% of its budget spent at 68% of the
 period` (or `eligible (relaxed to high); ...`).
 
-**Choice.** With a preference: that tier if eligible, else the most capable
-eligible tier *below* it (`preferred fable not eligible; downgraded to opus`).
-Without one: `critical`/`high` take the most capable eligible tier, `normal`
-takes `default_model` or the best eligible tier below it, `low` the same with
-`low_model`.
-
 **Throttle.** If nothing fits the task gets no model and a `retry_at`: the
-earliest hint among the blocking tiers (rate-limit expiry, the next relaxation
-or end-game boundary, the period end, or `WINDOW_RECHECK` = 15 minutes when
-the window was the blocker), capped at the period end and never in the past.
+earliest hint across providers among the blocking models (rate-limit or
+observed cooldown end, the next relaxation or end-game boundary, a period
+end, or `WINDOW_RECHECK` = 15 minutes when the window was the blocker),
+capped at the earliest period end and never in the past. For a hard override
+only its own provider's hints count.
 The task state becomes `throttled` and `not_before` is set; `pick_next` takes
 it again once that passes.
 
@@ -182,15 +265,26 @@ in the `task.starting` / `task.throttled` event and printed by
 
 Claude Code does not exit on a rate limit; it fires a `StopFailure` hook with
 `error_type: rate_limit` (also `overloaded`, `usage_limit`, `quota`). The
-daemon marks the session's tier exhausted for `rate_limit_cooldown_mins`
-(default 30; at least one minute, never past the period end), logs
-`budget.rate_limited` and puts the task in `throttled` with `not_before` at
-the cooldown end. If the session is still alive when the cooldown passes the
-task simply goes back to `running`; otherwise it is relaunched like any
-throttled task. The state is persisted in the `kv` table under
-`budget.rate_limits` (`RATE_LIMITS_KEY`) so a daemon restart does not forget
-it. `powerqueue budget clear-limits` forgets it on purpose, for example after
-`/usage` shows the window has reset.
+daemon looks at the provider of the session's model and cools it down for
+that provider's `rate_limit_cooldown_mins` (default 30; at least one minute,
+never past that provider's period end): subscription limits are account-wide,
+so a `rate_limit` marks every model of the provider; `overloaded` marks only
+the model that reported it. It logs `budget.rate_limited` (naming the
+provider) and puts the task in `throttled` with `not_before` at the cooldown
+end. Meanwhile other providers keep running tasks. If the session is still
+alive when the cooldown passes the task simply goes back to `running`;
+otherwise it is relaunched like any throttled task. The state is persisted in
+the `kv` table under `budget.rate_limits` (`RATE_LIMITS_KEY`) so a daemon
+restart does not forget it. `powerqueue budget clear-limits [--provider P]`
+forgets it on purpose, for example after `/usage` shows the window has reset.
+
+Recent Claude Code versions wait in the session instead and print `Usage
+limit reached · continuing automatically at 3:45pm`. A pane showing that
+text is *waiting*, not hung: while the provider is on cooldown the session is
+neither marked stale (`scheduler.stale_session_secs`) nor killed for
+`max_session_secs`; the task shows as `throttled` until the cooldown ends
+(event `session.waiting_for_reset`). If no hook reported the limit, the pane
+text itself starts the provider's cooldown.
 
 ## Calibration
 
@@ -255,10 +349,15 @@ weighted budget, window 12M.
 - Fable: no cooldown; `critical` meets `min_criticality`; 600k × 5 = 3M fits
   the 19M available (20M × 0.95), pushes the period to 4% and fits the 12M
   window.
-- Decision: **Fable**. Reasons: `period 5% elapsed, 0% spent; window 0% used;
-  predicted cost 600000 weighted tokens (label=incident (n=3))`,
-  `fable: eligible; 0% of its budget spent at 5% of the period`, ...,
+- Decision: **Fable**. Reasons: `predicted cost 600000 weighted tokens
+  (label=incident (n=3))`, `claude: period 5% elapsed, 0% spent; window 0%
+  used`, `fable: eligible; 0% of its budget spent at 5% of the period`, ...,
   `preferred by rules: fable`, `preferred fable is eligible`.
+
+With Codex enabled too and `## Models` saying `critical: fable |
+gpt-6.1-sol`, a Claude rate limit (`fable: rate limited until … (claude
+account-wide)`) would send the same ticket to `gpt-6.1-sol` (`preferred fable
+not eligible and no cheaper tier is`, `preferred gpt-6.1-sol is eligible`).
 
 Had the window already held 10M, the window gate would fail for Fable
 (`fable: window: 10000000 of 12000000 weighted tokens used, needs 3000000
