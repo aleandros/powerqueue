@@ -23,6 +23,23 @@ import datetime, json, os, subprocess, sys, time, uuid
 
 args = sys.argv[1:]
 mode = os.environ.get("FAKE_AGY_MODE", "complete")
+
+# `agy -p "/usage" --output-format json`: the usage probe (community-reported
+# shape, see docs/reference/providers-research.md).
+if "-p" in args or "--print" in args:
+    reset = int(time.time()) + 3600
+    print(json.dumps({"conversation_id": str(uuid.uuid4()), "status": "SUCCESS", "num_turns": 0, "response": "",
+                      "command": {"name": "usage", "data": {"groups": [{"name": "Gemini Models", "buckets": [
+                          {"id": "gemini-5h", "remaining_fraction": 0.8, "disabled": False, "window_minutes": 300, "reset_time": reset},
+                          {"id": "gemini-weekly", "remaining_fraction": 0.6, "disabled": False, "window_minutes": 10080, "reset_time": reset + 86400}]}]}}}),
+          flush=True)
+    sys.exit(0)
+
+# Never act outside a powerqueue task (the daemon may run this binary with
+# other arguments from an arbitrary directory).
+if not os.environ.get("POWERQUEUE_TASK_ID"):
+    print(f"fake-agy: no POWERQUEUE_TASK_ID in the environment; ignoring args {args}", file=sys.stderr)
+    sys.exit(0)
 home = os.environ.get("POWERQUEUE_AGY_HOME") or os.path.expanduser("~/.gemini/antigravity-cli")
 conversation = None
 model = "gemini-3-pro"

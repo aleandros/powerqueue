@@ -24,6 +24,33 @@ import datetime, json, os, subprocess, sys, time, uuid, glob
 
 args = sys.argv[1:]
 mode = os.environ.get("FAKE_CODEX_MODE", "complete")
+
+# `codex app-server`: the usage probe. Speak just enough JSON-RPC for
+# `account/rateLimits/read` (shape from docs/reference/providers-research.md).
+if "app-server" in args:
+    for line in sys.stdin:
+        try:
+            req = json.loads(line)
+        except ValueError:
+            continue
+        rid, method = req.get("id"), req.get("method")
+        if method == "initialize":
+            print(json.dumps({"id": rid, "result": {"userAgent": "fake-codex", "codexHome": os.environ.get("CODEX_HOME", "")}}), flush=True)
+        elif method == "account/rateLimits/read":
+            limits = {"limitId": "codex", "limitName": None, "normalModelSlug": None,
+                      "primary": {"usedPercent": 17, "windowDurationMins": 10080, "resetsAt": int(time.time()) + 86400},
+                      "secondary": None, "credits": {"hasCredits": False, "unlimited": False, "balance": "0"},
+                      "individualLimit": None, "spendControlReached": False, "planType": "prolite", "rateLimitReachedType": None}
+            print(json.dumps({"id": rid, "result": {"ordinaryUsageAllowed": True, "rateLimits": limits,
+                                                     "rateLimitsByLimitId": {"codex": limits}}}), flush=True)
+            break
+    sys.exit(0)
+
+# Never act outside a powerqueue task: the daemon (probes, doctor) may run
+# this binary with other arguments from an arbitrary directory.
+if not os.environ.get("POWERQUEUE_TASK_ID"):
+    print(f"fake-codex: no POWERQUEUE_TASK_ID in the environment; ignoring args {args}", file=sys.stderr)
+    sys.exit(0)
 state_dir = os.environ.get("FAKE_CODEX_STATE_DIR") or os.environ.get("TMPDIR", "/tmp")
 os.makedirs(state_dir, exist_ok=True)
 home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")

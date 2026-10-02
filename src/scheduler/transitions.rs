@@ -328,8 +328,8 @@ pub fn on_probe(
         }
         let reason = match (probe.pane_exists, probe.exit_status) {
             (false, _) => "tmux pane disappeared".to_string(),
-            (true, Some(code)) => format!("Claude exited with status {code}"),
-            (true, None) => "Claude exited".to_string(),
+            (true, Some(code)) => format!("{} exited with status {code}", session.model.provider().display_name()),
+            (true, None) => format!("{} exited", session.model.provider().display_name()),
         };
         return on_crash(task, Some(session), &reason, probe.exit_status, cfg, now, ctx.pane_tail.as_deref());
     }
@@ -830,7 +830,7 @@ mod tests {
         let fx = on_probe(&mut t, &mut s, &dead(Some(1)), &cfg().scheduler, &ctx);
         assert_eq!(t.state, TaskState::Crashed);
         assert_eq!(t.not_before, Some(now() + Duration::seconds(120)), "second attempt uses the second backoff");
-        assert_eq!(t.last_error.as_deref(), Some("Claude exited with status 1"));
+        assert_eq!(t.last_error.as_deref(), Some("Claude Code exited with status 1"));
         assert_eq!(s.state, SessionState::Crashed);
         assert_eq!(s.exit_code, Some(1));
         match &fx[0] {
