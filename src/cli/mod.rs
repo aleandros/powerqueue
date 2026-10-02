@@ -142,7 +142,7 @@ pub struct InitArgs {
     #[arg(long, conflicts_with = "force")]
     pub reconfigure: bool,
     /// Also run tasks on this provider (codex | gemini; repeatable). Claude is always on.
-    /// Sets budget.providers.<provider>.enabled = true; interactive runs ask instead.
+    /// Sets `budget.providers.<provider>.enabled` = true; interactive runs ask instead.
     #[arg(long, value_enum, value_name = "PROVIDER")]
     pub provider: Vec<Provider>,
 }
@@ -174,7 +174,7 @@ pub struct AddArgs {
     /// critical | high | normal | low.
     #[arg(short, long, value_parser = parse_criticality)]
     pub criticality: Option<Criticality>,
-    /// Force a model: fable | opus | sonnet | haiku, or another provider's model (gpt-6.1-sol, gemini-3-pro, codex:<name>);
+    /// Force a model: fable | opus | sonnet | haiku, or another provider's model (gpt-6.1-sol, gemini-3-pro, `codex:<name>`);
     /// warns when that provider is disabled in config.
     #[arg(short, long, value_parser = parse_model)]
     pub model: Option<ModelTier>,
@@ -223,7 +223,7 @@ pub enum TaskCommand {
     Model {
         #[command(flatten)]
         task: TaskRef,
-        /// fable | opus | sonnet | haiku | auto, or another provider's model (gpt-6.1-sol, gemini-3-pro, codex:<name>);
+        /// fable | opus | sonnet | haiku | auto, or another provider's model (gpt-6.1-sol, gemini-3-pro, `codex:<name>`);
         /// warns when that provider is disabled in config
         model: String,
     },
