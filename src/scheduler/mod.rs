@@ -12,9 +12,13 @@
 //!    policy for a model, launch it.
 //!
 //! State transitions are logged as events so `task show` reconstructs the story.
+//! The decisions themselves live in [`transitions`] as pure functions; the
+//! [`daemon`] applies the [`transitions::Effect`]s they return.
 
 pub mod daemon;
 pub mod lifecycle;
+pub mod transitions;
 
-pub use daemon::{Daemon, DaemonHandle};
-pub use lifecycle::{cleanup_task, pick_next};
+pub use daemon::{Daemon, DaemonHandle, SKIP_REASON};
+pub use lifecycle::{CleanupPlan, cleanup_plan, cleanup_task, pick_next, worktree_dir};
+pub use transitions::{CRASH_TAIL_LINES, Effect, LinearTarget, NUDGE_TEXT, ProbeContext, on_crash, on_hook_outcome, on_probe};

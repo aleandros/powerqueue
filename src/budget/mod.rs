@@ -15,7 +15,7 @@ pub mod ledger;
 pub mod period;
 pub mod policy;
 
-pub use estimator::{Estimator, Prediction};
-pub use ledger::{Ledger, TierLedger};
+pub use estimator::{Estimator, Prediction, Sample};
+pub use ledger::{CALIBRATION_KEY, Calibration, Ledger, TierLedger, tier_share, tier_weight};
 pub use period::{Period, PeriodClock};
-pub use policy::{Decision, Policy, RateLimitState};
+pub use policy::{Decision, Policy, RATE_LIMITS_KEY, RateLimitState, WINDOW_RECHECK};
