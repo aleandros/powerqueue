@@ -207,3 +207,42 @@ subscription provider any more; out of scope for now.
 Claude: code.claude.com/docs/en/{cli-reference,statusline,errors,costs,hooks,sessions,authentication,commands,interactive-mode}; github.com/wakamex/ccusage; github.com/steipete/CodexBar.
 Codex: learn.chatgpt.com/docs/{app-server,config-file/config-reference,developer-commands,hooks,pricing}; github.com/openai/codex (`codex-rs/app-server-protocol`, `codex-rs/protocol/src/error.rs`, `codex-rs/rollout`, `codex-rs/hooks/src/legacy_notify.rs`); local runs of codex-cli 0.159.2.
 Google: developers.googleblog.com (Gemini CLI → Antigravity CLI transition); geminicli.com/docs/resources/quota-and-pricing; antigravity.google/docs/cli/{headless,reference,commands/usage}; github.com/stablyai/orca PR 24073; github.com/google-antigravity/antigravity-cli issue 387.
+
+## Appendix: verified on this machine (2026-10-01, tmux private server)
+
+### Claude Code 2.1.287 status line
+Per-task `settings.json` `{"statusLine":{"type":"command","command":"<script>"}}`
+ran the script after the first response with this JSON on stdin (abridged):
+```json
+{"session_id":"936b3978-…","transcript_path":"/Users/edgar/.claude/projects/<encoded cwd>/936b3978-….jsonl","cwd":"…",
+ "model":{"id":"claude-sonnet-5-5","display_name":"Sonnet 5.5"},"version":"2.1.287",
+ "cost":{"total_cost_usd":0.0419,"total_duration_ms":37888,…},
+ "context_window":{"total_input_tokens":34228,"total_output_tokens":4,"current_usage":{"input_tokens":2,"output_tokens":4,"cache_creation_input_tokens":8963,"cache_read_input_tokens":25263},…},
+ "rate_limits":{"five_hour":{"used_percentage":75,"resets_at":1790914200},"seven_day":{"used_percentage":89,"resets_at":1790920800}}}
+```
+Keys present: `session_id, transcript_path, cwd, scratchpad_dir, prompt_id,
+effort, session_name, model, workspace, version, output_style, cost,
+context_window, exceeds_200k_tokens, prompt_cache, fast_mode, thinking,
+rate_limits`. `resets_at` is unix seconds. The script's stdout is shown as
+the status line, so it should print something short.
+
+### Codex CLI 0.159.2 interactive launch
+Command: `codex -C <dir> -m gpt-6-luna -a never -s read-only -c 'notify=["<script>"]' -c model_reasoning_effort=low '<prompt>'`.
+- Showed the **folder trust dialog** first ("Trust this folder? … 1. Trust and
+  continue 2. Quit"); the daemon must seed `projects."<worktree>".trust_level
+  = "trusted"` (via `-c`) or the session stalls.
+- `notify` fired twice with the payload as the single argv:
+  1. `{"type":"agent-turn-complete","thread-id":"01a0faa4-a7c0-…","turn-id":"…","cwd":"<dir>","client":"codex-tui","input-messages":["<prompt>"],"last-assistant-message":"OK"}`
+  2. a **title-generation side turn** on a *different* thread id whose
+     `input-messages[0]` starts with "Generate a concise, single-line task
+     title" and whose `last-assistant-message` is `{"title":"…"}`. Ignore
+     payloads whose input message starts with that text; the side thread
+     has no rollout file.
+- Rollout `~/.codex/sessions/2026/10/01/rollout-2026-10-01T21-24-50-<thread-id>.jsonl`
+  for the main thread (found by `session_meta.cwd == <dir>`), events:
+  `task_started` (`turn_id`, `started_at`, `model_context_window`),
+  `turn_context` (`cwd`, `approval_policy`, `sandbox_policy`, **`model`**),
+  `token_count` with `info.last_token_usage` = `{"input_tokens":18699,"cached_input_tokens":12032,"cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0,"total_tokens":18704}`
+  and a snake_case **`rate_limits` snapshot**: `{"limit_id":"codex","primary":{"used_percent":17.0,"window_minutes":10080,"resets_at":1791234430},"secondary":null,"credits":{…},"plan_type":"prolite","rate_limit_reached_type":null}`,
+  `task_complete` (`last_agent_message`, `started_at`, `completed_at`, `duration_ms`).
+  `input_tokens` includes the cached part (18699 total, 12032 cached).
