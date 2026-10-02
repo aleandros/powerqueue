@@ -90,7 +90,11 @@ impl Snapshot {
 
     /// Last `n` events of a task, oldest first.
     pub fn events_for(&self, task_id: TaskId, n: usize) -> Vec<&Event> {
-        let mut v: Vec<&Event> = self.recent_events.iter().filter(|e| e.task_id == Some(task_id)).collect();
+        let mut v: Vec<&Event> = self
+            .recent_events
+            .iter()
+            .filter(|e| e.task_id == Some(task_id) && e.level != crate::domain::EventLevel::Debug)
+            .collect();
         if v.len() > n {
             v.drain(..v.len() - n);
         }

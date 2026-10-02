@@ -119,6 +119,9 @@ pub struct InitArgs {
     /// Do not prompt; fail if something required is missing.
     #[arg(long)]
     pub non_interactive: bool,
+    /// Skip Linear entirely (manual tasks only); can be enabled later in config.toml.
+    #[arg(long)]
+    pub no_linear: bool,
     /// Overwrite an existing configuration.
     #[arg(long)]
     pub force: bool,

@@ -169,8 +169,8 @@ pub fn missing_for_non_interactive(args: &InitArgs, repo_is_git: bool) -> Vec<St
     if !repo_is_git {
         missing.push("a git repository (--repo PATH or run inside one)".to_string());
     }
-    if args.linear_key.as_deref().map(str::trim).filter(|k| !k.is_empty()).is_none() {
-        missing.push("Linear API key (--linear-key or LINEAR_API_KEY)".to_string());
+    if !args.no_linear && args.linear_key.as_deref().map(str::trim).filter(|k| !k.is_empty()).is_none() {
+        missing.push("Linear API key (--linear-key, LINEAR_API_KEY, or --no-linear)".to_string());
     }
     missing
 }
@@ -310,6 +310,10 @@ fn linear_step(
     rt: &tokio::runtime::Runtime,
 ) -> Result<Option<LinearClient>> {
     ui.section("Linear");
+    if args.no_linear {
+        println!("  skipped (--no-linear); manual tasks only");
+        return Ok(None);
+    }
     let endpoint = crate::config::LinearConfig::default().endpoint;
     let mut candidate = args.linear_key.clone().map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     let from_env =
@@ -809,6 +813,8 @@ mod tests {
         let missing = missing_for_non_interactive(&args, false);
         assert_eq!(missing.len(), 2);
         let args = InitArgs { linear_key: Some("lin_x".into()), ..InitArgs::default() };
+        assert!(missing_for_non_interactive(&args, true).is_empty());
+        let args = InitArgs { no_linear: true, ..InitArgs::default() };
         assert!(missing_for_non_interactive(&args, true).is_empty());
     }
 
