@@ -4,14 +4,41 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 2024](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](Cargo.toml)
 
-powerqueue turns Linear tickets into Claude Code sessions. It is a single Rust
-binary that runs as a daemon on your machine. It polls Linear, scores tickets
-with rules you write in Markdown, gives each task its own git worktree and tmux
-window, and launches an interactive Claude Code session in it. It learns how
-much each kind of task costs, restarts crashed sessions, paces model usage
-across your subscription period (Fable is held back for critical work), cleans
-up when a task is done, and ships a live dashboard plus a `doctor` command that
-tells you what is wrong and how to tune it.
+**Get the most out of the Claude subscription you already pay for.** powerqueue
+is an autonomous work queue that turns Linear tickets into Claude Code sessions
+and keeps them running around the clock, on a cheap VPS or on your own machine.
+
+You are paying for a weekly allowance that mostly goes unused: the 5-hour
+windows reset while you sleep, and the strongest model sits idle until
+something urgent comes up. powerqueue is a single Rust binary that puts that
+capacity to work. It polls Linear, scores tickets with rules you write in
+Markdown, gives each task its own git worktree and tmux window, launches an
+interactive Claude Code session in it, and paces model usage so the week's
+budget is spent on the work that matters most: Fable is held back for critical
+tickets early in the period and released before it would go to waste.
+
+The whole stack is your subscription plus one small box. No API keys, no
+per-token bills, no orchestration platform to host. A VPS with a couple of
+gigabytes of RAM runs several sessions side by side, and your laptop works just
+as well. Setup is `init`, `run`, done; everything else is optional tuning.
+
+Along the way it learns what each kind of task costs, restarts crashed sessions
+with their context intact, cleans up when a task is done, and ships a live
+dashboard plus a `doctor` command that tells you what is wrong and which knob
+to turn.
+
+## Why this is cheap
+
+| You need | What it costs |
+|----------|---------------|
+| A Claude subscription (Pro or Max) | you already have it; powerqueue only spends the allowance you are not using |
+| One machine that stays on | the smallest VPS you can rent, or your laptop; it runs git, tmux and Claude Code, nothing heavier |
+| Linear | optional; `powerqueue add` queues work by hand |
+
+That is the whole bill. Sessions run through your normal Claude Code login, so
+usage counts against the subscription, not an API account. The budget policy
+keeps you inside the weekly limit and the 5-hour window instead of hitting
+rate limits, and `doctor` tells you when the pacing is off.
 
 ## How it flows
 
@@ -76,6 +103,31 @@ powerqueue init --team ENG          # keys, repo, Linear team, PRIORITY.md
 powerqueue doctor                   # checks git/tmux/claude, keys, config
 powerqueue run                      # daemon, foreground
 ```
+
+### On a VPS
+
+The cheapest way to run powerqueue all week is a small Linux box that stays on.
+The setup is the same as on a laptop, plus a one-time login:
+
+```sh
+# 1. tools: git, tmux, Node (for Claude Code)
+sudo apt install -y git tmux nodejs npm
+npm install -g @anthropic-ai/claude-code
+
+# 2. log in with your subscription (prints a URL; open it on any device, paste the code back)
+claude
+
+# 3. powerqueue, your repo, and the guided setup
+curl -fsSL https://raw.githubusercontent.com/aleandros/powerqueue/main/install.sh | sh
+git clone git@github.com:you/your-repo.git ~/code/your-repo
+cd ~/code/your-repo && powerqueue init --team ENG --permission-mode auto
+```
+
+Pick the `auto` permission mode (or `bypassPermissions`) during `init` so
+sessions never wait for a human; on a laptop where you are around,
+`acceptEdits` is the safer choice. Then keep the daemon alive with systemd
+(below) and check on it from anywhere with `ssh box -t powerqueue dashboard`
+or `powerqueue attach ENG-123`.
 
 Run the daemon somewhere that survives your terminal. In a tmux window:
 

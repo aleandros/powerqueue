@@ -237,3 +237,7 @@ footer .dim { color: var(--text-muted); margin-left: 8px; }
   * { animation: none !important; transition: none !important; }
   html { scroll-behavior: auto; }
 }
+
+/* cost */
+.cost { background: linear-gradient(180deg, rgba(18, 23, 35, 0.4), transparent); }
+.section-lead { font-size: 17px; color: var(--text-dim); line-height: 1.6; max-width: 820px; margin: -12px 0 32px; }

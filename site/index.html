@@ -3,10 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>powerqueue — Linear tickets in, Claude Code sessions out</title>
-<meta name="description" content="An autonomous work queue for Claude Code: one git worktree and tmux window per Linear ticket, with usage learning, crash recovery and model-budget pacing that keeps Fable for what matters.">
-<meta property="og:title" content="powerqueue — Linear tickets in, Claude Code sessions out">
-<meta property="og:description" content="One worktree and tmux window per ticket. Learns cost, restarts crashes, paces your Claude subscription.">
+<title>powerqueue — get the most out of your Claude subscription</title>
+<meta name="description" content="An autonomous work queue that turns Linear tickets into Claude Code sessions and runs them around the clock on a cheap VPS or your laptop, paced so your whole weekly subscription allowance goes to the work that matters.">
+<meta property="og:title" content="powerqueue — get the most out of your Claude subscription">
+<meta property="og:description" content="Autonomous Claude Code sessions from your Linear queue, 24/7, on one cheap VPS. Spends the subscription allowance you are not using, nothing else.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://aleandros.github.io/powerqueue/">
 <meta name="twitter:card" content="summary">
@@ -28,6 +28,7 @@
       <span class="prompt">$</span> powerqueue
     </a>
     <nav class="nav-links">
+      <a href="#cost">why it's cheap</a>
       <a href="#flow">how it works</a>
       <a href="#features">features</a>
       <a href="#install">install</a>
@@ -53,14 +54,15 @@
       </div>
 
       <h1>
-        Linear tickets in.<br>
-        <span class="accent">Claude Code</span> sessions out,<br>
-        <span class="accent-alt">one tmux window</span> each.
+        Your Claude subscription,<br>
+        <span class="accent">working all week</span>,<br>
+        on <span class="accent-alt">one cheap VPS</span>.
       </h1>
       <p class="tagline">
-        A daemon that pulls your queue, gives every task its own git worktree and tmux window,
-        learns what tasks cost, restarts what crashes, and paces your Claude subscription so
-        <code>fable</code> is there when an incident lands.
+        powerqueue turns your Linear queue into autonomous Claude Code sessions and keeps them
+        running around the clock. It paces them so the whole weekly allowance goes to the work
+        that matters, with <code>fable</code> held for what is critical. It needs nothing but the
+        subscription you already pay for and a small box that stays on, or your laptop.
       </p>
 
       <div class="install-box">
@@ -91,6 +93,39 @@
         <div class="terminal-body">
           <pre id="term-screen" aria-label="powerqueue session demo"></pre>
         </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="cost" class="install-section cost">
+  <div class="section-inner">
+    <h2><span class="prompt">›</span> why it's cheap</h2>
+    <p class="section-lead">Most of a Claude subscription goes unused: the 5-hour windows reset while you sleep and the best model sits idle until something urgent lands. powerqueue spends that capacity for you and stops at the limit, so the bill is what you already pay.</p>
+    <div class="install-grid">
+      <div class="install-card">
+        <h3>the subscription you have</h3>
+        <p class="install-desc">Sessions run through your normal Claude Code login, so usage counts against Pro or Max, not an API account. No per-token bills, no keys to rotate.</p>
+        <div class="code-block"><pre><code><span class="c-comment"># budget pacing, per tier, per week</span>
+fable   held for critical work
+opus    high-priority tickets
+sonnet  everything else, all week</code></pre></div>
+      </div>
+      <div class="install-card">
+        <h3>one small box</h3>
+        <p class="install-desc">The daemon only runs git, tmux and Claude Code. A VPS with a couple of gigabytes of RAM runs several sessions side by side. Your laptop works just as well while it is open.</p>
+        <div class="code-block"><pre><code>ssh box
+claude                  <span class="c-comment"># log in once</span>
+powerqueue init --permission-mode auto
+powerqueue run          <span class="c-comment"># or a systemd unit</span></code></pre></div>
+      </div>
+      <div class="install-card">
+        <h3>nothing else</h3>
+        <p class="install-desc">One static binary, SQLite, a Markdown rules file. No orchestration platform, no cloud account, no agents-as-a-service. Linear is optional: <code>powerqueue add</code> queues work by hand.</p>
+        <div class="code-block"><pre><code>$ powerqueue budget show
+period  43% used, day 3.1 of 7
+window  12% of the 5h window
+fable   8% of 25% share, 12 tasks ok</code></pre></div>
       </div>
     </div>
   </div>
@@ -197,7 +232,7 @@ POWERQUEUE_INSTALL_DIR=~/bin \
     <div class="usage-preview">
       <h3>then use it</h3>
       <div class="code-block">
-        <pre><code><span class="c-comment"># guided setup: Linear key → keychain, team, states, PRIORITY.md</span>
+        <pre><code><span class="c-comment"># guided setup: Linear key → keychain, team, states, permission mode, PRIORITY.md</span>
 powerqueue init
 
 <span class="c-comment"># check tools, keys, state and the algorithm</span>
@@ -274,14 +309,14 @@ relax_after_fraction = 0.3</code></pre></div>
     <h2><span class="prompt">›</span> why</h2>
     <blockquote>
       <p>
-        Claude Code is great at a ticket. The chore is everything around it: the worktree, the window, noticing the session died, remembering which model you can still afford this week, cleaning up, moving the issue.
+        Claude Code is great at a ticket, and you are already paying for far more tickets than you run. The chore is everything around them: the worktree, the window, noticing the session died, remembering which model you can still afford this week, cleaning up, moving the issue.
       </p>
       <p>
-        powerqueue does the chore. You keep <em>attach, answer, review</em>.
+        powerqueue does the chore on a box that never sleeps. You keep <em>attach, answer, review</em>, and come back to pushed branches.
       </p>
     </blockquote>
     <div class="scope-note">
-      <strong>Scope.</strong> Sessions are interactive so you can always attach, which means a permission prompt waits for you (the task goes to <code>needs_attention</code>). For fully unattended runs set <code>claude.permission_mode</code> to <code>auto</code> or <code>bypassPermissions</code>, or pre-approve commands in <code>claude.allowed_tools</code>. Linear is the only tracker today — <a href="https://github.com/aleandros/powerqueue/pulls">PRs welcome</a>.
+      <strong>Scope.</strong> Sessions are interactive so you can always attach, which means a permission prompt waits for you (the task goes to <code>needs_attention</code>). For a VPS that nobody watches pick the <code>auto</code> permission mode in <code>init</code> (or <code>bypassPermissions</code>), or pre-approve commands in <code>claude.allowed_tools</code>; change it later with <code>powerqueue config set claude.permission_mode auto</code>. Linear is the only tracker today — <a href="https://github.com/aleandros/powerqueue/pulls">PRs welcome</a>.
     </div>
   </div>
 </section>
@@ -290,7 +325,7 @@ relax_after_fraction = 0.3</code></pre></div>
   <div class="section-inner">
     <div class="cta-box">
       <h2>let the queue run.</h2>
-      <p>Come back to pushed branches, updated tickets and a dashboard that explains what happened.</p>
+      <p>Spend the subscription you already pay for. Come back to pushed branches, updated tickets and a dashboard that explains what happened.</p>
       <div class="cta-row">
         <a href="https://github.com/aleandros/powerqueue" class="btn btn-primary">★ star on github</a>
         <a href="https://github.com/aleandros/powerqueue#readme" class="btn btn-ghost">full docs →</a>
