@@ -22,6 +22,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--provider` too. `task model` and `add --model` accept any provider's model.
 - Database schema v2: `sessions.agent_session_id` for CLIs that generate
   their own ids; the Claude calibration moved to kv `budget.calibration.claude`.
+- Multi-provider scheduling: the budget policy considers every enabled model
+  of every enabled provider (in `budget.provider_order`), tries the task's
+  preference list in order (each model through its provider's downgrade
+  chain), then falls back to the first eligible model in provider order. A
+  `task model` override never crosses providers. Throttled tasks retry at the
+  earliest reset across providers.
+- Usage probes: Codex (`codex app-server` → `account/rateLimits/read`), Claude
+  (the per-task `statusLine`, which also shows `pq <model> 5h 75% · 7d 89%`
+  in the session) and Antigravity (`agy -p /usage`, experimental). The daemon
+  runs them at start and every `budget.probe_interval_mins` in the
+  background; `budget probe [--provider P]` runs them now. Observed usage
+  calibrates the ledger, the reported weekly reset becomes the period anchor,
+  and a provider that reports its allowance exhausted is skipped until the
+  reset. Results are logged as `budget.probe` events.
+- `budget show` prints one section per enabled provider with the observed
+  usage, its age and the anchor source; `budget show --json` is now
+  `{"providers": {"claude": {...}}, "next": {...}}`.
+- Rate limits cool down the provider of the session's model (its own
+  `rate_limit_cooldown_mins`, capped at its own period end); other providers
+  keep working. A Claude pane showing `Usage limit reached · continuing
+  automatically` is treated as waiting (`session.waiting_for_reset`), not as
+  hung, while the provider is on cooldown.
+- `run` lists the enabled providers and the probe interval at start; `hook`
+  routes `--provider` payloads through the provider's normaliser and accepts
+  the payload as a trailing argument (Codex `notify`).
 
 - `dashboard --once` renders one frame as plain text and exits (works without
   a TTY; `--json` prints the snapshot), and `dashboard --ascii` draws with
@@ -42,6 +67,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `budget show --json` no longer prints Claude's ledger at the top level;
+  read it from `.providers.claude` (`.next` holds the policy's answer for a
+  normal task).
 - `dashboard` refuses to start without `config.toml` (same "run `powerqueue
   init`" message as `status`), or when stdin/stdout are not a terminal or
   `TERM` is unset/`dumb` (exit 2 with a plain error) instead of writing escape

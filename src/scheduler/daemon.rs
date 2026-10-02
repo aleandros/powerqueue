@@ -15,7 +15,9 @@ use anyhow::{Context as _, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::Notify;
 
-use crate::budget::{Decision, Estimator, Ledgers, PeriodClock, Policy, RATE_LIMITS_KEY, RateLimitState, tier_weight};
+use crate::budget::{
+    Decision, Estimator, Ledgers, PeriodClock, Policy, RATE_LIMITS_KEY, RateLimitState, load_observed, probe_all, tier_weight,
+};
 use crate::config::Config;
 use crate::domain::{DaemonCommand, EventLevel, ModelTier, Provider, Session, SessionState, Task, TaskId, TaskState};
 use crate::jev::{JevClient, JevQuestion, content_hash};
@@ -83,6 +85,9 @@ struct RuntimeState {
     jev_error_logged: bool,
     last_resource_sample: Option<DateTime<Utc>>,
     last_prune: Option<DateTime<Utc>>,
+    /// Usage probes running on a blocking thread (they record their own results).
+    usage_probe: Option<tokio::task::JoinHandle<()>>,
+    last_usage_probe: Option<DateTime<Utc>>,
     system: sysinfo::System,
     shutdown: bool,
 }
@@ -133,6 +138,8 @@ impl Daemon {
             jev_error_logged: false,
             last_resource_sample: None,
             last_prune: None,
+            usage_probe: None,
+            last_usage_probe: None,
             system: sysinfo::System::new(),
             shutdown: false,
         };
@@ -251,6 +258,7 @@ impl Daemon {
         self.report_phase("finalize", r);
         let r = self.sample_resources(now);
         self.report_phase("resources", r);
+        self.run_usage_probes(now);
         let r = self.launch_tasks(now).await;
         self.report_phase("launch", r);
         Ok(())
@@ -292,9 +300,55 @@ impl Daemon {
         }
     }
 
-    /// Claude's period clock (hook cooldowns are capped at its period end).
-    fn clock(&self, now: DateTime<Utc>) -> PeriodClock {
-        PeriodClock::from_provider(self.cfg.budget.provider(Provider::Claude), now)
+    /// End of `provider`'s current period (an observed reset in kv overrides
+    /// the configured anchor, as in [`crate::budget::Ledger::load`]).
+    /// Rate-limit cooldowns are capped there: the allowance resets anyway.
+    fn provider_period_end(&self, provider: Provider, now: DateTime<Utc>) -> DateTime<Utc> {
+        let mut clock = PeriodClock::from_provider(self.cfg.budget.provider(provider), now);
+        if let Ok(Some(reset)) = load_observed(&self.store, provider).map(|o| o.and_then(|o| o.period_resets_at))
+            && reset > now
+        {
+            clock = clock.with_observed_anchor(reset);
+        }
+        clock.current_period(now).end
+    }
+
+    /// Until when `provider` is cooling down, if it is: every enabled model
+    /// rate-limited, or a stored observation saying the allowance is
+    /// exhausted ([`crate::budget::ObservedUsage::cooldown_until`]). The
+    /// later of the two wins.
+    fn provider_cooldown(&self, provider: Provider, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let marks = self.rt.rate_limits.provider_blocked_until(&self.cfg.budget, provider, now);
+        let observed = load_observed(&self.store, provider).ok().flatten().and_then(|o| o.cooldown_until()).filter(|u| *u > now);
+        match (marks, observed) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Put `provider` on cooldown for its `rate_limit_cooldown_mins` (capped
+    /// at its period end), persist it and log `budget.rate_limited`. Used
+    /// when a pane shows the agent waiting for a usage reset that no hook
+    /// reported. Returns the cooldown end.
+    fn start_provider_cooldown(&mut self, provider: Provider, task: &Task, reason: &str, now: DateTime<Utc>) -> DateTime<Utc> {
+        let mins = self.cfg.budget.provider(provider).rate_limit_cooldown_mins.max(1) as i64;
+        let until = (now + Duration::minutes(mins)).min(self.provider_period_end(provider, now)).max(now + Duration::minutes(1));
+        self.rt.rate_limits.mark_provider(&self.cfg.budget, provider, until);
+        if let Err(e) = self.store.kv_set(RATE_LIMITS_KEY, &self.rt.rate_limits) {
+            tracing::warn!(error = %e, "cannot persist rate limits");
+        }
+        self.log(
+            Some(task.id),
+            None,
+            EventLevel::Warn,
+            "budget.rate_limited",
+            &format!(
+                "{provider}: {reason}; cooling down every {provider} model until {}",
+                until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ),
+            serde_json::json!({ "provider": provider, "until": until, "account_wide": true, "source": "pane" }),
+        );
+        until
     }
 
     // ------------------------------------------------------------ commands
@@ -831,9 +885,8 @@ impl Daemon {
         if events.is_empty() {
             return Ok(());
         }
-        let period_end = self.clock(now).current_period(now).end;
         for ev in events {
-            if let Err(e) = self.process_hook(&ev, now, period_end).await {
+            if let Err(e) = self.process_hook(&ev, now).await {
                 tracing::warn!(task = %ev.task_id, event = ev.event.as_str(), error = %format!("{e:#}"), "hook processing failed");
                 self.log(
                     Some(ev.task_id),
@@ -848,7 +901,7 @@ impl Daemon {
         Ok(())
     }
 
-    async fn process_hook(&mut self, ev: &PendingHookEvent, now: DateTime<Utc>, period_end: DateTime<Utc>) -> Result<()> {
+    async fn process_hook(&mut self, ev: &PendingHookEvent, now: DateTime<Utc>) -> Result<()> {
         let Some(mut task) = self.store.get_task(ev.task_id)? else {
             tracing::debug!(task = %ev.task_id, "hook for unknown task ignored");
             return Ok(());
@@ -871,6 +924,7 @@ impl Daemon {
             );
             return Ok(());
         };
+        let period_end = self.provider_period_end(session.model.provider(), now);
         let outcome = interpret_hook(ev.event, &ev.payload);
         tracing::debug!(task = %task.key, session = %session.id, event = ev.event.as_str(), ?outcome, "hook outcome");
         let effects = transitions::on_hook_outcome(&mut task, &mut session, &outcome, &self.cfg, now, period_end);
@@ -936,6 +990,12 @@ impl Daemon {
                 }
                 Effect::RateLimit { tier, until } => {
                     self.rt.rate_limits.mark(tier, until);
+                    if let Err(e) = self.store.kv_set(RATE_LIMITS_KEY, &self.rt.rate_limits) {
+                        tracing::warn!(error = %e, "cannot persist rate limits");
+                    }
+                }
+                Effect::RateLimitProvider { provider, until } => {
+                    self.rt.rate_limits.mark_provider(&self.cfg.budget, provider, until);
                     if let Err(e) = self.store.kv_set(RATE_LIMITS_KEY, &self.rt.rate_limits) {
                         tracing::warn!(error = %e, "cannot persist rate limits");
                     }
@@ -1037,7 +1097,18 @@ impl Daemon {
             } else {
                 None
             };
-            let ctx = ProbeContext { now, nudged: self.rt.nudged.contains(&session.id), pane_tail };
+            let provider = session.model.provider();
+            let mut provider_cooldown_until = None;
+            if (stale || timeout) && pane_tail.as_deref().is_some_and(transitions::pane_waits_for_usage_reset) {
+                self.rt.rate_limits.clear_expired(now);
+                provider_cooldown_until = match self.provider_cooldown(provider, now) {
+                    Some(until) => Some(until),
+                    // The agent hit its limit without a StopFailure hook: the
+                    // account is throttled, so cool the provider down.
+                    None => Some(self.start_provider_cooldown(provider, &task, "pane shows the usage limit was reached", now)),
+                };
+            }
+            let ctx = ProbeContext { now, nudged: self.rt.nudged.contains(&session.id), pane_tail, provider_cooldown_until };
             let effects = transitions::on_probe(&mut task, &mut session, &probe, &self.cfg.scheduler, &ctx);
             if effects.is_empty() {
                 continue;
@@ -1121,6 +1192,40 @@ impl Daemon {
         Ok(())
     }
 
+    // --------------------------------------------------------- usage probes
+
+    /// Start the enabled providers' usage probes at the first tick and then
+    /// every `budget.probe_interval_mins` (0 disables them). They run on a
+    /// blocking thread and record their own results (kv + `budget.probe`
+    /// events), so a slow CLI never delays the tick; a new round starts only
+    /// after the previous one finished.
+    fn run_usage_probes(&mut self, now: DateTime<Utc>) {
+        if self.rt.usage_probe.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        self.rt.usage_probe = None;
+        let interval = self.cfg.budget.probe_interval_mins;
+        if interval == 0 {
+            return;
+        }
+        let due = self.rt.last_usage_probe.is_none_or(|t| now - t >= Duration::minutes(interval as i64));
+        if !due {
+            return;
+        }
+        self.rt.last_usage_probe = Some(now);
+        let cfg = self.cfg.clone();
+        let store = self.store.clone();
+        self.rt.usage_probe = Some(tokio::task::spawn_blocking(move || {
+            for (provider, result) in probe_all(&cfg, &store, Utc::now()) {
+                match result {
+                    Ok(Some(_)) => tracing::debug!(provider = %provider, "usage probe learned something"),
+                    Ok(None) => tracing::debug!(provider = %provider, "usage probe learned nothing"),
+                    Err(e) => tracing::debug!(provider = %provider, error = %format!("{e:#}"), "usage probe failed"),
+                }
+            }
+        }));
+    }
+
     // --------------------------------------------------------------- launch
 
     async fn launch_tasks(&mut self, now: DateTime<Utc>) -> Result<()> {
@@ -1147,10 +1252,10 @@ impl Daemon {
             // Rules express a *preference* (`## Models`, `KEY: model = x`); only
             // `task model <tier>` on the CLI is a hard override. Either way the
             // policy may still downgrade when the tier is out of budget.
-            let rule_model =
-                self.rt.rules.evaluate(&task, now, None, 0.0, 0.0).model.or_else(|| self.rt.rules.model_for(task.criticality));
-            let preferred = task.model_override.clone().or(rule_model);
-            let decision = Policy::new(&self.cfg.budget, &ledgers, &self.rt.rate_limits).decide(&task, prediction, preferred);
+            // `task.model_override` is read by the policy itself (it never
+            // crosses providers); `preferred` is the rules' list.
+            let preferred = self.preferred_models(&task, now);
+            let decision = Policy::new(&self.cfg.budget, &ledgers, &self.rt.rate_limits).decide(&task, prediction, &preferred);
             match decision.model.clone() {
                 None => self.throttle(task, &decision, now)?,
                 Some(model) => {
@@ -1178,6 +1283,14 @@ impl Daemon {
             }
         }
         Ok(())
+    }
+
+    /// The rules' preference list for a task, most wanted first: the
+    /// per-task override line (`KEY: model = ...`) else the `## Models`
+    /// entry for its criticality. Empty when the rules say nothing.
+    fn preferred_models(&self, task: &Task, now: DateTime<Utc>) -> Vec<ModelTier> {
+        let evaluated = self.rt.rules.evaluate(task, now, None, 0.0, 0.0).model;
+        evaluated.or_else(|| self.rt.rules.model_for(task.criticality)).into_iter().collect()
     }
 
     fn throttle(&mut self, mut task: Task, decision: &Decision, now: DateTime<Utc>) -> Result<()> {

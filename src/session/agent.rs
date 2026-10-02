@@ -131,7 +131,8 @@ impl AgentCli for ClaudeCli {
     fn prepare(&self, ctx: &LaunchContext<'_>) -> Result<AgentLaunch> {
         use crate::session::launcher::{Launcher, hook_settings, session_env};
         let settings_path = ctx.task_dir.join("settings.json");
-        let settings = hook_settings(ctx.self_bin, ctx.task.id, ctx.session_id, &ctx.cfg.claude);
+        let mut settings = hook_settings(ctx.self_bin, ctx.task.id, ctx.session_id, &ctx.cfg.claude);
+        settings["statusLine"] = crate::budget::probes::claude::status_line_setting(ctx.self_bin, ctx.task.id, ctx.session_id);
         let settings_text = serde_json::to_string_pretty(&settings).context("serialise settings.json")? + "\n";
         let argv = Launcher::claude_command(
             ctx.cfg,
@@ -217,8 +218,8 @@ impl AgentCli for ClaudeCli {
         &CLAUDE_PERMISSION_MODES
     }
 
-    fn probe(&self, _cfg: &Config, _store: &Store) -> Result<Option<ObservedUsage>> {
-        Ok(None)
+    fn probe(&self, _cfg: &Config, store: &Store) -> Result<Option<ObservedUsage>> {
+        crate::budget::UsageProbe::probe(&crate::budget::probes::claude::ClaudeProbe::new(store.clone()))
     }
 }
 
@@ -262,7 +263,8 @@ impl AgentCli for CodexCli {
         None
     }
 
-    fn normalize_hook(&self, _event: &str, _payload: serde_json::Value) -> Option<(HookEvent, serde_json::Value)> {
+    fn normalize_hook(&self, event: &str, _payload: serde_json::Value) -> Option<(HookEvent, serde_json::Value)> {
+        tracing::warn!(provider = "codex", event, "codex hook normalisation is not implemented yet; event ignored");
         None
     }
 
@@ -283,8 +285,8 @@ impl AgentCli for CodexCli {
         &CODEX_APPROVAL_MODES
     }
 
-    fn probe(&self, _cfg: &Config, _store: &Store) -> Result<Option<ObservedUsage>> {
-        Ok(None)
+    fn probe(&self, cfg: &Config, _store: &Store) -> Result<Option<ObservedUsage>> {
+        crate::budget::UsageProbe::probe(&crate::budget::probes::codex::CodexProbe::new(&cfg.codex.binary))
     }
 }
 
@@ -326,7 +328,8 @@ impl AgentCli for GeminiCli {
         None
     }
 
-    fn normalize_hook(&self, _event: &str, _payload: serde_json::Value) -> Option<(HookEvent, serde_json::Value)> {
+    fn normalize_hook(&self, event: &str, _payload: serde_json::Value) -> Option<(HookEvent, serde_json::Value)> {
+        tracing::warn!(provider = "gemini", event, "gemini hook normalisation is not implemented yet; event ignored");
         None
     }
 
@@ -349,8 +352,8 @@ impl AgentCli for GeminiCli {
         &GEMINI_MODES
     }
 
-    fn probe(&self, _cfg: &Config, _store: &Store) -> Result<Option<ObservedUsage>> {
-        Ok(None)
+    fn probe(&self, cfg: &Config, _store: &Store) -> Result<Option<ObservedUsage>> {
+        crate::budget::UsageProbe::probe(&crate::budget::probes::gemini::GeminiProbe::new(&cfg.gemini.binary))
     }
 }
 
@@ -414,6 +417,11 @@ mod tests {
         assert_eq!(launch.files[0].2, 0o644);
         let settings: serde_json::Value = serde_json::from_str(&launch.files[0].1).unwrap();
         assert_eq!(settings["hooks"].as_object().unwrap().len(), 7);
+        assert_eq!(settings["statusLine"]["type"], "command");
+        assert_eq!(
+            settings["statusLine"]["command"],
+            format!("/bin/powerqueue hook --task {} --session {sid} --event StatusLine", t.id)
+        );
         assert_eq!(launch.argv[0], "claude");
         assert_eq!(launch.argv[1], "--session-id");
         assert!(launch.argv.contains(&"opus".to_string()));
@@ -455,7 +463,9 @@ mod tests {
     #[test]
     fn stubs_say_where_the_launcher_lives() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+        cfg.codex.binary = "/definitely/not/codex".into();
+        cfg.gemini.binary = "/definitely/not/agy".into();
         let t = task(dir.path());
         let model = ModelTier::new("gpt-6.1-sol");
         let ctx = LaunchContext {
@@ -479,7 +489,7 @@ mod tests {
             assert!(agent.normalize_hook("Stop", serde_json::json!({})).is_none());
             assert!(agent.parse_transcript_line("{}", uuid::Uuid::new_v4(), TaskId::new(), &model).is_none());
             let store = Store::open_in_memory().unwrap();
-            assert!(agent.probe(&cfg, &store).unwrap().is_none());
+            assert!(agent.probe(&cfg, &store).is_err(), "the probe runs the configured binary");
             assert!(agent.auth_status("/definitely/not/a/binary").is_err());
         }
     }

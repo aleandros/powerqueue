@@ -133,10 +133,109 @@ fn budget_show_reports_spend_and_json() {
         .stdout(predicate::str::contains("critical"));
 
     let out = home.cmd().args(["--json", "budget", "show"]).assert().success().get_output().stdout.clone();
-    let ledger: serde_json::Value = serde_json::from_slice(&out).expect("ledger json");
+    let v: serde_json::Value = serde_json::from_slice(&out).expect("budget json");
+    let ledger = &v["providers"]["claude"];
     // 1000 output tokens = 5000 weighted × opus weight 3.
     assert_eq!(ledger["total_period_weighted"].as_f64(), Some(15_000.0));
     assert_eq!(ledger["period_budget"].as_f64(), Some(80_000_000.0));
+    assert_eq!(ledger["anchor_source"], "config");
+    assert!(ledger["observed"].is_null());
+    assert!(ledger["observed_age_secs"].is_null());
+    assert_eq!(v["providers"].as_object().unwrap().len(), 1, "disabled providers are left out");
+    assert_eq!(v["next"]["model"], "sonnet", "a normal task runs on the default model");
+    assert!(v["next"]["reasons"].as_array().unwrap().len() > 2);
+}
+
+#[test]
+fn status_line_hook_feeds_observed_usage_into_budget_show() {
+    let home = Home::new();
+    let store = home.store();
+    let task = running_task(&store, "ENG-9");
+    let sid = uuid::Uuid::new_v4();
+    let reset = Utc::now() + chrono::Duration::hours(2);
+    let payload = serde_json::json!({
+        "session_id": sid,
+        "model": { "id": "claude-sonnet-5-5", "display_name": "Sonnet 5.5" },
+        "rate_limits": {
+            "five_hour": { "used_percentage": 75, "resets_at": reset.timestamp() },
+            "seven_day": { "used_percentage": 40, "resets_at": (Utc::now() + chrono::Duration::days(3)).timestamp() }
+        }
+    });
+    home.cmd()
+        .args(["hook", "--task", &task.id.to_string(), "--session", &sid.to_string(), "--event", "StatusLine"])
+        .write_stdin(payload.to_string())
+        .assert()
+        .success()
+        .stdout("pq sonnet 5h 75% · 7d 40%\n");
+    assert!(store.drain_hook_events().unwrap().is_empty(), "the status line is not a hook event");
+
+    let out = home.cmd().args(["--json", "budget", "show"]).assert().success().get_output().stdout.clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let claude = &v["providers"]["claude"];
+    assert_eq!(claude["observed"]["window_used"].as_f64(), Some(0.75));
+    assert_eq!(claude["anchor_source"], "observed", "the weekly reset moves the period");
+    assert!(claude["observed_age_secs"].as_i64().unwrap() < 60);
+    home.cmd()
+        .args(["budget", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("observed window 75%"))
+        .stdout(predicate::str::contains("anchor learned from the provider"));
+
+    // `budget probe` reads it back for claude.
+    let out = home.cmd().args(["--json", "budget", "probe"]).assert().success().get_output().stdout.clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["claude"]["ok"], true);
+    assert_eq!(v["claude"]["observed"]["period_used"].as_f64(), Some(0.4));
+
+    // Garbage still prints a status line and exits 0.
+    home.cmd()
+        .args(["hook", "--task", "whatever", "--event", "StatusLine"])
+        .write_stdin("nope")
+        .assert()
+        .success()
+        .stdout("pq\n");
+}
+
+#[test]
+fn hook_from_other_providers_is_ignored_until_normalised() {
+    let home = Home::new();
+    let store = home.store();
+    let task = running_task(&store, "ENG-10");
+    home.cmd()
+        .args(["hook", "--provider", "codex", "--task", &task.id.to_string(), "--event", "Notify"])
+        .arg(r#"{"type":"agent-turn-complete","last-assistant-message":"ok"}"#)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+    home.cmd()
+        .args(["hook", "--provider", "gemini", "--task", &task.id.to_string(), "--event", "Stop"])
+        .write_stdin("{}")
+        .assert()
+        .success();
+    assert!(store.drain_hook_events().unwrap().is_empty());
+}
+
+#[test]
+fn budget_probe_reports_failures_per_provider() {
+    let home = Home::new();
+    let mut cfg = Config::load(&home.paths()).unwrap();
+    cfg.codex.binary = home.path().join("no-such-codex").display().to_string();
+    cfg.save(&home.paths()).unwrap();
+    home.cmd()
+        .args(["budget", "probe", "--provider", "codex"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("failed"))
+        .stdout(predicate::str::contains("no-such-codex"));
+    home.cmd()
+        .args(["budget", "probe"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("claude"))
+        .stdout(predicate::str::contains("status line"));
+    let events = home.store().recent_events(20).unwrap();
+    assert!(events.iter().any(|e| e.kind == "budget.probe" && e.message.contains("codex usage probe failed")), "{events:?}");
 }
 
 #[test]
@@ -178,7 +277,8 @@ fn budget_provider_flags_and_legacy_config_keep_working() {
     std::fs::write(home.paths().config_file(), &legacy).unwrap();
 
     let out = home.cmd().args(["--json", "budget", "show"]).assert().success().get_output().stdout.clone();
-    let ledger: serde_json::Value = serde_json::from_slice(&out).expect("ledger json");
+    let v: serde_json::Value = serde_json::from_slice(&out).expect("budget json");
+    let ledger = &v["providers"]["claude"];
     assert_eq!(ledger["provider"], "claude");
     assert_eq!(ledger["period_budget"].as_f64(), Some(1_000_000.0));
     assert_eq!(ledger["period"]["start"], "2026-09-28T00:00:00Z");

@@ -267,7 +267,7 @@ pub enum PriorityCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum BudgetCommand {
-    /// Show period/window spend per model and what the policy would allow.
+    /// Show period/window spend per provider and model, observed usage, and what the policy would allow.
     Show,
     /// Record a provider's period reset instant (from `/usage` in Claude Code; RFC 3339 or "in 3d4h").
     SetReset {
@@ -282,6 +282,12 @@ pub enum BudgetCommand {
         /// Which provider's budget to calibrate.
         #[arg(long, value_enum, default_value_t = Provider::Claude)]
         provider: Provider,
+    },
+    /// Ask providers for their remaining allowance now (Codex app-server, Claude status line, agy /usage).
+    Probe {
+        /// Probe only this provider (default: every enabled provider).
+        #[arg(long, value_enum)]
+        provider: Option<Provider>,
     },
     /// Forget a provider's rate-limit cooldowns.
     ClearLimits {
@@ -377,6 +383,9 @@ pub struct HookArgs {
     /// Which agent CLI sent the hook; payloads of other providers are normalised to the Claude shape.
     #[arg(long, value_enum, default_value_t = Provider::Claude)]
     pub provider: Provider,
+    /// The JSON payload as an argument (Codex `notify` appends it); read from stdin when absent.
+    #[arg(value_name = "PAYLOAD")]
+    pub payload: Option<String>,
 }
 
 fn parse_criticality(s: &str) -> Result<Criticality, String> {

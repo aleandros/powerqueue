@@ -10,7 +10,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, SchedulerConfig};
-use crate::domain::{EventLevel, HookEvent, ModelTier, Session, SessionState, Task, TaskState};
+use crate::domain::{EventLevel, HookEvent, ModelTier, Provider, Session, SessionState, Task, TaskState};
 use crate::session::{HookOutcome, SessionProbe};
 
 /// What Claude is told when a session sits idle without a completion signal.
@@ -43,6 +43,8 @@ pub enum Effect {
     KillWindow,
     /// Record a rate-limit cooldown for a tier.
     RateLimit { tier: ModelTier, until: DateTime<Utc> },
+    /// Record a cooldown for every model of a provider (account-wide limits).
+    RateLimitProvider { provider: Provider, until: DateTime<Utc> },
 }
 
 impl Effect {
@@ -59,10 +61,31 @@ pub struct ProbeContext {
     pub nudged: bool,
     /// Last lines of the pane, captured before anything is killed.
     pub pane_tail: Option<String>,
+    /// When the session's provider is usable again, if it is cooling down
+    /// (rate-limit marks or an observed exhaustion).
+    pub provider_cooldown_until: Option<DateTime<Utc>>,
 }
 
-/// Apply a hook outcome. `period_end` caps rate-limit cooldowns (the
-/// allowance resets there anyway).
+/// Pane text (lower-case substrings) of an agent that hit its usage limit and
+/// waits in-session until the reset, then continues by itself (Claude Code:
+/// `Usage limit reached · continuing automatically at 3:45pm · esc to cancel`).
+pub const WAITING_FOR_RESET_SIGNATURES: [&str; 2] =
+    ["usage limit reached · continuing automatically", "continuing automatically at"];
+
+/// Does the pane's tail show the agent waiting for its usage limit to reset?
+/// Only the last few non-empty lines count, so an old message scrolled up
+/// does not keep a hung session alive.
+pub fn pane_waits_for_usage_reset(pane_tail: &str) -> bool {
+    let lines: Vec<&str> = pane_tail.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let start = lines.len().saturating_sub(8);
+    lines[start..].iter().any(|l| {
+        let lower = l.to_lowercase();
+        WAITING_FOR_RESET_SIGNATURES.iter().any(|s| lower.contains(s))
+    })
+}
+
+/// Apply a hook outcome. `period_end` is the end of the session provider's
+/// period and caps rate-limit cooldowns (the allowance resets there anyway).
 pub fn on_hook_outcome(
     task: &mut Task,
     session: &mut Session,
@@ -169,22 +192,29 @@ pub fn on_hook_outcome(
             // so a `rate_limit` pauses every model of the provider; `overloaded`
             // is specific to the model that reported it.
             let account_wide = error_type != "overloaded";
-            if account_wide {
-                for tier in cfg.budget.models_for(provider) {
-                    effects.push(Effect::RateLimit { tier, until });
-                }
+            let scope = if account_wide {
+                effects.push(Effect::RateLimitProvider { provider, until });
+                format!("every {provider} model")
             } else {
                 effects.push(Effect::RateLimit { tier: session.model.clone(), until });
-            }
+                format!("{provider} model {}", session.model)
+            };
             effects.push(Effect::log(
                 EventLevel::Warn,
                 "budget.rate_limited",
                 format!(
-                    "{} reported {error_type}; cooling down until {}",
+                    "{provider} ({}) reported {error_type}; cooling down {scope} until {}",
                     session.model,
                     until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
                 ),
-                serde_json::json!({ "tier": session.model, "error_type": error_type, "message": message, "until": until }),
+                serde_json::json!({
+                    "provider": provider,
+                    "tier": session.model,
+                    "error_type": error_type,
+                    "message": message,
+                    "until": until,
+                    "account_wide": account_wide,
+                }),
             ));
         }
         HookOutcome::TurnFailed { error_type, message } => {
@@ -309,6 +339,8 @@ pub fn on_probe(
         task.state = TaskState::Running;
         task.not_before = None;
         session.state = SessionState::Running;
+        // The wait was not silence: staleness counts from the end of the cooldown.
+        session.last_activity_at = session.last_activity_at.max(now);
         effects.push(Effect::log(
             EventLevel::Info,
             "task.resumed",
@@ -320,7 +352,39 @@ pub fn on_probe(
 
     let since_activity = now - session.last_activity_at;
     let running = matches!(task.state, TaskState::Running | TaskState::Starting);
-    if running && cfg.stale_session_secs > 0 && since_activity > Duration::seconds(cfg.stale_session_secs as i64) {
+    let stale = running && cfg.stale_session_secs > 0 && since_activity > Duration::seconds(cfg.stale_session_secs as i64);
+    let age = now - session.started_at;
+    let timed_out = cfg.max_session_secs > 0 && !task.state.is_terminal() && age > Duration::seconds(cfg.max_session_secs as i64);
+
+    // An agent waiting in-session for its usage limit to reset is not hung:
+    // while its provider is on cooldown, park the task as throttled instead
+    // of killing the session.
+    if (stale || timed_out)
+        && let Some(until) = ctx.provider_cooldown_until.filter(|u| *u > now)
+        && ctx.pane_tail.as_deref().is_some_and(pane_waits_for_usage_reset)
+    {
+        if !(task.state == TaskState::Throttled && task.not_before == Some(until)) {
+            task.state = TaskState::Throttled;
+            task.not_before = Some(until);
+            effects.push(Effect::log(
+                EventLevel::Info,
+                "session.waiting_for_reset",
+                format!(
+                    "{} is waiting for its usage limit to reset; not treated as hung until {}",
+                    session.model.provider(),
+                    until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                ),
+                serde_json::json!({
+                    "provider": session.model.provider(),
+                    "until": until,
+                    "idle_secs": since_activity.num_seconds(),
+                }),
+            ));
+        }
+        return effects;
+    }
+
+    if stale {
         let reason =
             format!("no activity for {}s (stale_session_secs = {})", since_activity.num_seconds(), cfg.stale_session_secs);
         effects.push(Effect::log(
@@ -333,8 +397,7 @@ pub fn on_probe(
         effects.extend(on_crash(task, Some(session), &reason, None, cfg, now, ctx.pane_tail.as_deref()));
         return effects;
     }
-    let age = now - session.started_at;
-    if cfg.max_session_secs > 0 && !task.state.is_terminal() && age > Duration::seconds(cfg.max_session_secs as i64) {
+    if timed_out {
         let reason = format!("attempt ran for {}s (max_session_secs = {})", age.num_seconds(), cfg.max_session_secs);
         effects.push(Effect::log(
             EventLevel::Warn,
@@ -510,6 +573,7 @@ mod tests {
                 Effect::Nudge { .. } => "nudge".into(),
                 Effect::KillWindow => "kill".into(),
                 Effect::RateLimit { .. } => "ratelimit".into(),
+                Effect::RateLimitProvider { provider, .. } => format!("ratelimit({provider})"),
             })
             .collect()
     }
@@ -593,21 +657,117 @@ mod tests {
         assert_eq!(t.state, TaskState::Throttled);
         assert_eq!(t.not_before, Some(now() + Duration::minutes(30)));
         assert_eq!(s.state, SessionState::Running, "the session stays alive; Claude retries by itself");
-        for tier in [ModelTier::fable(), ModelTier::opus(), ModelTier::sonnet(), ModelTier::haiku()] {
-            assert!(fx.contains(&Effect::RateLimit { tier, until: now() + Duration::minutes(30) }), "rate_limit is account-wide");
+        assert_eq!(
+            fx[0],
+            Effect::RateLimitProvider { provider: Provider::Claude, until: now() + Duration::minutes(30) },
+            "rate_limit is account-wide"
+        );
+        assert_eq!(kinds(&fx), vec!["ratelimit(claude)", "budget.rate_limited"]);
+        match &fx[1] {
+            Effect::Log { message, data, .. } => {
+                assert!(message.starts_with("claude (opus) reported rate_limit; cooling down every claude model"), "{message}");
+                assert_eq!(data["provider"], "claude");
+            }
+            other => panic!("{other:?}"),
         }
-        assert_eq!(kinds(&fx), vec!["ratelimit", "ratelimit", "ratelimit", "ratelimit", "budget.rate_limited"]);
 
         let mut t = task(TaskState::Running, 1);
         let fx = on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), now() + Duration::minutes(5));
         assert_eq!(t.not_before, Some(now() + Duration::minutes(5)), "capped at the period end");
-        assert!(matches!(fx[0], Effect::RateLimit { until, .. } if until == now() + Duration::minutes(5)));
+        assert!(matches!(fx[0], Effect::RateLimitProvider { until, .. } if until == now() + Duration::minutes(5)));
 
         let mut t = task(TaskState::Running, 1);
         let out = HookOutcome::RateLimited { error_type: "overloaded".into(), message: "busy".into() };
         let fx = on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), period_end());
         assert_eq!(fx[0], Effect::RateLimit { tier: ModelTier::opus(), until: now() + Duration::minutes(30) });
         assert_eq!(kinds(&fx), vec!["ratelimit", "budget.rate_limited"], "overloaded only affects the reporting tier");
+    }
+
+    #[test]
+    fn rate_limited_uses_the_sessions_provider() {
+        let mut c = cfg();
+        c.budget.providers.codex.rate_limit_cooldown_mins = 45;
+        let mut t = task(TaskState::Running, 1);
+        let mut s = session(SessionState::Running, 1);
+        s.model = ModelTier::new("gpt-6-astra");
+        let out = HookOutcome::RateLimited { error_type: "rate_limit".into(), message: "usage limit".into() };
+        let fx = on_hook_outcome(&mut t, &mut s, &out, &c, now(), period_end());
+        assert_eq!(t.not_before, Some(now() + Duration::minutes(45)), "codex's own cooldown");
+        assert_eq!(fx[0], Effect::RateLimitProvider { provider: Provider::Codex, until: now() + Duration::minutes(45) });
+        assert_eq!(kinds(&fx), vec!["ratelimit(codex)", "budget.rate_limited"]);
+    }
+
+    const WAITING_PANE: &str =
+        "⏺ Working on it\n\n  Usage limit reached · continuing automatically at 3:45pm · esc to cancel\n\n> \n";
+
+    #[test]
+    fn waiting_pane_detection() {
+        assert!(pane_waits_for_usage_reset(WAITING_PANE));
+        assert!(pane_waits_for_usage_reset("Usage limit reset · continuing automatically at 4pm"));
+        assert!(!pane_waits_for_usage_reset("Usage limit reset · continuing automatically"));
+        assert!(!pane_waits_for_usage_reset("all good\n> "));
+        let scrolled = format!("{WAITING_PANE}{}", "more output\n".repeat(10));
+        assert!(!pane_waits_for_usage_reset(&scrolled), "only the last lines count");
+    }
+
+    #[test]
+    fn waiting_for_usage_reset_is_not_stale_while_provider_cools_down() {
+        let until = now() + Duration::minutes(40);
+        let mut t = task(TaskState::Running, 1);
+        let mut s = session(SessionState::Running, 1);
+        s.last_activity_at = now() - Duration::hours(1);
+        let ctx = ProbeContext {
+            now: now(),
+            nudged: false,
+            pane_tail: Some(WAITING_PANE.into()),
+            provider_cooldown_until: Some(until),
+        };
+        let fx = on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx);
+        assert_eq!(kinds(&fx), vec!["session.waiting_for_reset"]);
+        assert_eq!(t.state, TaskState::Throttled);
+        assert_eq!(t.not_before, Some(until));
+        assert_eq!(s.state, SessionState::Running, "the session is left alone");
+        // Re-probing while still waiting changes nothing (no duplicate events).
+        assert!(on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx).is_empty());
+
+        // The cooldown passes: the task resumes and staleness counts from now.
+        let later = ProbeContext { now: until + Duration::seconds(1), ..ctx.clone() };
+        let fx = on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &later);
+        assert_eq!(kinds(&fx), vec!["task.resumed"]);
+        assert_eq!(s.last_activity_at, until + Duration::seconds(1));
+
+        // Not on cooldown: the same pane is stale as before.
+        let mut t = task(TaskState::Running, 1);
+        let mut s = session(SessionState::Running, 1);
+        s.last_activity_at = now() - Duration::hours(1);
+        let ctx = ProbeContext { provider_cooldown_until: None, ..ctx.clone() };
+        let fx = on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx);
+        assert_eq!(kinds(&fx), vec!["session.stale", "kill", "session.crashed"]);
+
+        // On cooldown but the pane shows something else: stale.
+        let mut t = task(TaskState::Running, 1);
+        let mut s = session(SessionState::Running, 1);
+        s.last_activity_at = now() - Duration::hours(1);
+        let ctx = ProbeContext { pane_tail: Some("$ ".into()), provider_cooldown_until: Some(until), ..ctx };
+        let fx = on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx);
+        assert_eq!(kinds(&fx), vec!["session.stale", "kill", "session.crashed"]);
+    }
+
+    #[test]
+    fn waiting_for_usage_reset_also_defers_the_session_timeout() {
+        let until = now() + Duration::hours(2);
+        let mut t = task(TaskState::Running, 1);
+        let mut s = session(SessionState::Running, 1);
+        s.started_at = now() - Duration::hours(5);
+        let ctx = ProbeContext {
+            now: now(),
+            nudged: false,
+            pane_tail: Some(WAITING_PANE.into()),
+            provider_cooldown_until: Some(until),
+        };
+        let fx = on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx);
+        assert_eq!(kinds(&fx), vec!["session.waiting_for_reset"]);
+        assert_eq!(t.state, TaskState::Throttled);
     }
 
     #[test]
@@ -666,7 +826,7 @@ mod tests {
     fn dead_pane_crashes_with_backoff_and_captures_tail() {
         let mut t = task(TaskState::Running, 2);
         let mut s = session(SessionState::Running, 2);
-        let ctx = ProbeContext { now: now(), nudged: false, pane_tail: Some("boom".into()) };
+        let ctx = ProbeContext { now: now(), nudged: false, pane_tail: Some("boom".into()), provider_cooldown_until: None };
         let fx = on_probe(&mut t, &mut s, &dead(Some(1)), &cfg().scheduler, &ctx);
         assert_eq!(t.state, TaskState::Crashed);
         assert_eq!(t.not_before, Some(now() + Duration::seconds(120)), "second attempt uses the second backoff");
@@ -748,7 +908,7 @@ mod tests {
         let mut t = task(TaskState::Idle, 1);
         let mut s = session(SessionState::Idle, 1);
         s.last_activity_at = now() - Duration::minutes(11);
-        let ctx = ProbeContext { now: now(), nudged: false, pane_tail: None };
+        let ctx = ProbeContext { now: now(), nudged: false, pane_tail: None, provider_cooldown_until: None };
         let fx = on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx);
         assert_eq!(kinds(&fx), vec!["nudge", "session.nudged"]);
         assert_eq!(fx[0], Effect::Nudge { text: NUDGE_TEXT.to_string() });
@@ -756,7 +916,7 @@ mod tests {
         assert_eq!(t.state, TaskState::Idle);
 
         s.last_activity_at = now() - Duration::minutes(11);
-        let ctx = ProbeContext { now: now(), nudged: true, pane_tail: None };
+        let ctx = ProbeContext { now: now(), nudged: true, pane_tail: None, provider_cooldown_until: None };
         let fx = on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx);
         assert_eq!(kinds(&fx), vec!["task.needs_attention"]);
         assert_eq!(t.state, TaskState::NeedsAttention);

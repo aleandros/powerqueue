@@ -30,6 +30,15 @@ pub fn run(ctx: &mut Context, args: RunArgs) -> Result<i32> {
             cfg.tmux.session_name,
             paths.log_file().display()
         );
+        let providers: Vec<String> = cfg.budget.enabled_providers_in_order().iter().map(|p| p.to_string()).collect();
+        let probes = match cfg.budget.probe_interval_mins {
+            0 => "usage probes off".to_string(),
+            m => format!("usage probes every {m}m"),
+        };
+        eprintln!(
+            "providers {} (in fallback order) | {probes}",
+            if providers.is_empty() { "none enabled".to_string() } else { providers.join(", ") }
+        );
         if args.once {
             eprintln!("running a single scheduling pass");
         } else {
