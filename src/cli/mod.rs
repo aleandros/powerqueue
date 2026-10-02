@@ -1,7 +1,7 @@
 //! Command-line interface.
 //!
 //! ```text
-//! powerqueue init                 guided setup (keys, repo, team, PRIORITY.md)
+//! powerqueue init                 guided setup (keys, repo, team, PRIORITY.md); --reconfigure edits an existing install
 //! powerqueue run [--once]         start the scheduler daemon (foreground)
 //! powerqueue stop                 ask a running daemon to exit
 //! powerqueue dashboard            live TUI
@@ -14,7 +14,7 @@
 //! powerqueue linear <teams|states|test|sync>
 //! powerqueue doctor [--fix]       diagnostics + tuning advice
 //! powerqueue logs [-f] [--task]   read the daemon log
-//! powerqueue config <show|path|edit|validate>
+//! powerqueue config <show|get|set|unset|path|edit|validate>
 //! powerqueue secrets <set|unset|list>
 //! powerqueue hook ...             (internal) called by Claude Code hooks
 //! powerqueue completions <shell>
@@ -135,6 +135,12 @@ pub struct InitArgs {
     /// Overwrite an existing configuration.
     #[arg(long)]
     pub force: bool,
+    /// Permission mode for Claude Code sessions: acceptEdits | auto | bypassPermissions | dontAsk | plan | default.
+    #[arg(long, value_name = "MODE")]
+    pub permission_mode: Option<String>,
+    /// Change the settings of an existing installation (keeps keys and everything not asked about).
+    #[arg(long, conflicts_with = "force")]
+    pub reconfigure: bool,
 }
 
 #[derive(Debug, Args, Default)]
@@ -322,6 +328,12 @@ pub struct LogsArgs {
 pub enum ConfigCommand {
     /// Print the effective configuration (TOML).
     Show,
+    /// Print one value by dotted key, e.g. `claude.permission_mode` (TOML; `--json` for JSON).
+    Get { key: String },
+    /// Set one value by dotted key; the value is TOML (`3`, `true`, `["ENG","OPS"]`) or a bare string.
+    Set { key: String, value: String },
+    /// Remove one key from config.toml so its default applies again.
+    Unset { key: String },
     /// Print config/data/state paths.
     Path,
     /// Open config.toml in $EDITOR.

@@ -13,6 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a TTY; `--json` prints the snapshot), and `dashboard --ascii` draws with
   `*`/`>`/`#` and `+-|` borders (automatic when the locale is not UTF-8).
 - `doctor` warns when `TERM` is unset/`dumb` or the locale is not UTF-8.
+- `init` offers every permission mode (`acceptEdits`, `auto`,
+  `bypassPermissions`, `dontAsk`, `plan`, `default`) with a one-line
+  description each, and `--permission-mode MODE` sets it without the prompt
+  (validated in non-interactive mode).
+- `init` on an existing install offers "Change settings"; `init --reconfigure`
+  walks the editable settings (repository, default branch, Linear team and
+  states, concurrency, permission mode, weekly budget, reset anchor) with the
+  current values as defaults and writes only those keys back.
+- `config get <key>`, `config set <key> <value>` and `config unset <key>`
+  change single keys by dotted path. Edits keep comments and formatting
+  (`toml_edit`), are validated before anything is written, and ask a running
+  daemon to reload.
 
 ### Changed
 

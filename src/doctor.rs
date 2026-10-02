@@ -317,7 +317,12 @@ fn check_config(cfg: &Config, paths: &Paths) -> CheckResult {
     if problems.is_empty() {
         CheckResult::ok(CONF, "config.toml", format!("{} is valid", file.display()))
     } else {
-        CheckResult::fail(CONF, "config.toml", problems.join("; "), "fix the listed keys with `powerqueue config edit`")
+        CheckResult::fail(
+            CONF,
+            "config.toml",
+            problems.join("; "),
+            "fix the listed keys with `powerqueue config set <key> <value>` or `powerqueue config edit`",
+        )
     }
 }
 

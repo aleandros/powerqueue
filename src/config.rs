@@ -209,8 +209,9 @@ impl SchedulerConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ClaudeConfig {
     pub binary: String,
-    /// `--permission-mode` value. `acceptEdits` is a good unattended default;
-    /// `bypassPermissions` is fully unattended but riskier.
+    /// `--permission-mode` value. `acceptEdits` is the safe default (other
+    /// tools still prompt); `auto` lets Claude Code's classifier approve
+    /// routine commands for unattended runs; `bypassPermissions` never asks.
     pub permission_mode: String,
     /// `--effort` value, if any.
     pub effort: Option<String>,
