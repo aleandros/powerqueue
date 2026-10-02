@@ -141,7 +141,7 @@ Global flags work on every command.
 
 | Command | What it does |
 |---------|--------------|
-| `init [--repo PATH] [--team KEY]... [--linear-key K] [--jev-key K] [--no-linear] [--non-interactive] [--force]` | guided first-time setup; writes `config.toml` and `PRIORITY.md`, stores keys; `--no-linear` sets `linear.enabled = false` (manual tasks only) |
+| `init [--repo PATH] [--team KEY]... [--linear-key K] [--jev-key K] [--no-linear] [--permission-mode MODE] [--non-interactive] [--reconfigure] [--force]` | guided first-time setup; writes `config.toml` and `PRIORITY.md`, stores keys; `--no-linear` sets `linear.enabled = false` (manual tasks only); `--permission-mode` picks `acceptEdits` (default), `auto`, `bypassPermissions`, `dontAsk`, `plan` or `default`; on an existing install the menu offers "Change settings", and `--reconfigure` walks the editable settings (repository, default branch, Linear team and states, concurrency, permission mode, weekly budget, reset anchor) with the current values as defaults, keeping keys and every other key |
 | `run [--once] [--offline]` | run the scheduler in the foreground; `--once` does one pass; `--offline` skips Linear |
 | `stop` | ask the running daemon to exit (sessions keep running in tmux) |
 | `dashboard` (`ui`, `top`) | live TUI |
@@ -209,6 +209,9 @@ state machine allows it. `complete` and `block` always write directly.
 |---------|--------------|
 | `config show` | effective configuration as TOML |
 | `config path` | config/data/state paths |
+| `config get <key>` | one value by dotted key (`claude.permission_mode`, `budget.models.fable.share`, `linear.team_keys`) as TOML; `--json` for JSON |
+| `config set <key> <value>` | change one key; `<value>` is TOML (`3`, `true`, `["ENG","OPS"]`) or a bare string (`auto`); the result is validated before anything is written, comments in `config.toml` survive, and a running daemon is asked to reload (new sessions use the new value) |
+| `config unset <key>` | remove a key so its default applies again |
 | `config edit` | open `config.toml` in `$EDITOR` |
 | `config validate` | validate `config.toml` and the repo's `.powerqueue.toml` |
 | `secrets set <linear\|jev> [value]` | store a key (prompts if omitted) |
@@ -345,7 +348,7 @@ problems in plain language.
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `binary` | `"claude"` | Claude Code executable |
-| `permission_mode` | `"acceptEdits"` | `--permission-mode`; `bypassPermissions` is fully unattended but riskier |
+| `permission_mode` | `"acceptEdits"` | `--permission-mode`; `auto` is the unattended choice, `bypassPermissions` never asks at all |
 | `effort` | none | `--effort` value |
 | `extra_args` | `[]` | flags appended verbatim |
 | `allowed_tools` | `[]` | extra `--allowedTools` patterns |
@@ -355,15 +358,18 @@ problems in plain language.
 | `env` | `{}` | environment variables for the session |
 
 Allowed permission modes: `default`, `manual`, `acceptEdits`, `plan`, `auto`,
-`dontAsk`, `bypassPermissions`.
+`dontAsk`, `bypassPermissions`. `powerqueue init` offers them with a one-line
+description each (`--permission-mode MODE` skips the prompt), and
+`powerqueue config set claude.permission_mode auto` changes the mode later.
 
 Every session also gets `--allowedTools "Bash(powerqueue task *)"` so the
 completion protocol never waits on a permission prompt. In `acceptEdits` mode
 other shell commands (tests, `git commit`, package installs) still prompt and
 leave the task in `needs_attention` until you attach and answer. For truly
-unattended runs pick `auto` (Claude's classifier decides) or
-`bypassPermissions`, and/or pre-approve what your repo needs in
-`allowed_tools`, for example `["Bash(git *)", "Bash(cargo *)", "Bash(npm test*)"]`.
+unattended runs (a VPS, a daemon nobody watches) pick `auto`, where Claude
+Code's own classifier approves routine commands, or `bypassPermissions`,
+and/or pre-approve what your repo needs in `allowed_tools`, for example
+`["Bash(git *)", "Bash(cargo *)", "Bash(npm test*)"]`.
 
 ### `[budget]` and `[budget.models.<tier>]`
 

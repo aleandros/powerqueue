@@ -1,13 +1,139 @@
-//! `powerqueue config ...` — show, locate, edit and validate configuration.
+//! `powerqueue config ...` — show, locate, edit, validate and change single
+//! keys of the configuration.
+//!
+//! `get`/`set`/`unset` address keys by dotted path (`claude.permission_mode`,
+//! `budget.models.fable.share`). Edits go through `toml_edit` so comments and
+//! formatting in `config.toml` survive, and nothing is written unless the
+//! result parses as a [`Config`] and passes [`Config::validate`].
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use owo_colors::{OwoColorize, Stream, Style};
+use toml_edit::{DocumentMut, Item, Table};
 
+use crate::cli::commands::status::daemon_status;
 use crate::cli::{ConfigCommand, Context};
-use crate::config::{Config, REPO_CONFIG_FILE, RepoOverrides};
+use crate::config::{Config, REPO_CONFIG_FILE, RepoOverrides, write_private};
+use crate::domain::DaemonCommand;
 use crate::paths::Paths;
+
+/// Split a dotted key into segments, rejecting empty ones.
+fn key_segments(key: &str) -> Result<Vec<&str>> {
+    let segs: Vec<&str> = key.split('.').collect();
+    if key.trim().is_empty() || segs.iter().any(|s| s.trim().is_empty()) {
+        bail!("`{key}` is not a dotted key such as `claude.permission_mode`");
+    }
+    Ok(segs)
+}
+
+/// Parse `raw` as a TOML value (`3`, `true`, `0.25`, `"x"`, `["ENG", "OPS"]`,
+/// `{ a = 1 }`); anything that does not parse is taken as a plain string, so
+/// `auto` and `In Progress` work without quotes. Date-times are kept as
+/// strings too, because every timestamp in the configuration is a string
+/// (`budget.period_anchor`).
+pub fn parse_toml_value(raw: &str) -> toml_edit::Value {
+    match raw.trim().parse::<toml_edit::Value>() {
+        Ok(v) if v.is_datetime() => toml_edit::Value::from(raw.trim()),
+        Ok(v) if !v.is_str() || raw.trim().starts_with(['"', '\'']) => v,
+        _ => toml_edit::Value::from(raw),
+    }
+}
+
+/// Set `key` to the TOML value `raw` in `text` (the contents of
+/// `config.toml`), creating intermediate tables as needed. Returns the new
+/// contents. Fails when the document does not parse, when the result is not a
+/// valid [`Config`] (unknown key, wrong type) or when [`Config::validate`]
+/// reports problems.
+pub fn set_in_toml(text: &str, key: &str, raw: &str) -> Result<String> {
+    let segs = key_segments(key)?;
+    let mut doc: DocumentMut = text.parse().context("config.toml does not parse")?;
+    let value = parse_toml_value(raw);
+    let (last, parents) = segs.split_last().expect("key_segments returns at least one segment");
+    let mut table: &mut dyn toml_edit::TableLike = doc.as_table_mut();
+    for seg in parents {
+        let item = table.entry(seg).or_insert_with(|| {
+            let mut t = Table::new();
+            t.set_implicit(true);
+            Item::Table(t)
+        });
+        table = item.as_table_like_mut().ok_or_else(|| anyhow!("`{seg}` in `{key}` is not a table"))?;
+    }
+    table.insert(last, Item::Value(value));
+    let out = doc.to_string();
+    check_edited(&out, key)?;
+    Ok(out)
+}
+
+/// Remove `key` from `text` so its default applies again. Returns the new
+/// contents and whether the key was present. Fails like [`set_in_toml`] when
+/// the result is invalid (for example after removing `repo.path`).
+pub fn unset_in_toml(text: &str, key: &str) -> Result<(String, bool)> {
+    let segs = key_segments(key)?;
+    let mut doc: DocumentMut = text.parse().context("config.toml does not parse")?;
+    let (last, parents) = segs.split_last().expect("key_segments returns at least one segment");
+    let mut table: &mut dyn toml_edit::TableLike = doc.as_table_mut();
+    for seg in parents {
+        match table.get_mut(seg).and_then(|i| i.as_table_like_mut()) {
+            Some(t) => table = t,
+            None => return Ok((text.to_string(), false)),
+        }
+    }
+    let present = table.remove(last).is_some();
+    let out = doc.to_string();
+    check_edited(&out, key)?;
+    Ok((out, present))
+}
+
+/// Parse the edited text as a [`Config`] and validate it, naming `key` in errors.
+fn check_edited(text: &str, key: &str) -> Result<()> {
+    let cfg = Config::from_toml(text).map_err(|e| anyhow!("`{key}`: {}", e.to_string().trim()))?;
+    let problems = cfg.validate();
+    if !problems.is_empty() {
+        bail!("`{key}` would leave config.toml invalid:\n  - {}", problems.join("\n  - "));
+    }
+    Ok(())
+}
+
+/// The effective value at `key` (file plus defaults, no repo overrides) as
+/// JSON; `None` when the key names nothing in the configuration or is unset.
+pub fn get_value(cfg: &Config, key: &str) -> Result<Option<serde_json::Value>> {
+    let segs = key_segments(key)?;
+    let root = serde_json::to_value(cfg)?;
+    let mut cur = &root;
+    for seg in segs {
+        match cur.get(seg) {
+            Some(v) if !v.is_null() => cur = v,
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(cur.clone()))
+}
+
+/// Render a JSON value the way it would appear in `config.toml`.
+pub fn toml_display(value: &serde_json::Value) -> Result<String> {
+    use serde::Deserialize as _;
+    let v = toml::Value::deserialize(value.clone()).map_err(|e| anyhow!("cannot render as TOML: {e}"))?;
+    Ok(match v {
+        toml::Value::Table(t) => toml::to_string(&t)?.trim_end().to_string(),
+        other => other.to_string(),
+    })
+}
+
+/// Tell the user whether a changed setting reaches the daemon: a live daemon
+/// is asked to reload (new sessions use the new values; running sessions and
+/// `logging.*` do not), otherwise the next `powerqueue run` picks it up.
+pub fn apply_note(ctx: &mut Context) -> Result<String> {
+    let store = ctx.store()?;
+    let daemon = daemon_status(store, chrono::Utc::now())?;
+    Ok(if daemon.alive {
+        store.enqueue_command(&DaemonCommand::Reload).context("queue reload command")?;
+        "daemon asked to reload: new sessions use the new settings; running sessions keep theirs and `logging.*` needs a restart"
+            .to_string()
+    } else {
+        "no daemon running; the next `powerqueue run` uses the new settings".to_string()
+    })
+}
 
 /// Everything `config path` prints, in order.
 pub fn path_entries(cfg: &Config, paths: &Paths) -> Vec<(&'static str, PathBuf)> {
@@ -117,6 +243,96 @@ pub fn run(ctx: &mut Context, cmd: ConfigCommand) -> Result<i32> {
             print!("{}", cfg.to_toml()?);
             Ok(0)
         }
+        ConfigCommand::Get { key } => {
+            super::status::ensure_initialised(ctx)?;
+            let cfg = Config::load(&ctx.paths)?;
+            match get_value(&cfg, &key)? {
+                Some(v) if ctx.json => {
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                    Ok(0)
+                }
+                Some(v) => {
+                    println!("{}", toml_display(&v)?);
+                    Ok(0)
+                }
+                None if ctx.json => {
+                    println!("null");
+                    Ok(1)
+                }
+                None => {
+                    eprintln!("{key} is not set (and has no default); see `powerqueue config show` for the known keys");
+                    Ok(1)
+                }
+            }
+        }
+        ConfigCommand::Set { key, value } => {
+            super::status::ensure_initialised(ctx)?;
+            let file = ctx.paths.config_file();
+            let text = std::fs::read_to_string(&file).with_context(|| format!("cannot read {}", file.display()))?;
+            let edited = match set_in_toml(&text, &key, &value) {
+                Ok(t) => t,
+                Err(e) => {
+                    if ctx.json {
+                        println!("{}", serde_json::json!({ "ok": false, "key": key, "error": format!("{e:#}") }));
+                    } else {
+                        print_problems(&[format!("{e:#}")]);
+                        eprintln!("nothing written");
+                    }
+                    return Ok(1);
+                }
+            };
+            write_private(&file, edited.as_bytes()).with_context(|| format!("write {}", file.display()))?;
+            let cfg = Config::load(&ctx.paths)?;
+            let shown = get_value(&cfg, &key)?.unwrap_or(serde_json::Value::Null);
+            let note = apply_note(ctx)?;
+            if ctx.json {
+                println!("{}", serde_json::json!({ "ok": true, "key": key, "value": shown, "note": note }));
+            } else {
+                println!("{} {key} = {}", "set".if_supports_color(Stream::Stdout, |t| t.green()), toml_display(&shown)?);
+                println!("{note}");
+            }
+            Ok(0)
+        }
+        ConfigCommand::Unset { key } => {
+            super::status::ensure_initialised(ctx)?;
+            let file = ctx.paths.config_file();
+            let text = std::fs::read_to_string(&file).with_context(|| format!("cannot read {}", file.display()))?;
+            let (edited, present) = match unset_in_toml(&text, &key) {
+                Ok(r) => r,
+                Err(e) => {
+                    if ctx.json {
+                        println!("{}", serde_json::json!({ "ok": false, "key": key, "error": format!("{e:#}") }));
+                    } else {
+                        print_problems(&[format!("{e:#}")]);
+                        eprintln!("nothing written");
+                    }
+                    return Ok(1);
+                }
+            };
+            if !present {
+                if ctx.json {
+                    println!("{}", serde_json::json!({ "ok": true, "key": key, "changed": false }));
+                } else {
+                    println!("{key} is not set in {}; the default already applies", file.display());
+                }
+                return Ok(0);
+            }
+            write_private(&file, edited.as_bytes()).with_context(|| format!("write {}", file.display()))?;
+            let cfg = Config::load(&ctx.paths)?;
+            let shown = get_value(&cfg, &key)?.unwrap_or(serde_json::Value::Null);
+            let note = apply_note(ctx)?;
+            if ctx.json {
+                println!("{}", serde_json::json!({ "ok": true, "key": key, "changed": true, "value": shown, "note": note }));
+            } else {
+                println!(
+                    "{} {key} (now {})",
+                    "unset".if_supports_color(Stream::Stdout, |t| t.green()),
+                    if shown.is_null() { "not set".to_string() } else { toml_display(&shown)? }
+                );
+                println!("{note}");
+            }
+            Ok(0)
+        }
         ConfigCommand::Edit => {
             super::status::ensure_initialised(ctx)?;
             let file = ctx.paths.config_file();
@@ -208,5 +424,111 @@ mod tests {
     fn editor_fallback_is_vi() {
         let cmd = editor_command();
         assert!(!cmd.is_empty());
+    }
+
+    const BASE: &str =
+        "# header comment\n[repo]\npath = \"/tmp/repo\" # keep me\n\n[claude]\npermission_mode = \"acceptEdits\"\n";
+
+    #[test]
+    fn set_scalar_keeps_comments() {
+        let out = set_in_toml(BASE, "claude.permission_mode", "auto").unwrap();
+        assert!(out.starts_with("# header comment\n"), "{out}");
+        assert!(out.contains("path = \"/tmp/repo\" # keep me"), "{out}");
+        assert!(out.contains("permission_mode = \"auto\""), "{out}");
+        let cfg = Config::from_toml(&out).unwrap();
+        assert_eq!(cfg.claude.permission_mode, "auto");
+
+        let out = set_in_toml(BASE, "scheduler.max_concurrent", "3").unwrap();
+        assert!(out.contains("[scheduler]\nmax_concurrent = 3"), "{out}");
+        assert_eq!(Config::from_toml(&out).unwrap().scheduler.max_concurrent, 3);
+
+        // Quoted strings and bare strings with spaces both work.
+        let out = set_in_toml(BASE, "linear.in_progress_state", "In Progress").unwrap();
+        assert_eq!(Config::from_toml(&out).unwrap().linear.in_progress_state.as_deref(), Some("In Progress"));
+        let out = set_in_toml(BASE, "linear.in_progress_state", "\"Doing\"").unwrap();
+        assert_eq!(Config::from_toml(&out).unwrap().linear.in_progress_state.as_deref(), Some("Doing"));
+    }
+
+    #[test]
+    fn set_array_and_nested_table() {
+        let out = set_in_toml(BASE, "linear.team_keys", "[\"ENG\", \"OPS\"]").unwrap();
+        assert_eq!(Config::from_toml(&out).unwrap().linear.team_keys, vec!["ENG".to_string(), "OPS".to_string()]);
+
+        let out = set_in_toml(BASE, "budget.models.fable.share", "0.1").unwrap();
+        assert!(out.contains("[budget.models.fable]\nshare = 0.1"), "{out}");
+        assert!(!out.contains("[budget]\n"), "intermediate tables stay implicit: {out}");
+        let cfg = Config::from_toml(&out).unwrap();
+        assert_eq!(cfg.budget.models[&crate::domain::ModelTier::Fable].share, 0.1);
+        // Untouched fields of the partially specified table use `ModelBudget`'s
+        // defaults, and the map replaces the default map (`init` writes every
+        // tier, so a normal config.toml keeps the other tiers).
+        assert_eq!(cfg.budget.models[&crate::domain::ModelTier::Fable].weight, 1.0);
+        assert_eq!(cfg.budget.models.len(), 1);
+
+        let full = Config::default().to_toml().unwrap().replace("path = \"\"", "path = \"/tmp/repo\"");
+        let out = set_in_toml(&full, "budget.models.fable.share", "0.1").unwrap();
+        let cfg = Config::from_toml(&out).unwrap();
+        assert_eq!(cfg.budget.models[&crate::domain::ModelTier::Fable].share, 0.1);
+        assert_eq!(cfg.budget.models[&crate::domain::ModelTier::Fable].weight, 5.0);
+        assert_eq!(cfg.budget.models.len(), 4);
+    }
+
+    #[test]
+    fn set_rejects_invalid_values_and_keys() {
+        let err = set_in_toml(BASE, "claude.permission_mode", "bogus").unwrap_err().to_string();
+        assert!(err.contains("permission_mode"), "{err}");
+        let err = set_in_toml(BASE, "scheduler.max_concurrent", "0").unwrap_err().to_string();
+        assert!(err.contains("max_concurrent must be >= 1"), "{err}");
+        let err = set_in_toml(BASE, "scheduler.max_concurrent", "three").unwrap_err().to_string();
+        assert!(err.contains("max_concurrent"), "{err}");
+        let err = set_in_toml(BASE, "claude.permision_mode", "auto").unwrap_err().to_string();
+        assert!(err.contains("permision_mode"), "{err}");
+        assert!(set_in_toml(BASE, "", "1").is_err());
+        assert!(set_in_toml(BASE, "claude..x", "1").is_err());
+        let err = set_in_toml(BASE, "repo.path.deeper", "1").unwrap_err().to_string();
+        assert!(err.contains("not a table"), "{err}");
+    }
+
+    #[test]
+    fn unset_removes_key_and_validates() {
+        let (out, present) = unset_in_toml(BASE, "claude.permission_mode").unwrap();
+        assert!(present);
+        assert!(!out.contains("permission_mode"), "{out}");
+        assert!(out.contains("# header comment"), "{out}");
+        assert_eq!(Config::from_toml(&out).unwrap().claude.permission_mode, "acceptEdits");
+
+        let (out, present) = unset_in_toml(BASE, "scheduler.max_concurrent").unwrap();
+        assert!(!present);
+        assert_eq!(out, BASE);
+
+        let err = unset_in_toml(BASE, "repo.path").unwrap_err().to_string();
+        assert!(err.contains("repo.path is empty"), "{err}");
+    }
+
+    #[test]
+    fn get_value_and_display() {
+        let cfg = Config::from_toml(BASE).unwrap();
+        let v = get_value(&cfg, "claude.permission_mode").unwrap().unwrap();
+        assert_eq!(toml_display(&v).unwrap(), "\"acceptEdits\"");
+        let v = get_value(&cfg, "scheduler.max_concurrent").unwrap().unwrap();
+        assert_eq!(toml_display(&v).unwrap(), "2");
+        let v = get_value(&cfg, "linear.queued_states").unwrap().unwrap();
+        assert_eq!(toml_display(&v).unwrap(), "[\"Todo\"]");
+        let v = get_value(&cfg, "budget.models.fable.share").unwrap().unwrap();
+        assert_eq!(toml_display(&v).unwrap(), "0.25");
+        let v = get_value(&cfg, "budget.models.fable").unwrap().unwrap();
+        assert!(toml_display(&v).unwrap().contains("share = 0.25"));
+        assert!(get_value(&cfg, "repo.default_branch").unwrap().is_none());
+        assert!(get_value(&cfg, "nope.nothing").unwrap().is_none());
+    }
+
+    #[test]
+    fn value_parsing_falls_back_to_string() {
+        assert!(parse_toml_value("3").is_integer());
+        assert!(parse_toml_value("true").is_bool());
+        assert!(parse_toml_value("[1, 2]").is_array());
+        assert_eq!(parse_toml_value("auto").as_str(), Some("auto"));
+        assert_eq!(parse_toml_value("In Progress").as_str(), Some("In Progress"));
+        assert_eq!(parse_toml_value("\"quoted\"").as_str(), Some("quoted"));
     }
 }

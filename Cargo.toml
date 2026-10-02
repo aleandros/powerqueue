@@ -51,6 +51,7 @@ sysinfo = "0.39.6"
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["full"] }
 toml = "1.1.6"
+toml_edit = "0.25.15"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json", "fmt"] }

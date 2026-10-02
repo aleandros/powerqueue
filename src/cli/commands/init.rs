@@ -3,6 +3,10 @@
 //! Interactive by default (dialoguer prompts, indicatif spinners for network
 //! calls); `--non-interactive` (or a non-TTY stdin) uses flags, environment
 //! variables and defaults and fails with a list of what is missing.
+//!
+//! On an existing installation the menu offers "Change settings" (also
+//! `--reconfigure`), which walks the same steps with the current values as
+//! defaults and writes only the answered keys back to `config.toml`.
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -16,7 +20,7 @@ use indicatif::ProgressBar;
 use owo_colors::{OwoColorize, Stream, Style};
 
 use crate::cli::{Context, InitArgs};
-use crate::config::{BudgetConfig, Config, config_template, write_private};
+use crate::config::{BudgetConfig, Config, RepoConfig, config_template, write_private};
 use crate::doctor::claude_auth_status;
 use crate::jev::JevClient;
 use crate::linear::client::{LinearClient, WorkflowState};
@@ -29,6 +33,7 @@ use crate::worktree::Repo;
 #[derive(Debug, Clone)]
 pub struct Answers {
     pub repo_path: PathBuf,
+    /// Explicit `repo.default_branch`; `None` lets powerqueue detect it.
     pub default_branch: Option<String>,
     pub linear_enabled: bool,
     pub team_keys: Vec<String>,
@@ -63,12 +68,71 @@ impl Default for Answers {
     }
 }
 
-/// Permission modes offered by the setup, most recommended first.
-pub const PERMISSION_MODES: [(&str, &str); 3] = [
-    ("acceptEdits", "auto-accept file edits, ask for other tools (recommended)"),
-    ("bypassPermissions", "fully unattended; Claude may run anything"),
-    ("default", "ask for everything (sessions will stall without a human)"),
+impl Answers {
+    /// The answers implied by an existing configuration (used as defaults by
+    /// "Change settings" / `--reconfigure`).
+    pub fn from_config(cfg: &Config) -> Self {
+        Self {
+            repo_path: cfg.repo_path(),
+            default_branch: cfg.repo.default_branch.clone(),
+            linear_enabled: cfg.linear.enabled,
+            team_keys: cfg.linear.team_keys.clone(),
+            queued_states: cfg.linear.queued_states.clone(),
+            in_progress_state: cfg.linear.in_progress_state.clone(),
+            done_state: cfg.linear.done_state.clone(),
+            jev_enabled: cfg.priority.jev.enabled,
+            max_concurrent: cfg.scheduler.max_concurrent,
+            permission_mode: cfg.claude.permission_mode.clone(),
+            period_weighted_tokens: cfg.budget.period_weighted_tokens,
+            period_anchor: cfg
+                .budget
+                .period_anchor
+                .as_deref()
+                .and_then(|a| DateTime::parse_from_rfc3339(a).ok())
+                .map(|a| a.with_timezone(&Utc)),
+        }
+    }
+
+    /// Write the answers into `cfg`, leaving every other key untouched.
+    pub fn apply_to(&self, cfg: &mut Config) {
+        cfg.repo.path = self.repo_path.display().to_string();
+        cfg.repo.default_branch = self.default_branch.clone();
+        cfg.linear.enabled = self.linear_enabled;
+        cfg.linear.team_keys = self.team_keys.clone();
+        if !self.queued_states.is_empty() {
+            cfg.linear.queued_states = self.queued_states.clone();
+        }
+        cfg.linear.in_progress_state = self.in_progress_state.clone();
+        cfg.linear.done_state = self.done_state.clone();
+        cfg.priority.jev.enabled = self.jev_enabled;
+        cfg.scheduler.max_concurrent = self.max_concurrent;
+        cfg.claude.permission_mode = self.permission_mode.clone();
+        cfg.budget.period_weighted_tokens = self.period_weighted_tokens;
+        cfg.budget.period_anchor = self.period_anchor.map(|a| a.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    }
+}
+
+/// Permission modes offered by the setup, with a one-line description each.
+/// `acceptEdits` is the interactive default.
+pub const PERMISSION_MODES: [(&str, &str); 6] = [
+    ("acceptEdits", "auto-accept file edits, ask before other tools (safe default; sessions may wait on you)"),
+    ("auto", "Claude Code's classifier approves routine commands itself; best for unattended runs (recommended for a VPS)"),
+    ("bypassPermissions", "never ask; Claude may run anything"),
+    ("dontAsk", "deny anything that would prompt instead of waiting"),
+    ("plan", "plan only, no changes"),
+    ("default", "ask for everything (sessions stall without a human)"),
 ];
+
+/// Reject a `--permission-mode` value that `init` does not offer. The error
+/// lists the accepted modes.
+pub fn check_permission_mode(mode: &str) -> Result<()> {
+    if PERMISSION_MODES.iter().any(|(m, _)| *m == mode) {
+        Ok(())
+    } else {
+        let names: Vec<&str> = PERMISSION_MODES.iter().map(|(m, _)| *m).collect();
+        bail!("permission mode `{mode}` is not one of {}", names.join(", "))
+    }
+}
 
 /// Pick sensible queued / in-progress / done states from a team's workflow:
 /// queued = the `unstarted` state called "Todo" (else the first unstarted,
@@ -163,7 +227,7 @@ fn parse_time(s: &str) -> Option<NaiveTime> {
     NaiveTime::from_hms_opt(hour, minute, second)
 }
 
-/// Items required by `--non-interactive` that were not provided.
+/// Items required by `--non-interactive` that were not provided (or invalid).
 pub fn missing_for_non_interactive(args: &InitArgs, repo_is_git: bool) -> Vec<String> {
     let mut missing = Vec::new();
     if !repo_is_git {
@@ -171,6 +235,11 @@ pub fn missing_for_non_interactive(args: &InitArgs, repo_is_git: bool) -> Vec<St
     }
     if !args.no_linear && args.linear_key.as_deref().map(str::trim).filter(|k| !k.is_empty()).is_none() {
         missing.push("Linear API key (--linear-key, LINEAR_API_KEY, or --no-linear)".to_string());
+    }
+    if let Some(mode) = &args.permission_mode
+        && let Err(e) = check_permission_mode(mode)
+    {
+        missing.push(format!("a valid --permission-mode ({e})"));
     }
     missing
 }
@@ -181,18 +250,7 @@ pub fn render_config(answers: &Answers) -> Result<String> {
     let template = config_template(&answers.repo_path.display().to_string(), &answers.team_keys);
     let header: Vec<&str> = template.lines().take_while(|l| l.starts_with('#')).collect();
     let mut cfg = Config::from_toml(&template)?;
-    cfg.linear.enabled = answers.linear_enabled;
-    cfg.linear.team_keys = answers.team_keys.clone();
-    if !answers.queued_states.is_empty() {
-        cfg.linear.queued_states = answers.queued_states.clone();
-    }
-    cfg.linear.in_progress_state = answers.in_progress_state.clone();
-    cfg.linear.done_state = answers.done_state.clone();
-    cfg.priority.jev.enabled = answers.jev_enabled;
-    cfg.scheduler.max_concurrent = answers.max_concurrent;
-    cfg.claude.permission_mode = answers.permission_mode.clone();
-    cfg.budget.period_weighted_tokens = answers.period_weighted_tokens;
-    cfg.budget.period_anchor = answers.period_anchor.map(|a| a.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    answers.apply_to(&mut cfg);
     cfg.ensure_valid()?;
     Ok(format!("{}\n\n{}", header.join("\n"), cfg.to_toml()?))
 }
@@ -283,15 +341,45 @@ fn detect_repo(args_repo: Option<&Path>) -> Result<PathBuf> {
     Ok(raw.canonicalize().unwrap_or(raw))
 }
 
-fn repo_step(ui: &Ui, args: &InitArgs, interactive: bool) -> Result<(PathBuf, Option<String>)> {
+/// Pick the repository. With `current` (reconfigure) the current path is the
+/// default and the user may also set an explicit default branch; otherwise
+/// the branch is left to detection. Returns the path and the explicit
+/// `repo.default_branch` value (`None` = detect).
+fn repo_step(ui: &Ui, args: &InitArgs, interactive: bool, current: Option<&RepoConfig>) -> Result<(PathBuf, Option<String>)> {
     ui.section("Repository");
-    let mut path = detect_repo(args.repo.as_deref())?;
+    let mut path = match (args.repo.as_deref(), current) {
+        (None, Some(cur)) if !cur.path.trim().is_empty() => {
+            if interactive {
+                let typed: String = Input::with_theme(ui.theme())
+                    .with_prompt("Path to the repository")
+                    .default(cur.path.clone())
+                    .interact_text()?;
+                detect_repo(Some(Path::new(typed.trim())))?
+            } else {
+                detect_repo(Some(Path::new(&cur.path)))?
+            }
+        }
+        _ => detect_repo(args.repo.as_deref())?,
+    };
     loop {
         let repo = Repo::new(&path);
         if repo.is_repo() {
-            let branch = repo.default_branch().ok();
-            ui.ok(&format!("{} (default branch: {})", path.display(), branch.as_deref().unwrap_or("unknown")));
-            return Ok((path, branch));
+            let detected = repo.default_branch().ok();
+            ui.ok(&format!("{} (default branch: {})", path.display(), detected.as_deref().unwrap_or("unknown")));
+            let Some(cur) = current else { return Ok((path, None)) };
+            if !interactive {
+                return Ok((path, cur.default_branch.clone()));
+            }
+            let typed: String = Input::with_theme(ui.theme())
+                .with_prompt(format!(
+                    "Branch new worktrees start from (empty = detect{})",
+                    detected.as_deref().map(|b| format!(": {b}")).unwrap_or_default()
+                ))
+                .default(cur.default_branch.clone().unwrap_or_default())
+                .allow_empty(true)
+                .interact_text()?;
+            let branch = typed.trim();
+            return Ok((path, (!branch.is_empty()).then(|| branch.to_string())));
         }
         ui.fail(&format!("{} is not a git repository", path.display()));
         if !interactive {
@@ -376,6 +464,9 @@ fn linear_step(
     }
 }
 
+/// Choose teams and workflow states. `--team` wins; otherwise the teams and
+/// states already in `answers` (the current config when reconfiguring) are
+/// the defaults, and a fresh install falls back to [`pick_default_states`].
 fn teams_step(
     ui: &Ui,
     client: &LinearClient,
@@ -385,14 +476,15 @@ fn teams_step(
     rt: &tokio::runtime::Runtime,
 ) -> Result<()> {
     ui.section("Teams and workflow states");
+    let wanted: Vec<String> = if args.team.is_empty() { answers.team_keys.clone() } else { args.team.clone() };
     let pb = ui.spinner("fetching teams…");
     let teams = rt.block_on(client.teams());
     pb.finish_and_clear();
     let teams = match teams {
         Ok(t) => t,
         Err(e) => {
-            ui.warn(&format!("could not list teams ({e:#}); using --team values as given"));
-            answers.team_keys = args.team.clone();
+            ui.warn(&format!("could not list teams ({e:#}); using team keys as given"));
+            answers.team_keys = wanted;
             return Ok(());
         }
     };
@@ -400,7 +492,7 @@ fn teams_step(
         ui.warn("the API key sees no teams; `linear.team_keys` left empty (all teams)");
         return Ok(());
     }
-    let preselected: Vec<bool> = teams.iter().map(|t| args.team.iter().any(|k| k.eq_ignore_ascii_case(&t.key))).collect();
+    let preselected: Vec<bool> = teams.iter().map(|t| wanted.iter().any(|k| k.eq_ignore_ascii_case(&t.key))).collect();
     let chosen: Vec<usize> = if interactive {
         let labels: Vec<String> = teams.iter().map(|t| format!("{} — {}", t.key, t.name)).collect();
         let defaults = if preselected.iter().any(|p| *p) { preselected.clone() } else { vec![teams.len() == 1; teams.len()] };
@@ -434,7 +526,13 @@ fn teams_step(
             return Ok(());
         }
     };
-    let (queued, in_progress, done) = pick_default_states(&states);
+    // Keep the current choices when they still exist in this team's workflow.
+    let current_valid = answers.queued_states.iter().any(|q| states.iter().any(|s| &s.name == q));
+    let (queued, in_progress, done) = if current_valid {
+        (answers.queued_states.clone(), answers.in_progress_state.clone(), answers.done_state.clone())
+    } else {
+        pick_default_states(&states)
+    };
     if !interactive {
         if !queued.is_empty() {
             answers.queued_states = queued;
@@ -546,11 +644,18 @@ fn jev_step(ctx: &mut Context, ui: &Ui, args: &InitArgs, interactive: bool, rt: 
     }
 }
 
-fn tuning_step(ui: &Ui, interactive: bool, answers: &mut Answers) -> Result<()> {
+/// Concurrency, permission mode, weekly budget and reset anchor. The values
+/// already in `answers` are the defaults; `--permission-mode` overrides the
+/// mode in both interactive and non-interactive runs.
+fn tuning_step(ui: &Ui, args: &InitArgs, interactive: bool, answers: &mut Answers) -> Result<()> {
     ui.section("Scheduling and budget");
+    if let Some(mode) = &args.permission_mode {
+        check_permission_mode(mode)?;
+        answers.permission_mode = mode.clone();
+    }
     if !interactive {
         ui.ok(&format!(
-            "defaults: {} concurrent sessions, permission mode {}, {} weighted tokens per week",
+            "{} concurrent sessions, permission mode {}, {} weighted tokens per week",
             answers.max_concurrent, answers.permission_mode, answers.period_weighted_tokens
         ));
         return Ok(());
@@ -560,9 +665,20 @@ fn tuning_step(ui: &Ui, interactive: bool, answers: &mut Answers) -> Result<()> 
         .default(answers.max_concurrent)
         .validate_with(|v: &u32| if *v >= 1 { Ok(()) } else { Err("must be at least 1") })
         .interact_text()?;
-    let labels: Vec<String> = PERMISSION_MODES.iter().map(|(m, d)| format!("{m} — {d}")).collect();
-    let mode = Select::with_theme(ui.theme()).with_prompt("Permission mode for sessions").items(&labels).default(0).interact()?;
-    answers.permission_mode = PERMISSION_MODES[mode].0.to_string();
+    let mut modes: Vec<String> = PERMISSION_MODES.iter().map(|(m, _)| m.to_string()).collect();
+    let mut labels: Vec<String> = PERMISSION_MODES.iter().map(|(m, d)| format!("{m} — {d}")).collect();
+    let selected = match modes.iter().position(|m| *m == answers.permission_mode) {
+        Some(i) => i,
+        None => {
+            // A mode set by hand (e.g. `manual`) stays selectable.
+            labels.push(format!("{} — keep the current value", answers.permission_mode));
+            modes.push(answers.permission_mode.clone());
+            modes.len() - 1
+        }
+    };
+    let mode =
+        Select::with_theme(ui.theme()).with_prompt("Permission mode for sessions").items(&labels).default(selected).interact()?;
+    answers.permission_mode = modes[mode].clone();
     answers.period_weighted_tokens = Input::with_theme(ui.theme())
         .with_prompt("Weekly budget in weighted tokens (see docs/budget.md)")
         .default(answers.period_weighted_tokens)
@@ -572,9 +688,11 @@ fn tuning_step(ui: &Ui, interactive: bool, answers: &mut Answers) -> Result<()> 
             .with_prompt(
                 "When does your weekly usage reset? (as shown by /usage, e.g. 'Mon 00:00' or RFC 3339; empty to set later)",
             )
+            .default(answers.period_anchor.map(|a| a.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap_or_default())
             .allow_empty(true)
             .interact_text()?;
         if typed.trim().is_empty() {
+            answers.period_anchor = None;
             ui.warn("no reset time; pacing assumes Monday 00:00 UTC until you run `powerqueue budget set-reset`");
             break;
         }
@@ -613,6 +731,119 @@ fn keys_only(ctx: &mut Context, ui: &Ui, args: &InitArgs, interactive: bool) -> 
     Ok(0)
 }
 
+/// A Linear client for the key already stored (or given with `--linear-key`
+/// / `LINEAR_API_KEY`), verified against the API. `Ok(None)` when there is no
+/// key; the error of a rejected key is returned so the caller can decide.
+fn stored_linear_client(
+    ctx: &mut Context,
+    ui: &Ui,
+    args: &InitArgs,
+    rt: &tokio::runtime::Runtime,
+) -> Result<Option<LinearClient>> {
+    let key = match args.linear_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        Some(k) => k.to_string(),
+        None => match ctx.secrets().get(SecretKind::LinearApiKey)? {
+            Some(k) => k,
+            None => return Ok(None),
+        },
+    };
+    let client = LinearClient::new(crate::config::LinearConfig::default().endpoint, key)?;
+    let pb = ui.spinner("checking the Linear API key…");
+    let viewer = rt.block_on(client.viewer());
+    pb.finish_and_clear();
+    let v = viewer.context("Linear rejected the stored API key")?;
+    ui.ok(&format!("authenticated as {} <{}>", v.name, v.email));
+    Ok(Some(client))
+}
+
+/// "Change settings": walk the editable settings with the current values as
+/// defaults and write only those keys back. Keys, PRIORITY.md and every
+/// other section are left alone. Non-interactive runs apply the flags given
+/// and keep everything else.
+fn reconfigure(ctx: &mut Context, ui: &Ui, args: &InitArgs, interactive: bool) -> Result<i32> {
+    let mut cfg = Config::load(&ctx.paths)
+        .with_context(|| "cannot load the existing configuration; fix it with `powerqueue config edit` or start over")?;
+    if let Some(mode) = &args.permission_mode {
+        check_permission_mode(mode)?;
+    }
+    let mut answers = Answers::from_config(&cfg);
+    let (repo_path, default_branch) = repo_step(ui, args, interactive, Some(&cfg.repo))?;
+    answers.repo_path = repo_path;
+    answers.default_branch = default_branch;
+
+    ui.section("Linear");
+    let rt = super::runtime()?;
+    answers.linear_enabled = if args.no_linear {
+        false
+    } else if interactive {
+        Confirm::with_theme(ui.theme()).with_prompt("Pull tasks from Linear?").default(answers.linear_enabled).interact()?
+    } else {
+        answers.linear_enabled || args.linear_key.is_some()
+    };
+    if !answers.linear_enabled {
+        println!("  disabled; manual tasks only");
+    } else {
+        // Interactively, every `None` below comes from linear_step, i.e. the
+        // user chose to skip Linear; non-interactively it means "no usable key,
+        // keep the current team/state settings".
+        let client = if args.linear_key.is_some() {
+            // A key given on the command line is verified and stored by linear_step.
+            linear_step(ctx, ui, args, interactive, &rt)?
+        } else {
+            match stored_linear_client(ctx, ui, args, &rt) {
+                Ok(Some(client)) => Some(client),
+                Ok(None) if interactive => linear_step(ctx, ui, args, interactive, &rt)?,
+                Ok(None) => {
+                    ui.warn("no Linear API key stored; team and state settings unchanged (`powerqueue secrets set linear`)");
+                    None
+                }
+                Err(e) if interactive => {
+                    ui.fail(&format!("{e:#}"));
+                    linear_step(ctx, ui, args, interactive, &rt)?
+                }
+                Err(e) => {
+                    ui.warn(&format!("{e:#}; team and state settings unchanged"));
+                    None
+                }
+            }
+        };
+        match client {
+            Some(client) if interactive || !args.team.is_empty() => {
+                teams_step(ui, &client, args, interactive, &mut answers, &rt)?;
+            }
+            Some(_) => {}
+            None if interactive => {
+                ui.warn("Linear disabled; add work with `powerqueue add`");
+                answers.linear_enabled = false;
+            }
+            None => {}
+        }
+    }
+
+    tuning_step(ui, args, interactive, &mut answers)?;
+
+    answers.apply_to(&mut cfg);
+    cfg.ensure_valid()?;
+    cfg.save(&ctx.paths).with_context(|| format!("write {}", ctx.paths.config_file().display()))?;
+    ui.section("Saved");
+    ui.ok(&ctx.paths.config_file().display().to_string());
+    println!();
+    println!("  repository     {}", answers.repo_path.display());
+    println!(
+        "  linear         {}",
+        if answers.linear_enabled {
+            format!("teams {}", if answers.team_keys.is_empty() { "all".to_string() } else { answers.team_keys.join(", ") })
+        } else {
+            "disabled".to_string()
+        }
+    );
+    println!("  sessions       up to {} at once, permission mode {}", answers.max_concurrent, answers.permission_mode);
+    println!("  weekly budget  {} weighted tokens", crate::cli::output::human_tokens(answers.period_weighted_tokens));
+    println!();
+    println!("{}", super::config::apply_note(ctx)?);
+    Ok(0)
+}
+
 /// Handle `powerqueue init`.
 pub fn run(ctx: &mut Context, args: InitArgs) -> Result<i32> {
     let interactive = !args.non_interactive && std::io::stdin().is_terminal();
@@ -630,19 +861,27 @@ pub fn run(ctx: &mut Context, args: InitArgs) -> Result<i32> {
         format!("config directory: {}", ctx.paths.config_dir.display()).if_supports_color(Stream::Stdout, |t| t.dimmed())
     );
 
+    if args.reconfigure {
+        if !ctx.is_initialised() {
+            bail!("nothing to reconfigure: {} does not exist (run `powerqueue init`)", ctx.paths.config_file().display());
+        }
+        return reconfigure(ctx, &ui, &args, interactive);
+    }
+
     if ctx.is_initialised() && !args.force {
         ui.warn(&format!("{} already exists", ctx.paths.config_file().display()));
         if !interactive {
-            bail!("configuration already exists; use --force to overwrite it");
+            bail!("configuration already exists; use --reconfigure to change settings or --force to overwrite it");
         }
         let choice = Select::with_theme(ui.theme())
             .with_prompt("What would you like to do?")
-            .items(["Update the API keys only", "Start over (overwrite config.toml)", "Abort"])
+            .items(["Change settings", "Update the API keys only", "Start over (overwrite config.toml)", "Abort"])
             .default(0)
             .interact()?;
         match choice {
-            0 => return keys_only(ctx, &ui, &args, interactive),
-            1 => {}
+            0 => return reconfigure(ctx, &ui, &args, interactive),
+            1 => return keys_only(ctx, &ui, &args, interactive),
+            2 => {}
             _ => {
                 println!("aborted; nothing changed");
                 return Ok(1);
@@ -659,7 +898,7 @@ pub fn run(ctx: &mut Context, args: InitArgs) -> Result<i32> {
     }
 
     let mut answers = Answers::default();
-    let (repo_path, default_branch) = repo_step(&ui, &args, interactive)?;
+    let (repo_path, default_branch) = repo_step(&ui, &args, interactive, None)?;
     answers.repo_path = repo_path;
     answers.default_branch = default_branch;
 
@@ -673,7 +912,7 @@ pub fn run(ctx: &mut Context, args: InitArgs) -> Result<i32> {
     let defaults = Config::default();
     tools_step(&ui, &defaults.claude.binary, &defaults.tmux.binary);
     answers.jev_enabled = jev_step(ctx, &ui, &args, interactive, &rt)?;
-    tuning_step(&ui, interactive, &mut answers)?;
+    tuning_step(&ui, &args, interactive, &mut answers)?;
 
     ui.section("Writing files");
     let written = write_files(ctx, &answers)?;
@@ -701,6 +940,12 @@ pub fn run(ctx: &mut Context, args: InitArgs) -> Result<i32> {
     );
     println!("  sessions       up to {} at once, permission mode {}", answers.max_concurrent, answers.permission_mode);
     println!("  weekly budget  {} weighted tokens", crate::cli::output::human_tokens(answers.period_weighted_tokens));
+    println!();
+    println!(
+        "{}",
+        "change any of this later with `powerqueue init --reconfigure [--permission-mode MODE]` or `powerqueue config set <key> <value>`"
+            .if_supports_color(Stream::Stdout, |t| t.dimmed())
+    );
     println!();
     println!("next steps:");
     println!("  powerqueue doctor      verify the installation and the algorithm");
@@ -816,6 +1061,65 @@ mod tests {
         assert!(missing_for_non_interactive(&args, true).is_empty());
         let args = InitArgs { no_linear: true, ..InitArgs::default() };
         assert!(missing_for_non_interactive(&args, true).is_empty());
+        let args = InitArgs { no_linear: true, permission_mode: Some("bogus".into()), ..InitArgs::default() };
+        let missing = missing_for_non_interactive(&args, true);
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].contains("bogus"), "{missing:?}");
+        let args = InitArgs { no_linear: true, permission_mode: Some("auto".into()), ..InitArgs::default() };
+        assert!(missing_for_non_interactive(&args, true).is_empty());
+    }
+
+    #[test]
+    fn permission_modes_are_all_valid_and_checked() {
+        let mut cfg = Config::default();
+        cfg.repo.path = "/x".into();
+        for (mode, description) in PERMISSION_MODES {
+            cfg.claude.permission_mode = mode.to_string();
+            assert!(cfg.validate().is_empty(), "{mode} must be accepted by Config::validate");
+            assert!(!description.is_empty());
+            check_permission_mode(mode).unwrap();
+        }
+        assert_eq!(PERMISSION_MODES[0].0, "acceptEdits");
+        assert!(PERMISSION_MODES.iter().any(|(m, _)| *m == "auto"));
+        let err = check_permission_mode("yolo").unwrap_err().to_string();
+        assert!(err.contains("auto") && err.contains("bypassPermissions"), "{err}");
+    }
+
+    #[test]
+    fn answers_round_trip_through_config_without_touching_other_keys() {
+        let mut cfg = Config::default();
+        cfg.repo.path = "/tmp/repo".into();
+        cfg.repo.default_branch = Some("develop".into());
+        cfg.repo.setup = vec!["make".into()];
+        cfg.linear.team_keys = vec!["ENG".into()];
+        cfg.linear.queued_states = vec!["Ready".into()];
+        cfg.linear.required_labels = vec!["agent".into()];
+        cfg.claude.permission_mode = "manual".into();
+        cfg.claude.allowed_tools = vec!["Bash(git *)".into()];
+        cfg.scheduler.max_concurrent = 4;
+        cfg.budget.period_anchor = Some("2026-03-02T09:00:00Z".into());
+
+        let mut answers = Answers::from_config(&cfg);
+        assert_eq!(answers.repo_path, PathBuf::from("/tmp/repo"));
+        assert_eq!(answers.default_branch.as_deref(), Some("develop"));
+        assert_eq!(answers.team_keys, vec!["ENG".to_string()]);
+        assert_eq!(answers.permission_mode, "manual");
+        assert_eq!(answers.max_concurrent, 4);
+        assert_eq!(answers.period_anchor, Some(Utc.with_ymd_and_hms(2026, 3, 2, 9, 0, 0).unwrap()));
+
+        let mut unchanged = cfg.clone();
+        answers.apply_to(&mut unchanged);
+        assert_eq!(unchanged, cfg, "applying unchanged answers is a no-op");
+
+        answers.permission_mode = "auto".into();
+        answers.max_concurrent = 1;
+        answers.apply_to(&mut cfg);
+        assert_eq!(cfg.claude.permission_mode, "auto");
+        assert_eq!(cfg.scheduler.max_concurrent, 1);
+        // Keys the wizard does not ask about are untouched.
+        assert_eq!(cfg.repo.setup, vec!["make".to_string()]);
+        assert_eq!(cfg.linear.required_labels, vec!["agent".to_string()]);
+        assert_eq!(cfg.claude.allowed_tools, vec!["Bash(git *)".to_string()]);
     }
 
     #[test]
