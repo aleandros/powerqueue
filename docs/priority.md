@@ -22,7 +22,7 @@ other headings) is ignored, so you can keep notes in the file.
 | `## Default` | criticality for tasks no rule matches (default `normal`) |
 | `## Scoring` | point adjustments |
 | `## Overrides` | per-ticket pins |
-| `## Models` | model tier per criticality |
+| `## Models` | preferred models per criticality (`fable \| gpt-6.1-sol`) |
 | `## Jev` | Jev question and rubric |
 
 Rules are bullet lines (`- ...` or `* ...`). Blank lines and non-bullet lines
@@ -31,7 +31,7 @@ lines) are stripped; there is no `#` line comment. Unknown sections, bullets
 before the first `##`, a repeated `## Default` or `## Models` entry and unknown
 Jev settings produce warnings, which `priority check` and `doctor` report with
 line numbers. A bullet that cannot be parsed (unknown field, bad operator,
-invalid regex, unknown tier) is an error.
+invalid regex, unknown model name) is an error.
 
 ## Conditions
 
@@ -144,27 +144,42 @@ One ticket may have several override bullets. `skip` moves the task to
 `paused` with the last error `skipped by PRIORITY.md`; remove the line and
 the daemon re-queues it on the next tick. A criticality override beats the
 section rules. A score override is added after scoring rules. A model
-override is a *preference* handed to the budget policy, which may still
-downgrade it when the tier is out of budget (it says so in `task explain`);
-only `task model` and `add --model` set a hard `model_override`, and even
-that is downgraded rather than ignored.
+override is a *preference list* handed to the budget policy (`KEY: model =
+fable | gpt-6.1-sol`, most wanted first; the alternatives may belong to
+different providers), which tries each entry through its provider's
+downgrade chain and may still pick something else when nothing on the list
+fits (it says so in `task explain`); only `task model` and `add --model` set
+a hard `model_override`, and even that is downgraded within its provider
+rather than ignored.
 
 ## Models
 
 ```markdown
 ## Models
-- critical: fable
-- high: opus
+- critical: fable | gpt-6.1-sol
+- high: opus | gpt-6-astra
 - normal: sonnet
 - low: sonnet
 ```
 
-Maps a criticality to a preferred tier (`fable`, `opus`, `sonnet`, `haiku`;
-`critical = fable` also works). Missing levels leave the choice to the budget
-policy: `normal` falls back to `budget.default_model`, `low` to
-`budget.low_model`, and `critical`/`high` take the most capable eligible
-tier. As with override models, this is a preference: the policy may pick a
-cheaper tier when the preferred one is over budget or rate-limited.
+Maps a criticality to a list of preferred models, most wanted first.
+Alternatives are separated by `|` (whitespace around them does not matter;
+`critical = fable | gpt-6.1-sol` also works). Each name is parsed with the
+same rules as `task model`: Claude's aliases (`fable`, `opus`, `sonnet`,
+`haiku`), `gpt-*`/`o1*`/`o3*`/`o4*`/`codex*` for Codex, `gemini-*` for
+Antigravity, or an explicit `codex:<name>` / `gemini:<name>`; an unknown
+name is an error with the line number and those rules, and a name listed
+twice is a warning (the repeat is ignored). A model whose provider is
+disabled in `config.toml` is simply skipped by the policy (`budget show`
+lists disabled providers).
+
+Missing levels leave the choice to the budget policy: `normal` falls back to
+`budget.default_model`, `low` to `budget.low_model`, and `critical`/`high`
+take the most capable eligible model. As with override models, this is a
+preference: the policy tries each alternative in order (each through its own
+provider's downgrade chain) and, when none is eligible, the first eligible
+model in `budget.provider_order`. `priority check` prints the lists;
+`priority explain` and `task explain` show which one applied.
 
 ## Jev
 
@@ -203,11 +218,13 @@ For one task, at every re-score:
    `+` any `## Overrides` score delta
    `+` Jev normalised score × `priority.jev.weight` (when enabled)
    `+` hours waiting × `priority.age_boost_per_hour`, capped at 200 points.
-4. **Model**: the CLI (`task model`, `add --model`) wins, then an
-   `## Overrides` model, then `## Models` for the criticality, else none. All
-   of these are handed to the budget policy as the preferred tier; it picks
-   that tier when eligible, else the most capable eligible tier *below* it,
-   and never upgrades above it (see [budget.md](budget.md)).
+4. **Model**: the CLI (`task model`, `add --model`) wins, then the
+   `## Overrides` model list, then the `## Models` list for the criticality,
+   else none. The list is handed to the budget policy as the preferences
+   (`Evaluation.models`; `Evaluation.model` is its first entry): each entry
+   is tried in order, downgraded within its own provider when it is out of
+   budget, never upgraded above it; when nothing on the list fits the
+   policy falls back to `budget.provider_order` (see [budget.md](budget.md)).
 
 Every step records a reason, shown by `task explain`, `task show` and the
 dashboard. The exact strings (`src/priority/rules.rs::evaluate`):
@@ -224,7 +241,7 @@ dashboard. The exact strings (`src/priority/rules.rs::evaluate`):
 | Jev | `jev 0.48 × 300 = +144` |
 | age | `age +4.0 (2.0h)` |
 | model from overrides | `model opus from ## Overrides` |
-| model from Models | `model fable from ## Models` |
+| model from Models | `model fable \| gpt-6.1-sol from ## Models` |
 
 Ties in score are broken by criticality, then by age (older first)
 (`scheduler::pick_next`).
@@ -269,6 +286,21 @@ rules.
 
 Pair with `budget.providers.claude.models.fable.min_criticality = "critical"` (the default) so
 only critical tasks touch Fable early in the period.
+
+**Spill critical work onto a second subscription**
+
+```markdown
+## Models
+- critical: fable | gpt-6.1-sol
+- high: opus | gpt-6-astra
+- low: gpt-6-luna | haiku
+```
+
+With `budget.providers.codex.enabled = true`, an incident still goes to
+Fable while Claude has room and to `gpt-6.1-sol` when it does not (a
+rate-limited or exhausted provider is skipped until its reset). Listing
+`gpt-6-luna` first for `low` sends chores to the Codex budget and keeps
+Claude's for everything else.
 
 **Deprioritise chores without blocking them**
 

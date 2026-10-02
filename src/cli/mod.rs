@@ -1,7 +1,7 @@
 //! Command-line interface.
 //!
 //! ```text
-//! powerqueue init                 guided setup (keys, repo, team, PRIORITY.md); --reconfigure edits an existing install
+//! powerqueue init                 guided setup (keys, repo, team, providers, PRIORITY.md); --reconfigure edits an existing install
 //! powerqueue run [--once]         start the scheduler daemon (foreground)
 //! powerqueue stop                 ask a running daemon to exit
 //! powerqueue dashboard            live TUI
@@ -141,6 +141,10 @@ pub struct InitArgs {
     /// Change the settings of an existing installation (keeps keys and everything not asked about).
     #[arg(long, conflicts_with = "force")]
     pub reconfigure: bool,
+    /// Also run tasks on this provider (codex | gemini; repeatable). Claude is always on.
+    /// Sets budget.providers.<provider>.enabled = true; interactive runs ask instead.
+    #[arg(long, value_enum, value_name = "PROVIDER")]
+    pub provider: Vec<Provider>,
 }
 
 #[derive(Debug, Args, Default)]
@@ -170,7 +174,8 @@ pub struct AddArgs {
     /// critical | high | normal | low.
     #[arg(short, long, value_parser = parse_criticality)]
     pub criticality: Option<Criticality>,
-    /// Force a model: fable | opus | sonnet | haiku, or another provider's model (gpt-6.1-sol, gemini-3-pro, codex:<name>).
+    /// Force a model: fable | opus | sonnet | haiku, or another provider's model (gpt-6.1-sol, gemini-3-pro, codex:<name>);
+    /// warns when that provider is disabled in config.
     #[arg(short, long, value_parser = parse_model)]
     pub model: Option<ModelTier>,
     /// Explicit key (default: `manual-<id>`).
@@ -214,11 +219,12 @@ pub enum TaskCommand {
     Retry(TaskRef),
     /// Explain the current score and model decision.
     Explain(TaskRef),
-    /// Force (or clear with `auto`) the model for the next attempt.
+    /// Force (or clear with `auto`) the model for the next attempt; any provider's model is accepted.
     Model {
         #[command(flatten)]
         task: TaskRef,
-        /// fable | opus | sonnet | haiku | auto, or another provider's model (gpt-6.1-sol, gemini-3-pro)
+        /// fable | opus | sonnet | haiku | auto, or another provider's model (gpt-6.1-sol, gemini-3-pro, codex:<name>);
+        /// warns when that provider is disabled in config
         model: String,
     },
     /// Print the last screen of the task's tmux pane.

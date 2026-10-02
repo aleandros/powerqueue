@@ -47,6 +47,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `run` lists the enabled providers and the probe interval at start; `hook`
   routes `--provider` payloads through the provider's normaliser and accepts
   the payload as a trailing argument (Codex `notify`).
+- `PRIORITY.md` model lists: `## Models` entries and `KEY: model = ...`
+  overrides take `|`-separated alternatives in preference order
+  (`critical: fable | gpt-6.1-sol`), which may belong to different providers.
+  Unknown names fail with the line number and the alias rules; repeats warn.
+  `priority check`, `priority explain` and `task explain` print the lists
+  (`Evaluation.models`; `Evaluation.model` stays the first entry).
+- Dashboard: the budget panel shows one block per enabled provider (a header
+  with period, elapsed, window and any cooldown, then a gauge per model) and
+  the header line carries a compact per-provider summary (`cl 34/12%  cx
+  17/–`) plus `next <model>`, what the policy would run now. `dashboard
+  --once --json` adds `ledgers`, `provider_order`, `cooldowns` and
+  `next_model` (`ledger` stays Claude's for older readers).
+- `doctor` checks every enabled provider: `<p>` (binary and version),
+  `<p> auth` (logged in), `<p> models` (shares ≤ 1, at least one enabled
+  model), `<p> budget anchor` (config / observed by a probe / Monday default,
+  with the matching hint), `<p> usage probe` (no probe yet, failing, or older
+  than 3 × `probe_interval_mins`), `<model> reservation` (pacing of the
+  provider's most capable model) and `<p> window pressure`; `gemini` gets an
+  "experimental" warning. Claude's check names are unchanged.
+- `init` asks "Also run tasks on Codex CLI / Antigravity CLI?" when the binary
+  is on PATH (warning when it is not logged in); `init --provider codex
+  --provider gemini` answers non-interactively, `init --reconfigure` offers
+  the same toggles, and the summary lists the enabled providers.
+- `task model` / `add --model` warn when the model's provider is disabled in
+  config; `status`, `task show` and `task explain` print non-Claude models
+  with their provider (`gpt-6-astra (codex)`) and `--json` includes
+  `provider`.
+- README "Providers" section, the landing page's "Three subscriptions, one
+  queue" card, and troubleshooting notes for the new doctor checks.
 
 - `dashboard --once` renders one frame as plain text and exits (works without
   a TTY; `--json` prints the snapshot), and `dashboard --ascii` draws with

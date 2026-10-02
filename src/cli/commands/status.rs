@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::cli::output::{self, human_bytes, human_duration, human_f64};
 use crate::cli::{Context, StatusArgs};
-use crate::domain::{ResourceSample, Session, Task, TokenUsage};
+use crate::domain::{Provider, ResourceSample, Session, Task, TokenUsage};
 use crate::store::{QueueCounts, Store};
 
 /// Heartbeats older than this mean the daemon is not running.
@@ -31,6 +31,8 @@ pub fn ensure_initialised(ctx: &Context) -> Result<()> {
 pub struct StatusRow {
     #[serde(flatten)]
     pub task: Task,
+    /// Provider of the task's model (chosen or forced), if any.
+    pub provider: Option<Provider>,
     pub session: Option<Session>,
     pub usage: TokenUsage,
     pub weighted_tokens: f64,
@@ -85,7 +87,8 @@ pub fn load_rows(store: &Store, all: bool) -> Result<Vec<StatusRow>> {
             Some(s) if s.state.is_live() => store.latest_resource_sample(s.id)?,
             _ => None,
         };
-        rows.push(StatusRow { weighted_tokens: usage.weighted(), task, session, usage, resource });
+        let provider = super::task::effective_model(&task).map(|m| m.provider());
+        rows.push(StatusRow { weighted_tokens: usage.weighted(), provider, task, session, usage, resource });
     }
     Ok(rows)
 }
@@ -201,8 +204,12 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
         let t = &row.task;
         let state = if color { output::state_colored(t.state) } else { t.state.to_string() };
         let crit = if color { output::criticality_colored(t.criticality) } else { t.criticality.to_string() };
-        let model = t.model.as_ref().or(t.model_override.as_ref());
-        let model_text = if color { output::model_colored(model) } else { model.map(|m| m.to_string()).unwrap_or("-".into()) };
+        let model = super::task::effective_model(t);
+        let model_text = if color {
+            output::model_colored_with_provider(model)
+        } else {
+            model.map(output::model_with_provider).unwrap_or("-".into())
+        };
         let model_text = if t.model_override.is_some() { format!("{model_text}*") } else { model_text };
         let attempts = match t.max_attempts {
             Some(max) => format!("{}/{}", t.attempts, max),

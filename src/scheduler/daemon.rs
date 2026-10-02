@@ -1289,8 +1289,8 @@ impl Daemon {
     /// per-task override line (`KEY: model = ...`) else the `## Models`
     /// entry for its criticality. Empty when the rules say nothing.
     fn preferred_models(&self, task: &Task, now: DateTime<Utc>) -> Vec<ModelTier> {
-        let evaluated = self.rt.rules.evaluate(task, now, None, 0.0, 0.0).model;
-        evaluated.or_else(|| self.rt.rules.model_for(task.criticality)).into_iter().collect()
+        let evaluated = self.rt.rules.evaluate(task, now, None, 0.0, 0.0).models;
+        if evaluated.is_empty() { self.rt.rules.model_for(task.criticality).to_vec() } else { evaluated }
     }
 
     fn throttle(&mut self, mut task: Task, decision: &Decision, now: DateTime<Utc>) -> Result<()> {

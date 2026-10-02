@@ -114,6 +114,10 @@ pub fn run(ctx: &mut Context, args: AddArgs) -> Result<i32> {
         labels: args.label,
         paused: args.paused,
     };
+    if let Some(m) = &req.model_override {
+        let cfg = ctx.config_cloned()?;
+        super::task::warn_if_provider_disabled(&cfg, m);
+    }
     let store = ctx.store()?.clone();
     let task = create_task(&store, &req)?;
 
@@ -130,6 +134,13 @@ pub fn run(ctx: &mut Context, args: AddArgs) -> Result<i32> {
         state
     );
     println!("  {}", task.title);
+    if let Some(m) = &task.model_override {
+        println!(
+            "  {}",
+            format!("model forced to {}", crate::cli::output::model_with_provider(m))
+                .if_supports_color(Stream::Stdout, |t| t.dimmed())
+        );
+    }
     if task.state == TaskState::Paused {
         println!(
             "  {}",

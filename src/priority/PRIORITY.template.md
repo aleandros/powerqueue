@@ -37,9 +37,11 @@ with ` and `.
 - +10 if source: manual
 
 ## Overrides
-<!-- Pin a ticket: `KEY: critical|high|normal|low`, `KEY: +50`, `KEY: model = opus`, `KEY: skip` -->
+<!-- Pin a ticket: `KEY: critical|high|normal|low`, `KEY: +50`, `KEY: model = opus | gpt-6-astra`, `KEY: skip` -->
 
 ## Models
+<!-- Preferred models per criticality, most wanted first. Alternatives may belong to
+     other providers (enable them in config.toml): `critical: fable | gpt-6.1-sol` -->
 - critical: fable
 - high: opus
 - normal: sonnet

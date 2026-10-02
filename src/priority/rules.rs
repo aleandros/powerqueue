@@ -93,7 +93,8 @@ pub struct ScoringRule {
 pub enum Override {
     Criticality(Criticality),
     Score(f64),
-    Model(ModelTier),
+    /// Preferred models, most wanted first (`KEY: model = fable | gpt-6.1-sol`).
+    Model(Vec<ModelTier>),
     /// Never schedule this ticket.
     Skip,
 }
@@ -103,7 +104,7 @@ impl fmt::Display for Override {
         match self {
             Override::Criticality(c) => write!(f, "{c}"),
             Override::Score(d) => write!(f, "{}", fmt_delta(*d)),
-            Override::Model(m) => write!(f, "model = {m}"),
+            Override::Model(m) => write!(f, "model = {}", fmt_models(m)),
             Override::Skip => f.write_str("skip"),
         }
     }
@@ -140,7 +141,9 @@ pub struct PriorityRules {
     pub scoring: Vec<ScoringRule>,
     /// Keyed by lower-cased task key.
     pub overrides: BTreeMap<String, Vec<Override>>,
-    pub models: BTreeMap<Criticality, ModelTier>,
+    /// `## Models`: preferred models per criticality, most wanted first.
+    /// Alternatives may belong to different providers.
+    pub models: BTreeMap<Criticality, Vec<ModelTier>>,
     pub jev: JevSection,
     /// Non-fatal problems found while parsing (unknown fields, odd lines).
     pub warnings: Vec<RuleError>,
@@ -165,7 +168,12 @@ impl Default for PriorityRules {
 pub struct Evaluation {
     pub criticality: Criticality,
     pub score: f64,
+    /// The first entry of `models` (kept for callers that want one model).
     pub model: Option<ModelTier>,
+    /// Preferred models, most wanted first: the `## Overrides` model list,
+    /// else the `## Models` entry for the criticality, else empty. The
+    /// scheduler hands this list to the budget policy.
+    pub models: Vec<ModelTier>,
     pub skip: bool,
     /// Human-readable trail: which rule set what.
     pub reasons: Vec<String>,
@@ -274,11 +282,11 @@ impl PriorityRules {
                     Ok(rule) => rules.scoring.push(rule),
                     Err(e) => errors.push(e),
                 },
-                Section::Overrides => match parse_override(bullet, line_no) {
+                Section::Overrides => match parse_override(bullet, line_no, &mut rules.warnings) {
                     Ok((key, ov)) => rules.overrides.entry(key).or_default().push(ov),
                     Err(e) => errors.push(e),
                 },
-                Section::Models => match parse_model_line(bullet, line_no) {
+                Section::Models => match parse_model_line(bullet, line_no, &mut rules.warnings) {
                     Ok((c, m)) => {
                         if rules.models.insert(c, m).is_some() {
                             rules.warnings.push(RuleError::new(line_no, format!("## Models: `{c}` set twice; last one wins")));
@@ -318,7 +326,7 @@ impl PriorityRules {
         let mut reasons: Vec<String> = Vec::new();
         let mut skip = false;
         let mut criticality: Option<Criticality> = None;
-        let mut model: Option<ModelTier> = None;
+        let mut models: Vec<ModelTier> = Vec::new();
         let mut override_delta = 0.0;
 
         if let Some(overrides) = self.overrides.get(&task.key.to_ascii_lowercase()) {
@@ -337,8 +345,8 @@ impl PriorityRules {
                         reasons.push(format!("{} override for {}", fmt_delta(*d), task.key));
                     }
                     Override::Model(m) => {
-                        model = Some(m.clone());
-                        reasons.push(format!("model {m} from ## Overrides"));
+                        models = m.clone();
+                        reasons.push(format!("model {} from ## Overrides", fmt_models(m)));
                     }
                 }
             }
@@ -391,19 +399,20 @@ impl PriorityRules {
             }
         }
 
-        if model.is_none()
+        if models.is_empty()
             && let Some(m) = self.models.get(&criticality)
         {
-            model = Some(m.clone());
-            reasons.push(format!("model {m} from ## Models"));
+            models = m.clone();
+            reasons.push(format!("model {} from ## Models", fmt_models(m)));
         }
 
-        Evaluation { criticality, score, model, skip, reasons }
+        Evaluation { criticality, score, model: models.first().cloned(), models, skip, reasons }
     }
 
-    /// Model the rules assign to a criticality, if any.
-    pub fn model_for(&self, criticality: Criticality) -> Option<ModelTier> {
-        self.models.get(&criticality).cloned()
+    /// Models the rules prefer for a criticality, most wanted first; empty
+    /// when `## Models` says nothing about it.
+    pub fn model_for(&self, criticality: Criticality) -> &[ModelTier] {
+        self.models.get(&criticality).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Number of rules under the criticality sections.
@@ -434,7 +443,7 @@ impl PriorityRules {
         out.push_str("Models\n");
         for c in Criticality::ALL {
             match self.models.get(&c) {
-                Some(m) => out.push_str(&format!("  {c}: {m}\n")),
+                Some(m) => out.push_str(&format!("  {c}: {}\n", fmt_models(m))),
                 None => out.push_str(&format!("  {c}: (budget policy decides)\n")),
             }
         }
@@ -718,10 +727,10 @@ fn parse_scoring(text: &str, line: usize) -> Result<ScoringRule, RuleError> {
     Ok(ScoringRule { line, delta, conditions })
 }
 
-fn parse_override(text: &str, line: usize) -> Result<(String, Override), RuleError> {
+fn parse_override(text: &str, line: usize, warnings: &mut Vec<RuleError>) -> Result<(String, Override), RuleError> {
     let (key, value) = text
         .split_once(':')
-        .ok_or_else(|| RuleError::new(line, format!("cannot parse override `{text}` (expected `KEY: critical|high|normal|low`, `KEY: +N`, `KEY: model = <tier>` or `KEY: skip`)")))?;
+        .ok_or_else(|| RuleError::new(line, format!("cannot parse override `{text}` (expected `KEY: critical|high|normal|low`, `KEY: +N`, `KEY: model = <model> [| <model>...]` or `KEY: skip`)")))?;
     let key = key.trim();
     if key.is_empty() || key.contains(char::is_whitespace) {
         return Err(RuleError::new(line, format!("override key `{key}` must be a single task key such as ENG-123")));
@@ -734,26 +743,50 @@ fn parse_override(text: &str, line: usize) -> Result<(String, Override), RuleErr
         let n: f64 = delta.trim().parse().map_err(|_| RuleError::new(line, format!("bad score delta `{value}` for {key}")))?;
         Override::Score(if value.starts_with('-') { -n } else { n })
     } else if let Some(rest) = lower.strip_prefix("model") {
-        let tier = rest.trim_start().strip_prefix(['=', ':']).map(str::trim).unwrap_or("");
-        let tier = tier.parse::<ModelTier>().map_err(|e| RuleError::new(line, format!("{key}: {e}")))?;
-        Override::Model(tier)
+        let list = rest.trim_start().strip_prefix(['=', ':']).map(str::trim).unwrap_or("");
+        let models = parse_model_list(list, line, &format!("{key}: model"), warnings)?;
+        Override::Model(models)
     } else {
         let c = value.parse::<Criticality>().map_err(|_| {
-            RuleError::new(line, format!("cannot parse override value `{value}` for {key} (expected critical|high|normal|low, +N, -N, model = <tier> or skip)"))
+            RuleError::new(line, format!("cannot parse override value `{value}` for {key} (expected critical|high|normal|low, +N, -N, model = <model> [| <model>...] or skip)"))
         })?;
         Override::Criticality(c)
     };
     Ok((key.to_ascii_lowercase(), ov))
 }
 
-fn parse_model_line(text: &str, line: usize) -> Result<(Criticality, ModelTier), RuleError> {
-    let (c, m) = text
-        .split_once(':')
-        .or_else(|| text.split_once('='))
-        .ok_or_else(|| RuleError::new(line, format!("cannot parse model line `{text}` (expected `<criticality>: <tier>`)")))?;
+fn parse_model_line(text: &str, line: usize, warnings: &mut Vec<RuleError>) -> Result<(Criticality, Vec<ModelTier>), RuleError> {
+    let (c, m) = text.split_once(':').or_else(|| text.split_once('=')).ok_or_else(|| {
+        RuleError::new(line, format!("cannot parse model line `{text}` (expected `<criticality>: <model> [| <model>...]`)"))
+    })?;
     let c = c.trim().parse::<Criticality>().map_err(|e| RuleError::new(line, format!("## Models: {e}")))?;
-    let m = m.trim().parse::<ModelTier>().map_err(|e| RuleError::new(line, format!("## Models: {e}")))?;
-    Ok((c, m))
+    let models = parse_model_list(m, line, "## Models", warnings)?;
+    Ok((c, models))
+}
+
+/// Parse `fable | gpt-6.1-sol | sonnet`: `|`-separated alternatives in
+/// preference order, whitespace tolerant. Every name goes through
+/// `ModelTier::from_str`, so an unknown name is an error naming the alias
+/// rules; a repeated name is dropped with a warning. `context` prefixes the
+/// messages (`## Models`, `ENG-1: model`).
+fn parse_model_list(text: &str, line: usize, context: &str, warnings: &mut Vec<RuleError>) -> Result<Vec<ModelTier>, RuleError> {
+    let mut models: Vec<ModelTier> = Vec::new();
+    for part in text.split('|') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(RuleError::new(line, format!("{context}: empty model name next to `|` in `{}`", text.trim())));
+        }
+        let model = part.parse::<ModelTier>().map_err(|e| RuleError::new(line, format!("{context}: {e}")))?;
+        if models.contains(&model) {
+            warnings.push(RuleError::new(line, format!("{context}: `{model}` listed twice; the repeat is ignored")));
+            continue;
+        }
+        models.push(model);
+    }
+    if models.is_empty() {
+        return Err(RuleError::new(line, format!("{context}: expected a model name such as `fable` or `fable | gpt-6.1-sol`")));
+    }
+    Ok(models)
 }
 
 fn parse_jev_line(text: &str, line: usize, rules: &mut PriorityRules) -> Result<(), RuleError> {
@@ -808,6 +841,11 @@ fn unquote(s: &str) -> String {
 /// keep the last informative one.
 fn regex_reason(s: &str) -> &str {
     s.lines().rev().map(str::trim).find(|l| !l.is_empty()).map(|l| l.strip_prefix("error: ").unwrap_or(l)).unwrap_or(s)
+}
+
+/// `fable | gpt-6.1-sol`: a preference list as written in the file.
+pub fn fmt_models(models: &[ModelTier]) -> String {
+    models.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(" | ")
 }
 
 fn fmt_conditions(conds: &[Condition]) -> String {
@@ -881,7 +919,7 @@ mod tests {
         assert_eq!(rules.default_criticality, Criticality::Normal);
         assert_eq!(rules.scoring.len(), 4);
         assert!(rules.overrides.is_empty());
-        assert_eq!(rules.models[&Criticality::Critical], ModelTier::fable());
+        assert_eq!(rules.models[&Criticality::Critical], vec![ModelTier::fable()]);
         assert!(!rules.jev.enabled);
         assert_eq!(rules.jev.levels.len(), 4);
         assert!(rules.warnings.is_empty(), "{:?}", rules.warnings);
@@ -1028,7 +1066,46 @@ mod tests {
         assert_eq!(eval(&rules, &t).model, Some(ModelTier::sonnet()));
         let no_models = parse_ok("## High\n- priority: high\n");
         assert_eq!(eval(&no_models, &t).model, None);
-        assert_eq!(rules.model_for(Criticality::Low), None);
+        assert!(rules.model_for(Criticality::Low).is_empty());
+    }
+
+    #[test]
+    fn model_lists_are_preference_ordered_and_cross_providers() {
+        let rules = parse_ok(
+            "## Critical\n- label: incident\n\n## Overrides\n- ENG-5: model = gpt-6-astra | sonnet\n\n## Models\n- critical: fable | gpt-6.1-sol\n- high = opus|gemini-3-pro | haiku\n",
+        );
+        assert!(rules.warnings.is_empty(), "{:?}", rules.warnings);
+        assert_eq!(rules.models[&Criticality::Critical], vec![ModelTier::fable(), ModelTier::new("gpt-6.1-sol")]);
+        assert_eq!(rules.model_for(Criticality::High), &[ModelTier::opus(), ModelTier::new("gemini-3-pro"), ModelTier::haiku()]);
+        assert!(rules.model_for(Criticality::Low).is_empty());
+        let mut t = linear_task("ENG-1");
+        t.labels = vec!["incident".into()];
+        let e = eval(&rules, &t);
+        assert_eq!(e.models, vec![ModelTier::fable(), ModelTier::new("gpt-6.1-sol")]);
+        assert_eq!(e.model, Some(ModelTier::fable()), "`model` is the first alternative");
+        assert!(e.reasons.contains(&"model fable | gpt-6.1-sol from ## Models".to_string()), "{:?}", e.reasons);
+        let e = eval(&rules, &linear_task("ENG-5"));
+        assert_eq!(e.models, vec![ModelTier::new("gpt-6-astra"), ModelTier::sonnet()]);
+        assert!(e.reasons.contains(&"model gpt-6-astra | sonnet from ## Overrides".to_string()), "{:?}", e.reasons);
+        assert_eq!(rules.overrides["eng-5"][0].to_string(), "model = gpt-6-astra | sonnet");
+        let text = rules.describe();
+        assert!(text.contains("critical: fable | gpt-6.1-sol"), "{text}");
+    }
+
+    #[test]
+    fn model_list_errors_and_duplicates() {
+        let errs =
+            parse_err("## Models\n- critical: fable | llama\n- high: opus |\n## Overrides\n- ENG-1: model = fable | turbo\n");
+        let lines: Vec<usize> = errs.iter().map(|e| e.line).collect();
+        assert_eq!(lines, vec![2, 3, 5]);
+        assert!(errs[0].message.contains("## Models: unknown model `llama`"), "{}", errs[0].message);
+        assert!(errs[0].message.contains("fable|opus|sonnet|haiku"), "alias rules in the error: {}", errs[0].message);
+        assert!(errs[1].message.contains("empty model name"), "{}", errs[1].message);
+        assert!(errs[2].message.starts_with("ENG-1: model: unknown model `turbo`"), "{}", errs[2].message);
+        let rules = parse_ok("## Models\n- critical: fable | opus | fable\n");
+        assert_eq!(rules.models[&Criticality::Critical], vec![ModelTier::fable(), ModelTier::opus()]);
+        assert_eq!(rules.warnings.len(), 1);
+        assert!(rules.warnings[0].message.contains("`fable` listed twice"), "{}", rules.warnings[0].message);
     }
 
     #[test]

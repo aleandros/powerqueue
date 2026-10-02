@@ -170,6 +170,32 @@ fn offline_control_commands_apply_directly() {
     pq(home.path()).args(["status", "--all"]).assert().success().stdout(predicate::str::contains("cancelled"));
     pq(home.path()).args(["task", "retry", "T-1"]).assert().success();
     pq(home.path()).args(["task", "model", "T-1", "opus"]).assert().success().stdout(predicate::str::contains("opus"));
+    // Another provider's model is accepted; a disabled provider only warns.
+    pq(home.path())
+        .args(["task", "model", "T-1", "gpt-6-astra"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("will use gpt-6-astra (codex)"))
+        .stderr(predicate::str::contains("codex is disabled in config"));
+    pq(home.path())
+        .args(["task", "show", "T-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("forced: gpt-6-astra (codex)"));
+    pq(home.path())
+        .args(["--json", "task", "show", "T-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"provider\": \"codex\""));
+    pq(home.path()).args(["--json", "status"]).assert().success().stdout(predicate::str::contains("\"provider\": \"codex\""));
+    pq(home.path()).arg("status").assert().success().stdout(predicate::str::contains("gpt-6-astra (codex)*"));
+    pq(home.path())
+        .args(["task", "model", "T-1", "llama"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("unknown model `llama`"))
+        .stderr(predicate::str::contains("fable|opus|sonnet|haiku"));
+    pq(home.path()).args(["task", "model", "T-1", "auto"]).assert().success();
     pq(home.path()).args(["task", "complete", "T-1"]).assert().code(1).stderr(predicate::str::contains("cannot complete"));
     pq(home.path()).args(["task", "show", "nope"]).assert().code(1).stderr(predicate::str::contains("no task matches"));
 }

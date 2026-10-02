@@ -147,8 +147,10 @@ powerqueue doctor                      # anchor, calibration, throttling rate
 
 Fixes:
 
-- No `period_anchor`: `budget set-reset <time from /usage>`. Without it the
-  period boundary is a guess.
+- No `period_anchor`: `budget set-reset <time from /usage>`, or let the
+  probe learn it (`doctor`'s `<provider> budget anchor` check says whether the
+  anchor comes from config, from a probe, or is the Monday default). Without
+  it the period boundary is a guess.
 - Spend looks too high compared with `/usage`: `budget set-observed 43%`
   corrects the offset; or raise `budget.providers.claude.period_weighted_tokens` /
   `window_weighted_tokens`.
@@ -273,9 +275,24 @@ Fixes:
   `codex reports its allowance blocked; skipped until the reset at …`.
   `budget probe --provider codex` re-reads the real state; `budget
   clear-limits --provider codex` forgets a stale rate-limit mark.
-- The probe fails (`budget show` prints `probe last run … failed`): log in
-  (`codex login`), check `codex.binary`, or set `probe_interval_mins = 0` to
-  rely on measurements only.
+- The probe fails (`budget show` prints `probe last run … failed`; `doctor`'s
+  `codex usage probe` check warns): log in (`codex login`), check
+  `codex.binary`, or set `probe_interval_mins = 0` to rely on measurements
+  only. The same check warns when the last observation is older than
+  3 × `budget.probe_interval_mins` (usually: the daemon is not running) and
+  says `no probe yet` before the first one.
+- `doctor` runs the provider checks for every enabled provider: `codex` /
+  `gemini` (binary on PATH and its version), `codex auth` / `gemini auth`
+  (logged in: `codex login status`; `agy` sign-in), `<provider> models`
+  (shares sum to at most 1 and at least one model is enabled), `<provider>
+  budget anchor`, `<model> reservation` (pacing of the provider's most
+  capable model, e.g. `gpt-6.1-sol reservation`) and `<provider> window
+  pressure`. Claude keeps its old names (`claude`, `claude auth`, `fable
+  reservation`, `window pressure`). `gemini` always carries an
+  "experimental" warning.
+- You forced a model of a disabled provider (`task model ENG-1 gpt-6-astra`
+  printed `warning: codex is disabled in config`): enable the provider or
+  clear the override; the task waits otherwise.
 - Codex Pro-family plans have no 5-hour window: set
   `budget.providers.codex.window_hours = 0` so the window estimate never
   blocks it.

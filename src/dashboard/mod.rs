@@ -7,7 +7,7 @@
 //! ```text
 //! ┌ powerqueue ─ daemon ● running ─ 2/2 slots ─ period 43% (day 3.1/7) ────┐
 //! │ tasks table: key | state | crit | model | tokens | cpu/rss | age | title │
-//! │ budget gauges per tier     │ selected task: timeline / last output       │
+//! │ budget gauges per provider │ selected task: timeline / last output       │
 //! │ footer: keys                                                              │
 //! └──────────────────────────────────────────────────────────────────────────┘
 //! ```
@@ -159,12 +159,17 @@ pub fn run(cfg: &Config, paths: &Paths, store: &Store, options: Options) -> Resu
 pub fn render_once(snapshot: Snapshot, options: Options, width: u16, height: u16) -> String {
     let mut app = DashboardApp::new(snapshot);
     app.ascii = options.ascii;
+    render_once_app(&app, width, height)
+}
+
+/// [`render_once`] for an already built app (keeps its `ascii` flag and state).
+pub fn render_once_app(app: &DashboardApp, width: u16, height: u16) -> String {
     let backend = ratatui::backend::TestBackend::new(width.max(20), height.max(6));
     let mut terminal = match ratatui::Terminal::new(backend) {
         Ok(t) => t,
         Err(e) => return format!("cannot create frame buffer: {e}\n"),
     };
-    if let Err(e) = terminal.draw(|f| ui::draw(f, &app)) {
+    if let Err(e) = terminal.draw(|f| ui::draw(f, app)) {
         return format!("cannot draw frame: {e}\n");
     }
     buffer_to_text(terminal.backend().buffer())
