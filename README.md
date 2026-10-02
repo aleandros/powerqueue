@@ -1,6 +1,6 @@
 # powerqueue
 
-[![CI](https://github.com/edgar/powerqueue/actions/workflows/ci.yml/badge.svg)](https://github.com/edgar/powerqueue/actions/workflows/ci.yml)
+[![CI](https://github.com/aleandros/powerqueue/actions/workflows/ci.yml/badge.svg)](https://github.com/aleandros/powerqueue/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 2024](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](Cargo.toml)
 
@@ -39,18 +39,34 @@ Linux and macOS are supported. Windows is untested.
 
 ## Install
 
-```sh
-# from a checkout
-cargo install --path .
+One line, no toolchain needed. The script detects your OS and architecture and
+drops the binary in `/usr/local/bin` (or `~/.local/bin` as a fallback):
 
-# from crates.io (placeholder until the first release is published)
-cargo install powerqueue
+```sh
+curl -fsSL https://raw.githubusercontent.com/aleandros/powerqueue/main/install.sh | sh
 ```
 
-Homebrew tap: TODO (`brew install edgar/tap/powerqueue`).
+**Update**: run the same command again. It replaces the binary atomically, so
+a running daemon keeps working until you restart it (`powerqueue stop`, then
+`powerqueue run`). Pin a version with `POWERQUEUE_VERSION=v0.1.0`, or choose
+the directory with `POWERQUEUE_INSTALL_DIR=~/bin`.
+
+Other ways:
+
+```sh
+# with a Rust toolchain
+cargo install --git https://github.com/aleandros/powerqueue
+
+# from a checkout
+cargo install --path .
+```
 
 Pre-built binaries for Linux (x86_64, aarch64) and macOS (x86_64, arm64) are
-attached to every [GitHub release](https://github.com/edgar/powerqueue/releases).
+attached to every [GitHub release](https://github.com/aleandros/powerqueue/releases),
+with SHA-256 sums. Releases are cut automatically when `version` in
+`Cargo.toml` changes on `main`.
+
+Project site: <https://aleandros.github.io/powerqueue/>
 
 ## Quick start
 

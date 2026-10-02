@@ -672,7 +672,7 @@ pub fn config_template(repo_path: &str, team_keys: &[String]) -> String {
     let body = cfg.to_toml().unwrap_or_default();
     format!(
         "# powerqueue configuration\n\
-         # Docs: https://github.com/edgar/powerqueue#configuration\n\
+         # Docs: https://github.com/aleandros/powerqueue#configuration\n\
          # Every key is optional; defaults are shown. Edit and run `powerqueue doctor`.\n\n{body}"
     )
 }

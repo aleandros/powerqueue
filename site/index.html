@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>powerqueue — Linear tickets in, Claude Code sessions out</title>
+<meta name="description" content="An autonomous work queue for Claude Code: one git worktree and tmux window per Linear ticket, with usage learning, crash recovery and model-budget pacing that keeps Fable for what matters.">
+<meta property="og:title" content="powerqueue — Linear tickets in, Claude Code sessions out">
+<meta property="og:description" content="One worktree and tmux window per ticket. Learns cost, restarts crashes, paces your Claude subscription.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://aleandros.github.io/powerqueue/">
+<meta name="twitter:card" content="summary">
+<link rel="icon" type="image/svg+xml" href="assets/logo.svg">
+<link rel="stylesheet" href="style.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+
+<div class="scanlines" aria-hidden="true"></div>
+<div class="glow-bg" aria-hidden="true"></div>
+
+<header class="nav">
+  <div class="nav-inner">
+    <a href="#" class="brand">
+      <img src="assets/logo.svg" alt="" aria-hidden="true">
+      <span class="prompt">$</span> powerqueue
+    </a>
+    <nav class="nav-links">
+      <a href="#flow">how it works</a>
+      <a href="#features">features</a>
+      <a href="#install">install</a>
+      <a href="#rules">rules &amp; budget</a>
+      <a href="https://github.com/aleandros/powerqueue#readme">docs</a>
+      <a href="https://github.com/aleandros/powerqueue" class="gh-link" aria-label="GitHub">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.44 9.8 8.2 11.39.6.11.82-.26.82-.58v-2.17c-3.34.73-4.04-1.41-4.04-1.41-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.21.09 1.84 1.24 1.84 1.24 1.07 1.84 2.81 1.31 3.5 1 .11-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.13-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.29-1.55 3.3-1.23 3.3-1.23.66 1.66.25 2.88.12 3.18.77.84 1.23 1.91 1.23 3.22 0 4.61-2.8 5.63-5.48 5.92.43.37.81 1.1.81 2.22v3.29c0 .32.22.69.83.57A12 12 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+      </a>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+<section class="hero">
+  <div class="hero-inner">
+    <div class="hero-text">
+      <div class="badges">
+        <a href="https://github.com/aleandros/powerqueue/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/aleandros/powerqueue/ci.yml?style=flat-square&color=2a2a2a&labelColor=0a0a0a&label=ci" alt="CI"></a>
+        <a href="https://github.com/aleandros/powerqueue/releases/latest"><img src="https://img.shields.io/github/v/release/aleandros/powerqueue?style=flat-square&color=2a2a2a&labelColor=0a0a0a" alt="release"></a>
+        <a href="https://github.com/aleandros/powerqueue/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-yellow.svg?style=flat-square&color=2a2a2a&labelColor=0a0a0a" alt="MIT"></a>
+        <img src="https://img.shields.io/badge/rust-2024%20edition-orange.svg?style=flat-square&color=2a2a2a&labelColor=0a0a0a" alt="Rust 2024">
+      </div>
+
+      <h1>
+        Linear tickets in.<br>
+        <span class="accent">Claude Code</span> sessions out,<br>
+        <span class="accent-alt">one tmux window</span> each.
+      </h1>
+      <p class="tagline">
+        A daemon that pulls your queue, gives every task its own git worktree and tmux window,
+        learns what tasks cost, restarts what crashes, and paces your Claude subscription so
+        <code>fable</code> is there when an incident lands.
+      </p>
+
+      <div class="install-box">
+        <div class="install-header">
+          <span class="dot red"></span><span class="dot yellow"></span><span class="dot green"></span>
+          <span class="install-title">install.sh — re-run to update</span>
+        </div>
+        <div class="install-body">
+          <code id="install-cmd">curl -fsSL https://raw.githubusercontent.com/aleandros/powerqueue/main/install.sh | sh</code>
+          <button class="copy-btn" data-clip="#install-cmd" aria-label="Copy install command">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="cta-row">
+        <a href="https://github.com/aleandros/powerqueue" class="btn btn-primary">view on github →</a>
+        <a href="#flow" class="btn btn-ghost">see how it works</a>
+      </div>
+    </div>
+
+    <div class="hero-visual">
+      <div class="terminal">
+        <div class="terminal-header">
+          <span class="dot red"></span><span class="dot yellow"></span><span class="dot green"></span>
+          <span class="terminal-title" id="term-title">~ powerqueue run</span>
+        </div>
+        <div class="terminal-body">
+          <pre id="term-screen" aria-label="powerqueue session demo"></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="flow" class="flow">
+  <div class="section-inner">
+    <h2><span class="prompt">›</span> how it works</h2>
+    <div class="flow-diagram">
+<pre>  <span class="hl">Linear</span> ──poll──▶ <span class="hl">queue</span> ──<span class="hp">PRIORITY.md</span>──▶ score ──<span class="ha">budget policy</span>──▶ pick model
+                                                                        │
+  tmux window ◀── claude --session-id … ◀── launch.sh ◀── git worktree ◀┘
+       │
+       ├─ hooks ──▶ <span class="hl">powerqueue hook</span> ──▶ SQLite ──▶ daemon tick
+       ├─ transcript.jsonl ──▶ token usage (per model)      ├─ crash?  → backoff, <span class="hp">--resume</span>
+       └─ /proc ──▶ CPU, RSS                               ├─ idle?   → nudge, needs_attention
+                                                            └─ done?   → push, clean up, Linear → In Review</pre>
+    </div>
+    <div class="flow-steps">
+      <div class="flow-step"><strong>1. sync</strong>Queued issues from your team become tasks. Manual tasks come from <code>powerqueue add</code>.</div>
+      <div class="flow-step"><strong>2. score</strong>Rules in a Markdown file set criticality and score. Edit it; the daemon reloads live. Optional Jev scoring.</div>
+      <div class="flow-step"><strong>3. pick a model</strong>The budget policy chooses the best tier the period and the 5-hour window can afford.</div>
+      <div class="flow-step"><strong>4. run</strong>A fresh worktree, a tmux window, an interactive Claude Code session you can attach to at any time.</div>
+      <div class="flow-step"><strong>5. watch</strong>Hooks report turns, prompts and failures. Transcripts give tokens. A dead pane means a resumed retry.</div>
+      <div class="flow-step"><strong>6. finish</strong>Claude runs <code>powerqueue task complete</code>; the branch is pushed, the worktree removed, Linear updated.</div>
+    </div>
+  </div>
+</section>
+
+<section id="features" class="features">
+  <div class="section-inner">
+    <h2><span class="prompt">›</span> what you get</h2>
+    <div class="feature-grid">
+      <div class="feature">
+        <div class="feature-icon"><pre>ENG-412 ─▶ @3
+ENG-398 ─▶ @4
+ENG-401 ─▶ @5</pre></div>
+        <h3>One window per task</h3>
+        <p>Each task gets its own git worktree and tmux window. <code>powerqueue attach ENG-412</code> drops you into the live session.</p>
+      </div>
+      <div class="feature">
+        <div class="feature-icon"><pre>fable  ████░░ 31%
+opus   ██░░░░ 14%
+sonnet █████░ 58%</pre></div>
+        <h3>Budget pacing</h3>
+        <p>Per-tier shares across your weekly period and 5-hour window. Fable is held for critical work early and released as the week ages.</p>
+      </div>
+      <div class="feature">
+        <div class="feature-icon"><pre>exit 1 → 30s
+--resume &lt;id&gt;
+attempt 2 ✓</pre></div>
+        <h3>Crash recovery</h3>
+        <p>Dead pane, stale session or rate limit: the daemon backs off and resumes the <em>same</em> Claude session, context intact.</p>
+      </div>
+      <div class="feature">
+        <div class="feature-icon"><pre>tokens 2.1M
+cpu 38%  rss 612M
+est ±18%</pre></div>
+        <h3>Learns what tasks cost</h3>
+        <p>Token usage from transcripts, CPU and memory from the process tree. Predictions improve with every completed ticket.</p>
+      </div>
+      <div class="feature">
+        <div class="feature-icon"><pre>## Critical
+- label: incident
+- priority: urgent</pre></div>
+        <h3>Priorities in Markdown</h3>
+        <p>Plain bullet rules, per-ticket overrides, scoring, model mapping. Live reload. Optional <a href="https://typesafe.ai">Jev</a> decision-model scoring.</p>
+      </div>
+      <div class="feature">
+        <div class="feature-icon"><pre>$ powerqueue doctor
+ ✓ 21  ! 1  ✗ 0
+ fix: lower relax…</pre></div>
+        <h3>Diagnoses itself</h3>
+        <p><code>doctor</code> checks tools, keys, state and the algorithm, and tells you which knob to turn. <code>--fix</code> repairs what is safe.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="install" class="install-section">
+  <div class="section-inner">
+    <h2><span class="prompt">›</span> get it running</h2>
+
+    <div class="install-grid">
+      <div class="install-card">
+        <h3>one-liner</h3>
+        <p class="install-desc">Detects OS + architecture, drops the binary in <code>/usr/local/bin</code> (or <code>~/.local/bin</code>). Run it again to update.</p>
+        <div class="code-block"><pre><code>curl -fsSL https://raw.githubusercontent.com/aleandros/powerqueue/main/install.sh | sh</code></pre></div>
+      </div>
+      <div class="install-card">
+        <h3>cargo</h3>
+        <p class="install-desc">Rust toolchain required. Builds the latest <code>main</code>.</p>
+        <div class="code-block"><pre><code>cargo install --git https://github.com/aleandros/powerqueue</code></pre></div>
+      </div>
+      <div class="install-card">
+        <h3>pinned</h3>
+        <p class="install-desc">Pin a release or pick the install directory with environment variables.</p>
+        <div class="code-block"><pre><code>POWERQUEUE_VERSION=v0.1.0 \
+POWERQUEUE_INSTALL_DIR=~/bin \
+  sh -c "$(curl -fsSL https://raw.githubusercontent.com/aleandros/powerqueue/main/install.sh)"</code></pre></div>
+      </div>
+    </div>
+
+    <div class="usage-preview">
+      <h3>then use it</h3>
+      <div class="code-block">
+        <pre><code><span class="c-comment"># guided setup: Linear key → keychain, team, states, PRIORITY.md</span>
+powerqueue init
+
+<span class="c-comment"># check tools, keys, state and the algorithm</span>
+powerqueue doctor
+
+<span class="c-comment"># start the scheduler (keep it in a tmux window or a service)</span>
+powerqueue run
+
+<span class="c-comment"># watch sessions, budget and the queue</span>
+powerqueue dashboard
+
+<span class="c-comment"># jump into a task's session, or queue something by hand</span>
+powerqueue attach ENG-412
+powerqueue add "Rotate the staging certs" --criticality high</code></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="rules" class="rules">
+  <div class="section-inner">
+    <h2><span class="prompt">›</span> rules and budget</h2>
+    <div class="two-col">
+      <div>
+        <h3>PRIORITY.md</h3>
+        <p>Criticality comes from the first matching section. Scoring lines add points. Overrides pin a ticket. <code>## Models</code> states a preference the budget may downgrade. Save the file and the daemon re-scores the queue.</p>
+        <div class="code-block"><pre><code><span class="md-h">## Critical</span>
+<span class="md-b">-</span> <span class="md-k">label:</span> <span class="md-v">incident</span>
+<span class="md-b">-</span> <span class="md-k">priority:</span> <span class="md-v">urgent</span> <span class="md-k">and</span> <span class="md-k">label:</span> <span class="md-v">customer</span>
+
+<span class="md-h">## Low</span>
+<span class="md-b">-</span> <span class="md-k">label:</span> <span class="md-v">chore</span>
+
+<span class="md-h">## Scoring</span>
+<span class="md-b">-</span> <span class="md-v">+40</span> <span class="md-k">if label:</span> <span class="md-v">customer</span>
+<span class="md-b">-</span> <span class="md-v">-30</span> <span class="md-k">if estimate &gt;</span> <span class="md-v">8</span>
+
+<span class="md-h">## Overrides</span>
+<span class="md-b">-</span> <span class="md-k">ENG-412:</span> <span class="md-v">critical</span>
+<span class="md-b">-</span> <span class="md-k">ENG-377:</span> <span class="md-v">skip</span>
+
+<span class="md-h">## Models</span>
+<span class="md-b">-</span> <span class="md-k">critical:</span> <span class="md-v">fable</span>
+<span class="md-b">-</span> <span class="md-k">high:</span> <span class="md-v">opus</span>
+<span class="md-b">-</span> <span class="md-k">normal:</span> <span class="md-v">sonnet</span></code></pre></div>
+      </div>
+      <div>
+        <h3>budget policy</h3>
+        <p>Each tier gets a share of the period's weighted tokens and a minimum criticality. Early in the week only critical work touches Fable. Once a tier is under-paced it relaxes one level; in the end game it opens up so nothing is wasted. A <code>rate_limit</code> pauses every tier until the cooldown.</p>
+        <div class="code-block"><pre><code><span class="c-comment"># config.toml</span>
+[budget]
+period_hours = 168
+window_hours = 5
+period_weighted_tokens = 80_000_000
+endgame_fraction = 0.8
+
+[budget.models.fable]
+share = 0.25
+min_criticality = "critical"
+relax_after_fraction = 0.5
+
+[budget.models.opus]
+share = 0.35
+min_criticality = "high"
+relax_after_fraction = 0.3</code></pre></div>
+        <p style="margin-top:16px">Calibrate with what <code>/usage</code> shows: <code>powerqueue budget set-reset "in 3d4h"</code> and <code>powerqueue budget set-observed 43%</code>. <code>doctor</code> says when Fable is over- or under-reserved.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="why" class="why">
+  <div class="section-inner">
+    <h2><span class="prompt">›</span> why</h2>
+    <blockquote>
+      <p>
+        Claude Code is great at a ticket. The chore is everything around it: the worktree, the window, noticing the session died, remembering which model you can still afford this week, cleaning up, moving the issue.
+      </p>
+      <p>
+        powerqueue does the chore. You keep <em>attach, answer, review</em>.
+      </p>
+    </blockquote>
+    <div class="scope-note">
+      <strong>Scope.</strong> Sessions are interactive so you can always attach, which means a permission prompt waits for you (the task goes to <code>needs_attention</code>). For fully unattended runs set <code>claude.permission_mode</code> to <code>auto</code> or <code>bypassPermissions</code>, or pre-approve commands in <code>claude.allowed_tools</code>. Linear is the only tracker today — <a href="https://github.com/aleandros/powerqueue/pulls">PRs welcome</a>.
+    </div>
+  </div>
+</section>
+
+<section class="cta">
+  <div class="section-inner">
+    <div class="cta-box">
+      <h2>let the queue run.</h2>
+      <p>Come back to pushed branches, updated tickets and a dashboard that explains what happened.</p>
+      <div class="cta-row">
+        <a href="https://github.com/aleandros/powerqueue" class="btn btn-primary">★ star on github</a>
+        <a href="https://github.com/aleandros/powerqueue#readme" class="btn btn-ghost">full docs →</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="footer-inner">
+    <div><span class="prompt">$</span> powerqueue <span class="dim">— MIT licensed</span></div>
+    <div class="footer-links">
+      <a href="https://github.com/aleandros/powerqueue">github</a>
+      <a href="https://github.com/aleandros/powerqueue/releases">releases</a>
+      <a href="https://github.com/aleandros/powerqueue/blob/main/CHANGELOG.md">changelog</a>
+      <a href="https://github.com/aleandros/powerqueue/issues">issues</a>
+      <a href="https://aleandros.github.io/mdx/">mdx</a>
+    </div>
+  </div>
+</footer>
+
+<script src="script.js"></script>
+</body>
+</html>

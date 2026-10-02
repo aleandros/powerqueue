@@ -12,7 +12,7 @@ for the recipes below. Claude Code is only needed to run real sessions, not to
 build or test.
 
 ```sh
-git clone https://github.com/edgar/powerqueue
+git clone https://github.com/aleandros/powerqueue
 cd powerqueue
 just build
 just test
@@ -98,6 +98,25 @@ Before you open one, go through the checklist from AGENTS.md:
 Keep PRs focused on one area where possible (see the ownership table in
 AGENTS.md). If you change a public signature another area depends on, say so
 in the PR description.
+
+## Releasing
+
+Releases are automatic:
+
+1. Bump `version` in `Cargo.toml`, add the entry to `CHANGELOG.md` under that
+   version, and merge to `main`.
+2. `.github/workflows/tag.yml` tags the commit `v<version>` and starts
+   `release.yml`, which builds Linux (x86_64, aarch64) and macOS (x86_64,
+   arm64) binaries, packages them as `powerqueue-<target>.tar.gz` with SHA-256
+   sums, and publishes a GitHub release with the changelog section as notes.
+3. `install.sh` (and users re-running the one-liner) picks up the latest release.
+
+No personal token is needed: the tag workflow starts the release with
+`workflow_dispatch`, which GitHub allows from the default `GITHUB_TOKEN`.
+To re-run a release by hand: `gh workflow run release.yml --ref v<version>`.
+
+The landing page lives in `site/` and deploys through `pages.yml` on every
+push that touches it.
 
 ## Commit style
 
