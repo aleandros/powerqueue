@@ -75,10 +75,14 @@ drops the binary in `/usr/local/bin` (or `~/.local/bin` as a fallback):
 curl -fsSL https://raw.githubusercontent.com/aleandros/powerqueue/main/install.sh | sh
 ```
 
-**Update**: run the same command again. It replaces the binary atomically, so
-a running daemon keeps working until you restart it (`powerqueue stop`, then
-`powerqueue run`). Pin a version with `POWERQUEUE_VERSION=v0.2.0`, or choose
-the directory with `POWERQUEUE_INSTALL_DIR=~/bin`.
+**Update**: `powerqueue update` downloads the latest release for your
+platform, verifies its SHA-256, checks that the new binary runs, and swaps it
+in atomically, so a running daemon keeps working until you restart it
+(`powerqueue stop`, then `powerqueue run`). `powerqueue update --check` only
+tells you whether a newer release exists (exit code 10 when it does, handy in
+cron). Re-running the install script works too. Pin a version with
+`powerqueue update --version v0.2.0` (or `POWERQUEUE_VERSION=v0.2.0` for the
+script), or choose the directory with `POWERQUEUE_INSTALL_DIR=~/bin`.
 
 Other ways:
 
@@ -188,7 +192,7 @@ Global flags work on every command.
 | `-v`, `-vv` | debug / trace logging on stderr |
 | `-q`, `--quiet` | only print errors |
 | `--home DIR` | base directory for config/data/state (env `POWERQUEUE_HOME`) |
-| `--json` | machine-readable output where supported (status, add, task, priority, budget, linear, doctor, config, `logs --events`) |
+| `--json` | machine-readable output where supported (status, add, task, priority, budget, linear, doctor, update, config, `logs --events`) |
 | `--no-color` | disable colours (env `NO_COLOR`) |
 
 ### Setup and daemon
@@ -201,6 +205,7 @@ Global flags work on every command.
 | `dashboard [--once] [--ascii]` (`ui`, `top`) | live TUI: task table, one budget block per enabled provider (period, window, cooldown, a gauge per model), a header with the compact per-provider summary (`cl 34/12%  cx 17/–` = period/window spent) and `next <model>` (what the policy would run now); needs an interactive terminal (exit 2 otherwise). `--once` prints one frame as text and exits (works in pipes; with `--json` prints the snapshot); `--ascii` uses `*`/`>`/`#` and `+-\|` borders (automatic when the locale is not UTF-8) |
 | `status [-a]` (`ls`) | one-shot table; `-a` includes completed/failed/cancelled |
 | `doctor [--fix] [--offline]` | diagnostics and tuning advice, per enabled provider (binary and version, logged in, model shares, period anchor source, probe freshness, top-model pacing, window pressure); `--fix` applies safe repairs |
+| `update [--check] [--version TAG] [-y] [--force]` | replace this binary with a [GitHub release](https://github.com/aleandros/powerqueue/releases): downloads `powerqueue-<target>.tar.gz` and its `.sha256`, verifies the checksum, writes the new file next to the current one, runs it with `--version`, then renames it over the old one (atomic; a running daemon keeps the old version until `stop` / `run`); asks before replacing unless `-y` / `--yes` or stdin is not a terminal; `--check` only reports (exit 0 up to date, 10 newer release available); `--version v0.3.0` installs a specific tag; `--force` reinstalls the same version; `--json` prints `{"current","latest","updated","path",...}`; `GITHUB_TOKEN` is used for the API when set; `POWERQUEUE_UPDATE_API` / `POWERQUEUE_UPDATE_TARGET` override the API base and target triple (mirrors, tests) |
 | `logs [-f] [-n N] [-t TASK] [-l LEVEL] [--events]` | read the daemon log (default 200 lines); `--events` shows the DB timeline instead; `-f` follows either |
 | `completions <shell>` | shell completions (bash, elvish, fish, powershell, zsh) |
 

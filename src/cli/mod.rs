@@ -13,6 +13,7 @@
 //! powerqueue budget <show|set-reset|set-observed|clear-limits|estimate> [--provider <p>]
 //! powerqueue linear <teams|states|test|sync>
 //! powerqueue doctor [--fix]       diagnostics + tuning advice
+//! powerqueue update [--check]     self-update from GitHub releases (--check exits 10 when a newer release exists)
 //! powerqueue logs [-f] [--task]   read the daemon log
 //! powerqueue config <show|get|set|unset|path|edit|validate>
 //! powerqueue secrets <set|unset|list>
@@ -87,6 +88,8 @@ pub enum Command {
     Linear(LinearCommand),
     /// Diagnose the installation, the data and the scheduling algorithm.
     Doctor(DoctorArgs),
+    /// Update this binary to the latest GitHub release (or `--check` for a newer one).
+    Update(UpdateArgs),
     /// Read the daemon log.
     Logs(LogsArgs),
     /// Configuration file helpers.
@@ -329,6 +332,26 @@ pub struct DoctorArgs {
     /// Skip network checks.
     #[arg(long)]
     pub offline: bool,
+}
+
+#[derive(Debug, Args, Default)]
+#[command(disable_version_flag = true)]
+pub struct UpdateArgs {
+    /// Only report whether a newer release exists: exit 0 when up to date, 10 when an update is available.
+    #[arg(long)]
+    pub check: bool,
+    /// Install this release tag (`v0.3.0` or `0.3.0`) instead of the latest.
+    #[arg(long, value_name = "TAG", conflicts_with = "check")]
+    pub version: Option<String>,
+    /// Do not ask for confirmation (implied when stdin is not a terminal).
+    #[arg(short, long)]
+    pub yes: bool,
+    /// Reinstall even when the installed version is already the requested one.
+    #[arg(long, conflicts_with = "check")]
+    pub force: bool,
+    /// Replace this file instead of the running executable (for tests).
+    #[arg(long, value_name = "PATH", hide = true)]
+    pub binary_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Args, Default)]
