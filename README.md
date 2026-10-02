@@ -81,7 +81,7 @@ in atomically, so a running daemon keeps working until you restart it
 (`powerqueue stop`, then `powerqueue run`). `powerqueue update --check` only
 tells you whether a newer release exists (exit code 10 when it does, handy in
 cron). Re-running the install script works too. Pin a version with
-`powerqueue update --version v0.2.0` (or `POWERQUEUE_VERSION=v0.2.0` for the
+`powerqueue update --version v0.3.0` (or `POWERQUEUE_VERSION=v0.3.0` for the
 script), or choose the directory with `POWERQUEUE_INSTALL_DIR=~/bin`.
 
 Other ways:

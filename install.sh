@@ -4,7 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/aleandros/powerqueue/main/install.sh | sh
 #
 # Re-run the same command to update. Environment overrides:
-#   POWERQUEUE_VERSION=v0.2.0   install a specific tag instead of the latest
+#   POWERQUEUE_VERSION=v0.3.0   install a specific tag instead of the latest
 #   POWERQUEUE_INSTALL_DIR=...  install somewhere other than /usr/local/bin or ~/.local/bin
 set -e
 
