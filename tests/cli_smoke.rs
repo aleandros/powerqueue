@@ -1,0 +1,174 @@
+//! End-to-end smoke tests of the CLI binary against an isolated
+//! `POWERQUEUE_HOME`. Nothing here needs tmux, git worktrees or the network.
+
+use std::path::Path;
+
+use assert_cmd::Command;
+use predicates::prelude::*;
+
+fn pq(home: &Path) -> Command {
+    let mut cmd = Command::cargo_bin("powerqueue").expect("binary builds");
+    cmd.env("POWERQUEUE_HOME", home)
+        .env("POWERQUEUE_SECRETS", "file")
+        // Output is not a TTY, so colours are off; `NO_COLOR` is removed because
+        // clap parses it as a bool and rejects the conventional `1`.
+        .env_remove("NO_COLOR")
+        .env_remove("LINEAR_API_KEY")
+        .env_remove("JEV_API_KEY");
+    cmd
+}
+
+fn write_minimal_config(home: &Path, repo: &Path) {
+    let config_dir = home.join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("config.toml"), format!("[repo]\npath = \"{}\"\n", repo.display())).unwrap();
+}
+
+#[test]
+fn help_and_completions() {
+    let home = tempfile::tempdir().unwrap();
+    pq(home.path()).arg("--help").assert().success().stdout(predicate::str::contains("Autonomous Linear"));
+    pq(home.path()).args(["completions", "zsh"]).assert().success().stdout(predicate::str::contains("#compdef powerqueue"));
+}
+
+#[test]
+fn config_path_works_before_init() {
+    let home = tempfile::tempdir().unwrap();
+    pq(home.path())
+        .args(["config", "path"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("config"))
+        .stdout(predicate::str::contains(home.path().join("config").join("config.toml").display().to_string()));
+    pq(home.path()).args(["--json", "config", "path"]).assert().success().stdout(predicate::str::contains("\"database\""));
+}
+
+#[test]
+fn status_before_init_is_friendly() {
+    let home = tempfile::tempdir().unwrap();
+    pq(home.path()).arg("status").assert().code(1).stderr(predicate::str::contains("powerqueue init"));
+}
+
+#[test]
+fn add_then_status_and_show() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    write_minimal_config(home.path(), repo.path());
+
+    pq(home.path())
+        .args(["add", "Fix the login flow", "--key", "MAN-1", "--criticality", "high", "--label", "auth"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added MAN-1"));
+
+    pq(home.path())
+        .args(["add", "Paused one", "--paused", "--description", "-", "--json"])
+        .write_stdin("details from stdin")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"state\": \"paused\""))
+        .stdout(predicate::str::contains("details from stdin"));
+
+    pq(home.path())
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("MAN-1"))
+        .stdout(predicate::str::contains("Fix the login flow"))
+        .stdout(predicate::str::contains("daemon"));
+
+    pq(home.path()).args(["--json", "status"]).assert().success().stdout(predicate::str::contains("\"key\": \"MAN-1\""));
+
+    pq(home.path())
+        .args(["task", "show", "MAN-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("MAN-1"))
+        .stdout(predicate::str::contains("criticality"))
+        .stdout(predicate::str::contains("task.created"));
+
+    pq(home.path()).args(["task", "explain", "man-1"]).assert().success().stdout(predicate::str::contains("score"));
+
+    // Duplicate key is a clean error.
+    pq(home.path()).args(["add", "Again", "--key", "MAN-1"]).assert().code(1).stderr(predicate::str::contains("already exists"));
+}
+
+#[test]
+fn offline_control_commands_apply_directly() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    write_minimal_config(home.path(), repo.path());
+    pq(home.path()).args(["add", "Thing", "--key", "T-1"]).assert().success();
+
+    pq(home.path()).args(["task", "pause", "T-1"]).assert().success().stdout(predicate::str::contains("applied directly"));
+    pq(home.path())
+        .args(["--json", "task", "show", "T-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"state\": \"paused\""));
+    pq(home.path()).args(["task", "resume", "T-1"]).assert().success();
+    pq(home.path()).args(["task", "cancel", "T-1"]).assert().success();
+    pq(home.path()).arg("status").assert().success().stdout(predicate::str::contains("no open tasks"));
+    pq(home.path()).args(["status", "--all"]).assert().success().stdout(predicate::str::contains("cancelled"));
+    pq(home.path()).args(["task", "retry", "T-1"]).assert().success();
+    pq(home.path()).args(["task", "model", "T-1", "opus"]).assert().success().stdout(predicate::str::contains("opus"));
+    pq(home.path()).args(["task", "complete", "T-1"]).assert().code(1).stderr(predicate::str::contains("cannot complete"));
+    pq(home.path()).args(["task", "show", "nope"]).assert().code(1).stderr(predicate::str::contains("no task matches"));
+}
+
+#[test]
+fn secrets_list_with_file_backend() {
+    let home = tempfile::tempdir().unwrap();
+    pq(home.path())
+        .args(["secrets", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("linear_api_key"))
+        .stdout(predicate::str::contains("jev_api_key"))
+        .stdout(predicate::str::contains("secrets.toml"));
+    pq(home.path())
+        .args(["secrets", "set", "linear", "lin_api_1234567890"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("stored"));
+    pq(home.path())
+        .args(["secrets", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("lin_************90"))
+        .stdout(predicate::str::contains("file"));
+    pq(home.path()).args(["secrets", "unset", "linear"]).assert().success();
+    pq(home.path()).args(["secrets", "set", "openai", "x"]).assert().code(1).stderr(predicate::str::contains("unknown secret"));
+}
+
+#[test]
+fn config_validate_and_show() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    write_minimal_config(home.path(), repo.path());
+    pq(home.path()).args(["config", "validate"]).assert().success().stdout(predicate::str::contains("is valid"));
+    pq(home.path()).args(["config", "show"]).assert().success().stdout(predicate::str::contains("[repo]"));
+
+    std::fs::write(repo.path().join(".powerqueue.toml"), "bogus = 1\n").unwrap();
+    pq(home.path()).args(["config", "validate"]).assert().code(1).stderr(predicate::str::contains("bogus"));
+
+    let config_dir = home.path().join("config");
+    std::fs::write(config_dir.join("config.toml"), "[repo]\npath = \"/x\"\n[scheduler]\nmax_concurrent = 0\n").unwrap();
+    pq(home.path()).args(["config", "validate"]).assert().code(1).stderr(predicate::str::contains("max_concurrent"));
+}
+
+#[test]
+fn logs_without_files_and_events() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    write_minimal_config(home.path(), repo.path());
+    pq(home.path()).args(["add", "Logged", "--key", "L-1"]).assert().success();
+    pq(home.path())
+        .args(["logs", "--events", "--task", "L-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("task.created"));
+    // The daemon log file is created lazily by tracing; a fresh install may
+    // have an (empty) file or none at all, both of which must not crash.
+    pq(home.path()).args(["logs", "-n", "5"]).assert().code(predicate::in_iter([0, 1]));
+}
