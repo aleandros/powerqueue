@@ -77,7 +77,7 @@ curl -fsSL https://raw.githubusercontent.com/aleandros/powerqueue/main/install.s
 
 **Update**: run the same command again. It replaces the binary atomically, so
 a running daemon keeps working until you restart it (`powerqueue stop`, then
-`powerqueue run`). Pin a version with `POWERQUEUE_VERSION=v0.1.0`, or choose
+`powerqueue run`). Pin a version with `POWERQUEUE_VERSION=v0.2.0`, or choose
 the directory with `POWERQUEUE_INSTALL_DIR=~/bin`.
 
 Other ways:
