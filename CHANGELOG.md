@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-02
+
+### Added
+
+- `powerqueue tune "<what you expect>"`: describe a change in plain words
+  ("ENG-12 should run before ENG-40", "chores are low and use sonnet", "run
+  three tasks at once") and let a headless Claude Code session edit drafts of
+  `PRIORITY.md` and `config.toml`. The drafts live under
+  `<state>/tune/<id>/` next to the originals, a `CONTEXT.md` snapshot of the
+  queue, tasks and budget, the full prompt and Claude's answer; the session
+  may only edit the drafts and run the read-only `priority check --file`,
+  `priority simulate --file --config` and `config validate --file` commands.
+  powerqueue validates the result, prints Claude's summary, a unified diff
+  per file and the simulated queue with the drafts, and asks before writing
+  the live files (`-y` applies directly, `--dry-run` never applies,
+  `--scope priority|config|all`, `-m MODEL`, `--timeout SECS`,
+  `--no-budget`, `-` reads stdin). `tune --apply [DIR]` applies a kept
+  proposal later, `tune --undo` restores the previous files; a running daemon
+  is asked to reload. Exit 3 means "proposed but not applied". `--json`
+  prints the draft, status, files with diffs and the simulation.
+- `[tune]` configuration: `model` (default `sonnet`), `timeout_secs` (600),
+  `extra_args`, `keep_drafts` (20; finished drafts beyond that are pruned).
+- `priority check --file PATH` validates a draft rules file;
+  `priority simulate --config PATH` tries a draft `config.toml` (budget,
+  concurrency) alongside `--file`; `config validate --file PATH` validates a
+  draft config.
+- `doctor` reports tune drafts that were proposed but never applied, or runs
+  that failed or produced invalid files, with the directory to look at.
+- Events `tune.applied` / `tune.undone` in the timeline (`logs --events`).
+
+### Changed
+
+- A timed-out headless session is killed together with its process group,
+  so tool commands it started cannot keep the output pipes open.
+
 ## [0.3.0] - 2026-10-02
 
 ### Added
@@ -226,7 +261,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.4.0
 [0.3.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.3.0
 [0.2.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.2.0
 [0.1.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.1.0

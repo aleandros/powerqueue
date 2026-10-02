@@ -81,7 +81,7 @@ in atomically, so a running daemon keeps working until you restart it
 (`powerqueue stop`, then `powerqueue run`). `powerqueue update --check` only
 tells you whether a newer release exists (exit code 10 when it does, handy in
 cron). Re-running the install script works too. Pin a version with
-`powerqueue update --version v0.3.0` (or `POWERQUEUE_VERSION=v0.3.0` for the
+`powerqueue update --version v0.4.0` (or `POWERQUEUE_VERSION=v0.4.0` for the
 script), or choose the directory with `POWERQUEUE_INSTALL_DIR=~/bin`.
 
 Other ways:
@@ -192,7 +192,7 @@ Global flags work on every command.
 | `-v`, `-vv` | debug / trace logging on stderr |
 | `-q`, `--quiet` | only print errors |
 | `--home DIR` | base directory for config/data/state (env `POWERQUEUE_HOME`) |
-| `--json` | machine-readable output where supported (status, add, task, priority, budget, linear, doctor, update, config, `logs --events`) |
+| `--json` | machine-readable output where supported (status, add, task, priority, tune, budget, linear, doctor, update, config, `logs --events`) |
 | `--no-color` | disable colours (env `NO_COLOR`) |
 
 ### Setup and daemon
@@ -206,7 +206,7 @@ Global flags work on every command.
 | `dashboard [--once] [--ascii]` (`ui`, `top`) | live TUI: task table, one budget block per enabled provider (period, window, cooldown, a gauge per model), a header with the compact per-provider summary (`cl 34/12%  cx 17/–` = period/window spent) and `next <model>` (what the policy would run now); needs an interactive terminal (exit 2 otherwise). `--once` prints one frame as text and exits (works in pipes; with `--json` prints the snapshot); `--ascii` uses `*`/`>`/`#` and `+-\|` borders (automatic when the locale is not UTF-8) |
 | `status [-a]` (`ls`) | one-shot table; `-a` includes completed/failed/cancelled |
 | `doctor [--fix] [--offline]` | diagnostics and tuning advice, per enabled provider (binary and version, logged in, model shares, period anchor source, probe freshness, top-model pacing, window pressure); `--fix` applies safe repairs |
-| `update [--check] [--version TAG] [-y] [--force]` | replace this binary with a [GitHub release](https://github.com/aleandros/powerqueue/releases): downloads `powerqueue-<target>.tar.gz` and its `.sha256`, verifies the checksum, writes the new file next to the current one, runs it with `--version`, then renames it over the old one (atomic; a running daemon keeps the old version until `stop` / `run`); asks before replacing unless `-y` / `--yes` or stdin is not a terminal; `--check` only reports (exit 0 up to date, 10 newer release available); `--version v0.3.0` installs a specific tag; `--force` reinstalls the same version; `--json` prints `{"current","latest","updated","path",...}`; `GITHUB_TOKEN` is used for the API when set; `POWERQUEUE_UPDATE_API` / `POWERQUEUE_UPDATE_TARGET` override the API base and target triple (mirrors, tests) |
+| `update [--check] [--version TAG] [-y] [--force]` | replace this binary with a [GitHub release](https://github.com/aleandros/powerqueue/releases): downloads `powerqueue-<target>.tar.gz` and its `.sha256`, verifies the checksum, writes the new file next to the current one, runs it with `--version`, then renames it over the old one (atomic; a running daemon keeps the old version until `stop` / `run`); asks before replacing unless `-y` / `--yes` or stdin is not a terminal; `--check` only reports (exit 0 up to date, 10 newer release available); `--version v0.4.0` installs a specific tag; `--force` reinstalls the same version; `--json` prints `{"current","latest","updated","path",...}`; `GITHUB_TOKEN` is used for the API when set; `POWERQUEUE_UPDATE_API` / `POWERQUEUE_UPDATE_TARGET` override the API base and target triple (mirrors, tests) |
 | `logs [-f] [-n N] [-t TASK] [-l LEVEL] [--events]` | read the daemon log (default 200 lines); `--events` shows the DB timeline instead; `-f` follows either |
 | `completions <shell>` | shell completions (bash, elvish, fish, powershell, zsh) |
 
@@ -240,11 +240,14 @@ state machine allows it. `complete` and `block` always write directly.
 | Command | What it does |
 |---------|--------------|
 | `priority show` | print the parsed rules (model preference lists joined with ` \| `) |
-| `priority check` | validate `PRIORITY.md`, report problems with line numbers and print the `## Models` lists |
+| `priority check [--file PATH]` | validate `PRIORITY.md` (or a draft), report problems with line numbers and print the `## Models` lists |
 | `priority edit` | open `PRIORITY.md` in `$EDITOR` |
 | `priority explain <task>` | show how the rules score one task |
-| `priority simulate [--file PATH] [-a] [--linear] [--reasons] [--no-budget] [-n N]` | dry-run: re-score every open task with the live rules (or a draft `--file`), rank them the way the scheduler would, and show what the budget policy would run for each (`▶` = would start now); nothing is written. `--linear` also ranks queued issues not yet in the queue, `-a` includes finished tasks, `--reasons` prints every rule that fired |
+| `priority simulate [--file PATH] [--config PATH] [-a] [--linear] [--reasons] [--no-budget] [-n N]` | dry-run: re-score every open task with the live rules (or a draft `--file`), rank them the way the scheduler would, and show what the budget policy would run for each (`▶` = would start now); nothing is written. `--config` tries a draft `config.toml` (budget, concurrency) too, `--linear` also ranks queued issues not yet in the queue, `-a` includes finished tasks, `--reasons` prints every rule that fired |
 | `priority path` | print the path of the rules file |
+| `tune "what you expect" [--scope priority\|config\|all] [-m MODEL] [-y] [--dry-run] [--no-budget] [--timeout SECS]` | describe the change in plain words ("ENG-12 should run before ENG-40", "chores are low and use sonnet", "run three tasks at once") and let a headless Claude Code session edit **drafts** of `PRIORITY.md` and `config.toml` under `<state>/tune/<id>/`; powerqueue validates the result, prints Claude's summary, the diff and the simulated queue with the drafts, then asks before writing the live files (`-y` applies directly, `--dry-run` never applies). Exit 0 applied/unchanged/dry run, 1 failed/invalid/declined, 3 proposed but not applied (no terminal, no `-y`). `-` reads the instruction from stdin |
+| `tune --apply [DIR]` | apply the newest proposed draft (or `DIR`) after reviewing it; `-y` skips the question |
+| `tune --undo` | restore the files the most recent apply replaced (a running daemon is asked to reload) |
 
 ### Budget
 
@@ -278,7 +281,7 @@ state machine allows it. `complete` and `block` always write directly.
 | `config set <key> <value>` | change one key; `<value>` is TOML (`3`, `true`, `["ENG","OPS"]`) or a bare string (`auto`); the result is validated before anything is written, comments in `config.toml` survive, and a running daemon is asked to reload (new sessions use the new value) |
 | `config unset <key>` | remove a key so its default applies again |
 | `config edit` | open `config.toml` in `$EDITOR` |
-| `config validate` | validate `config.toml` and the repo's `.powerqueue.toml` |
+| `config validate [--file PATH]` | validate `config.toml` (or a draft) and the repo's `.powerqueue.toml` |
 | `secrets set <linear\|jev> [value]` | store a key (prompts if omitted) |
 | `secrets unset <name>` | remove a key |
 | `secrets list` | which keys are configured and where they come from |
@@ -690,6 +693,24 @@ run = ["[ \"$POWERQUEUE_SUCCEEDED\" = 1 ] && claude -p --permission-mode acceptE
 | `keep_days` | `14` | rotated daily files to keep |
 | `json` | `true` | JSON lines (true) or text (false) in the file |
 
+### `[tune]`
+
+`powerqueue tune` runs a headless Claude Code session (`claude -p`) that edits
+drafts of `PRIORITY.md` and `config.toml`; see [Tuning with
+`tune`](#tuning-with-powerqueue-tune).
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `model` | `"sonnet"` | Claude model alias for the tuning session (`-m` overrides per run; must be a Claude model) |
+| `timeout_secs` | `600` | kill the session after this long; the draft is kept and reported as failed |
+| `extra_args` | `[]` | flags appended to the `claude -p` command line |
+| `keep_drafts` | `20` | drafts to keep under `<state>/tune/`; older finished ones (applied, undone, unchanged, failed, invalid) are pruned after each run, proposed ones never |
+
+The session uses `claude.binary`, runs in the draft directory with
+`--permission-mode acceptEdits`, and may only call `powerqueue priority
+check --file`, `powerqueue priority simulate --file --config` and
+`powerqueue config validate --file` (all read-only against the drafts).
+
 ### Per-repository overrides: `.powerqueue.toml`
 
 A `.powerqueue.toml` in the repository root overrides a subset of the global
@@ -763,6 +784,47 @@ the model is out of budget. Conditions can use `label`, `priority`,
 `cycle_number`, `team`, `title`, `description`, `source` and `key`; the two
 `cycle` lines above are the "prefer the current cycle" idiom. Full grammar,
 evaluation order and idioms: [docs/priority.md](docs/priority.md).
+
+### Tuning with `powerqueue tune`
+
+When the simulated queue is not what you expected, say so instead of editing
+the rules by hand:
+
+```text
+$ powerqueue priority simulate
+ #    was  task    state   criticality  score  prefers  policy would run  title
+ 1 ▶  =    CH-2    queued  normal       100    opus     opus              Tidy docs
+ 2    =    INC-1   queued  normal       100    opus     opus              Fix outage
+
+$ powerqueue tune "incidents (label incident) must be critical and use fable; docs chores are low on sonnet"
+Claude:
+  Added `- label: incident` under ## Critical and `- label: chore` under ## Low in PRIORITY.md,
+  and `critical: fable` / `low: sonnet` under ## Models. Simulation: INC-1 ranks first on fable.
+  [sonnet 4 turn(s), 38s]
+
+Change to PRIORITY.md → ~/.config/powerqueue/PRIORITY.md
+  --- a/PRIORITY.md
+  +++ b/PRIORITY.md
+  @@ -1,3 +1,5 @@
+   ## Critical
+  +- label: incident
+  ...
+Simulated queue with …/state/tune/20261002T141500Z-3f9a1c/PRIORITY.md (max 2 concurrent; nothing was written)
+ 1 ▶  ↑2   INC-1   queued  normal → critical  100 → 1000  fable   fable   Fix outage
+ 2 ▶  ↓1   CH-2    queued  normal → low       100 → 10    sonnet  sonnet  Tidy docs
+✔ Apply the change to PRIORITY.md? · yes
+applied: ~/.config/powerqueue/PRIORITY.md (daemon asked to reload…). Revert with `powerqueue tune --undo`.
+```
+
+Claude only ever edits copies in `<state>/tune/<id>/` (`original/` keeps what
+was live, `CONTEXT.md` the queue and budget snapshot it saw, `prompt.md` the
+full prompt, `result.json` its answer, `meta.json` the outcome). Nothing
+reaches the live files until you confirm; `--dry-run` stops before the
+question, `--apply` picks a proposal up later, `--undo` reverts the last
+apply, and `doctor` warns about proposals that were never applied.
+`--scope priority` / `--scope config` limits what may change. Requests the
+rules cannot satisfy (for example an order decided by the budget policy) come
+back as an explanation with no change.
 
 ## Budget pacing
 
