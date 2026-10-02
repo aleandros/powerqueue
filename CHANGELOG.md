@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-01
+
 ### Added
 
 - Project documentation: README, priority grammar, budget algorithm,
@@ -14,10 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI (fmt, clippy, test, doc, audit) and release workflows; Dependabot;
   issue and pull request templates.
 - `justfile` with build, test, lint, doc, ci and dev-state recipes.
-
-## [0.1.0] - 2026-10-01
-
-### Added
+- End-to-end tests driving the real daemon with a fake Claude Code binary
+  (`tests/fixtures/fake-claude.sh`) on a private tmux server.
+- Workspace trust pre-seeding (`claude.trust_workspace`) and an always-on
+  `Bash(powerqueue task *)` allow rule so unattended sessions never stall on
+  the trust dialog or on the completion command.
+- Account-wide rate-limit cooldowns: a `rate_limit` reported by one tier pauses
+  every tier until the cooldown or the period reset.
 
 - Linear integration: poll queued issues per team, state and label; move
   issues through workflow states; post progress comments.

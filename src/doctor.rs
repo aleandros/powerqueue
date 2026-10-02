@@ -374,6 +374,47 @@ fn check_period_anchor(cfg: &Config) -> CheckResult {
     }
 }
 
+/// Interactive Claude Code blocks on a trust dialog in untrusted folders.
+/// With `claude.trust_workspace` the launcher pre-seeds trust; otherwise the
+/// repository root must already be trusted in `~/.claude.json`.
+fn check_workspace_trust(cfg: &Config, fix: bool) -> CheckResult {
+    use crate::session::trust::{claude_json_path, ensure_trusted, is_trusted};
+    let file = claude_json_path();
+    let repo = cfg.repo_path();
+    let root = std::fs::canonicalize(&repo).unwrap_or(repo);
+    if is_trusted(&file, &root) {
+        return CheckResult::ok(CONF, "workspace trust", format!("{} is trusted in {}", root.display(), file.display()));
+    }
+    if cfg.claude.trust_workspace {
+        if fix {
+            return match ensure_trusted(&file, &[root.as_path()]) {
+                Ok(_) => {
+                    let mut r = CheckResult::ok(CONF, "workspace trust", format!("marked {} as trusted", root.display()));
+                    r.fixed = true;
+                    r
+                }
+                Err(e) => CheckResult::warn(
+                    CONF,
+                    "workspace trust",
+                    format!("could not update {}: {e:#}", file.display()),
+                    "accept the trust dialog once by running `claude` in the repository",
+                ),
+            };
+        }
+        return CheckResult::ok(
+            CONF,
+            "workspace trust",
+            format!("{} not yet trusted; the launcher marks it before the first session", root.display()),
+        );
+    }
+    CheckResult::warn(
+        CONF,
+        "workspace trust",
+        format!("{} is not trusted in {} and claude.trust_workspace is false", root.display(), file.display()),
+        "run `claude` in the repository once and accept the trust dialog, or set claude.trust_workspace = true",
+    )
+}
+
 // ------------------------------------------------------------------ secrets
 
 async fn check_secrets(cfg: &Config, secrets: &Secrets, online: bool) -> Vec<CheckResult> {
@@ -834,6 +875,7 @@ pub async fn run_all(
     results.push(check_priority_file(cfg, paths));
     results.push(check_repo_overrides(cfg));
     results.push(check_period_anchor(cfg));
+    results.push(check_workspace_trust(cfg, fix));
 
     results.extend(check_secrets(cfg, secrets, online).await);
 
