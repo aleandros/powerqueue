@@ -613,6 +613,19 @@ and `default_model` / `low_model` must belong to an enabled provider.
 | `close_tmux_window` | `true` | kill the window; otherwise it stays with the final output |
 | `commit_uncommitted` | `true` | commit changes the session left uncommitted (`powerqueue: uncommitted changes from <key>`) before pushing or removing the worktree; a failure keeps the worktree |
 
+`cleanup.run` commands execute with `sh -c` inside the worktree, before the
+auto-commit and the push, with `POWERQUEUE_TASK_ID`, `POWERQUEUE_TASK_KEY`,
+`POWERQUEUE_BRANCH`, `POWERQUEUE_WORKTREE` and `POWERQUEUE_SUCCEEDED`
+(`1`/`0`) in the environment. A failing command is logged
+(`cleanup.command_failed`) and the worktree is kept. That is also the hook
+for an agent-driven teardown, e.g. a one-shot session that tidies up what
+the task left behind:
+
+```toml
+[cleanup]
+run = ["[ \"$POWERQUEUE_SUCCEEDED\" = 1 ] && claude -p --permission-mode acceptEdits \"$(cat .powerqueue/cleanup-prompt.md)\" || true"]
+```
+
 ### `[tmux]`
 
 | Key | Default | Meaning |
