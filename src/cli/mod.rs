@@ -157,7 +157,7 @@ pub struct AddArgs {
     /// Force a model tier: fable | opus | sonnet | haiku.
     #[arg(short, long, value_parser = parse_model)]
     pub model: Option<ModelTier>,
-    /// Explicit key (default: manual-<id>).
+    /// Explicit key (default: `manual-<id>`).
     #[arg(short, long)]
     pub key: Option<String>,
     /// Labels for PRIORITY.md rules.

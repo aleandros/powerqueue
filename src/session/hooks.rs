@@ -93,7 +93,7 @@ pub fn interpret_hook(event: HookEvent, payload: &serde_json::Value) -> HookOutc
 
 /// Heuristic for "Claude stopped because it is waiting on a human": the last
 /// non-empty line ends with a question mark, or the message contains one of
-/// [`QUESTION_PHRASES`] (`should I`, `do you want me to`, `let me know`, ...).
+/// `QUESTION_PHRASES` (`should I`, `do you want me to`, `let me know`, ...).
 /// False positives only cost a `needs_attention` flag, so the bias is towards
 /// catching questions.
 pub fn looks_like_question(message: &str) -> bool {
