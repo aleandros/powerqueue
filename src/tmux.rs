@@ -249,9 +249,21 @@ impl Tmux {
     }
 
     /// Argument vector to attach a terminal to `window` of `session`
-    /// (switch-client when already inside tmux, attach-session otherwise).
+    /// (switch-client when already inside this tmux server, attach-session otherwise).
     pub fn attach_args(&self, session: &str, window_id: Option<&str>) -> Vec<String> {
-        Self::attach_args_for(Self::inside_tmux(), session, window_id)
+        Self::attach_args_for(self.inside_this_server(), session, window_id)
+    }
+
+    /// Switch the current tmux client to `window` of `session` without
+    /// replacing this process. Only works from inside the same tmux server
+    /// (see [`Tmux::inside_this_server`]); fails with tmux's message otherwise.
+    pub fn switch_client(&self, session: &str, window_id: Option<&str>) -> Result<()> {
+        let target = match window_id {
+            Some(w) => format!("{session}:{w}"),
+            None => session.to_string(),
+        };
+        self.run(&["switch-client", "-t", &target])?;
+        Ok(())
     }
 
     /// [`Tmux::attach_args`] with the "inside tmux" decision made explicit (testable).
@@ -277,6 +289,11 @@ impl Tmux {
         let args = self.attach_args(session, window_id);
         let mut cmd = self.command();
         cmd.args(&args);
+        if Self::inside_tmux() && !self.inside_this_server() {
+            // Attaching to another server from inside tmux is a nested attach;
+            // tmux refuses it unless `$TMUX` is cleared.
+            cmd.env_remove("TMUX");
+        }
         tracing::info!(session, window = window_id.unwrap_or("-"), "attaching to tmux");
         #[cfg(unix)]
         {
@@ -298,6 +315,20 @@ impl Tmux {
     /// True if the current process is running inside tmux (`$TMUX` set).
     pub fn inside_tmux() -> bool {
         std::env::var_os("TMUX").is_some()
+    }
+
+    /// True if the current process runs inside a client of *this* tmux server
+    /// (same socket as `-L socket_name`), so `switch-client` can reach it.
+    pub fn inside_this_server(&self) -> bool {
+        std::env::var("TMUX").map(|v| Self::tmux_env_matches_socket(&v, self.socket_name.as_deref())).unwrap_or(false)
+    }
+
+    /// Whether a `$TMUX` value (`socket_path,server_pid,session_index`) points
+    /// at the server reached with `-L socket_name` (`None` = the default socket).
+    pub fn tmux_env_matches_socket(tmux_env: &str, socket_name: Option<&str>) -> bool {
+        let socket_path = tmux_env.split(',').next().unwrap_or_default();
+        let basename = Path::new(socket_path).file_name().and_then(|f| f.to_str()).unwrap_or_default();
+        !basename.is_empty() && basename == socket_name.unwrap_or("default")
     }
 }
 
@@ -368,6 +399,16 @@ mod tests {
 
         assert!(parse_pane_line("@2\tx\t%2").is_err());
         assert!(parse_pane_line("@2\tx\t%2\tnope\t0\t\tsh").is_err());
+    }
+
+    #[test]
+    fn tmux_env_socket_matching() {
+        assert!(Tmux::tmux_env_matches_socket("/tmp/tmux-501/default,123,0", None));
+        assert!(!Tmux::tmux_env_matches_socket("/tmp/tmux-501/default,123,0", Some("powerqueue")));
+        assert!(Tmux::tmux_env_matches_socket("/private/tmp/tmux-501/powerqueue,123,2", Some("powerqueue")));
+        assert!(!Tmux::tmux_env_matches_socket("/tmp/tmux-501/powerqueue,123,2", None));
+        assert!(!Tmux::tmux_env_matches_socket("", None));
+        assert!(!Tmux::tmux_env_matches_socket("garbage", Some("x")));
     }
 
     #[test]

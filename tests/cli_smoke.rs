@@ -50,6 +50,61 @@ fn status_before_init_is_friendly() {
 }
 
 #[test]
+fn dashboard_before_init_is_friendly() {
+    let home = tempfile::tempdir().unwrap();
+    pq(home.path()).arg("dashboard").assert().code(1).stderr(predicate::str::contains("powerqueue init"));
+}
+
+#[test]
+fn dashboard_without_a_tty_exits_2() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    write_minimal_config(home.path(), repo.path());
+    // assert_cmd pipes stdin/stdout, so the TTY precondition fails before any
+    // escape sequence is written.
+    pq(home.path())
+        .env("TERM", "xterm-256color")
+        .arg("dashboard")
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("the dashboard needs an interactive terminal (stdin/stdout are not a TTY)"))
+        .stderr(predicate::str::contains("powerqueue status"));
+}
+
+#[test]
+fn dashboard_once_prints_a_frame() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    write_minimal_config(home.path(), repo.path());
+    pq(home.path()).args(["add", "Snapshot me", "--key", "MAN-9"]).assert().success();
+
+    pq(home.path())
+        .env("LANG", "en_US.UTF-8")
+        .args(["dashboard", "--once"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("powerqueue"))
+        .stdout(predicate::str::contains("daemon not running"))
+        .stdout(predicate::str::contains("MAN-9"))
+        .stdout(predicate::str::contains("Snapshot me"))
+        .stdout(predicate::str::contains("┌"));
+
+    // A non-UTF-8 locale switches to ASCII symbols and borders.
+    let out = pq(home.path()).env("LC_ALL", "C").args(["dashboard", "--once"]).assert().success().get_output().stdout.clone();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.is_ascii(), "{text}");
+    assert!(text.contains("+-") && text.contains("* daemon not running"), "{text}");
+
+    pq(home.path())
+        .args(["--json", "dashboard", "--once", "--ascii"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"daemon_alive\": false"))
+        .stdout(predicate::str::contains("\"key\": \"MAN-9\""));
+}
+
+#[test]
 fn add_then_status_and_show() {
     let home = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();

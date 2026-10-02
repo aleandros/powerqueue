@@ -171,7 +171,7 @@ WantedBy=default.target
 Then watch and interact:
 
 ```sh
-powerqueue dashboard                # live TUI (aliases: ui, top)
+powerqueue dashboard                # live TUI (aliases: ui, top); --once prints one frame
 powerqueue status                   # one-shot table
 powerqueue attach ENG-123           # jump into the task's tmux window
 powerqueue add "Fix flaky test" -c high   # manual task, no Linear needed
@@ -196,7 +196,7 @@ Global flags work on every command.
 | `init [--repo PATH] [--team KEY]... [--linear-key K] [--jev-key K] [--no-linear] [--non-interactive] [--force]` | guided first-time setup; writes `config.toml` and `PRIORITY.md`, stores keys; `--no-linear` sets `linear.enabled = false` (manual tasks only) |
 | `run [--once] [--offline]` | run the scheduler in the foreground; `--once` does one pass; `--offline` skips Linear |
 | `stop` | ask the running daemon to exit (sessions keep running in tmux) |
-| `dashboard` (`ui`, `top`) | live TUI |
+| `dashboard [--once] [--ascii]` (`ui`, `top`) | live TUI; needs an interactive terminal (exit 2 otherwise). `--once` prints one frame as text and exits (works in pipes; with `--json` prints the snapshot); `--ascii` uses `*`/`>`/`#` and `+-\|` borders (automatic when the locale is not UTF-8) |
 | `status [-a]` (`ls`) | one-shot table; `-a` includes completed/failed/cancelled |
 | `doctor [--fix] [--offline]` | diagnostics and tuning advice; `--fix` applies safe repairs |
 | `logs [-f] [-n N] [-t TASK] [-l LEVEL] [--events]` | read the daemon log (default 200 lines); `--events` shows the DB timeline instead; `-f` follows either |
@@ -567,6 +567,7 @@ isolated instances run.
 - `powerqueue logs -f` tails `logs/powerqueue.log.<date>` (JSON lines by default); `--task ENG-123` filters; `--events` replays the DB timeline.
 - `powerqueue task show ENG-123` prints the task's timeline, sessions and usage.
 - `powerqueue task output ENG-123` shows the last screen of the pane; `attach` opens it.
+- `powerqueue dashboard --once` prints the dashboard frame as plain text (`--json` for the raw snapshot); paste it when the live dashboard looks wrong.
 - `powerqueue doctor --json` is what to paste into bug reports.
 
 Symptoms and fixes: [docs/troubleshooting.md](docs/troubleshooting.md).

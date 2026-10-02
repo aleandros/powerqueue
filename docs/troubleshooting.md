@@ -252,6 +252,44 @@ subscription window is full. Check `/usage` inside Claude Code, run
 `POWERQUEUE_HOME=/x` moves everything to `/x/{config,data,state}`.
 `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_STATE_HOME` are honoured.
 
+## The dashboard shows garbage, squares, or does not take input
+
+**Symptom**: `powerqueue dashboard` paints boxes/squares or stray characters,
+the keys do nothing, or the shell prompt is still visible underneath.
+
+Checks:
+
+```sh
+powerqueue doctor                      # "terminal" check: TERM and locale
+echo "$TERM"; locale charmap           # want a real TERM and UTF-8
+tty; echo "$TMUX"                      # must be a terminal; inside tmux?
+powerqueue dashboard --once            # one frame as text, no TTY needed
+```
+
+- The live dashboard needs stdin **and** stdout to be a terminal and a usable
+  `TERM`. Started from a pipe, a `cron`/launchd job, an editor's embedded
+  console or an agent's shell tool, it now exits 2 with
+  `the dashboard needs an interactive terminal …` instead of writing escape
+  sequences into the pipe. Use `powerqueue status`, or `dashboard --once`
+  (`--json` for the raw snapshot).
+- Without `config.toml` it fails with the same "run `powerqueue init`" error
+  as `status`; check `POWERQUEUE_HOME`/`--home` if the setup seems lost.
+- Squares (tofu) where the status dot `●`, the row marker `▶`, the cursor
+  `█` or the box-drawing borders should be: the terminal font has no glyph
+  for them, or the locale is not UTF-8 (`LANG=C`). Fix the font (Ghostty
+  falls back to a Nerd Font symbols set automatically; other terminals need
+  a font with box-drawing glyphs), set `LANG=en_US.UTF-8`, or run
+  `powerqueue dashboard --ascii`, which uses `*`, `>`, `#` and `+-|`
+  borders. A non-UTF-8 locale selects `--ascii` automatically.
+- Rectangles in the budget panel: the gauges are drawn with background
+  colours; on a light theme they looked like black bars (fixed in
+  `[Unreleased]`). `--ascii` draws `[####....]` text bars instead.
+- Inside tmux, `a`/`enter` switches the tmux client to the task's window and
+  the dashboard keeps running in its own window; outside tmux it replaces the
+  dashboard with `tmux attach`.
+- Still wrong? Attach `powerqueue dashboard --once`, `echo $TERM`,
+  `locale`, the terminal name/version and `tmux -V` to the bug report.
+
 ## Reporting a bug
 
 Attach these, with secrets removed (they are never printed, but check):

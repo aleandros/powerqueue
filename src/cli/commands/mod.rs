@@ -5,6 +5,7 @@ pub mod add;
 pub mod attach;
 pub mod budget;
 pub mod config;
+pub mod dashboard;
 pub mod doctor;
 pub mod hook;
 pub mod init;
@@ -38,10 +39,11 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
         }
         Command::Hook(args) => hook::run(&mut ctx, args),
         Command::Init(args) => init::run(&mut ctx, args),
-        Command::Dashboard => {
-            ctx.init_logging(false)?;
-            crate::dashboard::run(&ctx.config_cloned()?, &ctx.paths.clone(), &ctx.store()?.clone())?;
-            Ok(0)
+        Command::Dashboard(args) => {
+            // The live TUI owns the screen, so logs go to the file only;
+            // `--once` behaves like any other one-shot command.
+            ctx.init_logging(args.once)?;
+            dashboard::run(&mut ctx, args)
         }
         other => {
             ctx.init_logging(true)?;
@@ -59,7 +61,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 Command::Logs(args) => logs::run(&mut ctx, args),
                 Command::Config(cmd) => config::run(&mut ctx, cmd),
                 Command::Secrets(cmd) => secrets::run(&mut ctx, cmd),
-                Command::Completions { .. } | Command::Hook(_) | Command::Init(_) | Command::Dashboard => unreachable!(),
+                Command::Completions { .. } | Command::Hook(_) | Command::Init(_) | Command::Dashboard(_) => unreachable!(),
             }
         }
     }

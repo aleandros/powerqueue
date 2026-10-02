@@ -227,6 +227,52 @@ fn check_tmux(cfg: &Config) -> CheckResult {
     }
 }
 
+/// Terminal facts for the dashboard: `TERM` and the locale charset. Pure so
+/// it can be tested; `interactive` is whether stdout is a terminal (when it is
+/// not, e.g. in CI, the check is skipped rather than nagging).
+pub fn terminal_status(interactive: bool, term: Option<&str>, locale: Option<&str>) -> CheckResult {
+    if !interactive {
+        return CheckResult::skipped(
+            ENV,
+            "terminal",
+            "stdout is not a terminal; the dashboard needs one (`dashboard --once` works anywhere)",
+        );
+    }
+    if let Err(e) = crate::dashboard::precheck(true, true, term) {
+        return CheckResult::warn(
+            ENV,
+            "terminal",
+            e.to_string(),
+            "export TERM (e.g. TERM=xterm-256color) before running `powerqueue dashboard`",
+        );
+    }
+    let utf8 = crate::dashboard::locale_is_utf8(locale, None, None);
+    let term = term.unwrap_or_default().trim().to_string();
+    if !utf8 {
+        return CheckResult::warn(
+            ENV,
+            "terminal",
+            format!(
+                "TERM={term}, locale `{}` is not UTF-8: the dashboard falls back to ASCII symbols",
+                locale.unwrap_or_default()
+            ),
+            "set LANG=en_US.UTF-8 (or LC_ALL) so box-drawing glyphs render; `dashboard --ascii` forces the fallback",
+        );
+    }
+    CheckResult::ok(ENV, "terminal", format!("TERM={term}, UTF-8 locale"))
+}
+
+fn check_terminal() -> CheckResult {
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let term = std::env::var("TERM").ok();
+    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty());
+    terminal_status(interactive, term.as_deref(), locale.as_deref())
+}
+
 fn check_claude(cfg: &Config) -> Vec<CheckResult> {
     let binary = &cfg.claude.binary;
     let found = which::which(binary).ok();
@@ -868,6 +914,7 @@ pub async fn run_all(
     results.push(check_git());
     results.push(check_tmux(cfg));
     results.extend(check_claude(cfg));
+    results.push(check_terminal());
 
     results.push(check_config(cfg, paths));
     results.push(check_repo(cfg));
@@ -900,6 +947,22 @@ pub fn exit_code(results: &[CheckResult]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_check_levels() {
+        assert_eq!(terminal_status(false, None, None).status, Status::Skipped);
+        let r = terminal_status(true, None, Some("en_US.UTF-8"));
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("TERM is not set"), "{}", r.detail);
+        let r = terminal_status(true, Some("dumb"), Some("en_US.UTF-8"));
+        assert_eq!(r.status, Status::Warn);
+        let r = terminal_status(true, Some("xterm-ghostty"), Some("C"));
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("ASCII"), "{}", r.detail);
+        let r = terminal_status(true, Some("xterm-ghostty"), Some("en_US.UTF-8"));
+        assert_eq!(r.status, Status::Ok);
+        assert_eq!(terminal_status(true, Some("xterm-ghostty"), None).status, Status::Ok, "unset locale assumed UTF-8");
+    }
 
     #[test]
     fn rate_thresholds() {

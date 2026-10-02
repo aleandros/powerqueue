@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `dashboard --once` renders one frame as plain text and exits (works without
+  a TTY; `--json` prints the snapshot), and `dashboard --ascii` draws with
+  `*`/`>`/`#` and `+-|` borders (automatic when the locale is not UTF-8).
+- `doctor` warns when `TERM` is unset/`dumb` or the locale is not UTF-8.
+
+### Changed
+
+- `dashboard` refuses to start without `config.toml` (same "run `powerqueue
+  init`" message as `status`), or when stdin/stdout are not a terminal or
+  `TERM` is unset/`dumb` (exit 2 with a plain error) instead of writing escape
+  sequences into a pipe; terminal initialisation errors are reported with
+  context.
+- Attaching from the dashboard inside the powerqueue tmux server uses
+  `switch-client` and keeps the dashboard running; nested attaches from
+  another tmux server clear `$TMUX` so tmux accepts them.
+- Budget gauges no longer hard-code a black background.
+
 ## [0.1.0] - 2026-10-01
 
 ### Added

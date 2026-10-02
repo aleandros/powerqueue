@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use serde::Serialize;
 
 use crate::budget::{Ledger, PeriodClock};
 use crate::cli::output::{human_bytes, human_duration, human_f64};
@@ -12,8 +13,9 @@ use crate::config::Config;
 use crate::domain::{Criticality, Event, ModelTier, ResourceSample, Session, Task, TaskId, TaskState};
 use crate::store::Store;
 
-/// Everything the UI needs for one frame.
-#[derive(Debug, Clone, Default)]
+/// Everything the UI needs for one frame. Serialises to JSON for
+/// `dashboard --once --json`.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Snapshot {
     pub taken_at: Option<DateTime<Utc>>,
     pub daemon_alive: bool,
@@ -176,6 +178,8 @@ pub struct DashboardApp {
     /// Text of the add-task modal while it is open.
     pub add_input: Option<String>,
     pub now: Option<DateTime<Utc>>,
+    /// Draw with ASCII symbols and borders (see [`crate::dashboard::Options`]).
+    pub ascii: bool,
 }
 
 impl DashboardApp {
@@ -414,6 +418,16 @@ mod tests {
         app.set_snapshot(Snapshot::default());
         assert_eq!(app.selected, 0);
         assert!(app.selected_task().is_none());
+    }
+
+    #[test]
+    fn snapshot_serialises_to_json() {
+        let s = snapshot();
+        let json = serde_json::to_value(&s).expect("snapshot is JSON-serialisable");
+        assert_eq!(json["max_concurrent"], 2);
+        assert_eq!(json["tasks"].as_array().map(|t| t.len()), Some(4));
+        let tokens = json["weighted_tokens"].as_object().expect("map with string keys");
+        assert_eq!(tokens.len(), 1);
     }
 
     #[test]

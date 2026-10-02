@@ -63,9 +63,9 @@ pub enum Command {
     Run(RunArgs),
     /// Ask the running daemon to stop (sessions keep running in tmux).
     Stop,
-    /// Live dashboard.
+    /// Live dashboard (needs an interactive terminal; `--once` works anywhere).
     #[command(alias = "ui", alias = "top")]
-    Dashboard,
+    Dashboard(DashboardArgs),
     /// One-shot status table.
     #[command(alias = "ls")]
     Status(StatusArgs),
@@ -100,6 +100,16 @@ pub enum Command {
     Hook(HookArgs),
     /// Generate shell completions.
     Completions { shell: clap_complete::Shell },
+}
+
+#[derive(Debug, Args, Default)]
+pub struct DashboardArgs {
+    /// Render one frame as plain text and exit (no TTY needed; with `--json` prints the snapshot).
+    #[arg(long)]
+    pub once: bool,
+    /// Use ASCII symbols and borders (automatic when the locale is not UTF-8).
+    #[arg(long)]
+    pub ascii: bool,
 }
 
 #[derive(Debug, Args, Default)]

@@ -1,9 +1,14 @@
 //! Rendering helpers (pure functions of `DashboardApp`).
+//!
+//! Every non-ASCII glyph goes through [`Symbols`] so `--ascii` (or a non-UTF-8
+//! locale) can swap in `*`, `>`, `#` and `+-|` borders for terminals or fonts
+//! that show boxes instead.
 
 use chrono::Utc;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap};
 
@@ -12,8 +17,109 @@ use crate::domain::{Criticality, ModelTier, TaskState};
 
 use super::app::DashboardApp;
 
-/// Footer key legend.
+/// Footer key legend (Unicode variant; see [`Symbols::keys`]).
 pub const KEYS: &str = "↑↓ select  a attach  p pause  r resume  c cancel  R retry  n new task  t terminal  ? help  q quit";
+/// Footer key legend in plain ASCII.
+pub const KEYS_ASCII: &str =
+    "up/down select  a attach  p pause  r resume  c cancel  R retry  n new task  t terminal  ? help  q quit";
+
+/// `+-|` borders for terminals without box-drawing glyphs.
+pub const ASCII_BORDER: border::Set = border::Set {
+    top_left: "+",
+    top_right: "+",
+    bottom_left: "+",
+    bottom_right: "+",
+    vertical_left: "|",
+    vertical_right: "|",
+    horizontal_top: "-",
+    horizontal_bottom: "-",
+};
+
+/// The glyphs the dashboard draws with, in Unicode or ASCII flavour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Symbols {
+    pub ascii: bool,
+    /// Daemon status dot.
+    pub bullet: &'static str,
+    /// Selected-row marker (two columns).
+    pub pointer: &'static str,
+    /// Text cursor in the add-task modal.
+    pub cursor: &'static str,
+    /// Em dash in messages.
+    pub dash: &'static str,
+    /// Footer legend.
+    pub keys: &'static str,
+    /// Up/down arrows in the help overlay.
+    pub arrows: &'static str,
+    /// Suffix of truncated titles.
+    pub ellipsis: &'static str,
+    pub border: border::Set<'static>,
+}
+
+impl Symbols {
+    /// Unicode glyphs, or ASCII look-alikes when `ascii`.
+    pub const fn for_mode(ascii: bool) -> Self {
+        if ascii {
+            Self {
+                ascii: true,
+                bullet: "*",
+                pointer: "> ",
+                cursor: "#",
+                dash: "-",
+                keys: KEYS_ASCII,
+                arrows: "up/dn",
+                ellipsis: "...",
+                border: ASCII_BORDER,
+            }
+        } else {
+            Self {
+                ascii: false,
+                bullet: "●",
+                pointer: "▶ ",
+                cursor: "█",
+                dash: "—",
+                keys: KEYS,
+                arrows: "↑/↓  ",
+                ellipsis: "…",
+                border: border::PLAIN,
+            }
+        }
+    }
+
+    /// A bordered panel with this symbol set.
+    pub fn panel(&self, title: String) -> Block<'static> {
+        Block::default().borders(Borders::ALL).border_set(self.border).title(title)
+    }
+
+    /// Truncate `s` to `max` columns, ending with this set's ellipsis.
+    pub fn truncate(&self, s: &str, max: usize) -> String {
+        use unicode_width::UnicodeWidthStr;
+        if s.width() <= max {
+            return s.to_string();
+        }
+        let keep = max.saturating_sub(self.ellipsis.width());
+        let mut out = String::new();
+        let mut width = 0;
+        for ch in s.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if width + w > keep {
+                break;
+            }
+            width += w;
+            out.push(ch);
+        }
+        out.push_str(self.ellipsis);
+        out
+    }
+}
+
+/// Textual progress bar (`[####......]`) used instead of a colour gauge in
+/// ASCII mode; `width` is the total width including the brackets.
+pub fn text_bar(ratio: f64, width: usize) -> String {
+    let inner = width.saturating_sub(2);
+    let filled = ((ratio.clamp(0.0, 1.0) * inner as f64).round() as usize).min(inner);
+    format!("[{}{}]", "#".repeat(filled), ".".repeat(inner - filled))
+}
 
 /// Colour of a task state; mirrors `cli::output::state_colored`.
 pub fn state_style(state: TaskState) -> Style {
@@ -65,6 +171,7 @@ pub fn pacing_color(spent: f64, elapsed: f64) -> Color {
 
 /// Draw one frame.
 pub fn draw(frame: &mut Frame, app: &DashboardApp) {
+    let sym = Symbols::for_mode(app.ascii);
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -75,29 +182,30 @@ pub fn draw(frame: &mut Frame, app: &DashboardApp) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
         .split(chunks[1]);
-    draw_table(frame, app, main[0]);
+    draw_table(frame, app, main[0], &sym);
     let tiers = app.snapshot.ledger.as_ref().map(|l| l.tiers.len()).unwrap_or(ModelTier::ALL.len()) as u16;
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(tiers + 2), Constraint::Min(5)])
         .split(main[1]);
-    draw_budget(frame, app, right[0]);
-    draw_detail(frame, app, right[1]);
-    draw_footer(frame, app, chunks[2]);
+    draw_budget(frame, app, right[0], &sym);
+    draw_detail(frame, app, right[1], &sym);
+    draw_footer(frame, app, chunks[2], &sym);
     if let Some(input) = &app.add_input {
-        draw_add_modal(frame, input, area);
+        draw_add_modal(frame, input, area, &sym);
     }
     if app.show_help {
-        draw_help(frame, area);
+        draw_help(frame, area, &sym);
     }
 }
 
 fn draw_header(frame: &mut Frame, app: &DashboardApp, area: Rect) {
+    let sym = Symbols::for_mode(app.ascii);
     let s = &app.snapshot;
     let daemon = if s.daemon_alive {
-        Span::styled(format!("● daemon pid {}", s.daemon_pid.unwrap_or(0)), Style::default().fg(Color::Green))
+        Span::styled(format!("{} daemon pid {}", sym.bullet, s.daemon_pid.unwrap_or(0)), Style::default().fg(Color::Green))
     } else {
-        Span::styled("● daemon not running", Style::default().fg(Color::Red))
+        Span::styled(format!("{} daemon not running", sym.bullet), Style::default().fg(Color::Red))
     };
     let mut spans = vec![
         Span::styled(" powerqueue ", Style::default().add_modifier(Modifier::BOLD)),
@@ -137,7 +245,7 @@ fn draw_header(frame: &mut Frame, app: &DashboardApp, area: Rect) {
     frame.render_widget(Paragraph::new(right), area);
 }
 
-fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect) {
+fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) {
     let rows = app.rows();
     let title_width = area.width.saturating_sub(2 + 12 + 11 + 9 + 7 + 7 + 5 + 9 + 7 + 8).max(10);
     let header =
@@ -153,7 +261,7 @@ fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect) {
             Cell::from(r.cpu.clone()),
             Cell::from(r.rss.clone()),
             Cell::from(r.age.clone()),
-            Cell::from(crate::cli::output::truncate(&r.title, title_width as usize)),
+            Cell::from(sym.truncate(&r.title, title_width as usize)),
         ])
     });
     let count = rows.len();
@@ -173,14 +281,14 @@ fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect) {
         ],
     )
     .header(header)
-    .block(Block::default().borders(Borders::ALL).title(title))
+    .block(sym.panel(title))
     .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-    .highlight_symbol("▶ ");
+    .highlight_symbol(sym.pointer);
     let mut state = TableState::default().with_selected(if count == 0 { None } else { Some(app.selected.min(count - 1)) });
     frame.render_stateful_widget(table, area, &mut state);
     if count == 0 {
         let msg = Paragraph::new(Line::from(Span::styled(
-            "no tasks — press n to add one, or let the daemon sync Linear",
+            format!("no tasks {} press n to add one, or let the daemon sync Linear", sym.dash),
             Style::default().fg(Color::DarkGray),
         )))
         .wrap(Wrap { trim: true });
@@ -189,8 +297,8 @@ fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect) {
     }
 }
 
-fn draw_budget(frame: &mut Frame, app: &DashboardApp, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" budget ");
+fn draw_budget(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) {
+    let block = sym.panel(" budget ".into());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let Some(ledger) = &app.snapshot.ledger else {
@@ -212,18 +320,24 @@ fn draw_budget(frame: &mut Frame, app: &DashboardApp, area: Rect) {
         let spent_of_total = if ledger.period_budget > 0.0 { tier.period_weighted / ledger.period_budget } else { 0.0 };
         let spent = tier.period_spent_fraction();
         let label = format!("{:<6} {:>3.0}% / {:>3.0}%", tier.tier.alias(), spent_of_total * 100.0, share * 100.0);
-        let gauge = Gauge::default()
-            .gauge_style(Style::default().fg(pacing_color(spent, elapsed)).bg(Color::Black))
-            .ratio(spent.clamp(0.0, 1.0))
-            .label(label);
-        if let Some(r) = rows.get(i) {
+        let Some(r) = rows.get(i) else { continue };
+        let colour = pacing_color(spent, elapsed);
+        if sym.ascii {
+            // A textual bar survives plain-text dumps and fonts without block glyphs.
+            let bar = text_bar(spent, (r.width as usize).saturating_sub(label.len() + 1).clamp(4, 30));
+            let line = Line::from(vec![Span::raw(format!("{label} ")), Span::styled(bar, Style::default().fg(colour))]);
+            frame.render_widget(Paragraph::new(line), *r);
+        } else {
+            // No hard-coded background: the unfilled part keeps the terminal's
+            // own colours so it does not show up as black blocks on light themes.
+            let gauge = Gauge::default().gauge_style(Style::default().fg(colour)).ratio(spent.clamp(0.0, 1.0)).label(label);
             frame.render_widget(gauge, *r);
         }
     }
 }
 
-fn draw_detail(frame: &mut Frame, app: &DashboardApp, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" selected task ");
+fn draw_detail(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) {
+    let block = sym.panel(" selected task ".into());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let Some(task) = app.selected_task() else {
@@ -283,13 +397,14 @@ fn draw_detail(frame: &mut Frame, app: &DashboardApp, area: Rect) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn draw_footer(frame: &mut Frame, app: &DashboardApp, area: Rect) {
+fn draw_footer(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) {
+    let keys = sym.keys;
     let line = match &app.status_line {
         Some(s) => Line::from(vec![
             Span::styled(format!(" {s}"), Style::default().fg(Color::Yellow)),
-            Span::styled(format!("   {KEYS}"), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("   {keys}"), Style::default().fg(Color::DarkGray)),
         ]),
-        None => Line::from(Span::styled(format!(" {KEYS}"), Style::default().fg(Color::DarkGray))),
+        None => Line::from(Span::styled(format!(" {keys}"), Style::default().fg(Color::DarkGray))),
     };
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -300,35 +415,37 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h }
 }
 
-fn draw_add_modal(frame: &mut Frame, input: &str, area: Rect) {
+fn draw_add_modal(frame: &mut Frame, input: &str, area: Rect, sym: &Symbols) {
     let rect = centered(area, 60, 5);
     frame.render_widget(Clear, rect);
-    let block = Block::default().borders(Borders::ALL).title(" new task — title (enter to add, esc to cancel) ");
+    let block = sym.panel(format!(" new task {} title (enter to add, esc to cancel) ", sym.dash));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
-    let text =
-        Paragraph::new(Line::from(vec![Span::raw(format!("> {input}")), Span::styled("█", Style::default().fg(Color::Yellow))]));
+    let text = Paragraph::new(Line::from(vec![
+        Span::raw(format!("> {input}")),
+        Span::styled(sym.cursor, Style::default().fg(Color::Yellow)),
+    ]));
     frame.render_widget(text, inner);
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
+fn draw_help(frame: &mut Frame, area: Rect, sym: &Symbols) {
     let lines = [
-        "↑/k ↓/j   move selection      g/G  first/last",
-        "a/enter   attach to the task's tmux window",
-        "p / r     pause / resume      c    cancel",
-        "R         retry (re-queue)    n    new manual task",
-        "t         show/hide finished  u    refresh now",
-        "?         this help           q    quit",
-        "",
-        "control commands go through the daemon; when it is not running",
-        "they are applied directly where the state machine allows it.",
+        format!("{} k/j  move selection      g/G  first/last", sym.arrows),
+        "a/enter    attach to the task's tmux window".to_string(),
+        "p / r      pause / resume      c    cancel".to_string(),
+        "R          retry (re-queue)    n    new manual task".to_string(),
+        "t          show/hide finished  u    refresh now".to_string(),
+        "?          this help           q    quit".to_string(),
+        String::new(),
+        "control commands go through the daemon; when it is not running".to_string(),
+        "they are applied directly where the state machine allows it.".to_string(),
     ];
     let rect = centered(area, 66, lines.len() as u16 + 2);
     frame.render_widget(Clear, rect);
-    let block = Block::default().borders(Borders::ALL).title(" keys ");
+    let block = sym.panel(" keys ".into());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
-    frame.render_widget(Paragraph::new(lines.iter().map(|l| Line::from(*l)).collect::<Vec<_>>()), inner);
+    frame.render_widget(Paragraph::new(lines.iter().map(|l| Line::from(l.as_str())).collect::<Vec<_>>()), inner);
 }
 
 #[cfg(test)]
@@ -360,6 +477,48 @@ mod tests {
         // Tiny terminal must not panic.
         let mut tiny = Terminal::new(TestBackend::new(20, 6)).unwrap();
         tiny.draw(|f| draw(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn ascii_mode_emits_only_ascii() {
+        let mut t = Task::new("ENG-2", "Ascii fallback — check", TaskSource::Manual);
+        t.state = TaskState::Running;
+        let snapshot = Snapshot { tasks: vec![t], max_concurrent: 2, ..Default::default() };
+        let mut app = DashboardApp::new(snapshot);
+        app.ascii = true;
+        app.add_input = Some("x".into());
+        app.show_help = true;
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        let ours: String = text.chars().filter(|c| !c.is_ascii()).collect();
+        // The only non-ASCII characters on screen come from user data (the title).
+        assert_eq!(ours, "—", "{text}");
+        assert!(text.contains("+-"), "ascii border: {text}");
+        assert!(text.contains("* daemon not running"), "{text}");
+        assert!(text.contains("> ENG-2"), "ascii pointer: {text}");
+        assert!(text.contains("up/down select"), "{text}");
+        app.show_help = false;
+        app.add_input = None;
+        app.ascii = false;
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("● daemon not running") && text.contains("▶ ENG-2"), "{text}");
+    }
+
+    #[test]
+    fn symbols_and_text_bar() {
+        assert_eq!(Symbols::for_mode(true).pointer, "> ");
+        assert_eq!(Symbols::for_mode(false).pointer, "▶ ");
+        assert!(Symbols::for_mode(true).keys.is_ascii());
+        assert_eq!(text_bar(0.0, 12), "[..........]");
+        assert_eq!(text_bar(0.5, 12), "[#####.....]");
+        assert_eq!(text_bar(1.5, 12), "[##########]");
+        assert_eq!(text_bar(0.5, 1), "[]");
+        let ascii = Symbols::for_mode(true);
+        assert_eq!(ascii.truncate("short", 10), "short");
+        assert_eq!(ascii.truncate("a long title here", 10), "a long ...");
+        assert_eq!(Symbols::for_mode(false).truncate("a long title here", 10), "a long ti…");
     }
 
     #[test]
