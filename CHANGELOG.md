@@ -13,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dry-run the rules against every open task, rank them the way the scheduler
   does, and show what the budget policy would run for each, without writing
   anything. `--file` tries a draft before it replaces the live file.
+- `powerqueue update [--check] [--version TAG] [-y] [--force]` self-updates
+  from GitHub releases: downloads the platform tarball and its `.sha256`,
+  verifies the checksum, stages the new binary next to the current one, runs
+  it with `--version`, then renames it over the old file atomically (a
+  running daemon keeps the old version until `stop` / `run`). `--check` exits
+  10 when a newer release exists; `--json` prints `current`, `latest`,
+  `updated` and `path`. `GITHUB_TOKEN`, `POWERQUEUE_UPDATE_API` and
+  `POWERQUEUE_UPDATE_TARGET` are honoured.
 
 ### Fixed
 

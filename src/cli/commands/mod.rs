@@ -16,6 +16,7 @@ pub mod run;
 pub mod secrets;
 pub mod status;
 pub mod task;
+pub mod update;
 
 use anyhow::Result;
 use clap::CommandFactory;
@@ -58,6 +59,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 Command::Budget(cmd) => budget::run(&mut ctx, cmd),
                 Command::Linear(cmd) => linear::run(&mut ctx, cmd),
                 Command::Doctor(args) => doctor::run(&mut ctx, args),
+                Command::Update(args) => update::run(&mut ctx, args),
                 Command::Logs(args) => logs::run(&mut ctx, args),
                 Command::Config(cmd) => config::run(&mut ctx, cmd),
                 Command::Secrets(cmd) => secrets::run(&mut ctx, cmd),
