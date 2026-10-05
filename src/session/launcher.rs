@@ -549,6 +549,10 @@ impl Launcher {
             argv.extend(["--append-system-prompt".to_string(), text.to_string()]);
         }
         argv.extend(c.extra_args.iter().cloned());
+        // `--allowedTools` (and `--add-dir`, `--betas`… from `extra_args`) are
+        // variadic: without the separator the prompt is read as one more tool
+        // rule and the session starts empty, waiting for input.
+        argv.push("--".to_string());
         argv.push(prompt_arg(prompt_path));
         argv
     }
@@ -733,6 +737,7 @@ mod tests {
             "Be terse.",
             "--add-dir",
             "/shared",
+            "--",
             "$(cat /s/prompt.md)",
         ];
         assert_eq!(argv, expected);
@@ -749,10 +754,13 @@ mod tests {
         );
         assert_eq!(argv[1], "--resume");
         assert_eq!(argv[2], sid.to_string());
-        assert_eq!(argv.len(), 14, "{argv:?}");
+        assert_eq!(argv.len(), 15, "{argv:?}");
         assert!(!argv.iter().any(|a| a == "--effort" || a == "--fallback-model" || a == "--append-system-prompt"));
         let allowed = argv.iter().position(|a| a == "--allowedTools").expect("completion commands are always allowed");
         assert_eq!(argv[allowed + 1], "Bash(powerqueue task *)");
+        // The variadic `--allowedTools` must not swallow the prompt.
+        assert_eq!(argv[allowed + 2], "--", "{argv:?}");
+        assert_eq!(argv.last().unwrap(), "$(cat /s/prompt.md)");
     }
 
     #[test]

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-05
+
+### Fixed
+
+- Claude Code sessions started empty: the prompt followed `--allowedTools`,
+  which is variadic, so Claude Code read it as more tool rules ("Ignoring
+  --allowedTools rule …") and waited for input. The prompt now comes after
+  `--`.
+- The pane probe, `set-hook` and `new-window` named the tmux session with a
+  bare `=name`, a *window* target that tmux resolves against the current
+  session's windows first. With the daemon started inside tmux (or that
+  session simply the most recently used one), `automatic-rename` calls the
+  window running `powerqueue run`/`tune` exactly `powerqueue`, so the daemon
+  listed the operator's panes, reported every live session as "tmux pane
+  disappeared" and installed its `remain-on-exit` hook on the operator's
+  session. Session targets are now `=name:`.
+- A crashed session that never wrote a transcript (it died before its first
+  prompt) is no longer resumed: `--resume` failed with "No conversation found"
+  on every remaining attempt. The retry starts a fresh session and logs
+  `session.fresh`.
+
 ## [0.4.0] - 2026-10-02
 
 ### Added

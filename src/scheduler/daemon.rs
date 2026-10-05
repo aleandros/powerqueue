@@ -1506,7 +1506,19 @@ impl Daemon {
             // Last chance to learn the id of a crashed session before resuming it.
             previous = Some(if p.state == SessionState::Crashed { self.discover_agent_session(p)? } else { p });
         }
-        let (session_id, resume, resume_id) = resume_plan(previous.as_ref(), &model);
+        let transcript_present =
+            previous.as_ref().and_then(|p| p.transcript_path.as_deref()).is_none_or(|p| Path::new(p).exists());
+        if let Some(p) = previous.as_ref().filter(|p| p.state == SessionState::Crashed && !transcript_present) {
+            self.log(
+                Some(task.id),
+                Some(p.id),
+                EventLevel::Info,
+                "session.fresh",
+                "crashed session left no transcript to resume; starting a new one",
+                serde_json::json!({ "previous": p.id, "transcript_path": p.transcript_path }),
+            );
+        }
+        let (session_id, resume, resume_id) = resume_plan(previous.as_ref(), &model, transcript_present);
         let prepared = self.rt.launcher.prepare_with_resume_id(
             &self.cfg,
             &task,
@@ -1629,9 +1641,13 @@ impl Daemon {
 /// A crashed previous session is resumed when it ran on the same provider
 /// and, for CLIs that generate their own ids, its id was discovered;
 /// otherwise the attempt starts fresh with a new session id.
-fn resume_plan(previous: Option<&Session>, model: &ModelTier) -> (uuid::Uuid, bool, Option<String>) {
+/// `transcript_present` says whether the crashed session left the transcript
+/// its provider resumes from. A session that died before its first prompt
+/// has nothing to resume: `--resume` would fail on every remaining attempt
+/// ("No conversation found with session ID"), so it starts over instead.
+fn resume_plan(previous: Option<&Session>, model: &ModelTier, transcript_present: bool) -> (uuid::Uuid, bool, Option<String>) {
     match previous {
-        Some(p) if p.state == SessionState::Crashed && p.model.provider() == model.provider() => {
+        Some(p) if p.state == SessionState::Crashed && p.model.provider() == model.provider() && transcript_present => {
             if agent_for(model.provider()).accepts_session_id() {
                 (p.id, true, None)
             } else if let Some(id) = &p.agent_session_id {
@@ -1736,19 +1752,22 @@ mod tests {
             agent_session_id: agent.map(str::to_string),
         };
         let claude = crashed(ModelTier::opus(), None);
-        assert_eq!(resume_plan(Some(&claude), &ModelTier::sonnet()), (claude.id, true, None));
+        assert_eq!(resume_plan(Some(&claude), &ModelTier::sonnet(), true), (claude.id, true, None));
+        let (id, resume, _) = resume_plan(Some(&claude), &ModelTier::sonnet(), false);
+        assert!(!resume && id != claude.id, "no transcript to resume from: start fresh");
         let codex = ModelTier::new("gpt-6-astra");
-        let (id, resume, _) = resume_plan(Some(&claude), &codex);
+        let (id, resume, _) = resume_plan(Some(&claude), &codex, true);
         assert!(!resume && id != claude.id, "never resume across providers");
         let found = crashed(codex.clone(), Some("thread-1"));
-        assert_eq!(resume_plan(Some(&found), &codex), (found.id, true, Some("thread-1".into())));
+        assert_eq!(resume_plan(Some(&found), &codex, true), (found.id, true, Some("thread-1".into())));
+        assert!(!resume_plan(Some(&found), &codex, false).1);
         let unknown = crashed(codex.clone(), None);
-        let (id, resume, _) = resume_plan(Some(&unknown), &codex);
+        let (id, resume, _) = resume_plan(Some(&unknown), &codex, true);
         assert!(!resume && id != unknown.id, "no discovered id: start fresh");
         let mut exited = found.clone();
         exited.state = SessionState::Exited;
-        assert!(!resume_plan(Some(&exited), &codex).1);
-        assert!(!resume_plan(None, &codex).1);
+        assert!(!resume_plan(Some(&exited), &codex, true).1);
+        assert!(!resume_plan(None, &codex, true).1);
     }
 
     #[test]
