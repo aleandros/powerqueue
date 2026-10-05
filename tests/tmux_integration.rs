@@ -200,3 +200,33 @@ fn missing_binary_is_an_error() {
     let err = t.version().unwrap_err().to_string();
     assert!(err.contains("is tmux installed"), "{err}");
 }
+
+/// A window named like the powerqueue session in *another* session (tmux's
+/// automatic-rename gives the window running `powerqueue run` that very
+/// name) must not hijack the lookups: `list-panes`, `set-hook` and
+/// `new-window` take window/pane targets, which tmux resolves against the
+/// current session's windows before trying session names.
+#[test]
+fn a_window_named_like_the_session_elsewhere_does_not_hijack_lookups() {
+    let Some(srv) = Server::start() else { return };
+    let t = &srv.tmux;
+    t.ensure_session("pq", &cwd()).unwrap();
+    let w = t.new_window("pq", "eng-1", &cwd(), "sleep 30", true).unwrap();
+    // The operator's own session, most recently active, with a window named "pq".
+    t.ensure_session("other", &cwd()).unwrap();
+    let decoy = t.new_window("other", "pq", &cwd(), "sleep 30", false).unwrap();
+
+    let panes = t.list_panes("pq").unwrap();
+    assert!(panes.iter().any(|p| p.pane_id == w.pane_id), "own pane missing: {panes:?}");
+    assert!(panes.iter().all(|p| p.pane_id != decoy.pane_id), "decoy session listed: {panes:?}");
+    assert!(t.find_pane("pq", &w.pane_id).unwrap().is_some());
+
+    // A second window in "pq" lands in "pq" and keeps its pane after exit…
+    let w2 = t.new_window("pq", "eng-2", &cwd(), "exit 0", true).unwrap();
+    let pane = wait_for_pane(t, "pq", &w2.pane_id, |p| p.dead).expect("pane kept by remain-on-exit");
+    assert!(pane.dead, "{pane:?}");
+    // …while the other session never received the remain-on-exit hook.
+    let hooks = std::process::Command::new("tmux").args(["-L", &srv.socket, "show-hooks", "-t", "=other:"]).output().unwrap();
+    let hooks = String::from_utf8_lossy(&hooks.stdout);
+    assert!(!hooks.contains("remain-on-exit"), "hook leaked into the other session: {hooks}");
+}

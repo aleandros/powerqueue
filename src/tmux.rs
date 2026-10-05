@@ -46,6 +46,22 @@ const PANES_FORMAT: &str =
 /// command exits. Session-scoped, so it never touches the user's own sessions.
 const REMAIN_ON_EXIT_HOOK: &str = "after-new-window";
 
+/// `session` as a target that tmux can only read as a *session*, whatever
+/// kind of target the command takes.
+///
+/// `list-panes`, `set-hook` and `new-window` take a window (or pane) target,
+/// and tmux resolves a bare name against the windows of the *current*
+/// session first — the one the daemon was started in, or the most recently
+/// used one — before trying it as a session name. The window the operator
+/// runs `powerqueue run` or `tune` in is called exactly `powerqueue` by
+/// `automatic-rename`, so a bare `=powerqueue` landed on that window: the
+/// daemon listed the operator's panes, reported every live session as "tmux
+/// pane disappeared" and installed its hook on the operator's session. The
+/// trailing colon forces the session part; `=` forces an exact match.
+fn session_target(session: &str) -> String {
+    format!("={session}:")
+}
+
 /// Wrapper around the `tmux` binary.
 #[derive(Debug, Clone)]
 pub struct Tmux {
@@ -151,10 +167,10 @@ impl Tmux {
         shell_command: &str,
         remain_on_exit: bool,
     ) -> Result<WindowInfo> {
+        let target = session_target(session);
         if remain_on_exit {
-            self.run(&["set-hook", "-t", session, REMAIN_ON_EXIT_HOOK, "set-option -w remain-on-exit on"])?;
+            self.run(&["set-hook", "-t", &target, REMAIN_ON_EXIT_HOOK, "set-option -w remain-on-exit on"])?;
         }
-        let target = format!("{session}:");
         let cwd_s = cwd.to_string_lossy();
         let line = self.run(&[
             "new-window",
@@ -203,7 +219,7 @@ impl Tmux {
         if !self.has_session(session)? {
             return Ok(Vec::new());
         }
-        let target = format!("={session}");
+        let target = session_target(session);
         let text = self.run(&["list-panes", "-s", "-t", &target, "-F", PANES_FORMAT])?;
         text.lines().filter(|l| !l.trim().is_empty()).map(parse_pane_line).collect()
     }
@@ -371,6 +387,12 @@ pub fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_target_can_only_name_a_session() {
+        assert_eq!(session_target("powerqueue"), "=powerqueue:");
+        assert_eq!(session_target("pq"), "=pq:");
+    }
 
     #[test]
     fn parses_window_info() {
