@@ -168,15 +168,18 @@ fn send_text_reaches_the_pane() {
     let Some(srv) = Server::start() else { return };
     let t = &srv.tmux;
     t.ensure_session("pq", &cwd()).unwrap();
-    let w = t.new_window("pq", "cat", &cwd(), "cat", true).unwrap();
-    let _ = wait_for_pane(t, "pq", &w.pane_id, |p| p.current_command == "cat");
+    // Observe cat's exit directly rather than the platform's sh wrapper.
+    let w = t.new_window("pq", "cat", &cwd(), "exec cat", true).unwrap();
+    let pane = wait_for_pane(t, "pq", &w.pane_id, |p| p.current_command == "cat").unwrap();
+    assert_eq!(pane.current_command, "cat", "{pane:?}");
     t.send_text(&w.pane_id, "-n hello -- world").unwrap();
     let text = wait_for_output(t, &w.pane_id, "hello -- world");
     assert!(text.contains("-n hello -- world"), "{text:?}");
     t.send_key(&w.pane_id, "C-d").unwrap();
-    let pane = wait_for_pane(t, "pq", &w.pane_id, |p| p.dead).unwrap();
-    assert!(pane.dead);
-    assert_eq!(pane.dead_status, Some(0));
+    // The PTY can close before tmux has reaped the process and its exit status.
+    let pane = wait_for_pane(t, "pq", &w.pane_id, |p| p.dead && p.dead_status.is_some()).unwrap();
+    assert!(pane.dead, "{pane:?}");
+    assert_eq!(pane.dead_status, Some(0), "{pane:?}");
 }
 
 #[test]
