@@ -136,16 +136,101 @@ fable   8% of 25% share, 12 tasks ok</code></pre></div>
 <section id="flow" class="flow">
   <div class="section-inner">
     <h2><span class="prompt">›</span> how it works</h2>
-    <div class="flow-diagram">
-<pre>  <span class="hl">Linear</span> ──poll──▶ <span class="hl">queue</span> ──<span class="hp">PRIORITY.md</span>──▶ score ──<span class="ha">budget policy</span>──▶ pick model
-                                                                        │
-  tmux window ◀── claude --session-id … ◀── launch.sh ◀── git worktree ◀┘
-       │
-       ├─ hooks ──▶ <span class="hl">powerqueue hook</span> ──▶ SQLite ──▶ daemon tick
-       ├─ transcript.jsonl ──▶ token usage (per model)      ├─ crash?  → backoff, <span class="hp">--resume</span>
-       └─ /proc ──▶ CPU, RSS                               ├─ idle?   → nudge, needs_attention
-                                                            └─ done?   → push, clean up, Linear → In Review</pre>
-    </div>
+    <p class="section-lead">A queue of work. One small VPS. A fresh session for every task.</p>
+    <figure class="flow-diagram" aria-labelledby="pipeline-caption">
+      <div class="pipeline-toolbar">
+        <span><span class="pipeline-status-dot"></span> the task lifecycle</span>
+        <button class="pipeline-toggle" type="button" aria-pressed="false" hidden>Pause animation</button>
+      </div>
+      <svg class="pipeline" viewBox="0 0 1120 460" role="img" aria-labelledby="pipeline-title pipeline-description">
+        <title id="pipeline-title">Tasks flow through a VPS running powerqueue</title>
+        <desc id="pipeline-description">Linear issues and manual tasks enter the queue. Inside your VPS, powerqueue scores tasks and checks the budget, then fills three independent session slots. Each session has its own git worktree and tmux window. Completed branches are pushed, worktrees cleaned up, and Linear issues moved to In Review. The daemon watches usage and resumes crashed sessions.</desc>
+        <defs>
+          <pattern id="pipeline-grid" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" fill="#253044"/></pattern>
+        </defs>
+        <rect width="100%" height="100%" fill="url(#pipeline-grid)" opacity="0.45"/>
+        <g class="pipeline-wires" fill="none">
+          <path class="pipeline-inlet" d="M224 218 H264 V159 H318"/>
+          <path class="pipeline-outlet" d="M810 295 H862 V218 H902"/>
+        </g>
+        <g class="pipeline-queue" transform="translate(24 112)">
+          <rect class="pipeline-panel" width="200" height="212" rx="10"/>
+          <text class="pipeline-heading" x="18" y="30">Incoming tasks</text>
+          <text class="pipeline-micro" x="18" y="51">Linear + manual</text>
+          <g class="pipeline-ticket" data-ticket="0" transform="translate(16 70)"><rect width="168" height="34" rx="5"/><circle cx="14" cy="17" r="3" fill="#c792ea"/><text x="27" y="22">ENG-412</text><text class="pipeline-ticket-priority" x="152" y="22">P0</text></g>
+          <g class="pipeline-ticket" data-ticket="1" transform="translate(16 112)"><rect width="168" height="34" rx="5"/><circle cx="14" cy="17" r="3" fill="#79c0ff"/><text x="27" y="22">ENG-398</text><text class="pipeline-ticket-priority" x="152" y="22">P2</text></g>
+          <g class="pipeline-ticket" data-ticket="2" transform="translate(16 154)"><rect width="168" height="34" rx="5"/><circle cx="14" cy="17" r="3" fill="#ffa657"/><text x="27" y="22">ENG-401</text><text class="pipeline-ticket-priority" x="152" y="22">P1</text></g>
+        </g>
+        <g class="pipeline-vps" transform="translate(294 40)">
+          <rect class="pipeline-vps-shell" width="540" height="382" rx="14"/>
+          <path class="pipeline-server-icon" d="M24 23h22v10H24z M24 38h22v10H24z M28 28h2 M28 43h2"/>
+          <text class="pipeline-heading" x="58" y="34">Your VPS</text>
+          <text class="pipeline-micro" x="58" y="54">powerqueue daemon</text>
+          <text class="pipeline-capacity" x="516" y="34" text-anchor="end">3 session slots</text>
+        </g>
+        <g class="pipeline-policy" transform="translate(318 128)">
+          <rect class="pipeline-policy-shell" width="492" height="62" rx="8"/>
+          <text class="pipeline-policy-title" x="16" y="25">PRIORITY.md → budget → model</text>
+          <text class="pipeline-micro" x="16" y="45">The right task, when capacity allows.</text>
+        </g>
+        <g class="pipeline-wires" fill="none">
+          <path data-route="0" d="M564 190 V207 H394 V224"/>
+          <path data-route="1" d="M564 190 V224"/>
+          <path data-route="2" d="M564 190 V207 H734 V224"/>
+        </g>
+          <g class="pipeline-slot pipeline-violet" data-slot="0" transform="translate(318 224)">
+            <rect class="pipeline-slot-shell" width="152" height="142" rx="8"/>
+            <rect class="pipeline-slot-fill" width="152" height="142" rx="8" opacity="0.07"/>
+            <text class="pipeline-micro" x="14" y="23">SESSION 01</text>
+            <circle class="pipeline-slot-led" cx="132" cy="19" r="3"/>
+            <text class="pipeline-slot-state" x="14" y="51">ENG-412</text>
+            <text class="pipeline-slot-model" x="14" y="74">fable</text>
+            <text class="pipeline-micro" x="14" y="99">worktree + tmux</text>
+            <rect class="pipeline-track" x="14" y="116" width="124" height="4" rx="2"/>
+            <rect class="pipeline-progress" x="14" y="116" width="36" height="4" rx="2"/>
+          </g>
+          <g class="pipeline-slot pipeline-blue" data-slot="1" transform="translate(488 224)">
+            <rect class="pipeline-slot-shell" width="152" height="142" rx="8"/>
+            <rect class="pipeline-slot-fill" width="152" height="142" rx="8" opacity="0.07"/>
+            <text class="pipeline-micro" x="14" y="23">SESSION 02</text>
+            <circle class="pipeline-slot-led" cx="132" cy="19" r="3"/>
+            <text class="pipeline-slot-state" x="14" y="51">ENG-398</text>
+            <text class="pipeline-slot-model" x="14" y="74">sonnet</text>
+            <text class="pipeline-micro" x="14" y="99">worktree + tmux</text>
+            <rect class="pipeline-track" x="14" y="116" width="124" height="4" rx="2"/>
+            <rect class="pipeline-progress" x="14" y="116" width="64" height="4" rx="2"/>
+          </g>
+          <g class="pipeline-slot pipeline-amber" data-slot="2" transform="translate(658 224)">
+            <rect class="pipeline-slot-shell" width="152" height="142" rx="8"/>
+            <rect class="pipeline-slot-fill" width="152" height="142" rx="8" opacity="0.07"/>
+            <text class="pipeline-micro" x="14" y="23">SESSION 03</text>
+            <circle class="pipeline-slot-led" cx="132" cy="19" r="3"/>
+            <text class="pipeline-slot-state" x="14" y="51">ENG-401</text>
+            <text class="pipeline-slot-model" x="14" y="74">opus</text>
+            <text class="pipeline-micro" x="14" y="99">worktree + tmux</text>
+            <rect class="pipeline-track" x="14" y="116" width="124" height="4" rx="2"/>
+            <rect class="pipeline-progress" x="14" y="116" width="92" height="4" rx="2"/>
+          </g>
+        <g class="pipeline-monitor" transform="translate(318 395)">
+          <circle cx="4" cy="-4" r="3" fill="#7ee787"/>
+          <text class="pipeline-micro" x="16" y="0">watch usage · resume crashes · free slots</text>
+        </g>
+        <g class="pipeline-review" transform="translate(902 160)">
+          <rect class="pipeline-panel" width="194" height="116" rx="10"/>
+          <circle cx="26" cy="29" r="10" class="pipeline-review-icon"/>
+          <path d="m21 29 4 4 7-8" fill="none" stroke="#7ee787" stroke-width="1.5"/>
+          <text class="pipeline-heading" x="46" y="34">In review</text>
+          <text class="pipeline-review-state" x="18" y="66">Ready for you</text>
+          <text class="pipeline-micro" x="18" y="91">push · clean up · sync</text>
+        </g>
+        <g aria-hidden="true">
+          <rect class="pipeline-packet pipeline-violet" data-packet="0" x="-5" y="-5" width="10" height="10" rx="3" opacity="0"/>
+          <rect class="pipeline-packet pipeline-blue" data-packet="1" x="-5" y="-5" width="10" height="10" rx="3" opacity="0"/>
+          <rect class="pipeline-packet pipeline-amber" data-packet="2" x="-5" y="-5" width="10" height="10" rx="3" opacity="0"/>
+        </g>
+      </svg>
+      <figcaption id="pipeline-caption"><span class="pipeline-caption-key">Queue → run → review</span> Slots fill as work arrives, then open up for the next task. Illustrative timing.</figcaption>
+    </figure>
     <div class="flow-steps">
       <div class="flow-step"><strong>1. sync</strong>Queued issues from your team become tasks. Manual tasks come from <code>powerqueue add</code>.</div>
       <div class="flow-step"><strong>2. score</strong>Rules in a Markdown file set criticality and score. Edit it; the daemon reloads live. Optional Jev scoring.</div>
@@ -359,5 +444,6 @@ relax_after_fraction = 0.3</code></pre></div>
 </footer>
 
 <script src="script.js"></script>
+<script src="flow.js"></script>
 </body>
 </html>
