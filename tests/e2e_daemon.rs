@@ -35,6 +35,9 @@ low_model = "gpt-6-luna"
 enabled = false
 [budget.providers.codex]
 enabled = true
+# Exercise the provider independently of weekly criticality relaxation.
+[budget.providers.codex.models.gpt-6-astra]
+min_criticality = "normal"
 [codex]
 binary = "{fake}"
 [codex.env]
@@ -66,6 +69,9 @@ low_model = "gemini-3-flash"
 enabled = false
 [budget.providers.gemini]
 enabled = true
+# Exercise the provider independently of weekly criticality relaxation.
+[budget.providers.gemini.models.gemini-3-pro]
+min_criticality = "normal"
 [gemini]
 binary = "{fake}"
 [gemini.env]

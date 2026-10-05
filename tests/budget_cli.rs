@@ -275,9 +275,11 @@ fn budget_set_reset_and_observed_and_clear_limits() {
 #[test]
 fn budget_provider_flags_and_legacy_config_keep_working() {
     let home = Home::new();
+    // Keep the CLI's real clock comfortably inside the configured week on any date.
+    let anchor = (Utc::now() - chrono::Duration::days(3)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     // A pre-multi-provider config.toml: flat [budget] keys and [budget.models.*].
     let legacy = format!(
-        "[repo]\npath = \"{}\"\n[budget]\nperiod_anchor = \"2026-09-28T00:00:00Z\"\nperiod_weighted_tokens = 1000000\n\n[budget.models.fable]\nshare = 0.1\n",
+        "[repo]\npath = \"{}\"\n[budget]\nperiod_anchor = \"{anchor}\"\nperiod_weighted_tokens = 1000000\n\n[budget.models.fable]\nshare = 0.1\n",
         home.path().join("repo").display()
     );
     std::fs::write(home.paths().config_file(), &legacy).unwrap();
@@ -287,7 +289,7 @@ fn budget_provider_flags_and_legacy_config_keep_working() {
     let ledger = &v["providers"]["claude"];
     assert_eq!(ledger["provider"], "claude");
     assert_eq!(ledger["period_budget"].as_f64(), Some(1_000_000.0));
-    assert_eq!(ledger["period"]["start"], "2026-09-28T00:00:00Z");
+    assert_eq!(ledger["period"]["start"], anchor);
     let fable = ledger["tiers"].as_array().unwrap().iter().find(|t| t["tier"] == "fable").expect("fable tier");
     assert_eq!(fable["period_budget"].as_f64(), Some(100_000.0), "legacy [budget.models.fable] share applies");
 
@@ -317,7 +319,7 @@ fn budget_provider_flags_and_legacy_config_keep_working() {
         .stdout(predicate::str::contains("codex period anchor set"));
     let cfg = Config::load(&home.paths()).unwrap();
     assert_eq!(cfg.budget.providers.codex.period_anchor.as_deref(), Some("2026-10-06T07:00:00Z"));
-    assert_eq!(cfg.budget.providers.claude.period_anchor.as_deref(), Some("2026-09-28T00:00:00Z"));
+    assert_eq!(cfg.budget.providers.claude.period_anchor.as_deref(), Some(anchor.as_str()));
     home.cmd()
         .args(["budget", "set-observed", "20%", "--provider", "codex"])
         .assert()
