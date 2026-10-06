@@ -1,8 +1,8 @@
 //! GitHub pull requests through the `gh` CLI (the PR watcher's eyes).
 //!
 //! One `gh api graphql` call per poll returns everything the watcher decides
-//! on: state, mergeability, labels, required checks of the head commit and
-//! review threads. Parsing is a pure function ([`parse_pr_status`]) so the
+//! on: state, mergeability, labels, merge queue membership and removals,
+//! required checks of the head commit and review threads. Parsing is a pure function ([`parse_pr_status`]) so the
 //! decision table is tested without `gh`.
 
 use std::fmt;
@@ -76,6 +76,24 @@ pub struct PrThread {
     pub last_comment_at: Option<DateTime<Utc>>,
 }
 
+/// The PR left the merge queue (a `RemovedFromMergeQueueEvent`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueRemoval {
+    pub at: DateTime<Utc>,
+    /// GitHub's reason: `merged`, `manual` (a person dequeued it), or why
+    /// the queue dropped it (failed checks, a conflict, ...).
+    pub reason: String,
+}
+
+impl QueueRemoval {
+    /// True when the queue itself dropped the PR, as opposed to merging it
+    /// or a person taking it out.
+    pub fn dropped(&self) -> bool {
+        let reason = self.reason.trim();
+        !(reason.eq_ignore_ascii_case("merged") || reason.eq_ignore_ascii_case("manual"))
+    }
+}
+
 /// What GitHub says about a pull request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrStatus {
@@ -87,6 +105,12 @@ pub struct PrStatus {
     /// `CLEAN`, `BLOCKED`, `BEHIND`, `DIRTY`, `UNSTABLE`, `HAS_HOOKS`, `UNKNOWN`, ...
     pub merge_state_status: String,
     pub auto_merge: bool,
+    /// The PR is in the repository's merge queue.
+    #[serde(default)]
+    pub in_merge_queue: bool,
+    /// The newest merge queue removals, oldest first.
+    #[serde(default)]
+    pub queue_removals: Vec<QueueRemoval>,
     pub labels: Vec<String>,
     pub head_oid: Option<String>,
     pub checks: Vec<PrCheck>,
@@ -107,6 +131,17 @@ impl PrStatus {
         self.threads.iter().filter(|t| !t.resolved && t.last_comment_at.is_some_and(|at| at > since)).count()
     }
 
+    /// Why the merge queue dropped this PR after `since`, when it is still
+    /// open and neither queued nor armed again: the reason of the newest
+    /// removal, if that removal was not a merge or a person's.
+    pub fn dropped_from_queue(&self, since: DateTime<Utc>) -> Option<&str> {
+        if self.state != "OPEN" || self.in_merge_queue || self.auto_merge {
+            return None;
+        }
+        let last = self.queue_removals.iter().max_by_key(|r| r.at)?;
+        (last.at > since && last.dropped()).then_some(last.reason.as_str())
+    }
+
     /// True if the PR carries `label` (case-insensitive).
     pub fn has_label(&self, label: &str) -> bool {
         let label = label.trim();
@@ -118,8 +153,11 @@ impl PrStatus {
 pub const PR_STATUS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      number state mergeable mergeStateStatus headRefOid
+      number state mergeable mergeStateStatus headRefOid isInMergeQueue
       autoMergeRequest { enabledAt }
+      timelineItems(last: 5, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
+        nodes { ... on RemovedFromMergeQueueEvent { createdAt reason } }
+      }
       labels(first: 50) { nodes { name } }
       reviewThreads(first: 100) { nodes { isResolved comments(last: 1) { nodes { createdAt } } } }
       commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
@@ -158,6 +196,13 @@ pub fn parse_pr_status(text: &str) -> Result<PrStatus> {
                 .max(),
         })
         .collect();
+    let queue_removals = nodes(&pr["timelineItems"])
+        .iter()
+        .filter_map(|e| {
+            let at = DateTime::parse_from_rfc3339(e["createdAt"].as_str()?).ok()?.with_timezone(&Utc);
+            Some(QueueRemoval { at, reason: s(&e["reason"]) })
+        })
+        .collect();
     let mut checks = Vec::new();
     for commit in nodes(&pr["commits"]) {
         for ctx in nodes(&commit["commit"]["statusCheckRollup"]["contexts"]) {
@@ -176,6 +221,8 @@ pub fn parse_pr_status(text: &str) -> Result<PrStatus> {
         mergeable: s(&pr["mergeable"]),
         merge_state_status: s(&pr["mergeStateStatus"]),
         auto_merge: !pr["autoMergeRequest"].is_null(),
+        in_merge_queue: pr["isInMergeQueue"].as_bool().unwrap_or(false),
+        queue_removals,
         labels,
         head_oid: pr["headRefOid"].as_str().map(str::to_string),
         checks,
@@ -241,7 +288,11 @@ mod tests {
     fn sample(state: &str, mergeable: &str) -> serde_json::Value {
         serde_json::json!({ "data": { "repository": { "pullRequest": {
             "number": 7, "state": state, "mergeable": mergeable, "mergeStateStatus": "BLOCKED", "headRefOid": "abc",
-            "autoMergeRequest": { "enabledAt": "2026-10-06T10:00:00Z" },
+            "autoMergeRequest": { "enabledAt": "2026-10-06T10:00:00Z" }, "isInMergeQueue": false,
+            "timelineItems": { "nodes": [
+                { "createdAt": "2026-10-06T09:00:00Z", "reason": "manual" },
+                { "createdAt": "2026-10-06T11:00:00Z", "reason": "failed checks" }
+            ] },
             "labels": { "nodes": [{ "name": "merge/hold" }] },
             "reviewThreads": { "nodes": [
                 { "isResolved": false, "comments": { "nodes": [{ "createdAt": "2026-10-06T12:00:00Z" }] } },
@@ -275,9 +326,28 @@ mod tests {
         assert_eq!((st.number, st.state.as_str(), st.mergeable.as_str()), (7, "OPEN", "MERGEABLE"));
         assert!(st.auto_merge);
         assert!(st.has_label("MERGE/HOLD") && !st.has_label(""));
+        assert_eq!(st.queue_removals.len(), 2);
+        assert!(!st.in_merge_queue);
         assert_eq!(st.failed_required_checks(), vec!["ci/legacy".to_string(), "test".to_string()]);
         let since = DateTime::parse_from_rfc3339("2026-10-06T10:00:00Z").unwrap().with_timezone(&Utc);
         assert_eq!(st.new_unresolved_threads(since), 1, "resolved and older threads do not count");
+    }
+
+    #[test]
+    fn a_queue_drop_counts_only_after_since_and_while_unqueued() {
+        let at = |h: u32| DateTime::parse_from_rfc3339(&format!("2026-10-06T{h:02}:00:00Z")).unwrap().with_timezone(&Utc);
+        let mut st = parse_pr_status(&sample("OPEN", "MERGEABLE").to_string()).unwrap();
+        assert_eq!(st.dropped_from_queue(at(10)), None, "auto-merge still armed");
+        st.auto_merge = false;
+        assert_eq!(st.dropped_from_queue(at(10)), Some("failed checks"));
+        assert_eq!(st.dropped_from_queue(at(12)), None, "removal before the hand-off");
+        st.in_merge_queue = true;
+        assert_eq!(st.dropped_from_queue(at(10)), None, "queued again");
+        st.in_merge_queue = false;
+        st.queue_removals.push(QueueRemoval { at: at(12), reason: "manual".into() });
+        assert_eq!(st.dropped_from_queue(at(10)), None, "a person took it out last");
+        st.queue_removals.push(QueueRemoval { at: at(13), reason: "MERGED".into() });
+        assert_eq!(st.dropped_from_queue(at(10)), None);
     }
 
     #[test]

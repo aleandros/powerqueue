@@ -387,14 +387,17 @@ threads) and acts on the first rule that matches:
 | merged | `completed`; local branch deleted. Linear is not touched (GitHub's integration moves the issue) |
 | closed without merging | `needs_attention` |
 | `CONFLICTING` | relaunch with reason `conflict` |
-| a required check failed | relaunch with reason `ci_failed <check names>` |
+| a required check failed | relaunch with reason `ci_failed <check names>` (comma-separated) |
+| dropped by the merge queue after the hand-off (a removal other than `merged` or `manual`) and neither queued nor armed again | relaunch with reason `ci_failed merge queue: <GitHub's reason>` |
 | unresolved review threads with a comment newer than the hand-off | relaunch with reason `review` |
-| `BLOCKED` and labelled `scheduler.merge_hold_label` (`merge/hold`) | wait for a human to merge; status and dashboard say "waiting for manual merge" |
+| labelled `scheduler.merge_hold_label` (`merge/hold`) | wait for a human to merge; status and dashboard say "waiting for manual merge" |
 | unchanged for `scheduler.review_stale_hours` (24) | Linear comment + `needs_attention` |
 
 A relaunch re-queues the task. When a slot and budget allow, the daemon
 recreates the worktree at the **same path** from the kept branch (`git
-worktree add <path> pq/<slug>`), runs `repo.setup` and resumes the **same**
+worktree add <path> pq/<slug>`), fast-forwarded to `origin/pq/<slug>` after
+the fetch so commits pushed to the PR since the hand-off are in it (a branch
+with local commits the remote lacks is left as is), runs `repo.setup` and resumes the **same**
 session (`claude --resume <session id>`) with `scheduler.review_prompt` as the
 prompt — by default `/ship-pr <n> --reason <reason> <detail>`. The issue stays
 in Linear's review state; only a comment says why the session was resumed.
@@ -656,7 +659,7 @@ without it the session has no way to tell powerqueue it is done.
 | `pr_poll_secs` | `120` | how often the PR of each `in_review` task is checked with `gh`; `0` turns the watcher off |
 | `review_rounds_max` | `5` | relaunches of one task for its PR (conflict, failed check, review) before `needs_attention`; separate from `max_attempts` |
 | `review_stale_hours` | `24` | a PR unchanged this long gets a Linear comment and the task goes to `needs_attention`; `0` disables |
-| `merge_hold_label` | `"merge/hold"` | PR label meaning "a human merges this": while the PR is `BLOCKED` with it, the watcher waits and never reports it stale |
+| `merge_hold_label` | `"merge/hold"` | PR label meaning "a human merges this": while the PR carries it, the watcher waits and never reports it stale |
 | `review_prompt` | `"/ship-pr {pr} --reason {reason} {detail}"` | prompt of a resumed review session; placeholders `{pr}`, `{url}`, `{reason}` (`conflict`, `ci_failed`, `review`), `{detail}` |
 | `gh_binary` | `"gh"` | GitHub CLI the watcher runs |
 

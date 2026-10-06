@@ -317,3 +317,29 @@ fn fast_forward_skips_a_rebase_in_progress() {
     assert!(matches!(repo.fast_forward_branch("main").unwrap(), FastForward::Skipped(why) if why.contains("rebase")));
     assert_eq!(rev(&repo.path, "main"), before);
 }
+
+#[test]
+fn review_round_branch_catches_up_with_commits_pushed_to_the_pr() {
+    use powerqueue::worktree::FastForward;
+    let Some((dir, repo)) = fixture() else { return };
+    let other = with_remote(&dir, &repo);
+    // The task's branch was pushed and its worktree removed at the hand-off.
+    let wt = dir.path().join("wt").join("review");
+    repo.add_worktree(&wt, "pq/review", "main").unwrap();
+    commit_file(&wt, "own.txt", "own work");
+    git(&wt, &["push", "-q", "origin", "pq/review"]);
+    repo.remove_worktree(&wt, true).unwrap();
+    // A reviewer commits a suggestion on GitHub.
+    git(&other, &["fetch", "-q", "origin", "pq/review"]);
+    git(&other, &["checkout", "-q", "-b", "pq/review", "FETCH_HEAD"]);
+    commit_file(&other, "suggestion.txt", "reviewer's suggestion");
+    git(&other, &["push", "-q", "origin", "pq/review"]);
+    let pushed = rev(&other, "HEAD");
+
+    // The review round: fetch, fast-forward the kept branch, recreate the worktree.
+    repo.fetch().unwrap();
+    assert!(matches!(repo.fast_forward_branch("pq/review").unwrap(), FastForward::Updated { .. }));
+    repo.add_worktree(&wt, "pq/review", "main").unwrap();
+    assert_eq!(rev(&wt, "HEAD"), pushed);
+    assert!(wt.join("suggestion.txt").exists(), "the session sees the reviewer's commit");
+}

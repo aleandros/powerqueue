@@ -2464,10 +2464,12 @@ impl Daemon {
         Ok(())
     }
 
-    /// Fast-forward the local `base` to `origin/<base>` so people working in
-    /// the main checkout see merged work too. Never fails the task; a skip
-    /// is logged at debug level, a git failure as `repo.fast_forward_failed`
-    /// (counted by `doctor`).
+    /// Fast-forward the local branch `base` to `origin/<base>`: the default
+    /// branch so people working in the main checkout see merged work too, or
+    /// a reused task branch so a review round starts from commits pushed to
+    /// the PR since the hand-off. Never fails the task; a skip is logged at
+    /// debug level, a git failure as `repo.fast_forward_failed` (counted by
+    /// `doctor`).
     fn fast_forward_base(&self, task: &Task, base: &str) {
         let (level, kind, message, data) = match self.rt.repo.fast_forward_branch(base) {
             Ok(FastForward::UpToDate) => return,
@@ -2502,7 +2504,10 @@ impl Daemon {
     /// fetched `origin/<base>` and the local base, and `worktree.stale_base`
     /// is logged. Creating the branch logs [`BRANCH_CREATED_EVENT`] with the
     /// base right away, so it is known even if `repo.setup` fails. An
-    /// existing branch (relaunch, review round) is reused as is.
+    /// existing branch (relaunch, review round) is reused, fast-forwarded
+    /// to `origin/<branch>` after a successful fetch (commits pushed to the
+    /// PR on GitHub since the hand-off); a branch with local commits the
+    /// remote lacks is left as is.
     fn prepare_worktree(&self, task: &Task, root: &Path, worktree: &Path, branch: &str) -> Result<()> {
         std::fs::create_dir_all(root).with_context(|| format!("create worktree root {}", root.display()))?;
         let new_branch = !self.rt.repo.branch_exists(branch).with_context(|| format!("look up branch {branch}"))?;
@@ -2533,6 +2538,9 @@ impl Daemon {
             }
             Some(self.rt.repo.start_point(&base, prefer)?)
         } else {
+            if self.cfg.repo.fetch_before_start && fetch_error.is_none() {
+                self.fast_forward_base(task, branch);
+            }
             None
         };
         self.rt

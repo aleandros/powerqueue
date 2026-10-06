@@ -11,8 +11,9 @@
 //! | closed without merge | `needs_attention` |
 //! | `CONFLICTING` | relaunch, reason `conflict` |
 //! | a required check failed | relaunch, reason `ci_failed <names>` |
+//! | dropped by the merge queue after the arming, not queued or armed again | relaunch, reason `ci_failed merge queue: <why>` |
 //! | unresolved threads with comments newer than the arming | relaunch, reason `review` |
-//! | `BLOCKED` with the hold label | wait for a human to merge (no stale report) |
+//! | labelled with the hold label | wait for a human to merge (no stale report) |
 //! | unchanged for `review_stale_hours` | Linear comment + `needs_attention` |
 //!
 //! A relaunch moves the task back to `queued` with a pending
@@ -37,10 +38,11 @@ pub fn fingerprint(status: &PrStatus, armed_at: DateTime<Utc>) -> String {
     let failed = status.failed_required_checks();
     let finished = status.checks.iter().filter(|c| !c.conclusion.is_empty()).count();
     format!(
-        "{} {} {} head {} checks {finished}/{} failed [{}] new threads {} labels [{}]",
+        "{} {} {} queued {} head {} checks {finished}/{} failed [{}] new threads {} labels [{}]",
         status.state,
         status.mergeable,
         status.merge_state_status,
+        status.in_merge_queue,
         status.head_oid.as_deref().map(|h| &h[..h.len().min(7)]).unwrap_or("?"),
         status.checks.len(),
         failed.join(","),
@@ -57,6 +59,9 @@ fn describe(status: &PrStatus, armed_at: DateTime<Utc>) -> String {
     if status.state == "OPEN" {
         parts.push(format!("{} / {}", status.mergeable.to_lowercase(), status.merge_state_status.to_lowercase()));
         parts.push(if status.auto_merge { "auto-merge armed".to_string() } else { "auto-merge off".to_string() });
+        if status.in_merge_queue {
+            parts.push("in the merge queue".to_string());
+        }
         parts.push(format!("{} check(s), {pending} pending", status.checks.len()));
         if !failed.is_empty() {
             parts.push(format!("failed: {}", failed.join(", ")));
@@ -120,15 +125,19 @@ pub fn on_pr_status(task: &mut Task, status: &PrStatus, cfg: &SchedulerConfig, n
     } else if status.mergeable == "CONFLICTING" {
         Some(("conflict", String::new()))
     } else if !failed.is_empty() {
-        Some(("ci_failed", failed.join(" ")))
+        Some(("ci_failed", failed.join(", ")))
+    } else if let Some(why) = status.dropped_from_queue(watch.armed_at) {
+        Some(("ci_failed", format!("merge queue: {why}")))
     } else if threads > 0 {
         Some(("review", format!("{threads} unresolved thread(s)")))
     } else {
-        let hold = status.merge_state_status == "BLOCKED" && status.has_label(&cfg.merge_hold_label);
+        // The label alone: a held PR with green checks and no required
+        // approvals is `CLEAN`, not `BLOCKED`.
+        let hold = status.has_label(&cfg.merge_hold_label);
         if hold != watch.waiting_manual_merge {
             watch.waiting_manual_merge = hold;
             let message = if hold {
-                format!("PR #{} is blocked with `{}`: waiting for a manual merge", status.number, cfg.merge_hold_label)
+                format!("PR #{} is labelled `{}`: waiting for a manual merge", status.number, cfg.merge_hold_label)
             } else {
                 format!("PR #{} is no longer held for a manual merge", status.number)
             };
@@ -219,7 +228,7 @@ fn log(level: EventLevel, kind: &str, message: String) -> Effect {
 mod tests {
     use super::*;
     use crate::domain::TaskSource;
-    use crate::github::{PrCheck, PrThread};
+    use crate::github::{PrCheck, PrThread, QueueRemoval};
 
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-10-06T12:00:00Z").unwrap().with_timezone(&Utc)
@@ -232,6 +241,8 @@ mod tests {
             mergeable: mergeable.into(),
             merge_state_status: "CLEAN".into(),
             auto_merge: true,
+            in_merge_queue: false,
+            queue_removals: Vec::new(),
             labels: Vec::new(),
             head_oid: Some("0123456789".into()),
             checks: vec![PrCheck { name: "test".into(), conclusion: "SUCCESS".into(), required: true }],
@@ -300,10 +311,15 @@ mod tests {
         let mut t = task();
         st.mergeable = "MERGEABLE".into();
         st.checks.push(PrCheck { name: "lint".into(), conclusion: "FAILURE".into(), required: false });
+        st.checks.push(PrCheck { name: "checks (typecheck)".into(), conclusion: "FAILURE".into(), required: true });
         on_pr_status(&mut t, &st, &cfg, now());
         let relaunch = t.review_relaunch().unwrap().clone();
-        assert_eq!((relaunch.reason.as_str(), relaunch.detail.as_str()), ("ci_failed", "test"));
-        assert_eq!(review_prompt(&cfg.review_prompt, &relaunch, "u"), "/ship-pr 7 --reason ci_failed test");
+        assert_eq!((relaunch.reason.as_str(), relaunch.detail.as_str()), ("ci_failed", "checks (typecheck), test"));
+        assert_eq!(
+            review_prompt(&cfg.review_prompt, &relaunch, "u"),
+            "/ship-pr 7 --reason ci_failed checks (typecheck), test",
+            "names with spaces stay apart"
+        );
 
         let mut t = task();
         let armed = t.review.as_ref().unwrap().armed_at;
@@ -317,6 +333,36 @@ mod tests {
             t.review_relaunch().map(|r| (r.reason.as_str(), r.detail.as_str())),
             Some(("review", "1 unresolved thread(s)"))
         );
+    }
+
+    #[test]
+    fn a_pr_dropped_by_the_merge_queue_relaunches_once() {
+        let cfg = SchedulerConfig::default();
+        let mut t = task();
+        let armed = t.review.as_ref().unwrap().armed_at;
+        let mut st = status("OPEN", "MERGEABLE");
+        st.auto_merge = false;
+        st.queue_removals = vec![QueueRemoval { at: armed + Duration::minutes(20), reason: "failed checks".into() }];
+        on_pr_status(&mut t, &st, &cfg, now());
+        assert_eq!(t.state, TaskState::Queued);
+        assert_eq!(
+            t.review_relaunch().map(|r| (r.reason.as_str(), r.detail.as_str())),
+            Some(("ci_failed", "merge queue: failed checks"))
+        );
+
+        // A new hand-off after the removal: the old drop no longer counts.
+        let mut t = task();
+        t.review = Some(ReviewWatch::armed(armed + Duration::minutes(30), None));
+        on_pr_status(&mut t, &st, &cfg, now());
+        assert_eq!(t.state, TaskState::InReview);
+
+        // Merged out of the queue, or a person dequeued it: no relaunch.
+        for reason in ["merged", "manual"] {
+            let mut t = task();
+            st.queue_removals[0].reason = reason.into();
+            on_pr_status(&mut t, &st, &cfg, now());
+            assert_eq!(t.state, TaskState::InReview, "{reason}");
+        }
     }
 
     #[test]
@@ -347,9 +393,11 @@ mod tests {
         assert_eq!(t.state, TaskState::NeedsAttention);
         assert_eq!(kinds(&fx), vec!["review.stale", "linear_comment"]);
 
+        // Green checks and no required approvals: GitHub says `CLEAN`, and the
+        // label alone holds it.
         let mut t = task();
         let mut held = st.clone();
-        held.merge_state_status = "BLOCKED".into();
+        held.auto_merge = false;
         held.labels = vec!["Merge/Hold".into()];
         let fx = on_pr_status(&mut t, &held, &cfg, now());
         assert_eq!(kinds(&fx), vec!["review.status", "review.hold"]);
