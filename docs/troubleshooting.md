@@ -98,10 +98,10 @@ The PR watcher runs `gh` (`scheduler.gh_binary`) every
 installed and logged in (`gh auth status` as the daemon's user) and lists
 `review.error` events; `task show <task>` prints the PR's timeline and the
 current review round. The watcher only relaunches for a conflict, a failed
-**required** check (branch protection) or unresolved review threads with a
-comment newer than the hand-off; anything else waits. A PR labelled
-`scheduler.merge_hold_label` and blocked waits for a manual merge and is never
-reported stale. After `scheduler.review_rounds_max` relaunches the task is
+**required** check (branch protection), a drop from the merge queue or
+unresolved review threads with a comment newer than the hand-off; anything
+else waits. A PR labelled `scheduler.merge_hold_label` waits for a manual
+merge and is never reported stale. After `scheduler.review_rounds_max` relaunches the task is
 parked in `needs_attention`: `task retry` runs one more round, `task resume`
 watches the PR again.
 

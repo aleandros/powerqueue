@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-06
+
+### Fixed
+
+- The PR watcher holds a PR labelled `scheduler.merge_hold_label`
+  (`merge/hold`) whatever its merge state. It used to require `BLOCKED`, but
+  a held PR with green checks and no required approvals is `CLEAN`, so it
+  was reported stale after `review_stale_hours`.
+- A PR the merge queue drops after the hand-off (its `merge_group` run
+  failed, a conflict with the queue) is relaunched with reason `ci_failed
+  merge queue: <reason>`. The watcher now reads `isInMergeQueue` and the PR's
+  merge queue removals. The PR's own checks stay green in that case, so it
+  used to sit until it was reported stale. A removal for `merged`, or by a
+  person (`manual`), relaunches nothing, and neither does a PR queued or
+  armed again.
+- A review round fast-forwards the kept task branch to `origin/<branch>`
+  after the fetch, so commits pushed to the PR since the hand-off (a
+  reviewer's suggestion, "Update branch") are in the recreated worktree and
+  the session's push is not rejected. A branch with local commits the
+  remote lacks is left as is.
+- `ci_failed` details list the failed checks separated by `, `: check names
+  can contain spaces.
+
 ## [0.6.0] - 2026-10-06
 
 The database migrates to schema v5 on first start (v4 adds `blocked_by`,
@@ -455,7 +478,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/aleandros/powerqueue/releases/tag/v0.6.1
 [0.6.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.6.0
 [0.5.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.5.0
 [0.4.3]: https://github.com/aleandros/powerqueue/releases/tag/v0.4.3

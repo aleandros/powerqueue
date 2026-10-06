@@ -386,8 +386,8 @@ pub struct SchedulerConfig {
     /// A PR whose status has not changed for this long is reported in a
     /// Linear comment and the task goes to `needs_attention`; 0 disables.
     pub review_stale_hours: u64,
-    /// Label of a PR that a human merges by hand: while the PR is blocked
-    /// and carries it, the watcher waits (no stale report).
+    /// Label of a PR that a human merges by hand: while the PR carries it,
+    /// the watcher waits (no stale report).
     pub merge_hold_label: String,
     /// Prompt of a resumed review session. Placeholders: `{pr}` (number),
     /// `{url}`, `{reason}` (`conflict`, `ci_failed`, `review`), `{detail}`.
