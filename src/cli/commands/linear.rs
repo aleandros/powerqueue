@@ -114,8 +114,9 @@ fn sync(ctx: &mut Context, apply: bool) -> Result<i32> {
     let client = LinearClient::new(&cfg.linear.endpoint, key)?;
     let rt = super::runtime()?;
     let filter = IssueFilter::from_config(&cfg.linear);
-    let issues = rt.block_on(client.fetch_issues(&filter)).context("fetch issues from Linear")?;
+    let mut issues = rt.block_on(client.fetch_issues(&filter)).context("fetch issues from Linear")?;
     let store = ctx.store()?.clone();
+    rt.block_on(add_dependencies(&client, &store, &mut issues))?;
 
     // Resolve the state type of an issue that left the queue. Errors must not
     // cancel anything, so they read as "still open".
@@ -193,6 +194,40 @@ fn sync(ctx: &mut Context, apply: bool) -> Result<i32> {
     println!("{t}");
     println!("Re-run with --apply to make these changes.");
     Ok(0)
+}
+
+/// Fill in each issue's sub-issues and `blocked by` issues (as the daemon
+/// does), so a sync never wipes the stored relations. A blocker's merged PR
+/// is kept from the store (merged stays merged) or asked for; a failed
+/// lookup leaves the blocker pending.
+async fn add_dependencies(client: &LinearClient, store: &crate::store::Store, issues: &mut [LinearIssue]) -> Result<()> {
+    let ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
+    let deps = client.fetch_dependencies(&ids).await.context("fetch issue relations from Linear")?;
+    let merged: std::collections::HashSet<String> = store
+        .list_open_tasks()?
+        .iter()
+        .flat_map(|t| t.blocked_by.iter().filter(|b| b.pr_merged).map(|b| b.key.clone()))
+        .collect();
+    for issue in issues.iter_mut() {
+        let Some(d) = deps.get(&issue.id) else {
+            // Not returned (should not happen): keep what is stored.
+            if let Some(t) = store.get_task_by_linear_issue(&issue.id)? {
+                issue.blocked_by = t.blocked_by;
+                issue.children = t.children;
+            }
+            continue;
+        };
+        issue.blocked_by = d.blocked_by.clone();
+        issue.children = d.children.clone();
+        for blocker in issue.blocked_by.iter_mut().filter(|b| !b.is_closed()) {
+            blocker.pr_merged = merged.contains(&blocker.key)
+                || client.pr_merged(&blocker.key).await.unwrap_or_else(|e| {
+                    warn!(target: "powerqueue::linear", blocker = %blocker.key, error = %e, "could not check the blocker's pull request");
+                    false
+                });
+        }
+    }
+    Ok(())
 }
 
 /// Compute what [`sync_issues`] would do without touching the store.

@@ -67,9 +67,7 @@ pub fn parents_to_watch(issues: &[LinearIssue]) -> BTreeSet<String> {
 /// closed (completed or canceled) and at least one was completed. A parent
 /// whose children were all canceled is left for a human to decide.
 pub fn container_finished(children: &[LinkedIssue]) -> bool {
-    !children.is_empty()
-        && children.iter().all(LinkedIssue::is_closed)
-        && children.iter().any(|c| c.state_type.trim().eq_ignore_ascii_case("completed"))
+    !children.is_empty() && children.iter().all(LinkedIssue::is_closed) && children.iter().any(LinkedIssue::is_completed)
 }
 
 /// Comment (in Spanish, like the team's tickets) posted on a parent when it
@@ -82,7 +80,7 @@ pub fn container_comment(children: &[LinkedIssue], state: Option<&str>) -> Strin
     };
     out.push('\n');
     for c in children {
-        let outcome = if c.state_type.trim().eq_ignore_ascii_case("completed") { "completada" } else { "cancelada" };
+        let outcome = if c.is_completed() { "completada" } else { "cancelada" };
         if c.title.trim().is_empty() {
             out.push_str(&format!("- {} ({outcome})\n", c.key));
         } else {

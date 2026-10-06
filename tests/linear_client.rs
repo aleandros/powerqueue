@@ -375,3 +375,139 @@ async fn child_labels_come_back_qualified_with_their_group() {
     let body: Value = requests[0].body_json().unwrap();
     assert!(body["query"].as_str().unwrap().contains("labels { nodes { name parent { name } } }"));
 }
+
+/// Dependency queries: batches of at most 10 issues, and truncated
+/// connections are followed page by page.
+struct Dependencies {
+    batches: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+}
+
+impl Respond for Dependencies {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = request.body_json().expect("json body");
+        let query = body["query"].as_str().unwrap_or("");
+        let vars = &body["variables"];
+        let linked = |key: String, state: &str| json!({ "identifier": key, "title": "t", "state": { "type": state } });
+        let page = |more: bool, cursor: &str| json!({ "hasNextPage": more, "endCursor": cursor });
+        let data = if query.contains("in: $ids") {
+            let ids: Vec<String> = vars["ids"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+            self.batches.lock().unwrap().push(ids.len());
+            let nodes: Vec<Value> = ids
+                .iter()
+                .map(|id| {
+                    if id == "big" {
+                        json!({
+                            "id": id,
+                            "children": { "nodes": (0..50).map(|i| linked(format!("C-{i}"), "completed")).collect::<Vec<_>>(), "pageInfo": page(true, "c50") },
+                            "inverseRelations": { "nodes": [{ "type": "related", "issue": linked("R-1".into(), "started") }], "pageInfo": page(true, "r1") }
+                        })
+                    } else {
+                        json!({ "id": id, "children": { "nodes": [], "pageInfo": page(false, "") }, "inverseRelations": { "nodes": [], "pageInfo": page(false, "") } })
+                    }
+                })
+                .collect();
+            json!({ "issues": { "nodes": nodes } })
+        } else if query.contains("children(first: 50, after: $after)") {
+            assert_eq!(vars["after"], "c50");
+            json!({ "issue": { "children": { "nodes": [linked("C-50".into(), "started")], "pageInfo": page(false, "c51") } } })
+        } else if query.contains("inverseRelations(first: 50, after: $after)") {
+            assert_eq!(vars["after"], "r1");
+            json!({ "issue": { "inverseRelations": { "nodes": [{ "type": "blocks", "issue": linked("B-1".into(), "started") }], "pageInfo": page(false, "r2") } } })
+        } else if query.contains("issue(id: $id)") {
+            json!({ "issue": {
+                "id": "big", "identifier": "P-1", "state": { "type": "started" }, "team": { "key": "ENG" },
+                "children": { "nodes": (0..50).map(|i| linked(format!("C-{i}"), "completed")).collect::<Vec<_>>(), "pageInfo": page(true, "c50") }
+            } })
+        } else {
+            return ResponseTemplate::new(200)
+                .set_body_json(json!({ "errors": [{ "message": format!("unexpected query: {query}") }] }));
+        };
+        ResponseTemplate::new(200).set_body_json(json!({ "data": data }))
+    }
+}
+
+#[tokio::test]
+async fn dependencies_are_batched_and_fully_paginated() {
+    let server = server().await;
+    let batches = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    Mock::given(method("POST")).respond_with(Dependencies { batches: batches.clone() }).mount(&server).await;
+    let client = client(&server);
+
+    let mut ids: Vec<String> = (0..11).map(|i| format!("small-{i}")).collect();
+    ids.push("big".into());
+    let deps = client.fetch_dependencies(&ids).await.unwrap();
+    assert_eq!(*batches.lock().unwrap(), vec![10, 2], "at most 10 issues per query");
+    assert_eq!(deps.len(), 12);
+    let big = &deps["big"];
+    assert_eq!(big.children.len(), 51, "the second page of sub-issues is fetched");
+    assert_eq!(big.children.last().unwrap().key, "C-50");
+    let blockers: Vec<&str> = big.blocked_by.iter().map(|b| b.key.as_str()).collect();
+    assert_eq!(blockers, vec!["B-1"], "a `blocks` relation past the first page is found; `related` is not a blocker");
+    assert!(deps["small-0"].children.is_empty() && deps["small-0"].blocked_by.is_empty());
+
+    // A parent with 51 sub-issues: the one still open on page two is seen.
+    let parent = client.parent_status("P-1").await.unwrap().expect("parent");
+    assert_eq!((parent.id.as_str(), parent.identifier.as_str(), parent.team_key.as_str()), ("big", "P-1", "ENG"));
+    assert_eq!(parent.children.len(), 51);
+    assert!(!powerqueue::linear::container_finished(&parent.children), "C-50 is still open");
+}
+
+/// `powerqueue linear sync --apply` stores relations too: a task blocked by
+/// an open issue is created `queued` with its blocker recorded (the daemon
+/// moves it to `blocked`), and a second sync does not wipe the blocker.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_linear_sync_keeps_relations() {
+    let server = server().await;
+    let blocked = {
+        let mut i = issue("uuid-a", "ENG-1", &[]);
+        i["parent"] = json!({ "identifier": "ENG-9" });
+        i
+    };
+    let deps = json!({ "issues": { "nodes": [{
+        "id": "uuid-a",
+        "children": { "nodes": [], "pageInfo": { "hasNextPage": false, "endCursor": null } },
+        "inverseRelations": { "nodes": [{ "type": "blocks", "issue": { "identifier": "ENG-2", "title": "B", "state": { "type": "started" } } }],
+                              "pageInfo": { "hasNextPage": false, "endCursor": null } }
+    }] } });
+    Mock::given(method("POST"))
+        .respond_with(ByQuery(vec![
+            ("in: $ids", deps),
+            ("attachments", json!({ "issue": { "attachments": { "nodes": [] } } })),
+            ("issues(", json!({ "issues": { "nodes": [blocked], "pageInfo": { "hasNextPage": false, "endCursor": null } } })),
+        ]))
+        .mount(&server)
+        .await;
+
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("config")).unwrap();
+    std::fs::write(
+        home.path().join("config").join("config.toml"),
+        format!("[repo]\npath = \"{}\"\n[linear]\nendpoint = \"{}/graphql\"\n", repo.path().display(), server.uri()),
+    )
+    .unwrap();
+    let pq = |args: &[&str]| {
+        let out = assert_cmd::Command::cargo_bin("powerqueue")
+            .unwrap()
+            .env("POWERQUEUE_HOME", home.path())
+            .env("POWERQUEUE_SECRETS", "file")
+            .env("LINEAR_API_KEY", KEY)
+            .env_remove("NO_COLOR")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let explain =
+        |pq: &dyn Fn(&[&str]) -> String| -> Value { serde_json::from_str(&pq(&["--json", "task", "explain", "ENG-1"])).unwrap() };
+    let args = ["linear", "sync", "--apply"];
+    tokio::task::block_in_place(|| {
+        pq(&args);
+        let e = explain(&pq);
+        assert_eq!(e["waiting_on"], json!(["ENG-2"]), "{e}");
+        assert_eq!(e["parent"], "ENG-9");
+        pq(&args);
+        assert_eq!(explain(&pq)["waiting_on"], json!(["ENG-2"]), "a second sync keeps the blocker");
+    });
+}

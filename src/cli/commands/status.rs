@@ -112,13 +112,18 @@ pub fn cpu_rss(sample: Option<&ResourceSample>) -> String {
 }
 
 /// The "waiting on" column: pending blocker keys, or the open sub-issues
-/// of a container (`parent` once they are all done); `-` otherwise.
+/// of a container (`parent (done)` once they are all done, `parent (all
+/// canceled)` when none was completed); `-` otherwise.
 pub fn waiting_on(task: &Task) -> String {
     let keys = task.waiting_on();
-    match (keys.is_empty(), task.is_container()) {
-        (false, _) => keys.join(", "),
-        (true, true) => "parent (done)".to_string(),
-        (true, false) => "-".to_string(),
+    if !keys.is_empty() {
+        keys.join(", ")
+    } else if task.container_all_canceled() {
+        "parent (all canceled)".to_string()
+    } else if task.is_container() {
+        "parent (done)".to_string()
+    } else {
+        "-".to_string()
     }
 }
 
@@ -321,6 +326,10 @@ mod tests {
         assert_eq!(waiting_on(&t), "C-2");
         t.children[1].state_type = "completed".into();
         assert_eq!(waiting_on(&t), "parent (done)");
+        for c in &mut t.children {
+            c.state_type = "canceled".into();
+        }
+        assert_eq!(waiting_on(&t), "parent (all canceled)");
     }
 
     #[test]

@@ -19,7 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   daemon moves it to the new `linear.done_state_parent` (default `Done`),
   comments the list of sub-issues (in Spanish) and completes its task. The
   parent does not need to be in `queued_states`; parents are tracked in kv
-  `linear.watched_parents` and handled once.
+  `linear.watched_parents`, checked every 5 minutes and handled once.
+  Relations come from a separate query (10 issues per request, every page
+  followed) so the issue list stays within Linear's complexity limit; a PR
+  seen merged stays merged, and tasks moved out of the queued states keep
+  their relations up to date.
 - `task explain` prints a `dependencies` block (`--json`: `waiting_on`,
   `blocked_by`, `children`, `parent`); `task show` shows parent, blockers,
   sub-issues and what the task waits on; `status` and the dashboard gain a

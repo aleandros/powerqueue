@@ -472,9 +472,14 @@ pub fn dependency_lines(task: &Task) -> Vec<String> {
     let mut out = vec![String::new(), "dependencies".to_string()];
     if task.is_container() {
         let open = task.waiting_on();
-        out.push(if open.is_empty() {
+        out.push(if task.container_all_canceled() {
             format!(
-                "  parent of {} sub-issue(s), all done; the daemon closes it on its next Linear poll (linear.done_state_parent)",
+                "  parent of {} sub-issue(s), all canceled: powerqueue leaves it to you (close it in Linear, or reopen or add a sub-issue)",
+                task.children.len()
+            )
+        } else if open.is_empty() {
+            format!(
+                "  parent of {} sub-issue(s), all done; the daemon closes it on its next parent check (linear.done_state_parent)",
                 task.children.len()
             )
         } else {
@@ -822,5 +827,7 @@ mod tests {
         assert!(text.contains("parent of 2 sub-issue(s): never scheduled; waiting on C-2"), "{text}");
         t.children[1].state_type = "canceled".into();
         assert!(dependency_lines(&t).join("\n").contains("all done; the daemon closes it"));
+        t.children[0].state_type = "canceled".into();
+        assert!(dependency_lines(&t).join("\n").contains("all canceled: powerqueue leaves it to you"));
     }
 }

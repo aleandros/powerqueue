@@ -1,23 +1,11 @@
 {
   "id": "e4a3e1e2-8a11-4152-9771-94116afd7d13",
-  "identifier": "AVS-1714",
-  "title": "M3.2 — dependencias blocked-by y padre contenedor",
-  "description": "Body",
-  "url": "https://linear.app/aceros-vs/issue/AVS-1714",
-  "priority": 2,
-  "estimate": null,
-  "labels": { "nodes": [{ "name": "Feature", "parent": null }] },
-  "state": { "name": "Todo", "type": "unstarted" },
-  "team": { "key": "AVS" },
-  "project": { "name": "Cola autónoma de tickets" },
-  "assignee": { "id": "user-1" },
-  "cycle": null,
-  "parent": { "identifier": "AVS-1429" },
   "children": {
     "nodes": [
       { "identifier": "AVS-1720", "title": "Child one", "state": { "type": "completed" } },
       { "identifier": "AVS-1721", "title": "Child two", "state": { "type": "started" } }
-    ]
+    ],
+    "pageInfo": { "hasNextPage": false, "endCursor": "c2" }
   },
   "inverseRelations": {
     "nodes": [
@@ -25,8 +13,7 @@
       { "type": "related", "issue": { "identifier": "AVS-1600", "title": "Just related", "state": { "type": "unstarted" } } },
       { "type": "duplicate", "issue": { "identifier": "AVS-1601", "title": "A duplicate", "state": { "type": "canceled" } } },
       { "type": "blocks", "issue": { "identifier": "AVS-1712", "title": "Second blocker", "state": { "type": "started" } } }
-    ]
-  },
-  "createdAt": "2026-10-05T02:37:51.230Z",
-  "updatedAt": "2026-10-06T14:26:14.366Z"
+    ],
+    "pageInfo": { "hasNextPage": false, "endCursor": "r4" }
+  }
 }

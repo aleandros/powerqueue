@@ -234,22 +234,48 @@ impl IssueFilter {
 }
 
 /// Fields requested for every issue query; shared by list and single lookups.
-///
-/// `inverseRelations` holds the relations *pointing at* this issue; a
-/// `blocks` one there means "blocked by `issue`". The nested connections
-/// have explicit `first:` bounds to keep the query under Linear's
-/// complexity limit with 50 issues per page.
+/// Sub-issues and relations are *not* here: nested connections on a page of
+/// 50 issues would blow Linear's query complexity limit, so they come from
+/// [`LinearClient::fetch_dependencies`] in small batches.
 const ISSUE_FIELDS: &str = "id identifier title description url priority estimate \
      labels { nodes { name parent { name } } } state { name type } team { key } \
      project { name } assignee { id } \
      cycle { number name isActive isNext isPast isFuture } \
-     parent { identifier } \
-     children(first: 50) { nodes { identifier title state { type } } } \
-     inverseRelations(first: 25) { nodes { type issue { identifier title state { type } } } } \
-     createdAt updatedAt";
+     parent { identifier } createdAt updatedAt";
 
 /// Linear relation type meaning "`issue` blocks `relatedIssue`".
 const BLOCKS_RELATION: &str = "blocks";
+
+/// Nodes of a `children` connection.
+const CHILD_NODE: &str = "identifier title state { type }";
+/// Nodes of an `inverseRelations` connection: relations *pointing at* the
+/// issue; a `blocks` one means "blocked by `issue`".
+const RELATION_NODE: &str = "type issue { identifier title state { type } }";
+/// Page size of the nested `children` / `inverseRelations` connections.
+const DEPENDENCY_PAGE: u32 = 50;
+/// Issues per dependency query. Each issue carries two connections of up to
+/// [`DEPENDENCY_PAGE`] nodes, so this keeps a query far below Linear's
+/// complexity limit (10 000 points).
+const DEPENDENCY_BATCH: usize = 10;
+
+/// Every sub-issue and every `blocked by` issue of one issue (all pages).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IssueDependencies {
+    pub blocked_by: Vec<LinkedIssue>,
+    pub children: Vec<LinkedIssue>,
+}
+
+/// A parent issue as seen by [`LinearClient::parent_status`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentStatus {
+    pub id: String,
+    pub identifier: String,
+    /// Workflow state type of the parent itself.
+    pub state_type: String,
+    pub team_key: String,
+    /// Every sub-issue (all pages).
+    pub children: Vec<LinkedIssue>,
+}
 
 /// Page size for issue pagination.
 const PAGE_SIZE: u32 = 50;
@@ -288,10 +314,6 @@ struct RawIssue {
     cycle: Option<RawCycle>,
     #[serde(default)]
     parent: Option<RawIdentifier>,
-    #[serde(default)]
-    children: Option<Nodes<RawLinked>>,
-    #[serde(default)]
-    inverse_relations: Option<Nodes<RawRelation>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -323,6 +345,47 @@ struct RawRelation {
     kind: String,
     #[serde(default)]
     issue: Option<RawLinked>,
+}
+
+/// A connection page: nodes plus whether more pages follow.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawConnection<T> {
+    nodes: Vec<T>,
+    #[serde(default)]
+    page_info: Option<PageInfo>,
+}
+
+impl<T> RawConnection<T> {
+    /// Cursor of the next page, if there is one.
+    fn next_cursor(&self) -> Option<String> {
+        self.page_info.as_ref().filter(|p| p.has_next_page).and_then(|p| p.end_cursor.clone())
+    }
+}
+
+/// One node of a dependency query (see [`LinearClient::fetch_dependencies`]).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawDependencies {
+    id: String,
+    #[serde(default)]
+    identifier: Option<String>,
+    #[serde(default)]
+    state: Option<RawStateType>,
+    #[serde(default)]
+    team: Option<Keyed>,
+    #[serde(default)]
+    children: Option<RawConnection<RawLinked>>,
+    #[serde(default)]
+    inverse_relations: Option<RawConnection<RawRelation>>,
+}
+
+/// The `blocks` relations of a page, as blockers.
+fn blockers_of(relations: Vec<RawRelation>) -> impl Iterator<Item = LinkedIssue> {
+    relations
+        .into_iter()
+        .filter(|rel| rel.kind.eq_ignore_ascii_case(BLOCKS_RELATION))
+        .filter_map(|rel| rel.issue.map(LinkedIssue::from))
 }
 
 impl From<RawLinked> for LinkedIssue {
@@ -438,17 +501,8 @@ impl From<RawIssue> for LinearIssue {
             project: raw.project.map(|p| p.name),
             assignee_id: raw.assignee.map(|a| a.id),
             cycle: raw.cycle.map(CycleInfo::from),
-            blocked_by: raw
-                .inverse_relations
-                .map(|r| {
-                    r.nodes
-                        .into_iter()
-                        .filter(|rel| rel.kind.eq_ignore_ascii_case(BLOCKS_RELATION))
-                        .filter_map(|rel| rel.issue.map(LinkedIssue::from))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            children: raw.children.map(|c| c.nodes.into_iter().map(LinkedIssue::from).collect()).unwrap_or_default(),
+            blocked_by: Vec::new(),
+            children: Vec::new(),
             parent: raw.parent.map(|p| p.identifier),
             created_at: raw.created_at,
             updated_at: raw.updated_at,
@@ -679,20 +733,121 @@ impl LinearClient {
     /// (case-insensitive). Errors list the valid state names if none matches.
     pub async fn set_state(&self, issue_id: &str, state_name: &str) -> Result<()> {
         let issue = self.get_issue(issue_id).await?.ok_or_else(|| anyhow!("Linear issue {issue_id} not found"))?;
-        let states = self.workflow_states(&issue.team_key).await?;
+        self.set_state_in_team(&issue.id, &issue.identifier, &issue.team_key, state_name).await
+    }
+
+    /// [`Self::set_state`] for an issue whose UUID (`issue_id`) and team are
+    /// already known, saving the issue lookup. `identifier` is only used in
+    /// messages.
+    pub async fn set_state_in_team(&self, issue_id: &str, identifier: &str, team_key: &str, state_name: &str) -> Result<()> {
+        let states = self.workflow_states(team_key).await?;
         let wanted = state_name.trim();
         let state = states.iter().find(|s| s.name.trim().eq_ignore_ascii_case(wanted)).ok_or_else(|| {
             let names: Vec<&str> = states.iter().map(|s| s.name.as_str()).collect();
-            anyhow!("team {} has no workflow state named `{wanted}` (valid: {})", issue.team_key, names.join(", "))
+            anyhow!("team {team_key} has no workflow state named `{wanted}` (valid: {})", names.join(", "))
         })?;
         let mutation =
             "mutation($id: String!, $stateId: String!) { issueUpdate(id: $id, input: { stateId: $stateId }) { success } }";
-        let data = self.graphql(mutation, serde_json::json!({ "id": issue.id, "stateId": state.id })).await?;
+        let data = self.graphql(mutation, serde_json::json!({ "id": issue_id, "stateId": state.id })).await?;
         if data.pointer("/issueUpdate/success").and_then(|v| v.as_bool()) != Some(true) {
-            bail!("Linear did not confirm the state change of {} to `{}`", issue.identifier, state.name);
+            bail!("Linear did not confirm the state change of {identifier} to `{}`", state.name);
         }
-        debug!(target: "powerqueue::linear", issue = %issue.identifier, state = %state.name, "issue state updated");
+        debug!(target: "powerqueue::linear", issue = %identifier, state = %state.name, "issue state updated");
         Ok(())
+    }
+
+    /// Sub-issues and `blocked by` issues of the issues with these UUIDs,
+    /// keyed by UUID. Queries [`DEPENDENCY_BATCH`] issues at a time and
+    /// follows every truncated connection to its last page, so the lists
+    /// are complete. Issues Linear does not return are absent from the map.
+    pub async fn fetch_dependencies(&self, ids: &[String]) -> Result<std::collections::HashMap<String, IssueDependencies>> {
+        let query = format!(
+            "query($ids: [ID!], $first: Int) {{ issues(filter: {{ id: {{ in: $ids }} }}, first: $first) {{ nodes {{ id \
+               children(first: {DEPENDENCY_PAGE}) {{ nodes {{ {CHILD_NODE} }} pageInfo {{ hasNextPage endCursor }} }} \
+               inverseRelations(first: {DEPENDENCY_PAGE}) {{ nodes {{ {RELATION_NODE} }} pageInfo {{ hasNextPage endCursor }} }} \
+             }} }} }}"
+        );
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        for batch in ids.chunks(DEPENDENCY_BATCH) {
+            let data = self.graphql(&query, serde_json::json!({ "ids": batch, "first": batch.len() })).await?;
+            let nodes = data.pointer("/issues/nodes").cloned().ok_or_else(|| anyhow!("issues missing from response"))?;
+            let nodes: Vec<RawDependencies> = serde_json::from_value(nodes).context("parse issue dependencies")?;
+            for raw in nodes {
+                let id = raw.id.clone();
+                let deps = self.complete_dependencies(raw).await?;
+                out.insert(id, deps);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The parent issue `id` (UUID or identifier) with *all* its sub-issues;
+    /// `Ok(None)` if it does not exist or is not visible to the key.
+    pub async fn parent_status(&self, id: &str) -> Result<Option<ParentStatus>> {
+        let query = format!(
+            "query($id: String!) {{ issue(id: $id) {{ id identifier state {{ type }} team {{ key }} \
+               children(first: {DEPENDENCY_PAGE}) {{ nodes {{ {CHILD_NODE} }} pageInfo {{ hasNextPage endCursor }} }} }} }}"
+        );
+        let data = match self.graphql(&query, serde_json::json!({ "id": id })).await {
+            Ok(d) => d,
+            Err(e) if is_not_found(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let raw = match data.get("issue") {
+            None | Some(serde_json::Value::Null) => return Ok(None),
+            Some(raw) => serde_json::from_value::<RawDependencies>(raw.clone()).context("parse parent issue")?,
+        };
+        let (identifier, state_type, team_key) = (
+            raw.identifier.clone().unwrap_or_else(|| id.to_string()),
+            raw.state.as_ref().map(|s| s.kind.clone()).unwrap_or_default(),
+            raw.team.as_ref().map(|t| t.key.clone()).unwrap_or_default(),
+        );
+        let issue_id = raw.id.clone();
+        let deps = self.complete_dependencies(raw).await?;
+        Ok(Some(ParentStatus { id: issue_id, identifier, state_type, team_key, children: deps.children }))
+    }
+
+    /// Turn a dependency node into lists, fetching the remaining pages of
+    /// any connection Linear truncated.
+    async fn complete_dependencies(&self, raw: RawDependencies) -> Result<IssueDependencies> {
+        let mut deps = IssueDependencies::default();
+        if let Some(conn) = raw.children {
+            let mut after = conn.next_cursor();
+            deps.children.extend(conn.nodes.into_iter().map(LinkedIssue::from));
+            while let Some(cursor) = after {
+                let page: RawConnection<RawLinked> = self.dependency_page(&raw.id, "children", CHILD_NODE, &cursor).await?;
+                after = page.next_cursor();
+                deps.children.extend(page.nodes.into_iter().map(LinkedIssue::from));
+            }
+        }
+        if let Some(conn) = raw.inverse_relations {
+            let mut after = conn.next_cursor();
+            deps.blocked_by.extend(blockers_of(conn.nodes));
+            while let Some(cursor) = after {
+                let page: RawConnection<RawRelation> =
+                    self.dependency_page(&raw.id, "inverseRelations", RELATION_NODE, &cursor).await?;
+                after = page.next_cursor();
+                deps.blocked_by.extend(blockers_of(page.nodes));
+            }
+        }
+        Ok(deps)
+    }
+
+    /// The page after `cursor` of the connection `field` of issue `id`.
+    async fn dependency_page<T: serde::de::DeserializeOwned>(
+        &self,
+        id: &str,
+        field: &str,
+        node: &str,
+        cursor: &str,
+    ) -> Result<RawConnection<T>> {
+        let query = format!(
+            "query($id: String!, $after: String) {{ issue(id: $id) {{ \
+               {field}(first: {DEPENDENCY_PAGE}, after: $after) {{ nodes {{ {node} }} pageInfo {{ hasNextPage endCursor }} }} }} }}"
+        );
+        let data = self.graphql(&query, serde_json::json!({ "id": id, "after": cursor })).await?;
+        let conn = data.get("issue").and_then(|i| i.get(field)).cloned().ok_or_else(|| anyhow!("{field} of {id} missing"))?;
+        serde_json::from_value(conn).with_context(|| format!("parse {field} page of {id}"))
     }
 
     /// True if a GitHub pull request attached to the issue (`id` is a UUID
@@ -791,25 +946,36 @@ mod tests {
         }
     }
 
-    /// Recorded shape of an `issues` node with relations (see
+    /// Recorded shape of a node of the dependency query (see
     /// `tests/fixtures/linear/issue_with_relations.json`).
     const RELATIONS_FIXTURE: &str = include_str!("../../tests/fixtures/linear/issue_with_relations.json");
 
     #[test]
-    fn relations_children_and_parent_are_parsed() {
-        let raw: RawIssue = serde_json::from_str(RELATIONS_FIXTURE).unwrap();
-        let issue = LinearIssue::from(raw);
-        assert_eq!(issue.parent.as_deref(), Some("AVS-1429"));
-        let blockers: Vec<(&str, &str)> = issue.blocked_by.iter().map(|b| (b.key.as_str(), b.state_type.as_str())).collect();
-        assert_eq!(blockers, vec![("AVS-1713", "completed"), ("AVS-1712", "started")], "only `blocks` relations count");
-        assert!(issue.blocked_by.iter().all(|b| !b.pr_merged), "merge status comes from a separate lookup");
-        assert_eq!(issue.blocked_by[1].title, "Second blocker");
-        let children: Vec<&str> = issue.children.iter().map(|c| c.key.as_str()).collect();
-        assert_eq!(children, vec!["AVS-1720", "AVS-1721"]);
-        assert!(issue.children[0].is_closed() && !issue.children[1].is_closed());
-        for field in ["parent { identifier }", "children(first: 50)", "inverseRelations(first: 25)"] {
-            assert!(ISSUE_FIELDS.contains(field), "{field}");
+    fn dependency_node_parses_blockers_and_children() {
+        let raw: RawDependencies = serde_json::from_str(RELATIONS_FIXTURE).unwrap();
+        assert!(raw.children.as_ref().unwrap().next_cursor().is_none());
+        let blockers: Vec<LinkedIssue> = blockers_of(raw.inverse_relations.unwrap().nodes).collect();
+        let keys: Vec<(&str, &str)> = blockers.iter().map(|b| (b.key.as_str(), b.state_type.as_str())).collect();
+        assert_eq!(keys, vec![("AVS-1713", "completed"), ("AVS-1712", "started")], "only `blocks` relations count");
+        assert!(blockers.iter().all(|b| !b.pr_merged), "merge status comes from a separate lookup");
+        assert_eq!(blockers[1].title, "Second blocker");
+        let children: Vec<LinkedIssue> = raw.children.unwrap().nodes.into_iter().map(LinkedIssue::from).collect();
+        assert_eq!(children.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec!["AVS-1720", "AVS-1721"]);
+        assert!(children[0].is_closed() && !children[1].is_closed());
+    }
+
+    #[test]
+    fn issue_query_stays_cheap() {
+        assert!(ISSUE_FIELDS.contains("parent { identifier }"));
+        for nested in ["children", "inverseRelations", "relations"] {
+            assert!(!ISSUE_FIELDS.contains(nested), "{nested} would multiply the page's complexity");
         }
+        let raw: RawIssue = serde_json::from_value(serde_json::json!({
+            "id": "abc", "identifier": "ENG-9", "title": "T", "url": "https://x", "parent": { "identifier": "ENG-1" },
+            "createdAt": "2026-01-01T00:00:00.000Z", "updatedAt": "2026-01-02T00:00:00.000Z"
+        }))
+        .unwrap();
+        assert_eq!(LinearIssue::from(raw).parent.as_deref(), Some("ENG-1"));
     }
 
     #[test]

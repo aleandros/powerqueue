@@ -474,8 +474,18 @@ Each poll also reads the issue's Linear relations:
   itself), and once all its sub-issues are closed with at least one
   completed it moves the parent to `done_state_parent` (when
   `manage_states` is on), posts a comment listing the sub-issues (when
-  `post_comments` is on) and completes the parent's task, if it has one.
-  A parent whose sub-issues were all canceled is left alone.
+  `post_comments` is on) and completes the parent's task, if it has one
+  (cleaning up its worktree if it had run before getting sub-issues).
+  The daemon looks watched parents up every 5 minutes, so closing one can
+  lag its last sub-issue by that much. A parent whose
+  sub-issues were all canceled is left alone (`status` shows
+  `parent (all canceled)`, `doctor` warns).
+
+Relations and sub-issues are read with a separate query in batches of 10
+issues, following every page, so long lists are complete. If that query
+fails the whole poll is skipped rather than risk starting a blocked task.
+Once a blocker's PR is seen merged it stays satisfied; an unmerged one is
+asked again at most every 5 minutes.
 
 `powerqueue doctor` reports blocked tasks, `blocked by` cycles between open
 tasks (which would wait forever) and failed attempts to close a parent.

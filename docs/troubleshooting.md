@@ -82,7 +82,10 @@ Fixes:
 
 powerqueue moves a parent to `linear.done_state_parent` (default `Done`)
 only when every sub-issue is closed and at least one is completed, and only
-with `linear.manage_states = true`. A state name the parent's team does not
+with `linear.manage_states = true`. The daemon checks parents every 5
+minutes, so give it that long. A
+parent whose sub-issues were all canceled is never closed for you; `doctor`
+lists it. A state name the parent's team does not
 have shows up as `linear.parent_error` events (`powerqueue logs --events`)
 and in `doctor`; the parent stays watched and is retried on the next poll.
 A parent powerqueue already closed is never handled again, even if you

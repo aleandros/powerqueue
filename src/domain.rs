@@ -676,6 +676,14 @@ impl Task {
         self.is_container() || self.blocked_by.iter().any(|b| !b.is_satisfied())
     }
 
+    /// True for a container whose sub-issues are all closed but none was
+    /// completed (all canceled): powerqueue never closes it; a human decides.
+    pub fn container_all_canceled(&self) -> bool {
+        self.is_container()
+            && self.children.iter().all(LinkedIssue::is_closed)
+            && !self.children.iter().any(LinkedIssue::is_completed)
+    }
+
     /// Keys the task is waiting on (the "waiting on" column): pending
     /// blockers, or for a container its sub-issues that are still open.
     pub fn waiting_on(&self) -> Vec<&str> {
@@ -708,6 +716,11 @@ impl LinkedIssue {
     /// True if the issue is closed in Linear (`completed` or `canceled`).
     pub fn is_closed(&self) -> bool {
         is_closed_state_type(&self.state_type)
+    }
+
+    /// True if the issue is `completed` (not merely canceled).
+    pub fn is_completed(&self) -> bool {
+        self.state_type.trim().eq_ignore_ascii_case("completed")
     }
 
     /// True if a task blocked by this issue may run: it is closed in Linear

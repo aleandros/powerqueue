@@ -867,6 +867,15 @@ pub fn dependency_status(tasks: &[Task], parent_errors: u64, parent_closing: boo
             "check that `linear.done_state_parent` names a workflow state of the parent's team (see `powerqueue logs --events`, kind `linear.parent_error`)",
         );
     }
+    let abandoned: Vec<&str> = open.iter().filter(|t| t.container_all_canceled()).map(|t| t.key.as_str()).collect();
+    if !abandoned.is_empty() {
+        return CheckResult::warn(
+            STATE,
+            NAME,
+            format!("parent issue(s) whose sub-issues were all canceled, never closed by powerqueue: {}", abandoned.join(", ")),
+            "close (or cancel) them in Linear, or reopen or add a sub-issue",
+        );
+    }
     let blocked: Vec<String> = open
         .iter()
         .filter(|t| t.state == TaskState::Blocked)
@@ -1586,8 +1595,12 @@ mod tests {
         let mut parent = task("P", TaskState::Blocked, &[]);
         parent.children = vec![linked("C-1", "started")];
         assert_eq!(dependency_status(std::slice::from_ref(&parent), 0, false).status, Status::Warn);
-        let r = dependency_status(&[parent], 0, true);
+        let r = dependency_status(std::slice::from_ref(&parent), 0, true);
         assert!(r.detail.contains("P (parent; open: C-1)"), "{}", r.detail);
+        parent.children[0].state_type = "canceled".into();
+        let r = dependency_status(&[parent], 0, true);
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("all canceled") && r.detail.contains('P'), "{}", r.detail);
     }
 
     #[test]
