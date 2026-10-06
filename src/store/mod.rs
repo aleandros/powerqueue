@@ -670,6 +670,42 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Usage per tier per minute (bucket start, oldest first) between two
+    /// instants; the budget ledger turns this into a cumulative series so it
+    /// can sum spend between any two readings without one query per pair.
+    /// Rows with an unknown model alias are skipped like in `usage_by_tier`.
+    pub fn usage_by_minute(&self, since: DateTime<Utc>, until: DateTime<Utc>) -> Result<Vec<(DateTime<Utc>, TierUsage)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT substr(timestamp, 1, 16) AS minute, tier, SUM(input_tokens), SUM(output_tokens),
+                    SUM(cache_creation_input_tokens), SUM(cache_read_input_tokens), COUNT(*)
+             FROM usage WHERE timestamp >= ?1 AND timestamp < ?2 GROUP BY minute, tier ORDER BY minute",
+        )?;
+        let rows = stmt.query_map(params![ts(&since), ts(&until)], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                TokenUsage {
+                    input_tokens: r.get::<_, i64>(2)? as u64,
+                    output_tokens: r.get::<_, i64>(3)? as u64,
+                    cache_creation_input_tokens: r.get::<_, i64>(4)? as u64,
+                    cache_read_input_tokens: r.get::<_, i64>(5)? as u64,
+                },
+                r.get::<_, i64>(6)? as u64,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (minute, tier, usage, messages) = row?;
+            let at = parse_ts(&format!("{minute}:00Z"))?;
+            match ModelTier::from_str(&tier) {
+                Ok(tier) => out.push((at, TierUsage { tier, usage, messages })),
+                Err(e) => tracing::warn!(tier = %tier, messages, error = %e, "skipping usage rows with an unknown model alias"),
+            }
+        }
+        Ok(out)
+    }
+
     /// Usage per tier between two instants. Rows whose `tier` is not a
     /// model name any provider claims are skipped with a warning rather than
     /// being attributed to Sonnet.

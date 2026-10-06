@@ -66,6 +66,11 @@ pub enum Command {
     Run(RunArgs),
     /// Ask the running daemon to stop (sessions keep running in tmux).
     Stop,
+    /// Stop launching new sessions; running ones continue and the daemon keeps
+    /// monitoring, cleaning up and syncing. Survives a daemon restart.
+    Pause(PauseArgs),
+    /// Launch sessions again after `pause`.
+    Resume,
     /// Live dashboard (needs an interactive terminal; `--once` works anywhere).
     #[command(alias = "ui", alias = "top")]
     Dashboard(DashboardArgs),
@@ -122,6 +127,13 @@ pub struct DashboardArgs {
     /// Use ASCII symbols and borders (automatic when the locale is not UTF-8).
     #[arg(long)]
     pub ascii: bool,
+}
+
+#[derive(Debug, Args, Default)]
+pub struct PauseArgs {
+    /// Why scheduling is paused (shown by `status`, `dashboard` and `doctor`).
+    #[arg(long, value_name = "TEXT")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Args, Default)]
@@ -336,10 +348,10 @@ pub enum BudgetCommand {
         #[arg(long, value_enum, default_value_t = Provider::Claude)]
         provider: Provider,
     },
-    /// Calibrate a provider's pacing with the usage percentage it shows (e.g. `43%`).
+    /// Record the period usage percentage a provider shows (e.g. `43%` from /usage) as a reading.
     SetObserved {
         percent: String,
-        /// Which provider's budget to calibrate.
+        /// Which provider the reading is for.
         #[arg(long, value_enum, default_value_t = Provider::Claude)]
         provider: Provider,
     },

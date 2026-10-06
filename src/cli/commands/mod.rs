@@ -53,6 +53,8 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             match other {
                 Command::Run(args) => run::run(&mut ctx, args),
                 Command::Stop => run::stop(&mut ctx),
+                Command::Pause(args) => run::pause(&mut ctx, args),
+                Command::Resume => run::resume(&mut ctx),
                 Command::Status(args) => status::run(&mut ctx, args),
                 Command::Add(args) => add::run(&mut ctx, args),
                 Command::Task(cmd) => task::run(&mut ctx, cmd),

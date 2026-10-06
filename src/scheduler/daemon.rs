@@ -20,8 +20,8 @@ use crate::budget::{
 };
 use crate::config::Config;
 use crate::domain::{
-    BRANCH_CREATED_EVENT, DaemonCommand, EventLevel, ModelTier, Provider, ReviewWatch, Session, SessionState, Task, TaskId,
-    TaskState, is_closed_state_type,
+    BRANCH_CREATED_EVENT, DaemonCommand, EventLevel, ModelTier, Provider, ReviewWatch, SCHEDULING_PAUSE_KEY, SchedulingPause,
+    Session, SessionState, Task, TaskId, TaskState, is_closed_state_type,
 };
 use crate::github::{Gh, PrRef};
 use crate::jev::{JevClient, JevQuestion, content_hash};
@@ -299,10 +299,13 @@ impl Daemon {
         if self.rt.shutdown {
             return Ok(());
         }
-        let r = self.refresh_rules(now).await;
-        self.report_phase("rules", r);
+        // Linear first, rules second: a ticket created this tick gets its
+        // criticality, score and preferred model before `launch_tasks` sees
+        // it (otherwise an urgent ticket is first scheduled as `normal`).
         let r = self.poll_linear(now).await;
         self.report_phase("linear", r);
+        let r = self.refresh_rules(now).await;
+        self.report_phase("rules", r);
         let r = self.process_hooks(now).await;
         self.report_phase("hooks", r);
         let r = self.relay_comments(now).await;
@@ -576,6 +579,28 @@ impl Daemon {
                 self.rt.shutdown = true;
                 self.handle.stop();
                 tracing::info!("shutdown requested");
+            }
+            DaemonCommand::PauseScheduling { reason } => {
+                // The CLI writes the kv row itself (so the pause holds at
+                // once); the command is the daemon's cue to log it. A
+                // command without the row (an older CLI) writes it here.
+                if SchedulingPause::load(&self.store)?.is_none() {
+                    let pause = SchedulingPause { since: now, reason: reason.clone() };
+                    self.store.kv_set(SCHEDULING_PAUSE_KEY, &pause)?;
+                }
+                let live = self.store.list_live_sessions()?.len();
+                self.log(
+                    None,
+                    None,
+                    EventLevel::Info,
+                    "daemon.paused",
+                    &format!("scheduling paused: no new session until `powerqueue resume` ({live} running session(s) continue)"),
+                    serde_json::json!({ "reason": reason, "live_sessions": live }),
+                );
+            }
+            DaemonCommand::ResumeScheduling => {
+                self.store.kv_delete(SCHEDULING_PAUSE_KEY)?;
+                self.log(None, None, EventLevel::Info, "daemon.resumed", "scheduling resumed", serde_json::json!({}));
             }
         }
         Ok(())
@@ -2171,6 +2196,10 @@ impl Daemon {
     // --------------------------------------------------------------- launch
 
     async fn launch_tasks(&mut self, now: DateTime<Utc>) -> Result<()> {
+        if let Some(pause) = SchedulingPause::load(&self.store)? {
+            tracing::debug!(since = %pause.since, "scheduling paused; launching nothing");
+            return Ok(());
+        }
         let live = self.store.list_live_sessions()?;
         let mut slots = self.cfg.scheduler.max_concurrent.saturating_sub(live.len() as u32);
         if slots == 0 {
@@ -2667,13 +2696,9 @@ fn rearm_watch(task: &mut Task, now: DateTime<Utc>) {
 /// provider so several launches in one tick do not each think they are the
 /// only one. A model whose provider has no ledger is ignored.
 fn reserve(ledgers: &mut Ledgers, tier: &ModelTier, weighted_cost: f64) {
-    let Some(ledger) = ledgers.for_model_mut(tier) else { return };
-    if let Some(t) = ledger.tiers.iter_mut().find(|t| t.tier == *tier) {
-        t.period_weighted += weighted_cost;
-        t.window_weighted += weighted_cost;
+    if let Some(ledger) = ledgers.for_model_mut(tier) {
+        ledger.add_spend(tier, weighted_cost);
     }
-    ledger.total_period_weighted += weighted_cost;
-    ledger.total_window_weighted += weighted_cost;
 }
 
 /// Resolve on SIGINT (ctrl-c) or, on unix, SIGTERM.
@@ -2960,6 +2985,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pause_stops_launches_and_resume_restores_them() {
+        use crate::domain::{Criticality, Task, TaskSource};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let (mut daemon, _mock, _server) = dependency_daemon(&store, dir.path()).await;
+        let now = Utc::now();
+        let mut task = Task::new("PAUSE-1", "queued work", TaskSource::Manual);
+        task.criticality = Criticality::Critical;
+        store.insert_task(&task).unwrap();
+
+        daemon.apply_command(&DaemonCommand::PauseScheduling { reason: Some("budget review".into()) }, now).await.unwrap();
+        let pause = SchedulingPause::load(&store).unwrap().expect("pause recorded");
+        assert_eq!(pause.reason.as_deref(), Some("budget review"));
+        assert_eq!(store.count_events_of_kind("daemon.paused", now - Duration::minutes(1)).unwrap(), 1);
+        // A second pause command keeps the original instant (the CLI only sends one per transition).
+        daemon.apply_command(&DaemonCommand::PauseScheduling { reason: None }, now + Duration::minutes(5)).await.unwrap();
+        assert_eq!(SchedulingPause::load(&store).unwrap().unwrap().since, pause.since);
+        // A pause the CLI wrote directly (kv row, no command yet) holds too.
+        store.kv_delete(SCHEDULING_PAUSE_KEY).unwrap();
+        store.kv_set(SCHEDULING_PAUSE_KEY, &SchedulingPause { since: now, reason: None }).unwrap();
+
+        daemon.launch_tasks(now).await.unwrap();
+        let t = store.get_task_by_key("PAUSE-1").unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Queued, "paused: the task is not even considered");
+        for kind in ["task.starting", "task.throttled", "task.error"] {
+            assert_eq!(store.count_events_of_kind(kind, now - Duration::minutes(1)).unwrap(), 0, "{kind} while paused");
+        }
+
+        daemon.apply_command(&DaemonCommand::ResumeScheduling, now).await.unwrap();
+        assert!(SchedulingPause::load(&store).unwrap().is_none());
+        assert_eq!(store.count_events_of_kind("daemon.resumed", now - Duration::minutes(1)).unwrap(), 1);
+        daemon.apply_command(&DaemonCommand::ResumeScheduling, now).await.unwrap();
+        assert!(SchedulingPause::load(&store).unwrap().is_none(), "resume is idempotent on the switch");
+        daemon.launch_tasks(now).await.unwrap();
+        let t = store.get_task_by_key("PAUSE-1").unwrap().unwrap();
+        assert_ne!(t.state, TaskState::Queued, "resumed: the task was considered (started or failed to start): {:?}", t.state);
+    }
+
+    #[tokio::test]
+    async fn a_ticket_created_this_tick_is_scored_before_it_is_scheduled() {
+        use crate::domain::Criticality;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let (mut daemon, _mock, _server) = dependency_daemon(&store, dir.path()).await;
+        // Every mock issue has Linear priority 2 (high).
+        let rules_path = daemon.cfg.priority_file(&daemon.paths);
+        std::fs::create_dir_all(rules_path.parent().unwrap()).unwrap();
+        std::fs::write(&rules_path, "## Critical\n- priority: high\n\n## Models\n- critical: fable\n").unwrap();
+        daemon.rt.force_sync = true;
+        let before = Utc::now() - Duration::seconds(1);
+        daemon.tick().await.unwrap();
+        let c2 = store.get_task_by_key("DEP-C2").unwrap().unwrap();
+        assert_eq!(c2.criticality, Criticality::Critical);
+        // The first scheduling decision about it (start attempt or throttle)
+        // already saw it as critical: no "task is normal" in its reasons.
+        let events = store.events_for_task(c2.id, 100).unwrap();
+        let decision = events.iter().find(|e| e.kind == "task.starting" || e.kind == "task.throttled").unwrap_or_else(|| {
+            panic!("no scheduling decision after the tick: {:?}", events.iter().map(|e| &e.kind).collect::<Vec<_>>())
+        });
+        assert!(decision.timestamp >= before);
+        let reasons = decision.data["reasons"].to_string();
+        assert!(!reasons.contains("task is normal"), "{reasons}");
+        assert!(reasons.contains("preferred by rules: fable"), "{reasons}");
+    }
+
+    #[tokio::test]
     async fn blocked_tasks_wait_and_parents_close_when_children_finish() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory().unwrap();
@@ -3075,21 +3166,17 @@ mod tests {
     #[test]
     fn reserve_counts_against_tier_and_totals() {
         let now = Utc::now();
-        let mut ledgers = Ledgers::single(Ledger {
-            provider: Provider::Claude,
+        let mut ledger = Ledger::blank(
+            Provider::Claude,
             now,
-            period: Period { start: now, end: now + Duration::days(7) },
-            window: Period { start: now - Duration::hours(5), end: now },
-            tiers: vec![TierLedger { tier: ModelTier::opus(), period_budget: 100.0, ..Default::default() }],
-            total_period_weighted: 0.0,
-            total_window_weighted: 0.0,
-            period_budget: 100.0,
-            window_budget: 50.0,
-            window_enabled: true,
-            calibration: None,
-            observed: None,
-            anchor_source: AnchorSource::Default,
-        });
+            Period { start: now, end: now + Duration::days(7) },
+            Period { start: now - Duration::hours(5), end: now },
+        );
+        ledger.tiers = vec![TierLedger { tier: ModelTier::opus(), period_budget: 100.0, ..Default::default() }];
+        ledger.period_budget = 100.0;
+        ledger.window_budget = 50.0;
+        ledger.anchor_source = AnchorSource::Default;
+        let mut ledgers = Ledgers::single(ledger);
         reserve(&mut ledgers, &ModelTier::opus(), 30.0);
         reserve(&mut ledgers, &ModelTier::haiku(), 5.0);
         reserve(&mut ledgers, &ModelTier::new("gpt-6-luna"), 7.0);

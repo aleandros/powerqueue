@@ -2,7 +2,7 @@
 //!
 //! Candidates are every enabled model (positive share) of every enabled
 //! provider, providers walked in `budget.provider_order`; each provider has
-//! its own [`Ledger`] (period, window, calibration, observed usage) in
+//! its own [`Ledger`] (period, window, learned rate, observed usage) in
 //! [`Ledgers`]. Capability order and downgrades come from
 //! `BudgetConfig::downgrade_chain` and never cross providers.
 //!
@@ -20,9 +20,12 @@
 //!    below the period's elapsed fraction (it is under-paced), one
 //!    criticality level lower qualifies; in the end game (`endgame_fraction`)
 //!    two levels lower qualify.
-//! 5. The predicted cost must fit the model's period share and the
-//!    provider's overall period budget (both with the safety margin) and,
-//!    when the provider has one, its rolling window.
+//! 5. The predicted cost must fit the provider's period allowance (with the
+//!    safety margin; the fraction starts from the provider's own reading
+//!    when there is one) and, when the provider has one, its rolling
+//!    window. A task *borrowing* a model reserved for more critical work
+//!    (relaxation) must also fit what is left of that model's share; work
+//!    the model is reserved for is never capped by the share.
 //!
 //! Choice: the preference list is the hard override (`task.model_override`)
 //! when set, else the rules' list (`PRIORITY.md`, in order), else the
@@ -181,8 +184,8 @@ impl<'a> Policy<'a> {
         reasons.push(format!("predicted cost {:.0} weighted tokens ({})", prediction.weighted_tokens, prediction.basis));
         for p in &providers {
             if let Some(ledger) = self.ledgers.get(*p) {
-                let window = if ledger.window_enabled {
-                    format!("window {:.0}% used", ledger.window_fraction() * 100.0)
+                let window = if ledger.has_window() {
+                    format!("window {:.0}% used ({})", ledger.window_fraction() * 100.0, ledger.window_fraction_source())
                 } else {
                     "no window".to_string()
                 };
@@ -357,10 +360,14 @@ impl<'a> Policy<'a> {
         // Budget gates.
         let cost = predicted_weighted * tier_weight(self.cfg, tier);
         let margin = (1.0 - self.cfg.safety_margin).max(0.0);
+        // A share caps what a model lends to less critical work; work the
+        // model is reserved for is limited by the whole allowance only.
+        // (`Criticality` orders most important first: "greater" = less critical.)
+        let borrowed = task.criticality > model.min_criticality;
         let available = tl.period_remaining() * margin;
-        if cost > available {
+        if borrowed && cost > available {
             return blocked(
-                format!("period budget: needs {:.0} weighted tokens, {:.0} available after safety margin", cost, available),
+                format!("{tier}'s share: needs {:.0} weighted tokens, {:.0} left after the safety margin", cost, available),
                 Some(period.end),
             );
         }
@@ -368,21 +375,28 @@ impl<'a> Policy<'a> {
         if overall_after > margin {
             return blocked(
                 format!(
-                    "overall period budget: {:.0}% spent (calibrated), this task would push it to {:.0}%",
+                    "period allowance: {:.0}% used ({}), this task would push it to {:.0}%",
                     ledger.period_fraction() * 100.0,
+                    ledger.period_fraction_source(),
                     overall_after * 100.0
                 ),
                 Some(period.end),
             );
         }
-        if ledger.window_enabled && ledger.total_window_weighted + cost > ledger.window_budget {
-            return blocked(
-                format!(
-                    "window: {:.0} of {:.0} weighted tokens used, needs {:.0} more",
-                    ledger.total_window_weighted, ledger.window_budget, cost
-                ),
-                Some(now + WINDOW_RECHECK),
-            );
+        if ledger.has_window() {
+            let window_after = ledger.window_fraction() + cost / ledger.window_divisor();
+            if window_after > margin {
+                let reset = ledger.observed.as_ref().and_then(|o| o.window_resets_at).filter(|r| *r > now);
+                return blocked(
+                    format!(
+                        "window: {:.0}% used ({}), this task would push it to {:.0}%",
+                        ledger.window_fraction() * 100.0,
+                        ledger.window_fraction_source(),
+                        window_after * 100.0
+                    ),
+                    Some(reset.map_or(now + WINDOW_RECHECK, |r| r.min(now + WINDOW_RECHECK))),
+                );
+            }
         }
 
         let how = if levels > 0 { format!("eligible (relaxed to {allowed})") } else { "eligible".to_string() };
@@ -453,8 +467,8 @@ fn fraction_of(d: Duration, f: f64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::budget::ledger::{Calibration, TierLedger};
-    use crate::budget::period::{AnchorSource, Period};
+    use crate::budget::ledger::TierLedger;
+    use crate::budget::period::Period;
     use crate::budget::probe::ObservedUsage;
     use crate::domain::TaskSource;
 
@@ -496,21 +510,14 @@ mod tests {
                 TierLedger { tier, period_weighted: budget * frac, period_budget: budget, ..Default::default() }
             })
             .collect();
-        Ledgers::single(Ledger {
-            provider: Provider::Claude,
-            now,
-            period,
-            window: Period { start: now - Duration::hours(5), end: now },
-            total_period_weighted: tiers.iter().map(|t| t.period_weighted).sum(),
-            total_window_weighted: 0.0,
-            tiers,
-            period_budget: claude.period_weighted_tokens as f64,
-            window_budget: claude.window_weighted_tokens as f64,
-            window_enabled: true,
-            calibration: None,
-            observed: None,
-            anchor_source: AnchorSource::Config,
-        })
+        let mut l = Ledger::blank(Provider::Claude, now, period, Period { start: now - Duration::hours(5), end: now });
+        l.total_period_weighted = tiers.iter().map(|t| t.period_weighted).sum();
+        l.tiers = tiers;
+        l.period_budget = claude.period_weighted_tokens as f64;
+        l.window_budget = claude.window_weighted_tokens as f64;
+        l.configured_period_budget = l.period_budget;
+        l.configured_window_budget = l.window_budget;
+        Ledgers::single(l)
     }
 
     /// A ledger for any provider at `elapsed` of a 7-day period, nothing spent.
@@ -526,21 +533,14 @@ mod tests {
                 TierLedger { tier, period_budget: b, ..Default::default() }
             })
             .collect();
-        Ledger {
-            provider,
-            now,
-            period: Period { start, end: start + Duration::hours(PERIOD_HOURS) },
-            window: Period { start: now - Duration::hours(5), end: now },
-            total_period_weighted: 0.0,
-            total_window_weighted: 0.0,
-            tiers,
-            period_budget: budget.period_weighted_tokens as f64,
-            window_budget: budget.window_weighted_tokens as f64,
-            window_enabled: true,
-            calibration: None,
-            observed: None,
-            anchor_source: AnchorSource::Config,
-        }
+        let period = Period { start, end: start + Duration::hours(PERIOD_HOURS) };
+        let mut l = Ledger::blank(provider, now, period, Period { start: now - Duration::hours(5), end: now });
+        l.tiers = tiers;
+        l.period_budget = budget.period_weighted_tokens as f64;
+        l.window_budget = budget.window_weighted_tokens as f64;
+        l.configured_period_budget = l.period_budget;
+        l.configured_window_budget = l.window_budget;
+        l
     }
 
     /// Claude and Codex both enabled, both at 10% of their period.
@@ -716,11 +716,17 @@ mod tests {
     }
 
     #[test]
-    fn override_of_cheapest_tier_when_it_is_out_yields_nothing() {
+    fn override_of_cheapest_tier_when_the_allowance_is_out_yields_nothing() {
         let cfg = BudgetConfig::default();
+        // Haiku's own share is gone but the allowance has room: a critical
+        // task forced onto haiku still runs (shares cap borrowing only).
         let l = ledger(&cfg, 0.1, &[(haiku(), 1.0)]);
         let mut t = task(Criticality::Critical);
         t.model_override = Some(haiku());
+        let d = decide(&cfg, &l, &RateLimitState::default(), &t, &[]);
+        assert_eq!(d.model, Some(haiku()), "{:?}", d.reasons);
+        // The whole allowance gone: nothing, until the period ends.
+        let l = ledger(&cfg, 0.1, &[(fable(), 1.0), (opus(), 1.0), (sonnet(), 1.0), (haiku(), 1.0)]);
         let d = decide(&cfg, &l, &RateLimitState::default(), &t, &[]);
         assert_eq!(d.model, None);
         assert_eq!(d.retry_at, Some(claude(&l).period.end));
@@ -743,17 +749,46 @@ mod tests {
     }
 
     #[test]
-    fn cheapest_tier_remains_when_expensive_ones_are_exhausted() {
+    fn a_spent_share_caps_borrowed_use_but_not_reserved_use() {
         let cfg = BudgetConfig::default();
-        let l = ledger(&cfg, 0.5, &[(fable(), 1.0), (opus(), 1.0), (sonnet(), 0.999)]);
+        // Fable's whole share is gone at 60% of the period; the allowance as a whole is 25% used.
+        let l = ledger(&cfg, 0.6, &[(fable(), 1.0)]);
+        let limits = RateLimitState::default();
+        let d = decide(&cfg, &l, &limits, &task(Criticality::Critical), &[]);
+        assert_eq!(d.model, Some(fable()), "critical work is what fable is reserved for: the share does not cap it");
+        assert!(d.reasons.iter().any(|r| r.starts_with("fable: eligible")), "{:?}", d.reasons);
+        // A high task may only borrow fable while its share has room.
+        let mut t = task(Criticality::High);
+        t.model_override = Some(fable());
+        let d = decide(&cfg, &l, &limits, &t, &[]);
+        assert_eq!(d.model, Some(opus()), "{:?}", d.reasons);
+        assert!(d.reasons.iter().any(|r| r.starts_with("fable: reserved for critical; task is high")), "{:?}", d.reasons);
+        // Under-paced opus lends itself to normal work only within what is left of its share.
+        let mut l = ledger(&cfg, 0.6, &[(opus(), 0.55)]);
+        claude_mut(&mut l).window_enabled = false;
+        let policy = Policy::new(&cfg, &l, &limits);
+        let left = claude(&l).tier(&opus()).period_remaining() * 0.95;
+        let w = tier_weight(&cfg, &opus());
+        let (ok, why) = policy.eligibility(&task(Criticality::Normal), &opus(), left / w * 1.1);
+        assert!(!ok && why.starts_with("opus's share: needs"), "{why}");
+        let (ok, why) = policy.eligibility(&task(Criticality::Normal), &opus(), left / w * 0.9);
+        assert!(ok, "{why}");
+        let (ok, why) = policy.eligibility(&task(Criticality::High), &opus(), left / w * 1.1);
+        assert!(ok, "high work is what opus is reserved for: {why}");
+    }
+
+    #[test]
+    fn the_whole_allowance_caps_everything() {
+        let cfg = BudgetConfig::default();
+        // 95% of the allowance used: nothing fits inside the 5% safety margin.
+        let l = ledger(&cfg, 0.5, &[(fable(), 1.0), (opus(), 1.0), (sonnet(), 1.0)]);
         let d = decide(&cfg, &l, &RateLimitState::default(), &task(Criticality::Normal), &[]);
-        assert_eq!(d.model, Some(haiku()));
-        assert!(d.reasons.iter().any(|r| r.starts_with("sonnet: period budget:")), "{:?}", d.reasons);
-        assert!(
-            d.reasons.iter().any(|r| r.contains("default model sonnet not eligible; downgraded to haiku")),
-            "{:?}",
-            d.reasons
-        );
+        assert_eq!(d.model, None, "{:?}", d.reasons);
+        assert!(d.reasons.iter().any(|r| r.starts_with("sonnet: period allowance: 95% used (measured)")), "{:?}", d.reasons);
+        assert!(d.reasons.iter().any(|r| r.starts_with("haiku: period allowance: 95% used (measured)")), "{:?}", d.reasons);
+        // The retry waits for the earliest thing that could change: fable's
+        // and opus's criticality gates relax in the end game, before the period ends.
+        assert!(d.retry_at.is_some_and(|at| at > now() && at <= claude(&l).period.end), "{:?}", d.retry_at);
     }
 
     #[test]
@@ -768,24 +803,55 @@ mod tests {
     #[test]
     fn safety_margin_keeps_the_last_slice_unspent() {
         let cfg = BudgetConfig { safety_margin: 0.10, ..BudgetConfig::default() };
-        let l = ledger(&cfg, 0.5, &[(sonnet(), 0.85)]);
+        // 85% of the allowance used (sonnet's share is 35%: 0.35 × 2.43 ≈ 0.85).
+        let l = ledger(&cfg, 0.5, &[(sonnet(), 0.85 / 0.35)]);
         let limits = RateLimitState::default();
         let policy = Policy::new(&cfg, &l, &limits);
-        let remaining = claude(&l).tier(&sonnet()).period_remaining();
+        let remaining = claude(&l).period_budget * (1.0 - claude(&l).period_fraction());
         let (ok, _) = policy.eligibility(&task(Criticality::Normal), &sonnet(), remaining * 0.95);
         assert!(!ok, "fits the raw remainder but not the margin");
-        let (ok, why) = policy.eligibility(&task(Criticality::Normal), &sonnet(), remaining * 0.85);
+        let (ok, why) = policy.eligibility(&task(Criticality::Normal), &sonnet(), remaining * 0.30);
         assert!(ok, "{why}");
     }
 
     #[test]
-    fn calibration_can_exhaust_the_overall_budget() {
+    fn the_providers_own_reading_can_exhaust_the_allowance() {
         let cfg = BudgetConfig::default();
         let mut l = ledger(&cfg, 0.5, &[]);
-        claude_mut(&mut l).calibration = Some(Calibration { observed_fraction: 0.97, at: now(), measured_fraction: 0.0 });
+        claude_mut(&mut l).observed = Some(ObservedUsage { period_used: Some(0.97), ..ObservedUsage::empty(now()) });
         let d = decide(&cfg, &l, &RateLimitState::default(), &task(Criticality::Critical), &[]);
         assert_eq!(d.model, None);
-        assert!(d.reasons.iter().any(|r| r.contains("overall period budget")), "{:?}", d.reasons);
+        assert!(d.reasons.iter().any(|r| r.contains("period allowance: 97% used (observed)")), "{:?}", d.reasons);
+    }
+
+    #[test]
+    fn an_observed_window_counts_even_without_a_configured_one() {
+        let cfg = BudgetConfig::default();
+        let mut l = ledger(&cfg, 0.5, &[]);
+        let reset = now() + Duration::minutes(40);
+        let limits = RateLimitState::default();
+        claude_mut(&mut l).window_enabled = false;
+        claude_mut(&mut l).observed =
+            Some(ObservedUsage { window_used: Some(0.5), window_resets_at: Some(reset), ..ObservedUsage::empty(now()) });
+        let policy = Policy::new(&cfg, &l, &limits);
+        // 1.2M × fable's weight 5 = 6M: fine for the 80M period, not for half of a 12M window.
+        let (ok, why) = policy.eligibility(&task(Criticality::Critical), &fable(), 1_200_000.0);
+        assert!(!ok, "config says no window but the provider has one: {why}");
+        assert!(why.starts_with("window: 50% used (observed)"), "{why}");
+        // The window is 12M weighted tokens; 40% used leaves room for 1M × 5.
+        claude_mut(&mut l).observed.as_mut().unwrap().window_used = Some(0.4);
+        let policy = Policy::new(&cfg, &l, &limits);
+        let (ok, why) = policy.eligibility(&task(Criticality::Critical), &fable(), 1_000_000.0);
+        assert!(ok, "{why}");
+        // When the window is the blocker, the retry waits for its reset (when sooner than the recheck).
+        // 40M: too big for the period on the expensive tiers, too big for the window even on haiku.
+        let d = policy.decide(&task(Criticality::Critical), prediction(40_000_000.0), &[]);
+        assert_eq!(d.model, None, "{:?}", d.reasons);
+        assert_eq!(d.retry_at, Some(now() + WINDOW_RECHECK), "reset in 40 min is later than the 15 min recheck");
+        claude_mut(&mut l).observed.as_mut().unwrap().window_resets_at = Some(now() + Duration::minutes(4));
+        let policy = Policy::new(&cfg, &l, &limits);
+        let d = policy.decide(&task(Criticality::Critical), prediction(40_000_000.0), &[]);
+        assert_eq!(d.retry_at, Some(now() + Duration::minutes(4)));
     }
 
     #[test]
@@ -996,6 +1062,23 @@ mod tests {
             Some(ObservedUsage { window_resets_at: None, observed_at: now() - Duration::hours(2), ..obs });
         let d = decide(&cfg_claude, &only, &limits, &task(Criticality::Critical), &[]);
         assert_eq!(d.model, Some(fable()), "an old exhausted observation without a reset expires");
+    }
+
+    #[test]
+    fn an_observed_window_without_any_budget_is_judged_on_the_reading_alone() {
+        let cfg = BudgetConfig::default();
+        let mut l = ledger(&cfg, 0.5, &[]);
+        let limits = RateLimitState::default();
+        claude_mut(&mut l).window_enabled = false;
+        claude_mut(&mut l).window_budget = 0.0;
+        claude_mut(&mut l).observed = Some(ObservedUsage { window_used: Some(0.10), ..ObservedUsage::empty(now()) });
+        let policy = Policy::new(&cfg, &l, &limits);
+        let (ok, why) = policy.eligibility(&task(Criticality::Critical), &fable(), 2_000_000.0);
+        assert!(ok, "{why}");
+        claude_mut(&mut l).observed.as_mut().unwrap().window_used = Some(0.96);
+        let policy = Policy::new(&cfg, &l, &limits);
+        let (ok, why) = policy.eligibility(&task(Criticality::Critical), &fable(), 1.0);
+        assert!(!ok && why.starts_with("window: 96% used (observed)"), "{why}");
     }
 
     #[test]

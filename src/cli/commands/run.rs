@@ -1,12 +1,12 @@
-//! `powerqueue run` / `powerqueue stop`.
+//! `powerqueue run` / `powerqueue stop` / `powerqueue pause` / `powerqueue resume`.
 
 use anyhow::{Context as _, Result};
 use owo_colors::{OwoColorize, Stream};
 
 use crate::cli::commands::runtime;
 use crate::cli::output::ago;
-use crate::cli::{Context, RunArgs};
-use crate::domain::DaemonCommand;
+use crate::cli::{Context, PauseArgs, RunArgs};
+use crate::domain::{DaemonCommand, SCHEDULING_PAUSE_KEY, SchedulingPause};
 use crate::scheduler::Daemon;
 use crate::secrets::Secrets;
 
@@ -74,6 +74,75 @@ pub fn stop(ctx: &mut Context) -> Result<i32> {
         println!("{}", serde_json::json!({ "running": true, "requested": "shutdown" }));
     } else {
         println!("shutdown requested; the daemon exits after its current tick (sessions keep running in tmux)");
+    }
+    Ok(0)
+}
+
+/// `powerqueue pause`: stop launching sessions. A live daemon is asked to
+/// record the pause (so the event lands in its log); without one the pause
+/// is written directly and the next daemon honours it. Idempotent.
+pub fn pause(ctx: &mut Context, args: PauseArgs) -> Result<i32> {
+    let tick_secs = ctx.config_or_default()?.scheduler.tick_secs.max(1) as i64;
+    let store = ctx.store()?;
+    let now = chrono::Utc::now();
+    let reason = args.reason.filter(|r| !r.trim().is_empty());
+    let already = SchedulingPause::load(store)?;
+    let was_paused = already.is_some();
+    let alive = store.daemon_alive(chrono::Duration::seconds(3 * tick_secs))?;
+    // The kv row is the switch the daemon reads every tick, so write it
+    // here: it takes effect (and `resume`/`status` see it) at once. A live
+    // daemon is also told, so the event lands in its log.
+    let pause = match already {
+        Some(p) => p,
+        None => {
+            let p = SchedulingPause { since: now, reason: reason.clone() };
+            store.kv_set(SCHEDULING_PAUSE_KEY, &p).context("record the pause")?;
+            if alive {
+                store.enqueue_command(&DaemonCommand::PauseScheduling { reason }).context("queue pause command")?;
+            }
+            p
+        }
+    };
+    let live = store.list_live_sessions()?.len();
+    if ctx.json {
+        println!(
+            "{}",
+            serde_json::json!({ "paused": true, "since": pause.since, "reason": pause.reason, "daemon_running": alive, "live_sessions": live })
+        );
+        return Ok(0);
+    }
+    if was_paused {
+        println!("scheduling is already {}", pause.describe());
+    } else if alive {
+        println!(
+            "scheduling paused: no new session will start until `powerqueue resume`; {live} running session(s) continue and the daemon keeps monitoring them"
+        );
+    } else {
+        println!("scheduling paused (no daemon running; the next `powerqueue run` starts paused until `powerqueue resume`)");
+    }
+    Ok(0)
+}
+
+/// `powerqueue resume`: launch sessions again. Idempotent.
+pub fn resume(ctx: &mut Context) -> Result<i32> {
+    let tick_secs = ctx.config_or_default()?.scheduler.tick_secs.max(1) as i64;
+    let store = ctx.store()?;
+    let was = SchedulingPause::load(store)?;
+    let alive = store.daemon_alive(chrono::Duration::seconds(3 * tick_secs))?;
+    if was.is_some() {
+        store.kv_delete(SCHEDULING_PAUSE_KEY).context("clear the pause")?;
+        if alive {
+            store.enqueue_command(&DaemonCommand::ResumeScheduling).context("queue resume command")?;
+        }
+    }
+    if ctx.json {
+        println!("{}", serde_json::json!({ "paused": false, "was_paused": was.is_some(), "daemon_running": alive }));
+        return Ok(0);
+    }
+    match (was, alive) {
+        (None, _) => println!("scheduling was not paused"),
+        (Some(p), true) => println!("scheduling resumes on the daemon's next tick (was {})", p.describe()),
+        (Some(p), false) => println!("pause cleared (was {}); no daemon running, start one with `powerqueue run`", p.describe()),
     }
     Ok(0)
 }

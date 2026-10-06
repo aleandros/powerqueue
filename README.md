@@ -206,10 +206,12 @@ Global flags work on every command.
 | `init [--repo PATH] [--team KEY]... [--linear-key K] [--jev-key K] [--no-linear] [--permission-mode MODE] [--provider P]... [--non-interactive] [--reconfigure] [--force]` | guided first-time setup; writes `config.toml` and `PRIORITY.md`, stores keys; `--no-linear` sets `linear.enabled = false` (manual tasks only); `--permission-mode` picks `acceptEdits` (default), `auto`, `bypassPermissions`, `dontAsk`, `plan` or `default`; when `codex` / `agy` are on PATH it asks whether to run tasks on them too (`--provider codex --provider gemini` answers yes non-interactively and warns when the CLI is not logged in); on an existing install the menu offers "Change settings", and `--reconfigure` walks the editable settings (repository, default branch, Linear team and states, concurrency, permission mode, weekly budget, reset anchor, providers) with the current values as defaults, keeping keys and every other key |
 | `run [--once] [--offline]` | run the scheduler in the foreground; `--once` does one pass; `--offline` skips Linear |
 | `stop` | ask the running daemon to exit (sessions keep running in tmux) |
-| `reset [-y] [--dry-run] [--force] [--delete-branches] [--everything] [--revert-linear]` | start over: stops the daemon, kills the tmux session, removes task worktrees (dirty or unpushed ones are kept and reported unless `--force`) and stray directories under the worktree root, empties `state/tasks/` and every table of the database; `--dry-run` prints the plan (`--json` for machine-readable), `-y` skips the prompt (required without a TTY), `--delete-branches` also deletes the local `pq/*` branches, `--everything` also clears `kv` (budget calibration, cooldowns, probe results), `--revert-linear` moves open Linear issues back to the first `linear.queued_states` entry. Config, secrets, `PRIORITY.md` and logs are never touched |
+| `pause [--reason TEXT]` | stop launching sessions: running ones continue, the daemon keeps monitoring, cleaning up and syncing, nothing new starts (crashed sessions are not relaunched either) until `resume`; survives a daemon restart; `status`, `dashboard` and `doctor` show it |
+| `resume` | launch sessions again after `pause` |
+| `reset [-y] [--dry-run] [--force] [--delete-branches] [--everything] [--revert-linear]` | start over: stops the daemon, kills the tmux session, removes task worktrees (dirty or unpushed ones are kept and reported unless `--force`) and stray directories under the worktree root, empties `state/tasks/` and every table of the database; `--dry-run` prints the plan (`--json` for machine-readable), `-y` skips the prompt (required without a TTY), `--delete-branches` also deletes the local `pq/*` branches, `--everything` also clears `kv` (usage readings, cooldowns, probe results, pause), `--revert-linear` moves open Linear issues back to the first `linear.queued_states` entry. Config, secrets, `PRIORITY.md` and logs are never touched |
 | `dashboard [--once] [--ascii]` (`ui`, `top`) | live TUI: task table, one budget block per enabled provider (period, window, cooldown, a gauge per model), a header with the compact per-provider summary (`cl 34/12%  cx 17/–` = period/window spent) and `next <model>` (what the policy would run now); needs an interactive terminal (exit 2 otherwise). `--once` prints one frame as text and exits (works in pipes; with `--json` prints the snapshot); `--ascii` uses `*`/`>`/`#` and `+-\|` borders (automatic when the locale is not UTF-8) |
 | `status [-a]` (`ls`) | one-shot table; `-a` includes completed/failed/cancelled |
-| `doctor [--fix] [--offline]` | diagnostics and tuning advice, per enabled provider (binary and version, logged in, model shares, period anchor source, probe freshness, top-model pacing, window pressure); `--fix` applies safe repairs |
+| `doctor [--fix] [--offline]` | diagnostics and tuning advice, per enabled provider (binary and version, logged in, model shares, period anchor source, probe freshness, top-model pacing, window pressure, the learned usage rate vs the configured budget, whether the top model's share can hold one typical task, a daemon-wide pause); `--fix` applies safe repairs |
 | `update [--check] [--version TAG] [-y] [--force]` | replace this binary with a [GitHub release](https://github.com/aleandros/powerqueue/releases): downloads `powerqueue-<target>.tar.gz` and its `.sha256`, verifies the checksum, writes the new file next to the current one, runs it with `--version`, then renames it over the old one (atomic; a running daemon keeps the old version until `stop` / `run`); asks before replacing unless `-y` / `--yes` or stdin is not a terminal; `--check` only reports (exit 0 up to date, 10 newer release available); `--version v0.4.0` installs a specific tag; `--force` reinstalls the same version; `--json` prints `{"current","latest","updated","path",...}`; `GITHUB_TOKEN` is used for the API when set; `POWERQUEUE_UPDATE_API` / `POWERQUEUE_UPDATE_TARGET` override the API base and target triple (mirrors, tests) |
 | `logs [-f] [-n N] [-t TASK] [-l LEVEL] [--events]` | read the daemon log (default 200 lines); `--events` shows the DB timeline instead; `-f` follows either |
 | `completions <shell>` | shell completions (bash, elvish, fish, powershell, zsh) |
@@ -257,10 +259,10 @@ state machine allows it. `complete` and `block` always write directly.
 
 | Command | What it does |
 |---------|--------------|
-| `budget show` | per enabled provider: period/window spend per model, observed usage and its age, anchor source and cooldowns; then what the policy would run now (`--json`: `{"providers": {...}, "next": {...}}`) |
+| `budget show` | per enabled provider: how much of the period and window is used (from the provider's own reading when there is one), spend per model, the learned exchange rate between weighted tokens and the provider's percentages, observed usage and its age, anchor source and cooldowns; then what the policy would run now for a typical task per criticality and for every task waiting in the queue (`--json`: `{"providers": {...}, "next": {...}, "queued": [...]}`) |
 | `budget probe [--provider P]` | ask providers for their remaining allowance now (Codex `app-server`, Claude's status line, `agy /usage`) and store it; exits 1 when a probe fails |
 | `budget set-reset <when> [--provider P]` | record a provider's period reset instant (from `/usage` in Claude Code; RFC 3339 or `in 3d4h`); default provider `claude` |
-| `budget set-observed <percent> [--provider P]` | calibrate a provider's pacing with the percentage it shows (e.g. `43%`) |
+| `budget set-observed <percent> [--provider P]` | record the period percentage a provider shows (e.g. `43%` from `/usage`) as a reading: pacing starts from it, and two readings far enough apart teach the exchange rate (see [docs/budget.md](docs/budget.md#learning-the-rate)) |
 | `budget clear-limits [--provider P]` | forget a provider's rate-limit cooldowns |
 | `budget estimate [<task>]` | the cost estimator's view of a task (or all history) |
 
@@ -793,9 +795,10 @@ without spending any of it: Codex through `codex app-server`
 also shows `pq <model> 5h 75% · 7d 89%` in the session), Antigravity through
 `agy -p /usage` (experimental). The daemon runs them at start and every
 `probe_interval_mins` in the background; `budget probe` runs them now. The
-reported weekly reset becomes the period anchor, the reported usage the
-calibration, and a provider that reports its allowance exhausted is skipped
-until the reset. Details: [docs/budget.md](docs/budget.md#usage-probes-and-observed-anchors).
+reported weekly reset becomes the period anchor, the reported usage is where
+pacing starts from (and, over time, teaches the exchange rate between
+powerqueue's weighted tokens and the provider's percentages), and a provider
+that reports its allowance exhausted is skipped until the reset. Details: [docs/budget.md](docs/budget.md#usage-probes-and-observed-anchors).
 
 Per provider (`[budget.providers.claude]`, `.codex`, `.gemini`); keys you
 omit keep the provider's defaults:
@@ -1036,7 +1039,7 @@ task's preferred models are tried in order (each through its own provider's
 downgrade chain), then the first eligible model in `budget.provider_order`;
 a rate-limited or exhausted provider is skipped until its reset. If nothing
 is eligible the task is `throttled` with a retry time.
-Usage probes keep the period anchor and calibration current; `budget set-reset`
+Usage probes keep the period anchor and the readings current; `budget set-reset`
 and `budget set-observed` do it by hand, and `doctor` tells you when to.
 Details and worked examples: [docs/budget.md](docs/budget.md).
 

@@ -784,7 +784,7 @@ fn print_plan(plan: &ResetPlan, args: &ResetArgs) {
         if plan.database.clear_kv {
             format!("{} row(s) cleared (--everything)", c.kv)
         } else {
-            format!("kept ({} row(s): budget calibration, cooldowns, probes; --everything clears it)", c.kv)
+            format!("kept ({} row(s): usage readings, cooldowns, probes, pause; --everything clears it)", c.kv)
         }
     );
 
