@@ -317,7 +317,20 @@ impl PriorityRules {
                 },
                 Section::Models if is_conditional_model_line(bullet) => {
                     match parse_conditional_model_line(bullet, line_no, &mut rules.warnings) {
-                        Ok(rule) => rules.model_rules.push(rule),
+                        Ok(rule) => {
+                            let key = condition_key(&rule.conditions);
+                            if let Some(prev) = rules.model_rules.iter().find(|r| condition_key(&r.conditions) == key) {
+                                rules.warnings.push(RuleError::new(
+                                    line_no,
+                                    format!(
+                                        "## Models: `if {}` repeats line {}; the first matching row wins, so this one never applies",
+                                        fmt_conditions(&rule.conditions),
+                                        prev.line
+                                    ),
+                                ));
+                            }
+                            rules.model_rules.push(rule);
+                        }
                         Err(e) => errors.push(e),
                     }
                 }
@@ -523,7 +536,12 @@ pub fn condition_matches(cond: &Condition, task: &Task) -> bool {
         Condition::Matches { field, pattern } => {
             let Some(re) = compile_regex(pattern) else { return false };
             if field == "label" {
-                return task.labels.iter().any(|l| re.is_match(l));
+                // The qualified form (`model/fable`) and, so regexes written
+                // before labels were qualified keep matching, the bare child name.
+                return task.labels.iter().any(|l| {
+                    re.is_match(l)
+                        || l.rsplit_once(crate::domain::LABEL_PARENT_SEPARATOR).is_some_and(|(_, child)| re.is_match(child))
+                });
             }
             field_text(field, task).map(|t| re.is_match(&t)).unwrap_or(false)
         }
@@ -832,24 +850,50 @@ fn parse_model_line(text: &str, line: usize, warnings: &mut Vec<RuleError>) -> R
     Ok((c, models))
 }
 
+/// Order- and case-insensitive identity of a condition list, to spot
+/// conditional `## Models` rows that repeat an earlier one.
+fn condition_key(conds: &[Condition]) -> Vec<String> {
+    let mut key: Vec<String> = conds.iter().map(|c| c.to_string().to_lowercase()).collect();
+    key.sort();
+    key.dedup();
+    key
+}
+
 /// `## Models` bullets starting with the word `if` are conditional rows.
 fn is_conditional_model_line(text: &str) -> bool {
     text.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("if ")) || text.eq_ignore_ascii_case("if")
 }
 
 /// `if <conditions>: <model> [| <model>...]`. Conditions use the grammar of
-/// the criticality sections; the model list follows the last `:`.
+/// the criticality sections. Both halves may contain `:` (`title ~ a:b`,
+/// `codex:gpt-6`), so every `:` is tried left to right and the first split
+/// where the conditions and the model list both parse wins; when none does,
+/// the error comes from the split at the last `:`.
 fn parse_conditional_model_line(text: &str, line: usize, warnings: &mut Vec<RuleError>) -> Result<ModelRule, RuleError> {
     let usage = "expected `if <conditions>: <model> [| <model>...]`, e.g. `if label: model/fable: fable`";
     let body = text.get(2..).unwrap_or("").trim();
-    let (conds, list) = body
-        .rsplit_once(':')
-        .filter(|(c, m)| !c.trim().is_empty() && !m.trim().is_empty())
-        .ok_or_else(|| RuleError::new(line, format!("## Models: cannot parse `{text}` ({usage})")))?;
-    let conditions =
-        parse_conditions(conds.trim(), line).map_err(|e| RuleError::new(line, format!("## Models: {} ({usage})", e.message)))?;
-    let models = parse_model_list(list, line, "## Models", warnings)?;
-    Ok(ModelRule { line, conditions, models })
+    let split = |i: usize, warnings: &mut Vec<RuleError>| -> Result<ModelRule, RuleError> {
+        let (conds, list) = (body[..i].trim(), body[i + 1..].trim());
+        if conds.is_empty() || list.is_empty() {
+            return Err(RuleError::new(line, format!("## Models: cannot parse `{text}` ({usage})")));
+        }
+        let conditions =
+            parse_conditions(conds, line).map_err(|e| RuleError::new(line, format!("## Models: {} ({usage})", e.message)))?;
+        let models = parse_model_list(list, line, "## Models", warnings)?;
+        Ok(ModelRule { line, conditions, models })
+    };
+    let colons: Vec<usize> = body.match_indices(':').map(|(i, _)| i).collect();
+    let Some(&last) = colons.last() else {
+        return Err(RuleError::new(line, format!("## Models: cannot parse `{text}` ({usage})")));
+    };
+    for &i in &colons[..colons.len() - 1] {
+        let mut tentative = Vec::new();
+        if let Ok(rule) = split(i, &mut tentative) {
+            warnings.extend(tentative);
+            return Ok(rule);
+        }
+    }
+    split(last, warnings)
 }
 
 /// Parse `fable | gpt-6.1-sol | sonnet`: `|`-separated alternatives in
@@ -1208,6 +1252,34 @@ mod tests {
     }
 
     #[test]
+    fn conditional_model_rows_split_around_colons_in_either_half() {
+        let rules = parse_ok(
+            "## Models\n- if label: x: claude:opus\n- if label: y: fable | codex:gpt-6\n- if title ~ a:b: fable\n- if label: codex: opus\n",
+        );
+        let r = &rules.model_rules;
+        assert_eq!(r[0].conditions, vec![Condition::Equals { field: "label".into(), value: "x".into() }]);
+        assert_eq!(r[0].models, vec![ModelTier::opus()]);
+        assert_eq!(r[1].conditions, vec![Condition::Equals { field: "label".into(), value: "y".into() }]);
+        assert_eq!(r[1].models, vec![ModelTier::fable(), "codex:gpt-6".parse::<ModelTier>().unwrap()]);
+        assert_eq!(r[2].conditions, vec![Condition::Matches { field: "title".into(), pattern: "a:b".into() }]);
+        assert_eq!(r[2].models, vec![ModelTier::fable()]);
+        assert_eq!(r[3].conditions, vec![Condition::Equals { field: "label".into(), value: "codex".into() }]);
+        assert_eq!(r[3].models, vec![ModelTier::opus()]);
+        assert!(rules.warnings.is_empty(), "{:?}", rules.warnings);
+    }
+
+    #[test]
+    fn repeated_conditional_rows_warn() {
+        let rules = parse_ok(
+            "## Models\n- if label: a and priority: high: fable\n- if priority: HIGH and label: A: opus\n- if label: b: opus\n",
+        );
+        assert_eq!(rules.model_rules.len(), 3);
+        assert_eq!(rules.warnings.len(), 1, "{:?}", rules.warnings);
+        assert_eq!(rules.warnings[0].line, 3);
+        assert!(rules.warnings[0].message.contains("repeats line 2"), "{}", rules.warnings[0].message);
+    }
+
+    #[test]
     fn conditional_model_row_errors() {
         let errs = parse_err(
             "## Models\n- if label: model/fable\n- if: fable\n- if colour: red: fable\n- if label: x: llama\n- if label: x:\n",
@@ -1227,6 +1299,7 @@ mod tests {
         let mut t = linear_task("ENG-1");
         t.linear_priority = Some(2);
         t.labels = vec!["model/fable".into(), "bug".into()];
+        assert!(rules.warnings[0].message.contains("repeats line 8"), "{:?}", rules.warnings);
         let e = eval(&rules, &t);
         assert_eq!(e.criticality, Criticality::High);
         assert_eq!(e.models, vec![ModelTier::fable()]);
@@ -1265,6 +1338,11 @@ mod tests {
         assert!(m(&qualified, &t));
         assert!(m(&bare, &t), "unqualified rules keep matching child labels");
         assert!(m(&Condition::Matches { field: "label".into(), pattern: "^model/fable$".into() }, &t));
+        assert!(
+            m(&Condition::Matches { field: "label".into(), pattern: "^fable$".into() }, &t),
+            "anchored regexes see the child name"
+        );
+        assert!(m(&Condition::Matches { field: "label".into(), pattern: "^model/".into() }, &t));
         t.labels = vec!["fable".into()];
         assert!(!m(&qualified, &t));
         assert!(m(&bare, &t));

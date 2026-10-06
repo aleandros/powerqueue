@@ -271,7 +271,14 @@ pub fn content_hash(title: &str, description: &str, labels: &[String]) -> String
     let mut h = std::collections::hash_map::DefaultHasher::new();
     title.hash(&mut h);
     description.hash(&mut h);
-    labels.hash(&mut h);
+    // Bare child names (`fable`, not `model/fable`), so qualifying grouped
+    // labels did not invalidate every cached score at once. Hashes the same
+    // as the unqualified `Vec<String>` did.
+    let bare: Vec<&str> = labels
+        .iter()
+        .map(|l| l.rsplit_once(crate::domain::LABEL_PARENT_SEPARATOR).map_or(l.as_str(), |(_, child)| child))
+        .collect();
+    bare.hash(&mut h);
     format!("{:016x}", h.finish())
 }
 
@@ -335,5 +342,6 @@ mod tests {
         let a = content_hash("t", "d", &["x".into()]);
         assert_eq!(a, content_hash("t", "d", &["x".into()]));
         assert_ne!(a, content_hash("t", "d2", &["x".into()]));
+        assert_eq!(a, content_hash("t", "d", &["group/x".into()]), "qualifying a label keeps the cached score");
     }
 }

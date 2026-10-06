@@ -15,7 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over the criticality row (an `## Overrides` model list still wins over it).
   `priority check` lists the rows, `priority explain` shows which line chose
   the model (`model: fable (if label: model/fable)` / `model: opus (high
-  row)`), and `priority simulate` tags conditional picks.
+  row)`), and `priority simulate` tags conditional picks. Conditions and
+  models are split at the first `:` where both parse, so provider-prefixed
+  models (`codex:gpt-6`) work; a row repeating an earlier row's conditions is
+  a warning. `priority check` / `explain` add a `note:` when the budget
+  reserves the chosen model for more critical tasks.
+- `task.models_changed` event; the daemon refreshes a task's stored reasons
+  when only its preferred models change.
 
 ### Changed
 
@@ -25,7 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `label: model/fable` matches only the child label; an unqualified
   `label: fable` (in rules and in `linear.required_labels` /
   `excluded_labels`) still matches both, so existing configurations keep
-  working. `label ~ regex` sees the qualified form.
+  working. `label ~ regex` matches the qualified form or the bare child
+  name. A label whose own name contains `/` is ambiguous (see
+  `docs/priority.md`). The Jev content hash uses bare label names, so cached
+  scores survive the upgrade.
 
 ## [0.4.3] - 2026-10-05
 

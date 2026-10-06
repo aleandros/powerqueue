@@ -70,8 +70,13 @@ existing tasks are re-synced on the next Linear poll.
 - `label: fable` (no `/`) matches a loose `fable` label **and** any child
   label called `fable`, so rules (and `linear.required_labels` /
   `excluded_labels`) written before labels were qualified keep working.
-- `label ~ regex` runs against the stored form: `label ~ ^model/` matches any
-  label in the `model` group.
+- `label ~ regex` matches the stored form or the bare child name:
+  `label ~ ^model/` matches any label in the `model` group, and an older
+  `label ~ ^fable$` still matches `model/fable`.
+- `/` is the group separator, so a label whose own name contains `/` is
+  ambiguous: a loose label named `frontend/web` also matches `label: web`,
+  and a child `ios/android` in group `platform` is stored as
+  `platform/ios/android` (write that, or `label: android`, to match it).
 
 ## Fields
 
@@ -190,11 +195,21 @@ rather than ignored.
 Maps a criticality to a list of preferred models, most wanted first.
 A bullet starting with `if` is a **conditional row**: `if <conditions>:
 <model> [| <model>...]`. Conditions use the same grammar as the criticality
-sections (`label: model/fable`, `label ~ regex`, `and`, ...); the model list
-follows the last `:`. Conditional rows are tried in file order and the first
-one whose conditions all hold wins over the criticality row (an `##
-Overrides` model list still wins over both). They do not change the task's
-criticality or score.
+sections (`label: model/fable`, `label ~ regex`, `and`, ...). The conditions
+and the model list are split at the first `:` where both halves parse, so
+`if title ~ a:b: fable` and `if label: x: codex:gpt-6` work. Conditional
+rows are tried in file order and the first one whose conditions all hold
+wins over the criticality row (an `## Overrides` model list still wins over
+both); a row repeating an earlier row's conditions is a warning, since it can
+never apply. They do not change the task's criticality or score.
+
+A conditional row is still a preference: the budget reservation
+(`budget.providers.<p>.models.<m>.min_criticality`, fable is reserved for
+`critical` by default) applies, so `if label: model/fable: fable` on a
+`high` task runs a downgrade until the reservation relaxes late in the
+period. `priority check` and `priority explain` print a `note:` when that
+happens. When a row changes a task's preferred models the daemon logs a
+`task.models_changed` event and refreshes the task's reasons.
 
 Alternatives are separated by `|` (whitespace around them does not matter;
 `critical = fable | gpt-6.1-sol` also works). Each name is parsed with the

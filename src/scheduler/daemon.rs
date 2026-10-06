@@ -566,6 +566,21 @@ impl Daemon {
                 task.score = eval.score;
                 changed = true;
             }
+            // A new label or `## Models` row can change the preferred models
+            // without moving criticality or score; keep the stored trail honest.
+            let model_line = |reasons: &[String]| reasons.iter().find(|r| r.starts_with("model ")).cloned();
+            let (old_model, new_model) = (model_line(&task.score_reasons), model_line(&eval.reasons));
+            if old_model != new_model {
+                changed = true;
+                self.log(
+                    Some(task.id),
+                    None,
+                    EventLevel::Info,
+                    "task.models_changed",
+                    new_model.as_deref().unwrap_or("no preferred model from PRIORITY.md"),
+                    serde_json::json!({ "models": eval.models, "source": eval.model_source, "previous": old_model }),
+                );
+            }
             if changed {
                 task.score_reasons = eval.reasons.clone();
             }
@@ -1777,6 +1792,45 @@ mod tests {
         daemon.rt.readers.clear();
         daemon.tail_transcripts(Utc::now()).await.unwrap();
         assert_eq!(store.get_task(task.id).unwrap().unwrap().state, TaskState::NeedsAttention);
+    }
+
+    #[tokio::test]
+    async fn rescore_refreshes_reasons_when_only_the_model_changes() {
+        use crate::domain::{Criticality, Task, TaskSource};
+        use crate::secrets::FileBackend;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        let store = Store::open_in_memory().unwrap();
+        let secrets = Secrets::with_backend(Box::new(FileBackend::new(paths.secrets_file())));
+        let mut cfg = Config::default();
+        cfg.priority.live_reload = false;
+        let rules_path = cfg.priority_file(&paths);
+        std::fs::create_dir_all(rules_path.parent().unwrap()).unwrap();
+        std::fs::write(&rules_path, "## High\n- source: manual\n\n## Models\n- high: opus\n").unwrap();
+        let mut daemon = Daemon::new(cfg, paths, store.clone(), secrets).unwrap();
+        let mut task = Task::new("LBL-1", "Grouped", TaskSource::Manual);
+        task.labels = vec!["model/fable".into()];
+        store.insert_task(&task).unwrap();
+        let since = Utc::now() - Duration::minutes(1);
+
+        daemon.refresh_rules(Utc::now()).await.unwrap();
+        let stored = store.get_task(task.id).unwrap().unwrap();
+        assert!(stored.score_reasons.contains(&"model opus from ## Models".to_string()), "{:?}", stored.score_reasons);
+
+        // Same criticality and score; only the model row changes.
+        std::fs::write(&rules_path, "## High\n- source: manual\n\n## Models\n- if label: model/fable: fable\n- high: opus\n")
+            .unwrap();
+        daemon.rt.rules_loaded = false;
+        daemon.refresh_rules(Utc::now()).await.unwrap();
+        let stored = store.get_task(task.id).unwrap().unwrap();
+        assert_eq!(stored.criticality, Criticality::High);
+        assert!(
+            stored.score_reasons.contains(&"model fable from ## Models line 5 (if label: model/fable)".to_string()),
+            "{:?}",
+            stored.score_reasons
+        );
+        assert_eq!(store.count_events_of_kind("task.models_changed", since).unwrap(), 2);
     }
 
     #[test]

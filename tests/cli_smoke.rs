@@ -179,7 +179,12 @@ fn conditional_model_rows_are_reported_by_priority_commands() {
         .args(["priority", "check"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("models line 5: if label: model/fable → fable"));
+        .stdout(predicate::str::contains("models line 5: if label: model/fable → fable"))
+        .stdout(predicate::str::contains("1 model if-row(s)"))
+        .stdout(predicate::str::contains("note: line 5: fable is reserved for critical tasks"));
+    pq(home.path()).args(["priority", "explain", "G-1"]).assert().success().stdout(
+        predicate::str::contains("fable is reserved for critical tasks").and(predicate::str::contains("this task is high")),
+    );
     pq(home.path())
         .args(["priority", "simulate", "--no-budget"])
         .assert()
