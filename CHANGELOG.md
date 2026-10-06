@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-06
+
+The database migrates to schema v5 on first start (v4 adds `blocked_by`,
+`children`, `parent`; v5 adds `pr_url`, `review`); older binaries cannot read
+it afterwards. The PR watcher needs the GitHub CLI (`gh`) authenticated for
+the user that runs the daemon. `linear.post_comments` still defaults to
+`true`; set it to `"questions"` to post only agent questions and watcher
+notices.
+
 ### Added
 
 - Question relay through Linear comments. When an agent asks something
@@ -446,7 +455,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.6.0
 [0.5.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.5.0
 [0.4.3]: https://github.com/aleandros/powerqueue/releases/tag/v0.4.3
 [0.4.2]: https://github.com/aleandros/powerqueue/releases/tag/v0.4.2
