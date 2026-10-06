@@ -53,8 +53,12 @@ pub struct RepoConfig {
     pub worktree_root: Option<String>,
     /// Template for branch names. `{key}` = task key slug, `{id}` = short task id.
     pub branch_template: String,
-    /// `git fetch` before creating a worktree.
+    /// `git fetch` before creating a worktree; a new branch then starts from
+    /// `origin/<default_branch>` instead of the local branch.
     pub fetch_before_start: bool,
+    /// After that fetch, fast-forward the local default branch to
+    /// `origin/<default_branch>` when it can be done without losing anything.
+    pub fast_forward_base: bool,
     /// Commands run inside a fresh worktree before Claude starts (e.g. `npm ci`).
     /// Each entry is run with `sh -c`.
     pub setup: Vec<String>,
@@ -68,6 +72,7 @@ impl Default for RepoConfig {
             worktree_root: None,
             branch_template: "pq/{key}".to_string(),
             fetch_before_start: true,
+            fast_forward_base: true,
             setup: Vec::new(),
         }
     }

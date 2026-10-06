@@ -245,6 +245,30 @@ git -C <repo> worktree list
 - Orphans (no open task references them): `powerqueue doctor --fix` removes
   the clean, pushed ones and lists the rest.
 
+## A task's branch lacks code that is already merged
+
+**Symptom**: a session works on an old `main` (a finished blocker's change is
+missing); `doctor` warns under "worktree base".
+
+```sh
+powerqueue task show ENG-123           # "base": origin/main at <sha>, or the local main
+powerqueue logs --events               # kinds `worktree.stale_base`, `repo.fast_forward_failed` carry git's error
+git -C <repo> fetch origin             # reproduce the fetch failure
+```
+
+- New branches start from `origin/<default_branch>` after a successful
+  `git fetch`. With `repo.fetch_before_start = false` or no `origin` they
+  start from the local branch; after a failed fetch (credentials, network),
+  from the newer of the last fetched `origin/<default_branch>` and the local
+  branch.
+- A branch that already existed (relaunch, review round) keeps its original
+  base; rebase it inside the session if needed.
+- `repo.fast_forward_base` leaves the local `main` alone when it has commits
+  of its own, a rebase or bisect of it is in progress, or its checkout has
+  uncommitted changes to tracked files (`powerqueue logs --events`, kind
+  `repo.fast_forward_skipped`, says why); that does not affect new task
+  branches.
+
 ## I want to start over
 
 **Symptom**: a bad first run left tasks, worktrees and tmux windows you

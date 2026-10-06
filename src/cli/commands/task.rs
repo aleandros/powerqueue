@@ -14,7 +14,7 @@ use owo_colors::{OwoColorize, Stream, Style};
 use crate::cli::output::{self, human_bytes, human_f64, model_with_provider};
 use crate::cli::{Context, TaskCommand, TaskRef};
 use crate::config::Config;
-use crate::domain::{DaemonCommand, Event, EventLevel, ModelTier, ReviewWatch, Session, Task, TaskState};
+use crate::domain::{BRANCH_CREATED_EVENT, DaemonCommand, Event, EventLevel, ModelTier, ReviewWatch, Session, Task, TaskState};
 use crate::github::PrRef;
 use crate::store::Store;
 use crate::tmux::Tmux;
@@ -245,6 +245,7 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let sessions = store.list_sessions_for_task(task.id)?;
     let events = store.events_for_task(task.id, 50)?;
     let pr_events = if task.pr_url.is_some() { pr_timeline(&store.events_for_task(task.id, 2000)?) } else { Vec::new() };
+    let base = store.last_task_event(task.id, BRANCH_CREATED_EVENT)?.and_then(|e| e.branch_base());
     let rounds_max = ctx.config_or_default()?.scheduler.review_rounds_max;
     let usage = store.usage_for_task(task.id)?;
     let mut session_rows = Vec::with_capacity(sessions.len());
@@ -270,6 +271,7 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
             })).collect::<Vec<_>>(),
             "events": events,
             "pr_timeline": pr_events,
+            "base": base.as_ref().map(|(reference, sha)| serde_json::json!({ "ref": reference, "sha": sha })),
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(0);
@@ -386,6 +388,9 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
                 usage.input_tokens, usage.output_tokens, usage.cache_creation_input_tokens, usage.cache_read_input_tokens
             ),
         );
+    }
+    if let Some((reference, sha)) = &base {
+        kv("base", format!("{reference} at {sha}"));
     }
     kv("created", opt_ts(Some(task.created_at)));
     kv("updated", opt_ts(Some(task.updated_at)));
@@ -859,6 +864,24 @@ mod tests {
         let ev = store.events_for_task(t.id, 10).unwrap();
         assert_eq!(ev.last().unwrap().kind, "task.completed_by_command");
         assert!(complete_task(&store, &mut t, None).is_err());
+    }
+
+    #[test]
+    fn branch_base_is_the_last_created_branch() {
+        let store = Store::open_in_memory().unwrap();
+        let t = stored(&store, "B-1", TaskState::Running);
+        let base = || store.last_task_event(t.id, BRANCH_CREATED_EVENT).unwrap().and_then(|e| e.branch_base());
+        assert_eq!(base(), None);
+        let created = |sha: &str| {
+            let data = serde_json::json!({ "branch": "pq/b-1", "base": "origin/main", "base_sha": sha });
+            store.log_event(Some(t.id), None, EventLevel::Info, BRANCH_CREATED_EVENT, "created", data).unwrap();
+        };
+        created("abc");
+        created("def");
+        // Other events (a relaunch's worktree.ready) do not count.
+        let ready = serde_json::json!({ "base": "main", "base_sha": "zzz" });
+        store.log_event(Some(t.id), None, EventLevel::Info, "worktree.ready", "ready", ready).unwrap();
+        assert_eq!(base(), Some(("origin/main".to_string(), "def".to_string())));
     }
 
     #[test]
