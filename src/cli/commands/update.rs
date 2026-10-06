@@ -349,10 +349,7 @@ impl Drop for Staging {
 
 /// Run `<path> --version` and require exit 0 plus `expected` in its output.
 fn sanity_check(path: &Path, expected: &str) -> Result<()> {
-    let out = Process::new(path)
-        .arg("--version")
-        .env_remove("POWERQUEUE_HOME")
-        .output()
+    let out = run_fresh_executable(|| Process::new(path).arg("--version").env_remove("POWERQUEUE_HOME").output())
         .with_context(|| format!("run {} --version", path.display()))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -367,6 +364,24 @@ fn sanity_check(path: &Path, expected: &str) -> Result<()> {
         bail!("the downloaded binary reports `{}` instead of version {expected}", stdout.trim());
     }
     Ok(())
+}
+
+/// Run a program written moments ago, retrying briefly while it is "busy".
+/// A process forked by another thread at the moment the file was still open
+/// for writing keeps that descriptor until it execs, and running the file in
+/// that window fails with `ETXTBSY`; it clears within milliseconds.
+fn run_fresh_executable(mut run: impl FnMut() -> std::io::Result<std::process::Output>) -> std::io::Result<std::process::Output> {
+    const ATTEMPTS: u64 = 10;
+    let mut attempt = 1;
+    loop {
+        match run() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(20 * attempt));
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
 }
 
 /// Best effort: drop macOS' quarantine attribute so Gatekeeper never blocks
@@ -619,6 +634,33 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
+    #[test]
+    fn fresh_executables_are_retried_while_busy() {
+        use std::os::unix::process::ExitStatusExt;
+        let busy = || std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy);
+        let ok =
+            || std::process::Output { status: std::process::ExitStatus::from_raw(0), stdout: Vec::new(), stderr: Vec::new() };
+        let mut calls = 0;
+        let out = run_fresh_executable(|| {
+            calls += 1;
+            if calls < 3 { Err(busy()) } else { Ok(ok()) }
+        });
+        assert!(out.is_ok() && calls == 3);
+        let mut calls = 0;
+        let err = run_fresh_executable(|| {
+            calls += 1;
+            Err(busy())
+        });
+        assert_eq!((err.unwrap_err().kind(), calls), (std::io::ErrorKind::ExecutableFileBusy, 10), "gives up after 10 tries");
+        let mut calls = 0;
+        let err = run_fresh_executable(|| {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        assert_eq!((err.unwrap_err().kind(), calls), (std::io::ErrorKind::NotFound, 1), "other errors are not retried");
+    }
+
     #[test]
     fn install_replaces_atomically_and_cleans_up_on_failure() {
         let dir = tempfile::tempdir().unwrap();

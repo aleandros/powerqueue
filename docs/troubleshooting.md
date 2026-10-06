@@ -72,6 +72,24 @@ Fixes:
   or every tier is throttled (see below). A task that is `paused` with the
   last error `skipped by PRIORITY.md` has a `KEY: skip` line in
   `## Overrides` (`powerqueue task explain ENG-123`).
+- Tasks are `blocked`: the issue is `blocked by` another one that is not
+  Done/Canceled in Linear and whose PR is not merged yet, or it has
+  sub-issues (a parent is never run; it is closed once they are all done).
+  `status` shows what each one waits on; `powerqueue task explain ENG-123`
+  lists every blocker. `powerqueue doctor` flags `blocked by` cycles.
+
+## A parent issue is not closed
+
+powerqueue moves a parent to `linear.done_state_parent` (default `Done`)
+only when every sub-issue is closed and at least one is completed, and only
+with `linear.manage_states = true`. The daemon checks parents every 5
+minutes, so give it that long. A
+parent whose sub-issues were all canceled is never closed for you; `doctor`
+lists it. A state name the parent's team does not
+have shows up as `linear.parent_error` events (`powerqueue logs --events`)
+and in `doctor`; the parent stays watched and is retried on the next poll.
+A parent powerqueue already closed is never handled again, even if you
+reopen it.
 
 ## A task keeps crashing
 

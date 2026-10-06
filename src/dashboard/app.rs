@@ -200,6 +200,8 @@ pub struct RowData {
     pub cpu: String,
     pub rss: String,
     pub age: String,
+    /// Keys the task waits on (blockers / open sub-issues), `-` when none.
+    pub waiting: String,
     pub title: String,
 }
 
@@ -227,6 +229,7 @@ pub fn rows_for(snapshot: &Snapshot, hide_terminal: bool, now: DateTime<Utc>) ->
                 cpu: sample.map(|s| format!("{:.0}%", s.cpu_percent)).unwrap_or_else(|| "-".into()),
                 rss: sample.map(|s| human_bytes(s.rss_bytes)).unwrap_or_else(|| "-".into()),
                 age,
+                waiting: crate::cli::commands::status::waiting_on(&t),
                 title: t.title.clone(),
             }
         })

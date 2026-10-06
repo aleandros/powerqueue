@@ -1,0 +1,19 @@
+{
+  "id": "e4a3e1e2-8a11-4152-9771-94116afd7d13",
+  "children": {
+    "nodes": [
+      { "identifier": "AVS-1720", "title": "Child one", "state": { "type": "completed" } },
+      { "identifier": "AVS-1721", "title": "Child two", "state": { "type": "started" } }
+    ],
+    "pageInfo": { "hasNextPage": false, "endCursor": "c2" }
+  },
+  "inverseRelations": {
+    "nodes": [
+      { "type": "blocks", "issue": { "identifier": "AVS-1713", "title": "First blocker", "state": { "type": "completed" } } },
+      { "type": "related", "issue": { "identifier": "AVS-1600", "title": "Just related", "state": { "type": "unstarted" } } },
+      { "type": "duplicate", "issue": { "identifier": "AVS-1601", "title": "A duplicate", "state": { "type": "canceled" } } },
+      { "type": "blocks", "issue": { "identifier": "AVS-1712", "title": "Second blocker", "state": { "type": "started" } } }
+    ],
+    "pageInfo": { "hasNextPage": false, "endCursor": "r4" }
+  }
+}

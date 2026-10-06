@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Linear dependencies. Each poll reads an issue's `blocked by` relations,
+  sub-issues and parent (stored on the task: `blocked_by`, `children`,
+  `parent`; schema v4). A task with a pending blocker is moved to the new
+  `blocked` state and never started until each blocker is `completed` /
+  `canceled` in Linear or its GitHub PR (Linear attachment) is merged; it
+  then returns to `queued`. An issue with sub-issues is a container: never
+  scheduled, and once every sub-issue is closed (at least one completed) the
+  daemon moves it to the new `linear.done_state_parent` (default `Done`),
+  comments the list of sub-issues (in Spanish) and completes its task. The
+  parent does not need to be in `queued_states`; parents are tracked in kv
+  `linear.watched_parents`, checked every 5 minutes and handled once.
+  Relations come from a separate query (10 issues per request, every page
+  followed) so the issue list stays within Linear's complexity limit; a PR
+  seen merged stays merged, and tasks moved out of the queued states keep
+  their relations up to date.
+- `task explain` prints a `dependencies` block (`--json`: `waiting_on`,
+  `blocked_by`, `children`, `parent`); `task show` shows parent, blockers,
+  sub-issues and what the task waits on; `status` and the dashboard gain a
+  `WAITING ON` column and a `blocked` count.
+- `doctor` `dependencies` check: blocked tasks, `blocked by` cycles between
+  open tasks, failed parent closes (`linear.parent_error` events).
+- Events `task.blocked`, `task.unblocked`, `linear.parent_closed`,
+  `linear.parent_error`.
+
 ## [0.5.0] - 2026-10-06
 
 Upgrade every machine that reads a `PRIORITY.md` before adding `if` rows to

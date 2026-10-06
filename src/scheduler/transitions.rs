@@ -107,18 +107,31 @@ pub fn on_hook_outcome(
             if transcript_path.is_some() {
                 session.transcript_path = transcript_path.clone();
             }
-            if session.state.is_live() && !task.state.is_terminal() && task.state != TaskState::Paused {
+            // A SessionStart drained after the daemon already saw this
+            // session die (crash right after launch) must not revive the
+            // task: nothing probes a dead session, so it would sit in
+            // `running` forever instead of being relaunched. A resumed
+            // attempt reuses the row as `launching`, which is live.
+            let live = session.state.is_live();
+            if live && !task.state.is_terminal() && task.state != TaskState::Paused {
                 session.state = SessionState::Running;
             }
-            if matches!(task.state, TaskState::Starting | TaskState::Idle | TaskState::NeedsAttention | TaskState::Crashed) {
+            if live
+                && matches!(task.state, TaskState::Starting | TaskState::Idle | TaskState::NeedsAttention | TaskState::Crashed)
+            {
                 task.state = TaskState::Running;
                 task.last_error = None;
             }
+            let message = if live {
+                format!("agent session started ({source})")
+            } else {
+                format!("agent session started ({source}) after it was marked {}; task left {}", session.state, task.state)
+            };
             effects.push(Effect::log(
                 EventLevel::Info,
                 "session.started",
-                format!("agent session started ({source})"),
-                serde_json::json!({ "source": source, "transcript_path": transcript_path, "attempt": session.attempt }),
+                message,
+                serde_json::json!({ "source": source, "transcript_path": transcript_path, "attempt": session.attempt, "late": !live }),
             ));
         }
         HookOutcome::Completed { summary } => {
@@ -538,6 +551,59 @@ pub fn on_crash(
     effects
 }
 
+/// Move a task between `queued` and `blocked` from its Linear dependencies
+/// (see [`Task::is_waiting`]). Only `queued` / `throttled` tasks are
+/// blocked: paused tasks stay paused, and a task that already ran (crashed,
+/// live) is never pulled back — [`crate::scheduler::pick_next`] still
+/// refuses to relaunch it while it waits. A `blocked` task whose blockers
+/// cleared goes back to `queued`. Containers stay `blocked` until the daemon
+/// closes them.
+pub fn on_dependencies(task: &mut Task) -> Vec<Effect> {
+    let waiting = task.is_waiting();
+    let waiting_on: Vec<String> = task.waiting_on().into_iter().map(str::to_string).collect();
+    match task.state {
+        TaskState::Queued | TaskState::Throttled if waiting => {
+            let previous = task.state;
+            task.state = TaskState::Blocked;
+            task.not_before = None;
+            let message = if task.is_container() {
+                format!(
+                    "parent issue with {} sub-issue(s); never scheduled, closed once they are done (open: {})",
+                    task.children.len(),
+                    list_or_none(&waiting_on)
+                )
+            } else {
+                format!("waiting on {}", waiting_on.join(", "))
+            };
+            vec![Effect::log(
+                EventLevel::Info,
+                "task.blocked",
+                message,
+                serde_json::json!({
+                    "previous_state": previous.as_str(),
+                    "waiting_on": waiting_on,
+                    "container": task.is_container(),
+                }),
+            )]
+        }
+        TaskState::Blocked if !waiting => {
+            task.state = TaskState::Queued;
+            let cleared: Vec<&str> = task.blocked_by.iter().map(|b| b.key.as_str()).collect();
+            vec![Effect::log(
+                EventLevel::Info,
+                "task.unblocked",
+                format!("blockers cleared ({}); queued", list_or_none(&cleared)),
+                serde_json::json!({ "blocked_by": cleared }),
+            )]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn list_or_none<S: AsRef<str>>(items: &[S]) -> String {
+    if items.is_empty() { "none".to_string() } else { items.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(", ") }
+}
+
 /// First `max` characters of a message, single-line.
 pub fn preview(text: &str, max: usize) -> String {
     let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -563,6 +629,62 @@ mod tests {
 
     fn cfg() -> Config {
         Config::default()
+    }
+
+    fn linked(key: &str, state_type: &str) -> crate::domain::LinkedIssue {
+        crate::domain::LinkedIssue { key: key.into(), title: String::new(), state_type: state_type.into(), pr_merged: false }
+    }
+
+    #[test]
+    fn dependencies_block_and_unblock_queued_tasks() {
+        let mut t = task(TaskState::Queued, 0);
+        t.blocked_by = vec![linked("ENG-0", "completed"), linked("ENG-2", "started")];
+        let effects = on_dependencies(&mut t);
+        assert_eq!(t.state, TaskState::Blocked);
+        assert!(
+            matches!(&effects[..], [Effect::Log { kind, message, .. }] if kind == "task.blocked" && message == "waiting on ENG-2"),
+            "{effects:?}"
+        );
+        assert!(on_dependencies(&mut t).is_empty(), "no event while it keeps waiting");
+
+        // A merged PR satisfies the blocker even before Linear says Done.
+        t.blocked_by[1].pr_merged = true;
+        let effects = on_dependencies(&mut t);
+        assert_eq!(t.state, TaskState::Queued);
+        assert!(matches!(&effects[..], [Effect::Log { kind, .. }] if kind == "task.unblocked"), "{effects:?}");
+
+        // A canceled blocker counts as satisfied too.
+        let mut t = task(TaskState::Throttled, 0);
+        t.not_before = Some(now());
+        t.blocked_by = vec![linked("ENG-0", "canceled")];
+        assert!(on_dependencies(&mut t).is_empty());
+        assert_eq!(t.state, TaskState::Throttled);
+    }
+
+    #[test]
+    fn dependencies_never_touch_paused_crashed_or_live_tasks() {
+        for state in [TaskState::Paused, TaskState::Crashed, TaskState::Running, TaskState::NeedsAttention] {
+            let mut t = task(state, 1);
+            t.blocked_by = vec![linked("ENG-0", "started")];
+            assert!(on_dependencies(&mut t).is_empty());
+            assert_eq!(t.state, state);
+        }
+    }
+
+    #[test]
+    fn containers_stay_blocked_even_when_children_are_done() {
+        let mut t = task(TaskState::Queued, 0);
+        t.children = vec![linked("ENG-2", "completed"), linked("ENG-3", "unstarted")];
+        let effects = on_dependencies(&mut t);
+        assert_eq!(t.state, TaskState::Blocked);
+        assert!(
+            matches!(&effects[..], [Effect::Log { message, .. }] if message.contains("2 sub-issue(s)") && message.contains("open: ENG-3")),
+            "{effects:?}"
+        );
+        assert_eq!(t.waiting_on(), vec!["ENG-3"]);
+        t.children[1].state_type = "completed".into();
+        assert!(on_dependencies(&mut t).is_empty());
+        assert_eq!(t.state, TaskState::Blocked, "the daemon closes containers; they never run");
     }
 
     fn task(state: TaskState, attempts: u32) -> Task {
@@ -621,6 +743,30 @@ mod tests {
                 Effect::RateLimitProvider { provider, .. } => format!("ratelimit({provider})"),
             })
             .collect()
+    }
+
+    #[test]
+    fn late_start_hook_never_revives_a_crashed_session() {
+        // The pane died and the probe marked the attempt crashed before the
+        // SessionStart hook was drained.
+        let mut t = task(TaskState::Crashed, 1);
+        t.not_before = Some(now() + Duration::seconds(1));
+        let mut s = session(SessionState::Crashed, 1);
+        let out = HookOutcome::Started { transcript_path: Some("/tmp/x.jsonl".into()), source: "startup".into() };
+        let fx = on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), period_end());
+        assert_eq!(t.state, TaskState::Crashed, "stays crashed so the daemon relaunches it");
+        assert_eq!(s.state, SessionState::Crashed);
+        assert_eq!(s.transcript_path.as_deref(), Some("/tmp/x.jsonl"), "the transcript is still worth knowing");
+        assert!(
+            matches!(&fx[..], [Effect::Log { kind, message, .. }] if kind == "session.started" && message.contains("after it was marked crashed")),
+            "{fx:?}"
+        );
+
+        // The resumed attempt reuses the row as `launching`: its start does count.
+        s.state = SessionState::Launching;
+        t.state = TaskState::Starting;
+        on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), period_end());
+        assert_eq!((t.state, s.state), (TaskState::Running, SessionState::Running));
     }
 
     #[test]

@@ -19,6 +19,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     project         TEXT,
     cycle           TEXT,                      -- active | next | past | future (v3)
     cycle_number    INTEGER,                   -- Linear Cycle.number (v3)
+    blocked_by      TEXT NOT NULL DEFAULT '[]', -- JSON [LinkedIssue]: Linear `blocked by` relations (v4)
+    children        TEXT NOT NULL DEFAULT '[]', -- JSON [LinkedIssue]: sub-issues; non-empty = container (v4)
+    parent          TEXT,                      -- identifier of the parent issue (v4)
     model_override  TEXT,
     model           TEXT,
     worktree_path   TEXT,

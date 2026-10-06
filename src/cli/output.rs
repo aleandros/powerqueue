@@ -93,6 +93,7 @@ pub fn state_colored(state: TaskState) -> String {
         TaskState::Idle => s.yellow().to_string(),
         TaskState::Crashed | TaskState::Failed => s.red().to_string(),
         TaskState::Throttled | TaskState::Paused => s.magenta().to_string(),
+        TaskState::Blocked => s.blue().to_string(),
         TaskState::NeedsAttention => s.bright_yellow().bold().to_string(),
         TaskState::Completed => s.bright_green().to_string(),
         TaskState::Cancelled => s.dimmed().to_string(),

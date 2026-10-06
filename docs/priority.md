@@ -298,6 +298,26 @@ dashboard. The exact strings (`src/priority/rules.rs::evaluate`):
 Ties in score are broken by criticality, then by age (older first)
 (`scheduler::pick_next`).
 
+### Dependencies come before the score
+
+The score only orders tasks that may run. A task waiting on another Linear
+issue is never picked, whatever its score or criticality:
+
+* `blocked by` an issue that is not `completed`/`canceled` in Linear and
+  whose GitHub PR is not merged → state `blocked`, back to `queued` once
+  every blocker is satisfied;
+* a parent issue (it has sub-issues) → `blocked` until powerqueue closes it
+  (moves it to `linear.done_state_parent` once every sub-issue is done); it
+  never runs.
+
+Rules still evaluate blocked tasks (their score, criticality and model are
+up to date when they unblock), and a `skip` override still wins: a skipped
+task is `paused`, not `blocked`. There is no `PRIORITY.md` field for
+relations; `task explain` prints a `dependencies` block with each blocker
+and why it does or does not hold the task back, and `status` / the
+dashboard show a `WAITING ON` column. See the README's
+[Dependencies](../README.md#dependencies-blocked-by-and-parent-issues).
+
 ## Live reload
 
 With `priority.live_reload = true` (default) the daemon watches the file's

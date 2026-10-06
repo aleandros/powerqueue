@@ -13,15 +13,18 @@ use crate::tmux::Tmux;
 use crate::worktree::{Repo, run_commands};
 
 /// Choose the next task to start: highest score among schedulable tasks whose
-/// `not_before` has passed; ties broken by criticality then age.
+/// `not_before` has passed and that wait on nothing ([`Task::is_waiting`]:
+/// no pending blocker, not a container); ties broken by criticality then age.
 pub fn pick_next(tasks: &[Task], now: DateTime<Utc>) -> Option<&Task> {
-    tasks.iter().filter(|t| t.state.is_schedulable() && t.not_before.is_none_or(|nb| nb <= now)).min_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.criticality.cmp(&b.criticality))
-            .then(a.created_at.cmp(&b.created_at))
-    })
+    tasks.iter().filter(|t| t.state.is_schedulable() && !t.is_waiting() && t.not_before.is_none_or(|nb| nb <= now)).min_by(
+        |a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.criticality.cmp(&b.criticality))
+                .then(a.created_at.cmp(&b.created_at))
+        },
+    )
 }
 
 /// What [`cleanup_task`] will do, decided from config and the repository facts.
@@ -375,6 +378,26 @@ mod tests {
         let tasks = vec![throttled, task("queued", TaskState::Queued, 1.0, Criticality::Low, 1)];
         assert_eq!(pick_next(&tasks, now()).unwrap().key, "throttled");
         assert!(pick_next(&[], now()).is_none());
+    }
+
+    #[test]
+    fn pick_next_skips_tasks_waiting_on_dependencies() {
+        let linked = |key: &str, state_type: &str| crate::domain::LinkedIssue {
+            key: key.into(),
+            title: String::new(),
+            state_type: state_type.into(),
+            pr_merged: false,
+        };
+        let mut blocked = task("blocked", TaskState::Queued, 999.0, Criticality::Critical, 1);
+        blocked.blocked_by = vec![linked("B-1", "started")];
+        let mut crashed = task("crashed", TaskState::Crashed, 998.0, Criticality::Critical, 1);
+        crashed.blocked_by = vec![linked("B-1", "started")];
+        let mut container = task("parent", TaskState::Queued, 997.0, Criticality::Critical, 1);
+        container.children = vec![linked("C-1", "completed")];
+        let mut tasks = vec![blocked, crashed, container, task("free", TaskState::Queued, 1.0, Criticality::Low, 1)];
+        assert_eq!(pick_next(&tasks, now()).unwrap().key, "free");
+        tasks[0].blocked_by[0].state_type = "completed".into();
+        assert_eq!(pick_next(&tasks, now()).unwrap().key, "blocked", "a done blocker no longer holds it back");
     }
 
     fn cleanup_cfg() -> CleanupConfig {

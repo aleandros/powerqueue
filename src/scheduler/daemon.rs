@@ -19,9 +19,14 @@ use crate::budget::{
     Decision, Estimator, Ledgers, PeriodClock, Policy, RATE_LIMITS_KEY, RateLimitState, load_observed, probe_all, tier_weight,
 };
 use crate::config::Config;
-use crate::domain::{DaemonCommand, EventLevel, ModelTier, Provider, Session, SessionState, Task, TaskId, TaskState};
+use crate::domain::{
+    DaemonCommand, EventLevel, ModelTier, Provider, Session, SessionState, Task, TaskId, TaskState, is_closed_state_type,
+};
 use crate::jev::{JevClient, JevQuestion, content_hash};
-use crate::linear::{IssueFilter, LinearClient, sync_issues};
+use crate::linear::{
+    IssueFilter, LinearClient, LinearIssue, WATCHED_PARENTS_KEY, WatchedParents, container_comment, container_finished,
+    parents_to_watch, sync_issues,
+};
 use crate::paths::Paths;
 use crate::priority::{PriorityRules, RulesWatcher};
 use crate::secrets::{SecretKind, Secrets};
@@ -44,6 +49,11 @@ const LINEAR_MAX_BACKOFF: Duration = Duration::minutes(10);
 const RESOURCE_RETENTION: Duration = Duration::days(7);
 /// Ended sessions keep having their transcript tailed for this long.
 const TRANSCRIPT_GRACE: Duration = Duration::minutes(5);
+/// Watched parent issues are looked up at most this often (or on a forced
+/// sync), so a parent that never finishes does not cost a request per poll.
+const PARENT_CHECK_INTERVAL: Duration = Duration::minutes(5);
+/// A blocker whose PR was not merged is asked again after this long.
+const MERGE_RECHECK: Duration = Duration::minutes(5);
 
 /// Shared stop flag.
 #[derive(Debug, Clone, Default)]
@@ -82,6 +92,11 @@ struct RuntimeState {
     linear_backoff: Duration,
     linear_next_allowed: Option<DateTime<Utc>>,
     force_sync: bool,
+    last_parent_check: Option<DateTime<Utc>>,
+    /// Blockers known to have a merged PR (merged stays merged).
+    merged_blockers: HashSet<String>,
+    /// When each blocker was last found *not* merged.
+    unmerged_checked: HashMap<String, DateTime<Utc>>,
     jev: Option<JevClient>,
     jev_error_logged: bool,
     last_resource_sample: Option<DateTime<Utc>>,
@@ -135,6 +150,9 @@ impl Daemon {
             linear_backoff: Duration::zero(),
             linear_next_allowed: None,
             force_sync: false,
+            last_parent_check: None,
+            merged_blockers: HashSet::new(),
+            unmerged_checked: HashMap::new(),
             jev: None,
             jev_error_logged: false,
             last_resource_sample: None,
@@ -603,6 +621,12 @@ impl Daemon {
                     serde_json::json!({}),
                 );
             }
+            for effect in transitions::on_dependencies(&mut task) {
+                changed = true;
+                if let Effect::Log { level, kind, message, data } = effect {
+                    self.log(Some(task.id), None, level, &kind, &message, data);
+                }
+            }
             if changed {
                 self.store.update_task(&task)?;
                 tracing::debug!(task = %task.key, criticality = %task.criticality, score = task.score, "re-scored");
@@ -766,11 +790,12 @@ impl Daemon {
             return Ok(());
         }
         let Some(client) = self.linear_client() else { return Ok(()) };
+        let forced = self.rt.force_sync;
         self.rt.force_sync = false;
         self.rt.last_linear_poll = Some(now);
 
         let filter = IssueFilter::from_config(&self.cfg.linear);
-        let issues = match client.fetch_issues(&filter).await {
+        let mut issues = match client.fetch_issues(&filter).await {
             Ok(issues) => issues,
             Err(e) => {
                 self.linear_failure(now, &format!("fetching issues failed: {e:#}"));
@@ -780,20 +805,28 @@ impl Daemon {
 
         // `sync_issues` takes a synchronous state lookup, so fetch the states
         // of open tasks whose issues are no longer in the queued set up front.
-        let present: HashSet<&str> = issues.iter().map(|i| i.id.as_str()).collect();
+        // Those still open in Linear are synced too, so their dependencies
+        // stay current while they sit outside the queued states.
+        let present: HashSet<String> = issues.iter().map(|i| i.id.clone()).collect();
         let mut states: HashMap<String, String> = HashMap::new();
         let open = self.store.list_open_tasks()?;
-        for task in open
-            .iter()
-            .filter(|t| matches!(t.state, TaskState::Queued | TaskState::Throttled | TaskState::Paused | TaskState::Crashed))
-        {
+        let mut still_open: Vec<LinearIssue> = Vec::new();
+        for task in open.iter().filter(|t| {
+            matches!(
+                t.state,
+                TaskState::Queued | TaskState::Throttled | TaskState::Paused | TaskState::Crashed | TaskState::Blocked
+            )
+        }) {
             let Some(issue_id) = task.linear_issue_id() else { continue };
             if present.contains(issue_id) {
                 continue;
             }
             match client.get_issue(issue_id).await {
                 Ok(Some(issue)) => {
-                    states.insert(issue_id.to_string(), issue.state_type);
+                    states.insert(issue_id.to_string(), issue.state_type.clone());
+                    if !is_closed_state_type(&issue.state_type) {
+                        still_open.push(issue);
+                    }
                 }
                 Ok(None) => {
                     states.insert(issue_id.to_string(), "canceled".to_string());
@@ -801,6 +834,34 @@ impl Daemon {
                 Err(e) => tracing::warn!(task = %task.key, error = %format!("{e:#}"), "cannot fetch issue state"),
             }
         }
+        issues.extend(still_open);
+
+        // Without complete relations a blocked task could be started early,
+        // so a failure here skips the whole sync.
+        let ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
+        let deps = match client.fetch_dependencies(&ids).await {
+            Ok(d) => d,
+            Err(e) => {
+                self.linear_failure(now, &format!("fetching issue relations failed: {e:#}"));
+                return Ok(());
+            }
+        };
+        for issue in &mut issues {
+            match deps.get(&issue.id) {
+                Some(d) => {
+                    issue.blocked_by = d.blocked_by.clone();
+                    issue.children = d.children.clone();
+                }
+                // Not returned (should not happen): keep what is stored.
+                None => {
+                    if let Some(t) = self.store.get_task_by_linear_issue(&issue.id)? {
+                        issue.blocked_by = t.blocked_by;
+                        issue.children = t.children;
+                    }
+                }
+            }
+        }
+        self.mark_merged_blockers(&client, &mut issues, &open, now).await;
 
         let report = sync_issues(&self.store, &self.cfg.linear, &issues, |id| states.get(id).cloned())?;
         self.rt.linear_backoff = Duration::zero();
@@ -835,7 +896,197 @@ impl Daemon {
         } else {
             tracing::debug!(fetched = issues.len(), "Linear sync: nothing changed");
         }
+        let parents_due = forced || self.rt.last_parent_check.is_none_or(|t| now - t >= PARENT_CHECK_INTERVAL);
+        if let Err(e) = self.close_finished_parents(&client, &issues, parents_due, now).await {
+            self.log(
+                None,
+                None,
+                EventLevel::Warn,
+                "linear.parent_error",
+                &format!("checking parent issues failed: {e:#}"),
+                serde_json::json!({}),
+            );
+        }
         Ok(())
+    }
+
+    /// Watch parent issues (from this poll's sub-issues and containers, plus
+    /// the ones remembered in kv) and close each one whose sub-issues are all
+    /// done ([`container_finished`]): move it to `linear.done_state_parent`
+    /// (when `linear.manage_states` is on), post [`container_comment`] (when
+    /// comments are on) and complete its powerqueue task, if it has one.
+    /// A parent is forgotten once it is closed, deleted or has no children;
+    /// one whose state change fails stays watched and is retried later.
+    /// Parents powerqueue closed are remembered and never handled twice.
+    /// New parents are recorded on every poll, but the watched ones are only
+    /// looked up when `due` ([`PARENT_CHECK_INTERVAL`] or a forced sync).
+    /// A completed container that had run before is cleaned up like any
+    /// finished task (worktree, branch, window).
+    async fn close_finished_parents(
+        &mut self,
+        client: &LinearClient,
+        issues: &[LinearIssue],
+        due: bool,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let mut watched: WatchedParents =
+            self.store.kv_get(WATCHED_PARENTS_KEY).context("read watched parents")?.unwrap_or_default();
+        let before = watched.clone();
+        watched.watch(parents_to_watch(issues));
+        let containers: Vec<String> = self
+            .store
+            .list_open_tasks()?
+            .iter()
+            .filter(|t| t.is_container())
+            .filter_map(|t| t.linear_identifier().map(str::to_string))
+            .collect();
+        watched.watch(containers);
+        let to_check = if due { watched.watching.clone() } else { Default::default() };
+        if due {
+            self.rt.last_parent_check = Some(now);
+        }
+        for key in to_check {
+            let parent = match client.parent_status(&key).await {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    watched.watching.remove(&key);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(parent = %key, error = %format!("{e:#}"), "cannot fetch parent issue");
+                    continue;
+                }
+            };
+            if is_closed_state_type(&parent.state_type) || parent.children.is_empty() {
+                watched.watching.remove(&key);
+                continue;
+            }
+            if !container_finished(&parent.children) {
+                continue;
+            }
+            let task = self.store.get_task_by_linear_issue(&parent.id)?;
+            if task.as_ref().is_some_and(|t| t.state.has_live_session()) {
+                tracing::debug!(parent = %key, "parent issue has a live session; not closing it");
+                continue;
+            }
+            let state = self
+                .cfg
+                .linear
+                .done_state_parent
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .filter(|_| self.cfg.linear.manage_states);
+            if let Some(name) = &state
+                && let Err(e) = client.set_state_in_team(&parent.id, &parent.identifier, &parent.team_key, name).await
+            {
+                self.log(
+                    task.as_ref().map(|t| t.id),
+                    None,
+                    EventLevel::Warn,
+                    "linear.parent_error",
+                    &format!("could not move parent issue {key} to {name}: {e:#}"),
+                    serde_json::json!({ "parent": key, "state": name }),
+                );
+                continue;
+            }
+            watched.mark_closed(&key);
+            let children: Vec<&str> = parent.children.iter().map(|c| c.key.as_str()).collect();
+            let message = match &state {
+                Some(name) => format!("all sub-issues of {key} are done ({}); moved it to {name}", children.join(", ")),
+                None => format!("all sub-issues of {key} are done ({}); state left alone", children.join(", ")),
+            };
+            self.log(
+                task.as_ref().map(|t| t.id),
+                None,
+                EventLevel::Info,
+                "linear.parent_closed",
+                &message,
+                serde_json::json!({ "parent": key, "children": children, "state": state }),
+            );
+            if self.cfg.linear.post_comments {
+                let body = container_comment(&parent.children, state.as_deref());
+                if let Err(e) = client.comment(&parent.id, &body).await {
+                    self.log(
+                        task.as_ref().map(|t| t.id),
+                        None,
+                        EventLevel::Warn,
+                        "linear.parent_error",
+                        &format!("could not comment on parent issue {key}: {e:#}"),
+                        serde_json::json!({ "parent": key }),
+                    );
+                }
+            }
+            if let Some(mut task) = task.filter(|t| !t.state.is_terminal()) {
+                // Written as computed, like the daemon's other transitions: a
+                // task that ran before it got sub-issues may be paused or
+                // crashed here, which the CLI could not complete directly.
+                let previous = task.state;
+                task.state = TaskState::Completed;
+                task.children = parent.children.clone();
+                task.summary = Some(format!("container closed: all sub-issues done ({})", children.join(", ")));
+                task.completed_at = Some(now);
+                task.not_before = None;
+                self.store.update_task(&task)?;
+                self.log(
+                    Some(task.id),
+                    None,
+                    EventLevel::Info,
+                    "task.completed",
+                    "container completed: every sub-issue is done",
+                    serde_json::json!({ "previous_state": previous.as_str(), "children": children }),
+                );
+                if task.worktree_path.is_some() || task.branch.is_some() {
+                    self.apply_effects(&mut task, None, vec![Effect::Cleanup { succeeded: true }]).await;
+                    self.store.update_task(&task)?;
+                }
+            }
+        }
+        if watched != before {
+            self.store.kv_set(WATCHED_PARENTS_KEY, &watched)?;
+        }
+        Ok(())
+    }
+
+    /// For every blocker that is still open in Linear, decide whether its
+    /// pull request is merged and set `pr_merged`. Merged stays merged: a
+    /// blocker known merged (from an earlier poll or the stored tasks in
+    /// `open`) is never asked again, one found unmerged is asked again after
+    /// [`MERGE_RECHECK`], and a failed lookup leaves it pending without
+    /// forgetting an earlier "merged".
+    async fn mark_merged_blockers(
+        &mut self,
+        client: &LinearClient,
+        issues: &mut [LinearIssue],
+        open: &[Task],
+        now: DateTime<Utc>,
+    ) {
+        for task in open {
+            self.rt.merged_blockers.extend(task.blocked_by.iter().filter(|b| b.pr_merged).map(|b| b.key.clone()));
+        }
+        for issue in issues.iter_mut() {
+            for blocker in issue.blocked_by.iter_mut().filter(|b| !b.is_closed()) {
+                if self.rt.merged_blockers.contains(&blocker.key) {
+                    blocker.pr_merged = true;
+                    continue;
+                }
+                if self.rt.unmerged_checked.get(&blocker.key).is_some_and(|at| now - *at < MERGE_RECHECK) {
+                    continue;
+                }
+                match client.pr_merged(&blocker.key).await {
+                    Ok(true) => {
+                        self.rt.merged_blockers.insert(blocker.key.clone());
+                        self.rt.unmerged_checked.remove(&blocker.key);
+                        blocker.pr_merged = true;
+                    }
+                    Ok(false) => {
+                        self.rt.unmerged_checked.insert(blocker.key.clone(), now);
+                    }
+                    Err(e) => {
+                        tracing::warn!(blocker = %blocker.key, error = %format!("{e:#}"), "cannot check the blocker's pull request");
+                    }
+                }
+            }
+        }
     }
 
     fn linear_failure(&mut self, now: DateTime<Utc>, message: &str) {
@@ -1831,6 +2082,272 @@ mod tests {
             stored.score_reasons
         );
         assert_eq!(store.count_events_of_kind("task.models_changed", since).unwrap(), 2);
+    }
+
+    /// Switches of the mock Linear used by the dependency tests.
+    #[derive(Default)]
+    struct MockState {
+        /// DEP-B is Done.
+        b_done: AtomicBool,
+        /// DEP-C2 (second child of DEP-P) is Done.
+        c2_done: AtomicBool,
+        /// DEP-B's GitHub PR is merged.
+        b_merged: AtomicBool,
+        /// Attachment lookups fail.
+        attachments_fail: AtomicBool,
+        /// DEP-A sits in Backlog: open, but not in the queued list.
+        a_backlog: AtomicBool,
+        /// `parent_status` lookups served.
+        parent_checks: std::sync::atomic::AtomicUsize,
+        mutations: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    /// Stateful mock Linear GraphQL server: DEP-A is blocked by DEP-B,
+    /// DEP-P is the parent of DEP-C1 (done) and DEP-C2.
+    struct LinearMock(std::sync::Arc<MockState>);
+
+    impl LinearMock {
+        fn issue(&self, key: &str) -> serde_json::Value {
+            let st = &self.0;
+            let state = |closed: bool| {
+                if closed {
+                    serde_json::json!({ "name": "Done", "type": "completed" })
+                } else {
+                    serde_json::json!({ "name": "Todo", "type": "unstarted" })
+                }
+            };
+            let linked = |key: &str, closed: bool| serde_json::json!({ "identifier": key, "title": format!("Title {key}"), "state": { "type": state(closed)["type"] } });
+            let no_more = serde_json::json!({ "hasNextPage": false, "endCursor": null });
+            let mut issue = serde_json::json!({
+                "id": format!("uuid-{key}"), "identifier": key, "title": format!("Title {key}"), "description": "",
+                "url": format!("https://linear.app/t/issue/{key}"), "priority": 2,
+                "labels": { "nodes": [] }, "state": state(false), "team": { "key": "DEP" },
+                "children": { "nodes": [], "pageInfo": no_more },
+                "inverseRelations": { "nodes": [], "pageInfo": no_more },
+                "createdAt": "2026-10-01T00:00:00.000Z", "updatedAt": "2026-10-01T00:00:00.000Z"
+            });
+            let b_done = st.b_done.load(Ordering::SeqCst);
+            let c2_done = st.c2_done.load(Ordering::SeqCst);
+            match key {
+                "DEP-A" => {
+                    if st.a_backlog.load(Ordering::SeqCst) {
+                        issue["state"] = serde_json::json!({ "name": "Backlog", "type": "backlog" });
+                    }
+                    issue["inverseRelations"]["nodes"] = serde_json::json!([
+                        { "type": "blocks", "issue": linked("DEP-B", b_done) },
+                        { "type": "related", "issue": linked("DEP-X", false) }
+                    ]);
+                }
+                "DEP-B" => issue["state"] = state(b_done),
+                "DEP-P" => issue["children"]["nodes"] = serde_json::json!([linked("DEP-C1", true), linked("DEP-C2", c2_done)]),
+                "DEP-C2" => {
+                    issue["parent"] = serde_json::json!({ "identifier": "DEP-P" });
+                    issue["state"] = state(c2_done);
+                }
+                _ => {}
+            }
+            issue
+        }
+    }
+
+    impl wiremock::Respond for LinearMock {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let st = &self.0;
+            let body: serde_json::Value = request.body_json().expect("json body");
+            let query = body["query"].as_str().unwrap_or_default();
+            let vars = &body["variables"];
+            let key_of = |v: &serde_json::Value| v.as_str().unwrap_or_default().trim_start_matches("uuid-").to_string();
+            let error = |msg: String| {
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({ "errors": [{ "message": msg }] }))
+            };
+            let data = if query.contains("issueUpdate") || query.contains("commentCreate") {
+                st.mutations.lock().unwrap().push(body.clone());
+                serde_json::json!({ "issueUpdate": { "success": true }, "commentCreate": { "success": true } })
+            } else if query.contains("workflowStates") {
+                serde_json::json!({ "workflowStates": { "nodes": [
+                    { "id": "state-todo", "name": "Todo", "type": "unstarted", "team": { "key": "DEP" } },
+                    { "id": "state-done", "name": "Done", "type": "completed", "team": { "key": "DEP" } }
+                ] } })
+            } else if query.contains("attachments") {
+                if st.attachments_fail.load(Ordering::SeqCst) {
+                    return error("attachments are down".into());
+                }
+                let merged = key_of(&vars["id"]) == "DEP-B" && st.b_merged.load(Ordering::SeqCst);
+                let nodes = if merged {
+                    serde_json::json!([{ "url": "https://github.com/o/r/pull/7", "sourceType": "github", "metadata": { "status": "merged" } }])
+                } else {
+                    serde_json::json!([])
+                };
+                serde_json::json!({ "issue": { "attachments": { "nodes": nodes } } })
+            } else if query.contains("in: $ids") {
+                assert!(query.contains("inverseRelations") && query.contains("children"), "{query}");
+                let nodes: Vec<serde_json::Value> =
+                    vars["ids"].as_array().unwrap().iter().map(|id| self.issue(&key_of(id))).collect();
+                serde_json::json!({ "issues": { "nodes": nodes } })
+            } else if query.contains("issues(") {
+                assert!(!query.contains("children"), "the list query must not nest connections");
+                let mut nodes = vec![self.issue("DEP-P")];
+                if !st.a_backlog.load(Ordering::SeqCst) {
+                    nodes.push(self.issue("DEP-A"));
+                }
+                if !st.c2_done.load(Ordering::SeqCst) {
+                    nodes.push(self.issue("DEP-C2"));
+                }
+                serde_json::json!({ "issues": { "nodes": nodes, "pageInfo": { "hasNextPage": false, "endCursor": null } } })
+            } else if query.contains("issue(id:") {
+                if query.contains("children(") {
+                    st.parent_checks.fetch_add(1, Ordering::SeqCst);
+                }
+                serde_json::json!({ "issue": self.issue(&key_of(&vars["id"])) })
+            } else {
+                return error(format!("unexpected query: {query}"));
+            };
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": data }))
+        }
+    }
+
+    /// A daemon talking to a fresh mock Linear; returns the shared mock state.
+    async fn dependency_daemon(store: &Store, dir: &Path) -> (Daemon, std::sync::Arc<MockState>, wiremock::MockServer) {
+        let server = wiremock::MockServer::start().await;
+        let state = std::sync::Arc::new(MockState::default());
+        wiremock::Mock::given(wiremock::matchers::method("POST")).respond_with(LinearMock(state.clone())).mount(&server).await;
+        let daemon = daemon_on(store, dir, &server).await;
+        (daemon, state, server)
+    }
+
+    /// A daemon (fresh runtime state) on `store`, polling `server`.
+    async fn daemon_on(store: &Store, dir: &Path, server: &wiremock::MockServer) -> Daemon {
+        use crate::secrets::FileBackend;
+        let paths = Paths::rooted(dir);
+        let secrets = Secrets::with_backend(Box::new(FileBackend::new(paths.secrets_file())));
+        secrets.set(SecretKind::LinearApiKey, "lin_api_test").unwrap();
+        let mut cfg = Config::default();
+        cfg.priority.live_reload = false;
+        cfg.linear.endpoint = format!("{}/graphql", server.uri());
+        // Never touch the developer's tmux server or a real repository.
+        cfg.tmux.socket_name = Some(format!("powerqueue-test-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
+        cfg.repo.path = dir.join("repo").display().to_string();
+        Daemon::new(cfg, paths, store.clone(), secrets).unwrap()
+    }
+
+    /// One forced Linear poll followed by a re-score.
+    async fn sync_now(daemon: &mut Daemon, now: DateTime<Utc>) {
+        daemon.rt.force_sync = true;
+        daemon.poll_linear(now).await.unwrap();
+        daemon.refresh_rules(now).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_tasks_wait_and_parents_close_when_children_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let (mut daemon, mock, _server) = dependency_daemon(&store, dir.path()).await;
+
+        sync_now(&mut daemon, Utc::now()).await;
+        let a = store.get_task_by_key("DEP-A").unwrap().unwrap();
+        assert_eq!(a.state, TaskState::Blocked, "A is blocked by B, not queued");
+        assert_eq!(a.waiting_on(), vec!["DEP-B"]);
+        let p = store.get_task_by_key("DEP-P").unwrap().unwrap();
+        assert_eq!(p.state, TaskState::Blocked, "a parent never runs");
+        let c2 = store.get_task_by_key("DEP-C2").unwrap().unwrap();
+        assert_eq!((c2.state, c2.parent.as_deref()), (TaskState::Queued, Some("DEP-P")));
+        let open = store.list_open_tasks().unwrap();
+        assert_eq!(pick_next(&open, Utc::now()).map(|t| t.key.as_str()), Some("DEP-C2"));
+        assert!(mock.mutations.lock().unwrap().is_empty(), "nothing is closed while C2 is open");
+        let watched: WatchedParents = store.kv_get(WATCHED_PARENTS_KEY).unwrap().unwrap();
+        assert!(watched.watching.contains("DEP-P"));
+
+        // B is done and the second child closes.
+        mock.b_done.store(true, Ordering::SeqCst);
+        mock.c2_done.store(true, Ordering::SeqCst);
+        sync_now(&mut daemon, Utc::now()).await;
+        let a = store.get_task_by_key("DEP-A").unwrap().unwrap();
+        assert_eq!(a.state, TaskState::Queued, "B is Done: A is queued again");
+        let p = store.get_task_by_key("DEP-P").unwrap().unwrap();
+        assert_eq!(p.state, TaskState::Completed, "{:?}", p);
+        assert!(p.summary.as_deref().unwrap_or_default().contains("DEP-C1, DEP-C2"));
+        let sent = mock.mutations.lock().unwrap().clone();
+        assert!(
+            sent.iter().any(|m| m["query"].as_str().unwrap().contains("issueUpdate")
+                && m["variables"]["id"] == "uuid-DEP-P"
+                && m["variables"]["stateId"] == "state-done"),
+            "{sent:?}"
+        );
+        let comment = sent.iter().find(|m| m["query"].as_str().unwrap().contains("commentCreate")).expect("a comment");
+        let text = comment["variables"]["body"].as_str().unwrap();
+        assert!(text.contains("**Done**") && text.contains("- DEP-C2 — Title DEP-C2 (completada)"), "{text}");
+        let since = Utc::now() - Duration::minutes(5);
+        assert_eq!(store.count_events_of_kind("linear.parent_closed", since).unwrap(), 1);
+        assert_eq!(store.count_events_of_kind("task.unblocked", since).unwrap(), 1);
+        let watched: WatchedParents = store.kv_get(WATCHED_PARENTS_KEY).unwrap().unwrap();
+        assert!(watched.watching.is_empty(), "closed parents are no longer watched: {watched:?}");
+        assert_eq!(watched.closed, vec!["DEP-P".to_string()]);
+
+        // The mock keeps the parent open (as with `manage_states = false`):
+        // another poll still does not close or comment twice.
+        sync_now(&mut daemon, Utc::now()).await;
+        assert_eq!(mock.mutations.lock().unwrap().len(), sent.len());
+    }
+
+    #[tokio::test]
+    async fn merged_prs_stick_relations_refresh_outside_the_queue_and_parent_checks_are_throttled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let (mut daemon, mock, server) = dependency_daemon(&store, dir.path()).await;
+        let t0 = Utc::now();
+        sync_now(&mut daemon, t0).await;
+        assert_eq!(store.get_task_by_key("DEP-A").unwrap().unwrap().state, TaskState::Blocked);
+        assert_eq!(mock.parent_checks.load(Ordering::SeqCst), 1);
+
+        // Unforced polls inside PARENT_CHECK_INTERVAL do not look the parent up again.
+        let t1 = t0 + Duration::seconds(61);
+        daemon.poll_linear(t1).await.unwrap();
+        assert_eq!(mock.parent_checks.load(Ordering::SeqCst), 1, "parent checks are throttled");
+        let t2 = t0 + PARENT_CHECK_INTERVAL + Duration::seconds(1);
+        daemon.poll_linear(t2).await.unwrap();
+        assert_eq!(mock.parent_checks.load(Ordering::SeqCst), 2);
+
+        // B's PR merges: A is queued while B is still open in Linear.
+        mock.b_merged.store(true, Ordering::SeqCst);
+        daemon.rt.unmerged_checked.clear();
+        sync_now(&mut daemon, t2).await;
+        let a = store.get_task_by_key("DEP-A").unwrap().unwrap();
+        assert_eq!(a.state, TaskState::Queued);
+        assert!(a.blocked_by[0].pr_merged);
+
+        // A restarted daemon whose attachment lookups fail keeps "merged".
+        mock.attachments_fail.store(true, Ordering::SeqCst);
+        let mut restarted = daemon_on(&store, dir.path(), &server).await;
+        sync_now(&mut restarted, t2).await;
+        let a = store.get_task_by_key("DEP-A").unwrap().unwrap();
+        assert_eq!(a.state, TaskState::Queued, "a failed lookup never re-blocks: {:?}", a.blocked_by);
+        assert!(a.blocked_by[0].pr_merged);
+
+        // A moves to Backlog (out of the queued list, still open) and B closes:
+        // its stored relations still follow Linear.
+        mock.a_backlog.store(true, Ordering::SeqCst);
+        mock.b_done.store(true, Ordering::SeqCst);
+        sync_now(&mut restarted, t2).await;
+        let a = store.get_task_by_key("DEP-A").unwrap().unwrap();
+        assert_eq!(a.blocked_by[0].state_type, "completed", "{:?}", a.blocked_by);
+        assert_ne!(a.state, TaskState::Cancelled, "Backlog is open: never cancelled");
+
+        // A container that had already run is cleaned up when it closes.
+        let mut p = store.get_task_by_key("DEP-P").unwrap().unwrap();
+        p.state = TaskState::Crashed;
+        p.branch = Some("pq/dep-p".into());
+        p.worktree_path = Some(dir.path().join("gone").display().to_string());
+        store.update_task(&p).unwrap();
+        mock.c2_done.store(true, Ordering::SeqCst);
+        sync_now(&mut restarted, t2).await;
+        let p = store.get_task_by_key("DEP-P").unwrap().unwrap();
+        assert_eq!(p.state, TaskState::Completed);
+        let events = store.events_for_task(p.id, 50).unwrap();
+        assert!(
+            events.iter().any(|e| e.kind == "cleanup.done" && e.message.contains("no worktree on disk")),
+            "cleanup ran for the container: {events:?}"
+        );
+        assert_eq!(p.worktree_path, None, "the stale worktree path is cleared");
     }
 
     #[test]

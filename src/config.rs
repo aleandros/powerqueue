@@ -100,6 +100,9 @@ pub struct LinearConfig {
     pub done_state: Option<String>,
     /// State to move an issue to when the task fails permanently or is blocked.
     pub blocked_state: Option<String>,
+    /// State to move a parent issue (one with sub-issues) to once every
+    /// sub-issue is completed or canceled. Empty = no change.
+    pub done_state_parent: Option<String>,
     /// Let powerqueue move issues between workflow states at all. `false`
     /// when your own Claude skills or CI own the status; comments still
     /// follow `post_comments`.
@@ -127,6 +130,7 @@ impl Default for LinearConfig {
             in_progress_state: Some("In Progress".to_string()),
             done_state: Some("In Review".to_string()),
             blocked_state: None,
+            done_state_parent: Some("Done".to_string()),
             manage_states: true,
             post_comments: true,
             poll_interval_secs: 60,
@@ -1104,7 +1108,7 @@ impl Config {
     }
 
     /// Post-load clean-up: an empty `linear.in_progress_state` /
-    /// `done_state` / `blocked_state` means "no state change for that
+    /// `done_state` / `blocked_state` / `done_state_parent` means "no state change for that
     /// transition" and becomes `None`; an empty `prompt.template` /
     /// `prompt.instructions` becomes `None` too.
     pub fn normalise(&mut self) {
@@ -1116,6 +1120,7 @@ impl Config {
         blank(&mut self.linear.in_progress_state);
         blank(&mut self.linear.done_state);
         blank(&mut self.linear.blocked_state);
+        blank(&mut self.linear.done_state_parent);
         blank(&mut self.prompt.template);
         blank(&mut self.prompt.instructions);
     }
@@ -1793,12 +1798,14 @@ mod tests {
     #[test]
     fn empty_state_names_mean_no_state_change() {
         let cfg = Config::from_toml(
-            "[repo]\npath = '/x'\n[linear]\nin_progress_state = ''\ndone_state = '  '\nblocked_state = 'Blocked'\n",
+            "[repo]\npath = '/x'\n[linear]\nin_progress_state = ''\ndone_state = '  '\nblocked_state = 'Blocked'\ndone_state_parent = ''\n",
         )
         .unwrap();
         assert_eq!(cfg.linear.in_progress_state, None);
         assert_eq!(cfg.linear.done_state, None);
         assert_eq!(cfg.linear.blocked_state.as_deref(), Some("Blocked"));
+        assert_eq!(cfg.linear.done_state_parent, None);
+        assert_eq!(LinearConfig::default().done_state_parent.as_deref(), Some("Done"));
         assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
     }
 

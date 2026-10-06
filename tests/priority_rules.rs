@@ -165,6 +165,9 @@ fn synced_issues_are_evaluated_from_stored_fields() {
         project: None,
         assignee_id: None,
         cycle: None,
+        blocked_by: Vec::new(),
+        children: Vec::new(),
+        parent: None,
         created_at: Utc::now() - Duration::hours(1),
         updated_at: Utc::now(),
     };

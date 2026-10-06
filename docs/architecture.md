@@ -76,19 +76,19 @@ connections. Timestamps are RFC 3339 UTC strings so they sort as text.
 
 | Table | Written by | Read by |
 |-------|------------|---------|
-| `tasks` | `linear::sync` (create/update/cancel), `add`, scheduler (state, attempts, model, worktree, branch, not_before, summary), `priority` re-score (score, criticality, reasons), `task *` commands via `commands` | everything |
+| `tasks` | `linear::sync` (create/update/cancel; `blocked_by`, `children`, `parent` from the issue's relations), `add`, scheduler (state, attempts, model, worktree, branch, not_before, summary), `priority` re-score (score, criticality, reasons), `task *` commands via `commands` | everything |
 | `sessions` | `Launcher::launch` (insert), scheduler probes and hook drain (state, pid, pane, transcript_path, exit_code, last_activity_at) | scheduler, `task show`, dashboard, `attach`, `task output` |
 | `usage` | scheduler from `TranscriptReader::read_new` (one row per `message_id`; duplicates ignored) | `Ledger::load` (per tier, period/window), `Estimator` via `task_usage_summaries`, `task show`, dashboard |
 | `resource_samples` | scheduler every `resource_sample_secs` (CPU%, RSS, process count per session) | dashboard, `task show`; pruned hourly to 7 days |
 | `events` | `store.log_event` on every state change, hook, crash, cleanup, error | `task show`, `logs --events`, dashboard, `doctor` (crash/idle/throttle rates by `kind`) |
 | `commands` | `task pause/resume/cancel/retry/model`, `stop`, dashboard keys (`DaemonCommand` as JSON: `Pause`, `Resume`, `Cancel`, `Retry`, `SetModel`, `SyncNow`, `Reload`, `Shutdown`) | daemon `drain_commands` at the start of each tick (marks `consumed_at`) |
 | `hook_events` | `powerqueue hook` (raw stdin JSON + event name) | daemon `drain_hook_events` (marks `consumed_at`) |
-| `kv` | daemon heartbeat (`daemon.heartbeat` = pid + time, every tick), budget calibration per provider (`budget.calibration.<provider>`, `CALIBRATION_KEY` for Claude), observed usage per provider (`budget.observed.<provider>`), rate-limit cooldowns (`budget.rate_limits`, `RATE_LIMITS_KEY`) | `status`/`doctor`/dashboard header (heartbeat older than 30 s = daemon down), `budget show`, ledger, policy |
+| `kv` | daemon heartbeat (`daemon.heartbeat` = pid + time, every tick), budget calibration per provider (`budget.calibration.<provider>`, `CALIBRATION_KEY` for Claude), observed usage per provider (`budget.observed.<provider>`), rate-limit cooldowns (`budget.rate_limits`, `RATE_LIMITS_KEY`), parent issues being watched / already closed (`linear.watched_parents`, `WATCHED_PARENTS_KEY`) | `status`/`doctor`/dashboard header (heartbeat older than 30 s = daemon down), `budget show`, ledger, policy |
 | `jev_scores` | priority re-score when Jev is enabled (keyed by task, with content hash) | priority re-score (cache hit unless the hash changed) |
 
 The estimator keeps no state of its own; it is rebuilt from
 `task_usage_summaries` (tasks + usage) on every launch pass. The schema is
-applied idempotently and versioned with `PRAGMA user_version` (currently 1).
+applied idempotently and versioned with `PRAGMA user_version` (currently 4; see `SCHEMA_VERSION`).
 Foreign keys are on; deleting a task cascades to its sessions.
 
 ## State machines
@@ -98,19 +98,20 @@ Foreign keys are on; deleting a task cascades to its sessions.
 From `TaskState::can_transition_to` in `domain.rs`. A state may always
 transition to itself.
 
-| from \ to | queued | starting | running | idle | crashed | throttled | paused | needs_attention | completed | failed | cancelled |
-|-----------|:------:|:--------:|:-------:|:----:|:-------:|:---------:|:------:|:---------------:|:---------:|:------:|:---------:|
-| queued | | ✓ | | | | ✓ | ✓ | | | | ✓ |
-| starting | ✓ | | ✓ | | ✓ | | | | | ✓ | ✓ |
-| running | | | | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| idle | | | ✓ | | ✓ | | ✓ | ✓ | ✓ | ✓ | ✓ |
-| crashed | ✓ | ✓ | | | | ✓ | ✓ | | | ✓ | ✓ |
-| throttled | ✓ | ✓ | ✓ | | | | ✓ | | | | ✓ |
-| paused | ✓ | | | | | | | | | | ✓ |
-| needs_attention | | | ✓ | ✓ | ✓ | | ✓ | | ✓ | ✓ | ✓ |
-| completed | ✓ | | | | | | | | | | |
-| failed | ✓ | | | | | | | | | | |
-| cancelled | ✓ | | | | | | | | | | |
+| from \ to | queued | starting | running | idle | crashed | throttled | paused | blocked | needs_attention | completed | failed | cancelled |
+|-----------|:------:|:--------:|:-------:|:----:|:-------:|:---------:|:------:|:-------:|:---------------:|:---------:|:------:|:---------:|
+| queued | | ✓ | | | | ✓ | ✓ | ✓ | | | | ✓ |
+| starting | ✓ | | ✓ | | ✓ | | | | | | ✓ | ✓ |
+| running | | | | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ | ✓ | ✓ |
+| idle | | | ✓ | | ✓ | | ✓ | | ✓ | ✓ | ✓ | ✓ |
+| crashed | ✓ | ✓ | | | | ✓ | ✓ | | | | ✓ | ✓ |
+| throttled | ✓ | ✓ | ✓ | | | | ✓ | ✓ | | | | ✓ |
+| paused | ✓ | | | | | | | | | | | ✓ |
+| blocked | ✓ | | | | | | ✓ | | | ✓ | | ✓ |
+| needs_attention | | | ✓ | ✓ | ✓ | | ✓ | | | ✓ | ✓ | ✓ |
+| completed | ✓ | | | | | | | | | | | |
+| failed | ✓ | | | | | | | | | | | |
+| cancelled | ✓ | | | | | | | | | | | |
 
 ```mermaid
 stateDiagram-v2
@@ -118,6 +119,9 @@ stateDiagram-v2
     queued --> starting: slot + model
     queued --> throttled: no eligible tier
     queued --> paused: task pause / PRIORITY.md skip
+    queued --> blocked: pending `blocked by` issue / parent of sub-issues
+    blocked --> queued: blockers Done/Canceled or PR merged
+    blocked --> completed: parent closed, every sub-issue done
     starting --> running: launched (SessionStart hook confirms)
     starting --> crashed: worktree, setup or launch failed
     running --> idle: Stop without marker
@@ -142,7 +146,10 @@ stateDiagram-v2
 
 Helper predicates: `is_terminal` (completed, failed, cancelled),
 `has_live_session` (starting, running, idle, needs_attention),
-`is_schedulable` (queued, crashed, throttled). The table is enforced by the
+`is_schedulable` (queued, crashed, throttled). `Task::is_waiting` (a pending
+`blocked by` issue, or sub-issues) additionally keeps `pick_next` from
+starting a task, whatever its state; `transitions::on_dependencies` moves
+queued/throttled tasks to `blocked` and back on every re-score. The table is enforced by the
 CLI's direct writes (`task complete/block` and offline `pause/resume/cancel/
 retry`); the daemon's transitions are written as computed.
 
