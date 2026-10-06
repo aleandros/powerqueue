@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::budget::{Estimator, Ledger, Ledgers, load_observed, load_probe_status};
 use crate::config::{Config, REPO_CONFIG_FILE, RepoOverrides};
-use crate::domain::{EventLevel, ModelTier, Provider, SessionState, TaskState};
+use crate::domain::{EventLevel, ModelTier, Provider, SessionState, Task, TaskState};
 use crate::jev::JevClient;
 use crate::linear::client::LinearClient;
 use crate::paths::Paths;
@@ -842,6 +842,102 @@ fn check_daemon(store: &Store) -> CheckResult {
     }
 }
 
+/// Linear dependencies: which tasks are `blocked` and on what, `blocked by`
+/// cycles between open tasks (they would wait forever), and failed attempts
+/// to close parent issues (`parent_errors`, `linear.parent_error` events in
+/// the last day). `parent_closing` is false when `linear.manage_states` is
+/// off or `linear.done_state_parent` is empty.
+pub fn dependency_status(tasks: &[Task], parent_errors: u64, parent_closing: bool) -> CheckResult {
+    const NAME: &str = "dependencies";
+    let open: Vec<&Task> = tasks.iter().filter(|t| !t.state.is_terminal()).collect();
+    let cycles = blocker_cycles(&open);
+    if !cycles.is_empty() {
+        return CheckResult::fail(
+            STATE,
+            NAME,
+            format!("`blocked by` cycle between open tasks: {}; none of them can ever start", cycles.join("; ")),
+            "remove one of the `blocks` relations in Linear",
+        );
+    }
+    if parent_errors > 0 {
+        return CheckResult::warn(
+            STATE,
+            NAME,
+            format!("{parent_errors} failed attempt(s) to close a parent issue in the last 24h"),
+            "check that `linear.done_state_parent` names a workflow state of the parent's team (see `powerqueue logs --events`, kind `linear.parent_error`)",
+        );
+    }
+    let blocked: Vec<String> = open
+        .iter()
+        .filter(|t| t.state == TaskState::Blocked)
+        .map(|t| {
+            let on = t.waiting_on();
+            if t.is_container() {
+                format!("{} (parent; open: {})", t.key, if on.is_empty() { "none".to_string() } else { on.join(", ") })
+            } else {
+                format!("{} ← {}", t.key, on.join(", "))
+            }
+        })
+        .collect();
+    let containers = open.iter().filter(|t| t.is_container()).count();
+    if containers > 0 && !parent_closing {
+        return CheckResult::warn(
+            STATE,
+            NAME,
+            format!(
+                "{containers} parent issue(s) queued but parents are never moved (manage_states off or done_state_parent empty)"
+            ),
+            "set `linear.done_state_parent` (default \"Done\") and `linear.manage_states = true`, or close parents by hand",
+        );
+    }
+    if blocked.is_empty() {
+        CheckResult::ok(STATE, NAME, "no task waits on another issue")
+    } else {
+        CheckResult::ok(STATE, NAME, format!("{} blocked: {}", blocked.len(), blocked.join("; ")))
+    }
+}
+
+/// `blocked by` cycles among `tasks` whose blockers are still pending, as
+/// `A → B → A` strings (each cycle once).
+fn blocker_cycles(tasks: &[&Task]) -> Vec<String> {
+    use std::collections::{BTreeSet, HashMap};
+    let edges: HashMap<&str, Vec<&str>> =
+        tasks.iter().map(|t| (t.key.as_str(), t.pending_blockers().iter().map(|b| b.key.as_str()).collect())).collect();
+    let mut seen: BTreeSet<Vec<&str>> = BTreeSet::new();
+    let mut out = Vec::new();
+    for start in edges.keys().copied() {
+        // Depth-first walk from `start` looking for a path back to it.
+        let mut stack: Vec<(&str, Vec<&str>)> = vec![(start, vec![start])];
+        while let Some((node, path)) = stack.pop() {
+            for &next in edges.get(node).map(Vec::as_slice).unwrap_or(&[]) {
+                if next == start {
+                    let mut canon = path.clone();
+                    canon.sort_unstable();
+                    if seen.insert(canon) {
+                        out.push(format!("{} → {start}", path.join(" → ")));
+                    }
+                } else if !path.contains(&next) && edges.contains_key(next) {
+                    let mut p = path.clone();
+                    p.push(next);
+                    stack.push((next, p));
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn check_dependencies(cfg: &Config, store: &Store) -> CheckResult {
+    let tasks = match store.list_tasks() {
+        Ok(t) => t,
+        Err(e) => return CheckResult::fail(STATE, "dependencies", format!("{e:#}"), "check the database"),
+    };
+    let errors = store.count_events_of_kind("linear.parent_error", Utc::now() - Duration::hours(24)).unwrap_or(0);
+    let closing = cfg.linear.manage_states && cfg.linear.done_state_parent.as_deref().is_some_and(|s| !s.trim().is_empty());
+    dependency_status(&tasks, errors, closing)
+}
+
 fn pane_ids(tmux: &Tmux, session: &str) -> Option<Vec<crate::tmux::PaneInfo>> {
     tmux.list_panes(session).ok()
 }
@@ -1291,6 +1387,7 @@ pub async fn run_all(
     results.push(check_db(store));
     results.push(check_daemon(store));
     results.push(check_stuck_tasks(cfg, store, fix));
+    results.push(check_dependencies(cfg, store));
     results.push(check_orphan_worktrees(cfg, paths, store, fix));
     results.push(check_orphan_windows(cfg, store, fix));
     results.push(check_stale_lock(paths, store, fix));
@@ -1445,6 +1542,52 @@ mod tests {
         assert_eq!(c.detail, "Not logged in");
         let d = parse_claude_auth(true, "not json", "");
         assert!(d.logged_in);
+    }
+
+    #[test]
+    fn dependency_check_reports_blocked_cycles_and_parent_errors() {
+        use crate::domain::{LinkedIssue, TaskSource};
+        let linked = |key: &str, state_type: &str| LinkedIssue {
+            key: key.into(),
+            title: String::new(),
+            state_type: state_type.into(),
+            pr_merged: false,
+        };
+        let task = |key: &str, state: TaskState, blockers: &[&str]| {
+            let mut t = Task::new(key, key, TaskSource::Manual);
+            t.state = state;
+            t.blocked_by = blockers.iter().map(|b| linked(b, "started")).collect();
+            t
+        };
+        let r = dependency_status(&[task("A", TaskState::Queued, &[])], 0, true);
+        assert_eq!((r.status, r.detail.as_str()), (Status::Ok, "no task waits on another issue"));
+
+        let r = dependency_status(&[task("A", TaskState::Blocked, &["B"])], 0, true);
+        assert_eq!(r.status, Status::Ok);
+        assert!(r.detail.contains("A ← B"), "{}", r.detail);
+
+        let tasks = [
+            task("A", TaskState::Blocked, &["B"]),
+            task("B", TaskState::Blocked, &["C"]),
+            task("C", TaskState::Blocked, &["A"]),
+            task("D", TaskState::Blocked, &["A"]),
+        ];
+        let r = dependency_status(&tasks, 0, true);
+        assert_eq!(r.status, Status::Fail);
+        assert_eq!(r.detail.matches('→').count(), 3, "one cycle reported once: {}", r.detail);
+        let mut done = tasks.clone();
+        done[2].state = TaskState::Completed;
+        assert_ne!(dependency_status(&done, 0, true).status, Status::Fail, "a terminal task breaks the cycle");
+
+        let r = dependency_status(&[task("A", TaskState::Queued, &[])], 2, true);
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.fix_hint.unwrap().contains("done_state_parent"));
+
+        let mut parent = task("P", TaskState::Blocked, &[]);
+        parent.children = vec![linked("C-1", "started")];
+        assert_eq!(dependency_status(std::slice::from_ref(&parent), 0, false).status, Status::Warn);
+        let r = dependency_status(&[parent], 0, true);
+        assert!(r.detail.contains("P (parent; open: C-1)"), "{}", r.detail);
     }
 
     #[test]

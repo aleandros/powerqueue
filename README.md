@@ -223,7 +223,7 @@ Global flags work on every command.
 | `task pause <task>` | do not schedule; a running session stops after its turn |
 | `task resume <task>` | resume a paused or needs-attention task |
 | `task retry <task>` | re-queue a failed, cancelled or completed task (also crashed, throttled, paused, needs-attention) |
-| `task explain <task>` | current score and model decision, with reasons |
+| `task explain <task>` | current score and model decision, with reasons; for Linear tasks also what it waits on (pending `blocked by` issues, open sub-issues of a parent) |
 | `task model <task> <model\|auto>` | force (or clear) the model for the next attempt (`fable`, `opus`, `sonnet`, `haiku`, or another provider's model such as `gpt-6.1-sol`, `gemini-3-pro`, `codex:<name>`); the policy may still downgrade it within the same provider when the model is out of budget |
 | `task prompt <task>` | print the prompt the next attempt would receive (renders `prompt.template` with attempt = attempts + 1, the task's last error and its forced/last model); nothing is launched. `--json` prints `{"task", "template", "prompt", "warnings"}` |
 | `task output <task> [-n LINES]` | last screen of the task's tmux pane (default 60 lines) |
@@ -448,11 +448,37 @@ anything else uses the explicit `codex:<name>` form.
 | `in_progress_state` | `"In Progress"` | state set when a session starts; `""` = leave the state alone for this transition |
 | `done_state` | `"In Review"` | state set on completion; `""` = no change |
 | `blocked_state` | none | state set when a task fails permanently or is blocked |
+| `done_state_parent` | `"Done"` | state a parent issue (one with sub-issues) is moved to once every sub-issue is completed or canceled (at least one completed); a comment lists the sub-issues. `""` = no change. See [Dependencies](#dependencies-blocked-by-and-parent-issues) |
 | `manage_states` | `true` | let powerqueue move issues between workflow states at all. Set it to `false` when your own Claude skills or CI move issues: the daemon then never changes an issue's state, while comments still follow `post_comments` |
 | `post_comments` | `true` | post progress comments on the issue |
 | `poll_interval_secs` | `60` | how often to poll |
 | `max_issues` | `100` | cap per poll |
 | `endpoint` | `https://api.linear.app/graphql` | GraphQL endpoint (tests) |
+
+#### Dependencies: `blocked by` and parent issues
+
+Each poll also reads the issue's Linear relations:
+
+* **Blocked by.** A task whose issue is `blocked by` another one is moved to
+  the `blocked` state and never started until every blocker is satisfied:
+  its Linear state is of type `completed` or `canceled`, **or** the GitHub
+  pull request attached to it (Linear's GitHub integration) is merged. It
+  then goes back to `queued` on its own. `status` and the dashboard show a
+  **WAITING ON** column with the pending keys, `task show` a `waiting on`
+  line, and `task explain` lists every blocker and why it is (not) satisfied. Only
+  `queued`/`throttled` tasks are moved; a task that already ran is never
+  pulled back, but a crashed one is not relaunched while it waits.
+* **Parent issues.** An issue with sub-issues is a container: it is synced
+  (as `blocked`) but never run. powerqueue watches every parent it sees (the
+  parent of any synced sub-issue, even one that is not in `queued_states`
+  itself), and once all its sub-issues are closed with at least one
+  completed it moves the parent to `done_state_parent` (when
+  `manage_states` is on), posts a comment listing the sub-issues (when
+  `post_comments` is on) and completes the parent's task, if it has one.
+  A parent whose sub-issues were all canceled is left alone.
+
+`powerqueue doctor` reports blocked tasks, `blocked by` cycles between open
+tasks (which would wait forever) and failed attempts to close a parent.
 
 ### `[priority]` and `[priority.jev]`
 

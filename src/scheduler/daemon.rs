@@ -19,9 +19,14 @@ use crate::budget::{
     Decision, Estimator, Ledgers, PeriodClock, Policy, RATE_LIMITS_KEY, RateLimitState, load_observed, probe_all, tier_weight,
 };
 use crate::config::Config;
-use crate::domain::{DaemonCommand, EventLevel, ModelTier, Provider, Session, SessionState, Task, TaskId, TaskState};
+use crate::domain::{
+    DaemonCommand, EventLevel, ModelTier, Provider, Session, SessionState, Task, TaskId, TaskState, is_closed_state_type,
+};
 use crate::jev::{JevClient, JevQuestion, content_hash};
-use crate::linear::{IssueFilter, LinearClient, sync_issues};
+use crate::linear::{
+    IssueFilter, LinearClient, LinearIssue, WATCHED_PARENTS_KEY, WatchedParents, container_comment, container_finished,
+    parents_to_watch, sync_issues,
+};
 use crate::paths::Paths;
 use crate::priority::{PriorityRules, RulesWatcher};
 use crate::secrets::{SecretKind, Secrets};
@@ -44,6 +49,30 @@ const LINEAR_MAX_BACKOFF: Duration = Duration::minutes(10);
 const RESOURCE_RETENTION: Duration = Duration::days(7);
 /// Ended sessions keep having their transcript tailed for this long.
 const TRANSCRIPT_GRACE: Duration = Duration::minutes(5);
+
+/// For every blocker that is still open in Linear, ask whether its pull
+/// request is merged (GitHub attachment) and set `pr_merged`. One lookup per
+/// distinct blocker; a failed lookup leaves the blocker pending.
+async fn mark_merged_blockers(client: &LinearClient, issues: &mut [LinearIssue]) {
+    let mut merged: HashMap<String, bool> = HashMap::new();
+    for issue in issues.iter_mut() {
+        for blocker in issue.blocked_by.iter_mut().filter(|b| !b.is_closed()) {
+            if let Some(known) = merged.get(&blocker.key) {
+                blocker.pr_merged = *known;
+                continue;
+            }
+            let value = match client.pr_merged(&blocker.key).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(blocker = %blocker.key, error = %format!("{e:#}"), "cannot check the blocker's pull request");
+                    false
+                }
+            };
+            merged.insert(blocker.key.clone(), value);
+            blocker.pr_merged = value;
+        }
+    }
+}
 
 /// Shared stop flag.
 #[derive(Debug, Clone, Default)]
@@ -603,6 +632,12 @@ impl Daemon {
                     serde_json::json!({}),
                 );
             }
+            for effect in transitions::on_dependencies(&mut task) {
+                changed = true;
+                if let Effect::Log { level, kind, message, data } = effect {
+                    self.log(Some(task.id), None, level, &kind, &message, data);
+                }
+            }
             if changed {
                 self.store.update_task(&task)?;
                 tracing::debug!(task = %task.key, criticality = %task.criticality, score = task.score, "re-scored");
@@ -770,23 +805,26 @@ impl Daemon {
         self.rt.last_linear_poll = Some(now);
 
         let filter = IssueFilter::from_config(&self.cfg.linear);
-        let issues = match client.fetch_issues(&filter).await {
+        let mut issues = match client.fetch_issues(&filter).await {
             Ok(issues) => issues,
             Err(e) => {
                 self.linear_failure(now, &format!("fetching issues failed: {e:#}"));
                 return Ok(());
             }
         };
+        mark_merged_blockers(&client, &mut issues).await;
 
         // `sync_issues` takes a synchronous state lookup, so fetch the states
         // of open tasks whose issues are no longer in the queued set up front.
         let present: HashSet<&str> = issues.iter().map(|i| i.id.as_str()).collect();
         let mut states: HashMap<String, String> = HashMap::new();
         let open = self.store.list_open_tasks()?;
-        for task in open
-            .iter()
-            .filter(|t| matches!(t.state, TaskState::Queued | TaskState::Throttled | TaskState::Paused | TaskState::Crashed))
-        {
+        for task in open.iter().filter(|t| {
+            matches!(
+                t.state,
+                TaskState::Queued | TaskState::Throttled | TaskState::Paused | TaskState::Crashed | TaskState::Blocked
+            )
+        }) {
             let Some(issue_id) = task.linear_issue_id() else { continue };
             if present.contains(issue_id) {
                 continue;
@@ -834,6 +872,132 @@ impl Daemon {
             }
         } else {
             tracing::debug!(fetched = issues.len(), "Linear sync: nothing changed");
+        }
+        if let Err(e) = self.close_finished_parents(&client, &issues, now).await {
+            self.log(
+                None,
+                None,
+                EventLevel::Warn,
+                "linear.parent_error",
+                &format!("checking parent issues failed: {e:#}"),
+                serde_json::json!({}),
+            );
+        }
+        Ok(())
+    }
+
+    /// Watch parent issues (from this poll's sub-issues and containers, plus
+    /// the ones remembered in kv) and close each one whose sub-issues are all
+    /// done ([`container_finished`]): move it to `linear.done_state_parent`
+    /// (when `linear.manage_states` is on), post [`container_comment`] (when
+    /// comments are on) and complete its powerqueue task, if it has one.
+    /// A parent is forgotten once it is closed, deleted or has no children;
+    /// one whose state change fails stays watched and is retried next poll.
+    /// Parents powerqueue closed are remembered and never handled twice.
+    async fn close_finished_parents(&mut self, client: &LinearClient, issues: &[LinearIssue], now: DateTime<Utc>) -> Result<()> {
+        // An unreadable value (older shape) just starts the watch list over.
+        let mut watched: WatchedParents = self.store.kv_get(WATCHED_PARENTS_KEY).ok().flatten().unwrap_or_default();
+        let before = watched.clone();
+        watched.watch(parents_to_watch(issues));
+        let containers: Vec<String> = self
+            .store
+            .list_open_tasks()?
+            .iter()
+            .filter(|t| t.is_container())
+            .filter_map(|t| t.linear_identifier().map(str::to_string))
+            .collect();
+        watched.watch(containers);
+        for key in watched.watching.clone() {
+            let parent = match client.get_issue(&key).await {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    watched.watching.remove(&key);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(parent = %key, error = %format!("{e:#}"), "cannot fetch parent issue");
+                    continue;
+                }
+            };
+            if is_closed_state_type(&parent.state_type) || parent.children.is_empty() {
+                watched.watching.remove(&key);
+                continue;
+            }
+            if !container_finished(&parent.children) {
+                continue;
+            }
+            let task = self.store.get_task_by_linear_issue(&parent.id)?;
+            if task.as_ref().is_some_and(|t| t.state.has_live_session()) {
+                tracing::debug!(parent = %key, "parent issue has a live session; not closing it");
+                continue;
+            }
+            let state = self
+                .cfg
+                .linear
+                .done_state_parent
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .filter(|_| self.cfg.linear.manage_states);
+            if let Some(name) = &state
+                && let Err(e) = client.set_state(&parent.id, name).await
+            {
+                self.log(
+                    task.as_ref().map(|t| t.id),
+                    None,
+                    EventLevel::Warn,
+                    "linear.parent_error",
+                    &format!("could not move parent issue {key} to {name}: {e:#}"),
+                    serde_json::json!({ "parent": key, "state": name }),
+                );
+                continue;
+            }
+            watched.mark_closed(&key);
+            let children: Vec<&str> = parent.children.iter().map(|c| c.key.as_str()).collect();
+            let message = match &state {
+                Some(name) => format!("all sub-issues of {key} are done ({}); moved it to {name}", children.join(", ")),
+                None => format!("all sub-issues of {key} are done ({}); state left alone", children.join(", ")),
+            };
+            self.log(
+                task.as_ref().map(|t| t.id),
+                None,
+                EventLevel::Info,
+                "linear.parent_closed",
+                &message,
+                serde_json::json!({ "parent": key, "children": children, "state": state }),
+            );
+            if self.cfg.linear.post_comments {
+                let body = container_comment(&parent.children, state.as_deref());
+                if let Err(e) = client.comment(&parent.id, &body).await {
+                    self.log(
+                        task.as_ref().map(|t| t.id),
+                        None,
+                        EventLevel::Warn,
+                        "linear.parent_error",
+                        &format!("could not comment on parent issue {key}: {e:#}"),
+                        serde_json::json!({ "parent": key }),
+                    );
+                }
+            }
+            if let Some(mut task) = task.filter(|t| !t.state.is_terminal()) {
+                let previous = task.state;
+                task.state = TaskState::Completed;
+                task.children = parent.children.clone();
+                task.summary = Some(format!("container closed: all sub-issues done ({})", children.join(", ")));
+                task.completed_at = Some(now);
+                task.not_before = None;
+                self.store.update_task(&task)?;
+                self.log(
+                    Some(task.id),
+                    None,
+                    EventLevel::Info,
+                    "task.completed",
+                    "container completed: every sub-issue is done",
+                    serde_json::json!({ "previous_state": previous.as_str(), "children": children }),
+                );
+            }
+        }
+        if watched != before {
+            self.store.kv_set(WATCHED_PARENTS_KEY, &watched)?;
         }
         Ok(())
     }
@@ -1831,6 +1995,152 @@ mod tests {
             stored.score_reasons
         );
         assert_eq!(store.count_events_of_kind("task.models_changed", since).unwrap(), 2);
+    }
+
+    /// Mock Linear for the dependency test: a stateful GraphQL responder.
+    /// `done` flips B and the parent's second child to `completed`.
+    struct LinearMock {
+        done: std::sync::Arc<AtomicBool>,
+        mutations: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl LinearMock {
+        fn issue(&self, key: &str) -> serde_json::Value {
+            let done = self.done.load(Ordering::SeqCst);
+            let state = |closed: bool| {
+                if closed {
+                    serde_json::json!({ "name": "Done", "type": "completed" })
+                } else {
+                    serde_json::json!({ "name": "Todo", "type": "unstarted" })
+                }
+            };
+            let linked = |key: &str, closed: bool| serde_json::json!({ "identifier": key, "title": format!("Title {key}"), "state": { "type": state(closed)["type"] } });
+            let mut issue = serde_json::json!({
+                "id": format!("uuid-{key}"), "identifier": key, "title": format!("Title {key}"), "description": "",
+                "url": format!("https://linear.app/t/issue/{key}"), "priority": 2,
+                "labels": { "nodes": [] }, "state": state(false), "team": { "key": "DEP" },
+                "createdAt": "2026-10-01T00:00:00.000Z", "updatedAt": "2026-10-01T00:00:00.000Z"
+            });
+            match key {
+                "DEP-A" => {
+                    issue["inverseRelations"] = serde_json::json!({ "nodes": [
+                        { "type": "blocks", "issue": linked("DEP-B", done) },
+                        { "type": "related", "issue": linked("DEP-X", false) }
+                    ] })
+                }
+                "DEP-B" => issue["state"] = state(done),
+                "DEP-P" => issue["children"] = serde_json::json!({ "nodes": [linked("DEP-C1", true), linked("DEP-C2", done)] }),
+                "DEP-C2" => {
+                    issue["parent"] = serde_json::json!({ "identifier": "DEP-P" });
+                    issue["state"] = state(done);
+                }
+                _ => {}
+            }
+            issue
+        }
+    }
+
+    impl wiremock::Respond for LinearMock {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let body: serde_json::Value = request.body_json().expect("json body");
+            let query = body["query"].as_str().unwrap_or_default();
+            let vars = &body["variables"];
+            let data = if query.contains("issueUpdate") || query.contains("commentCreate") {
+                self.mutations.lock().unwrap().push(body.clone());
+                serde_json::json!({ "issueUpdate": { "success": true }, "commentCreate": { "success": true } })
+            } else if query.contains("workflowStates") {
+                serde_json::json!({ "workflowStates": { "nodes": [
+                    { "id": "state-todo", "name": "Todo", "type": "unstarted", "team": { "key": "DEP" } },
+                    { "id": "state-done", "name": "Done", "type": "completed", "team": { "key": "DEP" } }
+                ] } })
+            } else if query.contains("attachments") {
+                serde_json::json!({ "issue": { "attachments": { "nodes": [] } } })
+            } else if query.contains("issues(") {
+                let mut nodes = vec![self.issue("DEP-A"), self.issue("DEP-P")];
+                if !self.done.load(Ordering::SeqCst) {
+                    nodes.push(self.issue("DEP-C2"));
+                }
+                serde_json::json!({ "issues": { "nodes": nodes, "pageInfo": { "hasNextPage": false, "endCursor": null } } })
+            } else if query.contains("issue(id:") {
+                let key = vars["id"].as_str().unwrap_or_default().trim_start_matches("uuid-").to_string();
+                serde_json::json!({ "issue": self.issue(&key) })
+            } else {
+                return wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "errors": [{ "message": format!("unexpected query: {query}") }] }));
+            };
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": data }))
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_tasks_wait_and_parents_close_when_children_finish() {
+        use crate::secrets::FileBackend;
+
+        let server = wiremock::MockServer::start().await;
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let mutations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(LinearMock { done: done.clone(), mutations: mutations.clone() })
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        let store = Store::open_in_memory().unwrap();
+        let secrets = Secrets::with_backend(Box::new(FileBackend::new(paths.secrets_file())));
+        secrets.set(SecretKind::LinearApiKey, "lin_api_test").unwrap();
+        let mut cfg = Config::default();
+        cfg.priority.live_reload = false;
+        cfg.linear.endpoint = format!("{}/graphql", server.uri());
+        let mut daemon = Daemon::new(cfg, paths, store.clone(), secrets).unwrap();
+
+        daemon.poll_linear(Utc::now()).await.unwrap();
+        daemon.refresh_rules(Utc::now()).await.unwrap();
+        let a = store.get_task_by_key("DEP-A").unwrap().unwrap();
+        assert_eq!(a.state, TaskState::Blocked, "A is blocked by B, not queued");
+        assert_eq!(a.waiting_on(), vec!["DEP-B"]);
+        let p = store.get_task_by_key("DEP-P").unwrap().unwrap();
+        assert_eq!(p.state, TaskState::Blocked, "a parent never runs");
+        let c2 = store.get_task_by_key("DEP-C2").unwrap().unwrap();
+        assert_eq!((c2.state, c2.parent.as_deref()), (TaskState::Queued, Some("DEP-P")));
+        let open = store.list_open_tasks().unwrap();
+        assert_eq!(pick_next(&open, Utc::now()).map(|t| t.key.as_str()), Some("DEP-C2"));
+        assert!(mutations.lock().unwrap().is_empty(), "nothing is closed while C2 is open");
+        let watched: WatchedParents = store.kv_get(WATCHED_PARENTS_KEY).unwrap().unwrap();
+        assert!(watched.watching.contains("DEP-P"));
+
+        // B is done and the second child closes.
+        done.store(true, Ordering::SeqCst);
+        daemon.rt.force_sync = true;
+        daemon.poll_linear(Utc::now()).await.unwrap();
+        daemon.refresh_rules(Utc::now()).await.unwrap();
+        let a = store.get_task_by_key("DEP-A").unwrap().unwrap();
+        assert_eq!(a.state, TaskState::Queued, "B is Done: A is queued again");
+        let p = store.get_task_by_key("DEP-P").unwrap().unwrap();
+        assert_eq!(p.state, TaskState::Completed, "{:?}", p);
+        assert!(p.summary.as_deref().unwrap_or_default().contains("DEP-C1, DEP-C2"));
+        let sent = mutations.lock().unwrap().clone();
+        assert!(
+            sent.iter().any(|m| m["query"].as_str().unwrap().contains("issueUpdate")
+                && m["variables"]["id"] == "uuid-DEP-P"
+                && m["variables"]["stateId"] == "state-done"),
+            "{sent:?}"
+        );
+        let comment = sent.iter().find(|m| m["query"].as_str().unwrap().contains("commentCreate")).expect("a comment");
+        let text = comment["variables"]["body"].as_str().unwrap();
+        assert!(text.contains("**Done**") && text.contains("- DEP-C2 — Title DEP-C2 (completada)"), "{text}");
+        let since = Utc::now() - Duration::minutes(5);
+        assert_eq!(store.count_events_of_kind("linear.parent_closed", since).unwrap(), 1);
+        assert_eq!(store.count_events_of_kind("task.unblocked", since).unwrap(), 1);
+        let watched: WatchedParents = store.kv_get(WATCHED_PARENTS_KEY).unwrap().unwrap();
+        assert!(watched.watching.is_empty(), "closed parents are no longer watched: {watched:?}");
+        assert_eq!(watched.closed, vec!["DEP-P".to_string()]);
+
+        // The mock keeps the parent open (as with `manage_states = false`):
+        // another poll still does not close or comment twice.
+        daemon.rt.force_sync = true;
+        daemon.poll_linear(Utc::now()).await.unwrap();
+        assert_eq!(mutations.lock().unwrap().len(), sent.len());
     }
 
     #[test]

@@ -538,6 +538,59 @@ pub fn on_crash(
     effects
 }
 
+/// Move a task between `queued` and `blocked` from its Linear dependencies
+/// (see [`Task::is_waiting`]). Only `queued` / `throttled` tasks are
+/// blocked: paused tasks stay paused, and a task that already ran (crashed,
+/// live) is never pulled back — [`crate::scheduler::pick_next`] still
+/// refuses to relaunch it while it waits. A `blocked` task whose blockers
+/// cleared goes back to `queued`. Containers stay `blocked` until the daemon
+/// closes them.
+pub fn on_dependencies(task: &mut Task) -> Vec<Effect> {
+    let waiting = task.is_waiting();
+    let waiting_on: Vec<String> = task.waiting_on().into_iter().map(str::to_string).collect();
+    match task.state {
+        TaskState::Queued | TaskState::Throttled if waiting => {
+            let previous = task.state;
+            task.state = TaskState::Blocked;
+            task.not_before = None;
+            let message = if task.is_container() {
+                format!(
+                    "parent issue with {} sub-issue(s); never scheduled, closed once they are done (open: {})",
+                    task.children.len(),
+                    list_or_none(&waiting_on)
+                )
+            } else {
+                format!("waiting on {}", waiting_on.join(", "))
+            };
+            vec![Effect::log(
+                EventLevel::Info,
+                "task.blocked",
+                message,
+                serde_json::json!({
+                    "previous_state": previous.as_str(),
+                    "waiting_on": waiting_on,
+                    "container": task.is_container(),
+                }),
+            )]
+        }
+        TaskState::Blocked if !waiting => {
+            task.state = TaskState::Queued;
+            let cleared: Vec<&str> = task.blocked_by.iter().map(|b| b.key.as_str()).collect();
+            vec![Effect::log(
+                EventLevel::Info,
+                "task.unblocked",
+                format!("blockers cleared ({}); queued", list_or_none(&cleared)),
+                serde_json::json!({ "blocked_by": cleared }),
+            )]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn list_or_none<S: AsRef<str>>(items: &[S]) -> String {
+    if items.is_empty() { "none".to_string() } else { items.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(", ") }
+}
+
 /// First `max` characters of a message, single-line.
 pub fn preview(text: &str, max: usize) -> String {
     let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -563,6 +616,62 @@ mod tests {
 
     fn cfg() -> Config {
         Config::default()
+    }
+
+    fn linked(key: &str, state_type: &str) -> crate::domain::LinkedIssue {
+        crate::domain::LinkedIssue { key: key.into(), title: String::new(), state_type: state_type.into(), pr_merged: false }
+    }
+
+    #[test]
+    fn dependencies_block_and_unblock_queued_tasks() {
+        let mut t = task(TaskState::Queued, 0);
+        t.blocked_by = vec![linked("ENG-0", "completed"), linked("ENG-2", "started")];
+        let effects = on_dependencies(&mut t);
+        assert_eq!(t.state, TaskState::Blocked);
+        assert!(
+            matches!(&effects[..], [Effect::Log { kind, message, .. }] if kind == "task.blocked" && message == "waiting on ENG-2"),
+            "{effects:?}"
+        );
+        assert!(on_dependencies(&mut t).is_empty(), "no event while it keeps waiting");
+
+        // A merged PR satisfies the blocker even before Linear says Done.
+        t.blocked_by[1].pr_merged = true;
+        let effects = on_dependencies(&mut t);
+        assert_eq!(t.state, TaskState::Queued);
+        assert!(matches!(&effects[..], [Effect::Log { kind, .. }] if kind == "task.unblocked"), "{effects:?}");
+
+        // A canceled blocker counts as satisfied too.
+        let mut t = task(TaskState::Throttled, 0);
+        t.not_before = Some(now());
+        t.blocked_by = vec![linked("ENG-0", "canceled")];
+        assert!(on_dependencies(&mut t).is_empty());
+        assert_eq!(t.state, TaskState::Throttled);
+    }
+
+    #[test]
+    fn dependencies_never_touch_paused_crashed_or_live_tasks() {
+        for state in [TaskState::Paused, TaskState::Crashed, TaskState::Running, TaskState::NeedsAttention] {
+            let mut t = task(state, 1);
+            t.blocked_by = vec![linked("ENG-0", "started")];
+            assert!(on_dependencies(&mut t).is_empty());
+            assert_eq!(t.state, state);
+        }
+    }
+
+    #[test]
+    fn containers_stay_blocked_even_when_children_are_done() {
+        let mut t = task(TaskState::Queued, 0);
+        t.children = vec![linked("ENG-2", "completed"), linked("ENG-3", "unstarted")];
+        let effects = on_dependencies(&mut t);
+        assert_eq!(t.state, TaskState::Blocked);
+        assert!(
+            matches!(&effects[..], [Effect::Log { message, .. }] if message.contains("2 sub-issue(s)") && message.contains("open: ENG-3")),
+            "{effects:?}"
+        );
+        assert_eq!(t.waiting_on(), vec!["ENG-3"]);
+        t.children[1].state_type = "completed".into();
+        assert!(on_dependencies(&mut t).is_empty());
+        assert_eq!(t.state, TaskState::Blocked, "the daemon closes containers; they never run");
     }
 
     fn task(state: TaskState, attempts: u32) -> Task {

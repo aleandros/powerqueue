@@ -23,7 +23,9 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// * v2: `sessions.agent_session_id`; kv `budget.calibration` renamed to
 ///   `budget.calibration.claude` (budgets are per provider).
 /// * v3: `tasks.cycle` and `tasks.cycle_number` (the Linear cycle an issue is in).
-pub const SCHEMA_VERSION: i64 = 3;
+/// * v4: `tasks.blocked_by`, `tasks.children` and `tasks.parent` (Linear
+///   dependencies; see [`crate::domain::LinkedIssue`]).
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// kv key of the Claude calibration before schema v2.
 const LEGACY_CALIBRATION_KEY: &str = "budget.calibration";
@@ -74,6 +76,7 @@ pub struct QueueCounts {
     pub crashed: usize,
     pub throttled: usize,
     pub paused: usize,
+    pub blocked: usize,
     pub needs_attention: usize,
     pub completed: usize,
     pub failed: usize,
@@ -172,6 +175,23 @@ impl Store {
                 tracing::info!(from = version, to = SCHEMA_VERSION, columns_added = ?added, "migrated database schema to v3");
             }
         }
+        if version < 4 {
+            let cols = columns_of("tasks")?;
+            let mut added = Vec::new();
+            for (name, sql) in [
+                ("blocked_by", "ALTER TABLE tasks ADD COLUMN blocked_by TEXT NOT NULL DEFAULT '[]'"),
+                ("children", "ALTER TABLE tasks ADD COLUMN children TEXT NOT NULL DEFAULT '[]'"),
+                ("parent", "ALTER TABLE tasks ADD COLUMN parent TEXT"),
+            ] {
+                if !cols.iter().any(|c| c == name) {
+                    conn.execute(sql, []).with_context(|| format!("add tasks.{name}"))?;
+                    added.push(name);
+                }
+            }
+            if !added.is_empty() {
+                tracing::info!(from = version, to = SCHEMA_VERSION, columns_added = ?added, "migrated database schema to v4");
+            }
+        }
         if version < SCHEMA_VERSION {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
@@ -202,8 +222,10 @@ impl Store {
         conn.execute(
             "INSERT INTO tasks (id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score,
                 labels, linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts,
-                not_before, last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
+                not_before, last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number,
+                blocked_by, children, parent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
+                ?31, ?32, ?33)",
             params![
                 task.id.to_string(),
                 task.key,
@@ -235,6 +257,9 @@ impl Store {
                 task.completed_at.as_ref().map(ts),
                 task.cycle,
                 task.cycle_number,
+                json(&task.blocked_by),
+                json(&task.children),
+                task.parent,
             ],
         )
         .with_context(|| format!("insert task {}", task.key))?;
@@ -248,7 +273,8 @@ impl Store {
             "UPDATE tasks SET key=?2, title=?3, description=?4, source=?5, source_kind=?6, linear_issue_id=?7, state=?8,
                 criticality=?9, score=?10, labels=?11, linear_priority=?12, estimate=?13, project=?14, model_override=?15,
                 model=?16, worktree_path=?17, branch=?18, attempts=?19, max_attempts=?20, not_before=?21, last_error=?22,
-                summary=?23, score_reasons=?24, updated_at=?25, started_at=?26, completed_at=?27, cycle=?28, cycle_number=?29
+                summary=?23, score_reasons=?24, updated_at=?25, started_at=?26, completed_at=?27, cycle=?28, cycle_number=?29,
+                blocked_by=?30, children=?31, parent=?32
              WHERE id=?1",
             params![
                 task.id.to_string(),
@@ -280,6 +306,9 @@ impl Store {
                 task.completed_at.as_ref().map(ts),
                 task.cycle,
                 task.cycle_number,
+                json(&task.blocked_by),
+                json(&task.children),
+                task.parent,
             ],
         )?;
         if n == 0 {
@@ -300,6 +329,8 @@ impl Store {
         let model: Option<String> = row.get("model")?;
         let created_at: String = row.get("created_at")?;
         let updated_at: String = row.get("updated_at")?;
+        let blocked_by: String = row.get("blocked_by")?;
+        let children: String = row.get("children")?;
         Ok(Task {
             id: TaskId::from_str(&id).map_err(|e| conv(e.into()))?,
             key: row.get("key")?,
@@ -315,6 +346,9 @@ impl Store {
             project: row.get("project")?,
             cycle: row.get("cycle")?,
             cycle_number: row.get("cycle_number")?,
+            blocked_by: from_json(&blocked_by).map_err(conv)?,
+            children: from_json(&children).map_err(conv)?,
+            parent: row.get("parent")?,
             model_override: model_override.map(|m| ModelTier::from_str(&m)).transpose().map_err(|e| conv(anyhow!(e)))?,
             model: model.map(|m| ModelTier::from_str(&m)).transpose().map_err(|e| conv(anyhow!(e)))?,
             worktree_path: row.get("worktree_path")?,
@@ -335,7 +369,8 @@ impl Store {
     const TASK_COLS: &'static str =
         "id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score, labels,
         linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts, not_before,
-        last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number";
+        last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number,
+        blocked_by, children, parent";
 
     pub fn get_task(&self, id: TaskId) -> Result<Option<Task>> {
         let conn = self.lock();
@@ -411,6 +446,7 @@ impl Store {
                 TaskState::Crashed => c.crashed += 1,
                 TaskState::Throttled => c.throttled += 1,
                 TaskState::Paused => c.paused += 1,
+                TaskState::Blocked => c.blocked += 1,
                 TaskState::NeedsAttention => c.needs_attention += 1,
                 TaskState::Completed => c.completed += 1,
                 TaskState::Failed => c.failed += 1,
@@ -1518,5 +1554,46 @@ mod tests {
         store.update_task(&t).unwrap();
         let back = store.get_task(t.id).unwrap().unwrap();
         assert_eq!((back.cycle, back.cycle_number), (None, None));
+    }
+
+    #[test]
+    fn dependency_fields_round_trip_and_migrate_from_v3() {
+        let store = Store::open_in_memory().unwrap();
+        let mut t = linear_task("A-2");
+        t.blocked_by =
+            vec![LinkedIssue { key: "A-1".into(), title: "first".into(), state_type: "started".into(), pr_merged: true }];
+        t.children =
+            vec![LinkedIssue { key: "A-3".into(), title: String::new(), state_type: "completed".into(), pr_merged: false }];
+        t.parent = Some("A-0".into());
+        t.state = TaskState::Blocked;
+        store.insert_task(&t).unwrap();
+        let back = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(
+            (back.blocked_by.clone(), back.children.clone(), back.parent.clone()),
+            (t.blocked_by.clone(), t.children.clone(), t.parent.clone())
+        );
+        assert_eq!(back.state, TaskState::Blocked);
+        assert_eq!(store.counts().unwrap().blocked, 1);
+        t.blocked_by.clear();
+        t.parent = None;
+        store.update_task(&t).unwrap();
+        let back = store.get_task(t.id).unwrap().unwrap();
+        assert!(back.blocked_by.is_empty() && back.parent.is_none());
+
+        // A v3 file (cycle columns, no dependency columns) gains them with empty defaults.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pq.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V2_SCHEMA).unwrap();
+            conn.execute_batch("ALTER TABLE tasks ADD COLUMN cycle TEXT; ALTER TABLE tasks ADD COLUMN cycle_number INTEGER; PRAGMA user_version = 3;")
+                .unwrap();
+        }
+        for _ in 0..2 {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+            let t = store.get_task_by_key("ENG-2").unwrap().unwrap();
+            assert!(t.blocked_by.is_empty() && t.children.is_empty() && t.parent.is_none());
+        }
     }
 }

@@ -280,6 +280,19 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     if let Some(e) = task.estimate {
         kv("estimate", format!("{e}"));
     }
+    if let Some(p) = &task.parent {
+        kv("parent", p.clone());
+    }
+    if !task.blocked_by.is_empty() {
+        kv("blocked by", task.blocked_by.iter().map(|b| b.key.as_str()).collect::<Vec<_>>().join(", "));
+    }
+    if !task.children.is_empty() {
+        kv("sub-issues", task.children.iter().map(|c| c.key.as_str()).collect::<Vec<_>>().join(", "));
+    }
+    if task.is_waiting() {
+        let on = task.waiting_on();
+        kv("waiting on", if on.is_empty() { "-".to_string() } else { on.join(", ") });
+    }
     kv("branch", task.branch.clone().unwrap_or_else(|| "-".into()));
     kv("worktree", task.worktree_path.clone().unwrap_or_else(|| "-".into()));
     let attempts = match task.max_attempts {
@@ -391,6 +404,10 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
             "model_override": task.model_override,
             "provider": effective_model(&task).map(|m| m.provider()),
             "not_before": task.not_before,
+            "waiting_on": task.waiting_on(),
+            "blocked_by": task.blocked_by,
+            "children": task.children,
+            "parent": task.parent,
             "last_throttled": throttled,
             "last_model_decision": chosen,
         });
@@ -423,6 +440,9 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     if let Some(nb) = task.not_before {
         println!("  not before   {}", opt_ts(Some(nb)));
     }
+    for line in dependency_lines(&task) {
+        println!("{line}");
+    }
     match chosen {
         Some(e) => {
             println!("\n{}", "last model decision".if_supports_color(Stream::Stdout, |t| t.bold()));
@@ -440,6 +460,60 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
         None => println!("{}", "never throttled".if_supports_color(Stream::Stdout, |t| t.dimmed())),
     }
     Ok(0)
+}
+
+/// The "dependencies" block of `task explain`: why the task waits (or
+/// that nothing holds it back), one line per blocker / sub-issue. Empty
+/// when the task has no Linear relations at all.
+pub fn dependency_lines(task: &Task) -> Vec<String> {
+    if task.blocked_by.is_empty() && task.children.is_empty() && task.parent.is_none() {
+        return Vec::new();
+    }
+    let mut out = vec![String::new(), "dependencies".to_string()];
+    if task.is_container() {
+        let open = task.waiting_on();
+        out.push(if open.is_empty() {
+            format!(
+                "  parent of {} sub-issue(s), all done; the daemon closes it on its next Linear poll (linear.done_state_parent)",
+                task.children.len()
+            )
+        } else {
+            format!(
+                "  parent of {} sub-issue(s): never scheduled; waiting on {} to close it",
+                task.children.len(),
+                open.join(", ")
+            )
+        });
+        for c in &task.children {
+            let mark = if c.is_closed() { "done" } else { "open" };
+            out.push(format!("    · {} {} ({mark}, {})", c.key, c.title, c.state_type));
+        }
+    }
+    if !task.blocked_by.is_empty() {
+        let pending = task.pending_blockers();
+        out.push(if pending.is_empty() {
+            "  blocked by nothing pending: every blocker is done or its PR is merged".to_string()
+        } else {
+            format!(
+                "  waiting on {}: not scheduled until each is Done/Canceled in Linear or its PR is merged",
+                pending.iter().map(|b| b.key.as_str()).collect::<Vec<_>>().join(", ")
+            )
+        });
+        for b in &task.blocked_by {
+            let why = if b.is_closed() {
+                format!("satisfied, {}", b.state_type)
+            } else if b.pr_merged {
+                "satisfied, PR merged".to_string()
+            } else {
+                format!("pending, {}", if b.state_type.is_empty() { "unknown state" } else { b.state_type.as_str() })
+            };
+            out.push(format!("    · {} {} ({why})", b.key, b.title));
+        }
+    }
+    if let Some(parent) = &task.parent {
+        out.push(format!("  sub-issue of {parent}"));
+    }
+    out
 }
 
 fn print_data(data: &serde_json::Value) {
@@ -720,5 +794,33 @@ mod tests {
         assert_eq!(parse_model_arg("gpt-6.1-sol").unwrap(), Some(ModelTier::new("gpt-6.1-sol")));
         assert!(parse_model_arg("turbo").is_err());
         assert!(parse_model_arg("gpt").is_err());
+    }
+
+    #[test]
+    fn explain_lists_pending_blockers_and_children() {
+        use crate::domain::LinkedIssue;
+        let linked = |key: &str, state_type: &str, pr_merged: bool| LinkedIssue {
+            key: key.into(),
+            title: format!("T {key}"),
+            state_type: state_type.into(),
+            pr_merged,
+        };
+        let mut t = Task::new("A-1", "a", crate::domain::TaskSource::Manual);
+        assert!(dependency_lines(&t).is_empty());
+        t.blocked_by = vec![linked("B-1", "started", false), linked("B-2", "started", true), linked("B-3", "completed", false)];
+        t.parent = Some("P-1".into());
+        let text = dependency_lines(&t).join("\n");
+        assert!(text.contains("waiting on B-1: not scheduled"), "{text}");
+        assert!(text.contains("B-1 T B-1 (pending, started)"), "{text}");
+        assert!(text.contains("B-2 T B-2 (satisfied, PR merged)"), "{text}");
+        assert!(text.contains("B-3 T B-3 (satisfied, completed)"), "{text}");
+        assert!(text.contains("sub-issue of P-1"), "{text}");
+
+        t.blocked_by.clear();
+        t.children = vec![linked("C-1", "completed", false), linked("C-2", "unstarted", false)];
+        let text = dependency_lines(&t).join("\n");
+        assert!(text.contains("parent of 2 sub-issue(s): never scheduled; waiting on C-2"), "{text}");
+        t.children[1].state_type = "canceled".into();
+        assert!(dependency_lines(&t).join("\n").contains("all done; the daemon closes it"));
     }
 }

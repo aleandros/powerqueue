@@ -111,6 +111,17 @@ pub fn cpu_rss(sample: Option<&ResourceSample>) -> String {
     }
 }
 
+/// The "waiting on" column: pending blocker keys, or the open sub-issues
+/// of a container (`parent` once they are all done); `-` otherwise.
+pub fn waiting_on(task: &Task) -> String {
+    let keys = task.waiting_on();
+    match (keys.is_empty(), task.is_container()) {
+        (false, _) => keys.join(", "),
+        (true, true) => "parent (done)".to_string(),
+        (true, false) => "-".to_string(),
+    }
+}
+
 fn counts_line(c: &QueueCounts) -> String {
     let mut parts = vec![format!("queued {}", c.queued), format!("running {}", c.running)];
     for (label, n) in [
@@ -119,6 +130,7 @@ fn counts_line(c: &QueueCounts) -> String {
         ("crashed", c.crashed),
         ("throttled", c.throttled),
         ("paused", c.paused),
+        ("blocked", c.blocked),
         ("done", c.completed),
         ("failed", c.failed),
         ("cancelled", c.cancelled),
@@ -156,7 +168,7 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
             "tmux_session": cfg.tmux.session_name,
             "counts": {
                 "queued": counts.queued, "running": counts.running, "idle": counts.idle,
-                "crashed": counts.crashed, "throttled": counts.throttled, "paused": counts.paused,
+                "crashed": counts.crashed, "throttled": counts.throttled, "paused": counts.paused, "blocked": counts.blocked,
                 "needs_attention": counts.needs_attention, "completed": counts.completed,
                 "failed": counts.failed, "cancelled": counts.cancelled,
             },
@@ -193,13 +205,19 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
     }
 
     let width = terminal_width();
-    let title_max = width.saturating_sub(78).clamp(16, 80);
+    let waiting = rows.iter().any(|r| r.task.is_waiting() || !r.task.blocked_by.is_empty());
+    let title_max = width.saturating_sub(if waiting { 92 } else { 78 }).clamp(16, 80);
     let mut table = output::table();
     table.set_width(width as u16);
     if !color {
         table.force_no_tty();
     }
-    table.set_header(vec!["KEY", "STATE", "CRIT", "MODEL", "ATTEMPT", "WEIGHTED TOKENS", "CPU/RSS", "AGE/RUNTIME", "TITLE"]);
+    let mut header = vec!["KEY", "STATE", "CRIT", "MODEL", "ATTEMPT", "WEIGHTED TOKENS", "CPU/RSS", "AGE/RUNTIME"];
+    if waiting {
+        header.push("WAITING ON");
+    }
+    header.push("TITLE");
+    table.set_header(header);
     for row in &rows {
         let t = &row.task;
         let state = if color { output::state_colored(t.state) } else { t.state.to_string() };
@@ -216,7 +234,7 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
             None => t.attempts.to_string(),
         };
         let tokens = if row.usage.is_zero() { "-".to_string() } else { human_f64(row.weighted_tokens) };
-        table.add_row(vec![
+        let mut cells = vec![
             Cell::new(&t.key),
             Cell::new(state),
             Cell::new(crit),
@@ -225,8 +243,12 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
             Cell::new(tokens),
             Cell::new(cpu_rss(row.resource.as_ref())),
             Cell::new(age_or_runtime(t, now)),
-            Cell::new(output::truncate(&t.title, title_max)),
-        ]);
+        ];
+        if waiting {
+            cells.push(Cell::new(waiting_on(t)));
+        }
+        cells.push(Cell::new(output::truncate(&t.title, title_max)));
+        table.add_row(cells);
     }
     println!("{table}");
     if rows.iter().any(|r| r.task.model_override.is_some()) {
@@ -280,6 +302,25 @@ mod tests {
         assert_eq!(st.pid, Some(42));
         let later = now + Duration::seconds(DAEMON_ALIVE_SECS + 5);
         assert!(!daemon_status(&store, later).unwrap().alive);
+    }
+
+    #[test]
+    fn waiting_on_column() {
+        let linked = |key: &str, state_type: &str| crate::domain::LinkedIssue {
+            key: key.into(),
+            title: String::new(),
+            state_type: state_type.into(),
+            pr_merged: false,
+        };
+        let mut t = task("a", TaskState::Blocked, 1.0);
+        assert_eq!(waiting_on(&t), "-");
+        t.blocked_by = vec![linked("B-1", "started"), linked("B-2", "unstarted"), linked("B-3", "completed")];
+        assert_eq!(waiting_on(&t), "B-1, B-2");
+        t.blocked_by.clear();
+        t.children = vec![linked("C-1", "completed"), linked("C-2", "started")];
+        assert_eq!(waiting_on(&t), "C-2");
+        t.children[1].state_type = "completed".into();
+        assert_eq!(waiting_on(&t), "parent (done)");
     }
 
     #[test]

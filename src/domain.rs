@@ -440,6 +440,11 @@ pub enum TaskState {
     Throttled,
     /// Paused by the user; not scheduled until resumed.
     Paused,
+    /// Waiting on other Linear issues: a `blocked by` relation that is not
+    /// satisfied yet, or the issue is a parent (container) of sub-issues.
+    /// Never scheduled; the daemon moves it back to `queued` when the
+    /// blockers clear (a container is closed instead, never run).
+    Blocked,
     /// Claude needs a human (asked a question, blocked by permissions, or reported a blocker).
     NeedsAttention,
     /// Finished successfully; resources released.
@@ -451,7 +456,7 @@ pub enum TaskState {
 }
 
 impl TaskState {
-    pub const ALL: [TaskState; 11] = [
+    pub const ALL: [TaskState; 12] = [
         TaskState::Queued,
         TaskState::Starting,
         TaskState::Running,
@@ -459,6 +464,7 @@ impl TaskState {
         TaskState::Crashed,
         TaskState::Throttled,
         TaskState::Paused,
+        TaskState::Blocked,
         TaskState::NeedsAttention,
         TaskState::Completed,
         TaskState::Failed,
@@ -474,6 +480,7 @@ impl TaskState {
             TaskState::Crashed => "crashed",
             TaskState::Throttled => "throttled",
             TaskState::Paused => "paused",
+            TaskState::Blocked => "blocked",
             TaskState::NeedsAttention => "needs_attention",
             TaskState::Completed => "completed",
             TaskState::Failed => "failed",
@@ -502,13 +509,14 @@ impl TaskState {
             return true;
         }
         match self {
-            Queued => matches!(next, Starting | Paused | Cancelled | Throttled),
+            Queued => matches!(next, Starting | Paused | Cancelled | Throttled | Blocked),
             Starting => matches!(next, Running | Crashed | Failed | Cancelled | Queued),
             Running => matches!(next, Idle | Crashed | Throttled | NeedsAttention | Completed | Failed | Cancelled | Paused),
             Idle => matches!(next, Running | Crashed | NeedsAttention | Completed | Failed | Cancelled | Paused),
             Crashed => matches!(next, Starting | Queued | Failed | Cancelled | Paused | Throttled),
-            Throttled => matches!(next, Queued | Starting | Running | Cancelled | Paused),
+            Throttled => matches!(next, Queued | Starting | Running | Cancelled | Paused | Blocked),
             Paused => matches!(next, Queued | Cancelled),
+            Blocked => matches!(next, Queued | Paused | Cancelled | Completed),
             NeedsAttention => matches!(next, Queued | Running | Idle | Completed | Failed | Cancelled | Paused | Crashed),
             Completed | Failed | Cancelled => matches!(next, Queued),
         }
@@ -562,6 +570,17 @@ pub struct Task {
     /// Number of the issue's cycle (Linear's `Cycle.number`), if any.
     #[serde(default)]
     pub cycle_number: Option<u32>,
+    /// Linear issues this one is `blocked by`, with their state as of the
+    /// last sync. See [`Task::pending_blockers`].
+    #[serde(default)]
+    pub blocked_by: Vec<LinkedIssue>,
+    /// Sub-issues of this Linear issue. A task with children is a
+    /// container: it is never scheduled and is closed once they finish.
+    #[serde(default)]
+    pub children: Vec<LinkedIssue>,
+    /// Identifier of the parent issue, if this is a sub-issue.
+    #[serde(default)]
+    pub parent: Option<String>,
     /// Model forced by the user or `PRIORITY.md`; `None` lets the budget policy choose.
     pub model_override: Option<ModelTier>,
     /// Model actually used by the latest session.
@@ -602,6 +621,9 @@ impl Task {
             project: None,
             cycle: None,
             cycle_number: None,
+            blocked_by: Vec::new(),
+            children: Vec::new(),
+            parent: None,
             model_override: None,
             model: None,
             worktree_path: None,
@@ -637,6 +659,68 @@ impl Task {
     pub fn slug(&self) -> String {
         slugify(&self.key)
     }
+
+    /// True if the issue has sub-issues: a container that is never run.
+    pub fn is_container(&self) -> bool {
+        !self.children.is_empty()
+    }
+
+    /// Blockers that are not satisfied yet (see [`LinkedIssue::is_satisfied`]).
+    pub fn pending_blockers(&self) -> Vec<&LinkedIssue> {
+        self.blocked_by.iter().filter(|b| !b.is_satisfied()).collect()
+    }
+
+    /// True if dependencies keep this task from being scheduled: it is a
+    /// container, or a blocker is still pending.
+    pub fn is_waiting(&self) -> bool {
+        self.is_container() || self.blocked_by.iter().any(|b| !b.is_satisfied())
+    }
+
+    /// Keys the task is waiting on (the "waiting on" column): pending
+    /// blockers, or for a container its sub-issues that are still open.
+    pub fn waiting_on(&self) -> Vec<&str> {
+        if self.is_container() {
+            self.children.iter().filter(|c| !c.is_closed()).map(|c| c.key.as_str()).collect()
+        } else {
+            self.pending_blockers().into_iter().map(|b| b.key.as_str()).collect()
+        }
+    }
+}
+
+/// Another Linear issue a task depends on (a blocker or a sub-issue), as
+/// last seen by the Linear sync.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkedIssue {
+    /// Linear identifier (`ENG-123`).
+    pub key: String,
+    #[serde(default)]
+    pub title: String,
+    /// Workflow state *type* in Linear (`unstarted`, `started`,
+    /// `completed`, `canceled`, ...).
+    pub state_type: String,
+    /// The issue's pull request is known to be merged (GitHub attachment
+    /// on the Linear issue), even if Linear has not moved it to Done yet.
+    #[serde(default)]
+    pub pr_merged: bool,
+}
+
+impl LinkedIssue {
+    /// True if the issue is closed in Linear (`completed` or `canceled`).
+    pub fn is_closed(&self) -> bool {
+        is_closed_state_type(&self.state_type)
+    }
+
+    /// True if a task blocked by this issue may run: it is closed in Linear
+    /// or its pull request was merged.
+    pub fn is_satisfied(&self) -> bool {
+        self.is_closed() || self.pr_merged
+    }
+}
+
+/// True for the Linear workflow state types that close an issue
+/// (`completed`, `canceled`; the British spelling is accepted too).
+pub fn is_closed_state_type(state_type: &str) -> bool {
+    matches!(state_type.trim().to_ascii_lowercase().as_str(), "completed" | "canceled" | "cancelled")
 }
 
 /// Separator between a Linear label group and its child label

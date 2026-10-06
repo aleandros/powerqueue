@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 pub use crate::config::CycleScope;
+use crate::domain::LinkedIssue;
 
 /// The authenticated user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +62,17 @@ pub struct LinearIssue {
     /// The issue's cycle, if it is in one.
     #[serde(default)]
     pub cycle: Option<CycleInfo>,
+    /// Issues that block this one (Linear `blocks` relations pointing here),
+    /// with their state. `pr_merged` is filled in by the daemon
+    /// ([`LinearClient::pr_merged`]) for blockers that are still open.
+    #[serde(default)]
+    pub blocked_by: Vec<LinkedIssue>,
+    /// Sub-issues; non-empty makes the task a container.
+    #[serde(default)]
+    pub children: Vec<LinkedIssue>,
+    /// Identifier of the parent issue, if this is a sub-issue.
+    #[serde(default)]
+    pub parent: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -222,10 +234,22 @@ impl IssueFilter {
 }
 
 /// Fields requested for every issue query; shared by list and single lookups.
+///
+/// `inverseRelations` holds the relations *pointing at* this issue; a
+/// `blocks` one there means "blocked by `issue`". The nested connections
+/// have explicit `first:` bounds to keep the query under Linear's
+/// complexity limit with 50 issues per page.
 const ISSUE_FIELDS: &str = "id identifier title description url priority estimate \
      labels { nodes { name parent { name } } } state { name type } team { key } \
      project { name } assignee { id } \
-     cycle { number name isActive isNext isPast isFuture } createdAt updatedAt";
+     cycle { number name isActive isNext isPast isFuture } \
+     parent { identifier } \
+     children(first: 50) { nodes { identifier title state { type } } } \
+     inverseRelations(first: 25) { nodes { type issue { identifier title state { type } } } } \
+     createdAt updatedAt";
+
+/// Linear relation type meaning "`issue` blocks `relatedIssue`".
+const BLOCKS_RELATION: &str = "blocks";
 
 /// Page size for issue pagination.
 const PAGE_SIZE: u32 = 50;
@@ -262,8 +286,54 @@ struct RawIssue {
     assignee: Option<Ided>,
     #[serde(default)]
     cycle: Option<RawCycle>,
+    #[serde(default)]
+    parent: Option<RawIdentifier>,
+    #[serde(default)]
+    children: Option<Nodes<RawLinked>>,
+    #[serde(default)]
+    inverse_relations: Option<Nodes<RawRelation>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawIdentifier {
+    identifier: String,
+}
+
+/// A related issue as nested in `children` / relations.
+#[derive(Debug, Deserialize)]
+struct RawLinked {
+    identifier: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    state: Option<RawStateType>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawStateType {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRelation {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    issue: Option<RawLinked>,
+}
+
+impl From<RawLinked> for LinkedIssue {
+    fn from(raw: RawLinked) -> Self {
+        LinkedIssue {
+            key: raw.identifier,
+            title: raw.title.unwrap_or_default(),
+            state_type: raw.state.map(|s| s.kind).unwrap_or_default(),
+            pr_merged: false,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -368,6 +438,18 @@ impl From<RawIssue> for LinearIssue {
             project: raw.project.map(|p| p.name),
             assignee_id: raw.assignee.map(|a| a.id),
             cycle: raw.cycle.map(CycleInfo::from),
+            blocked_by: raw
+                .inverse_relations
+                .map(|r| {
+                    r.nodes
+                        .into_iter()
+                        .filter(|rel| rel.kind.eq_ignore_ascii_case(BLOCKS_RELATION))
+                        .filter_map(|rel| rel.issue.map(LinkedIssue::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            children: raw.children.map(|c| c.nodes.into_iter().map(LinkedIssue::from).collect()).unwrap_or_default(),
+            parent: raw.parent.map(|p| p.identifier),
             created_at: raw.created_at,
             updated_at: raw.updated_at,
         }
@@ -613,6 +695,20 @@ impl LinearClient {
         Ok(())
     }
 
+    /// True if a GitHub pull request attached to the issue (`id` is a UUID
+    /// or identifier) is merged, according to the attachment metadata the
+    /// Linear GitHub integration keeps (see [`attachments_show_merged_pr`]).
+    /// `Ok(false)` for a missing issue.
+    pub async fn pr_merged(&self, id: &str) -> Result<bool> {
+        let query = "query($id: String!) { issue(id: $id) { attachments(first: 20) { nodes { url sourceType metadata } } } }";
+        let data = match self.graphql(query, serde_json::json!({ "id": id })).await {
+            Ok(d) => d,
+            Err(e) if is_not_found(&e) => return Ok(false),
+            Err(e) => return Err(e).with_context(|| format!("fetch attachments of {id}")),
+        };
+        Ok(data.pointer("/issue/attachments/nodes").is_some_and(attachments_show_merged_pr))
+    }
+
     /// Post a Markdown comment on an issue.
     pub async fn comment(&self, issue_id: &str, body: &str) -> Result<()> {
         let mutation = "mutation($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success } }";
@@ -623,6 +719,23 @@ impl LinearClient {
         debug!(target: "powerqueue::linear", issue = %issue_id, bytes = body.len(), "comment posted");
         Ok(())
     }
+}
+
+/// True if any attachment in `nodes` (Linear `Attachment` objects with
+/// `url`, `sourceType`, `metadata`) is a GitHub pull request whose metadata
+/// says it is merged (`status: "merged"` or a `mergedAt` timestamp).
+pub fn attachments_show_merged_pr(nodes: &serde_json::Value) -> bool {
+    let Some(nodes) = nodes.as_array() else { return false };
+    nodes.iter().any(|a| {
+        let url = a.get("url").and_then(|u| u.as_str()).unwrap_or("");
+        let source = a.get("sourceType").and_then(|s| s.as_str()).unwrap_or("");
+        let is_pr = (url.contains("github.com") && url.contains("/pull/")) || source.to_ascii_lowercase().contains("github");
+        let meta = a.get("metadata");
+        let status_merged =
+            meta.and_then(|m| m.get("status")).and_then(|s| s.as_str()).is_some_and(|s| s.eq_ignore_ascii_case("merged"));
+        let merged_at = meta.and_then(|m| m.get("mergedAt")).is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty()));
+        is_pr && (status_merged || merged_at)
+    })
 }
 
 /// Delay before retry `attempt` (1-based): `Retry-After` if given, else
@@ -670,9 +783,52 @@ mod tests {
             project: None,
             assignee_id: None,
             cycle: None,
+            blocked_by: Vec::new(),
+            children: Vec::new(),
+            parent: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    /// Recorded shape of an `issues` node with relations (see
+    /// `tests/fixtures/linear/issue_with_relations.json`).
+    const RELATIONS_FIXTURE: &str = include_str!("../../tests/fixtures/linear/issue_with_relations.json");
+
+    #[test]
+    fn relations_children_and_parent_are_parsed() {
+        let raw: RawIssue = serde_json::from_str(RELATIONS_FIXTURE).unwrap();
+        let issue = LinearIssue::from(raw);
+        assert_eq!(issue.parent.as_deref(), Some("AVS-1429"));
+        let blockers: Vec<(&str, &str)> = issue.blocked_by.iter().map(|b| (b.key.as_str(), b.state_type.as_str())).collect();
+        assert_eq!(blockers, vec![("AVS-1713", "completed"), ("AVS-1712", "started")], "only `blocks` relations count");
+        assert!(issue.blocked_by.iter().all(|b| !b.pr_merged), "merge status comes from a separate lookup");
+        assert_eq!(issue.blocked_by[1].title, "Second blocker");
+        let children: Vec<&str> = issue.children.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(children, vec!["AVS-1720", "AVS-1721"]);
+        assert!(issue.children[0].is_closed() && !issue.children[1].is_closed());
+        for field in ["parent { identifier }", "children(first: 50)", "inverseRelations(first: 25)"] {
+            assert!(ISSUE_FIELDS.contains(field), "{field}");
+        }
+    }
+
+    #[test]
+    fn merged_pr_detection_from_attachments() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/linear/attachments.json")).unwrap();
+        let nodes = fixture.pointer("/data/issue/attachments/nodes").unwrap();
+        assert!(attachments_show_merged_pr(nodes));
+        let open_only = serde_json::json!([
+            { "url": "https://github.com/o/r/pull/1", "sourceType": "github", "metadata": { "status": "open" } },
+            { "url": "https://example.com/doc", "sourceType": "api", "metadata": { "status": "merged" } }
+        ]);
+        assert!(!attachments_show_merged_pr(&open_only), "a non-GitHub attachment never counts");
+        let merged_at = serde_json::json!([
+            { "url": "https://github.com/o/r/pull/2", "sourceType": null, "metadata": { "mergedAt": "2026-10-01T00:00:00Z" } }
+        ]);
+        assert!(attachments_show_merged_pr(&merged_at));
+        assert!(!attachments_show_merged_pr(&serde_json::json!([])));
+        assert!(!attachments_show_merged_pr(&serde_json::Value::Null));
     }
 
     #[test]

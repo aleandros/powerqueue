@@ -113,7 +113,7 @@ pub fn sync_issues(
         if seen.contains(issue_id.as_str()) {
             continue;
         }
-        if !(task.state.is_schedulable() || task.state == TaskState::Paused) {
+        if !(task.state.is_schedulable() || matches!(task.state, TaskState::Paused | TaskState::Blocked)) {
             // Running / idle / needs-attention: the daemon owns these.
             continue;
         }
@@ -179,13 +179,18 @@ pub fn task_from_issue(issue: &LinearIssue) -> Task {
     task.project = issue.project.clone();
     task.cycle = issue.cycle_status().map(str::to_string);
     task.cycle_number = issue.cycle.as_ref().map(|c| c.number);
+    task.blocked_by = issue.blocked_by.clone();
+    task.children = issue.children.clone();
+    task.parent = issue.parent.clone();
     task.created_at = issue.created_at;
     task
 }
 
 /// Copy the mutable issue fields onto an existing task. Returns the names of
 /// the fields that changed (empty = nothing to persist). State, score and
-/// scoring reasons are untouched; the scheduler re-evaluates rules itself.
+/// scoring reasons are untouched; the scheduler re-evaluates rules (and
+/// moves tasks between `queued` and `blocked` from the dependency fields)
+/// itself.
 pub fn apply_issue(task: &mut Task, issue: &LinearIssue) -> Vec<&'static str> {
     let mut changed = Vec::new();
     if task.title != issue.title {
@@ -219,6 +224,18 @@ pub fn apply_issue(task: &mut Task, issue: &LinearIssue) -> Vec<&'static str> {
         task.cycle_number = cycle_number;
         changed.push("cycle");
     }
+    if task.blocked_by != issue.blocked_by {
+        task.blocked_by = issue.blocked_by.clone();
+        changed.push("blocked_by");
+    }
+    if task.children != issue.children {
+        task.children = issue.children.clone();
+        changed.push("children");
+    }
+    if task.parent != issue.parent {
+        task.parent = issue.parent.clone();
+        changed.push("parent");
+    }
     let source = TaskSource::Linear {
         issue_id: issue.id.clone(),
         identifier: issue.identifier.clone(),
@@ -235,7 +252,51 @@ pub fn apply_issue(task: &mut Task, issue: &LinearIssue) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::Criticality;
+    use crate::domain::{Criticality, LinkedIssue};
+
+    fn linked(key: &str, state_type: &str) -> LinkedIssue {
+        LinkedIssue { key: key.into(), title: format!("Title {key}"), state_type: state_type.into(), pr_merged: false }
+    }
+
+    #[test]
+    fn dependencies_are_stored_and_updated() {
+        let store = Store::open_in_memory().unwrap();
+        let cfg = LinearConfig::default();
+        let mut issues = vec![issue("u1", "ENG-1", "One")];
+        issues[0].blocked_by = vec![linked("ENG-0", "started")];
+        issues[0].parent = Some("ENG-9".into());
+        sync_issues(&store, &cfg, &issues, no_state).unwrap();
+        let t = store.get_task_by_key("ENG-1").unwrap().unwrap();
+        assert_eq!(t.blocked_by, issues[0].blocked_by);
+        assert_eq!(t.parent.as_deref(), Some("ENG-9"));
+        assert!(t.is_waiting());
+        assert_eq!(t.waiting_on(), vec!["ENG-0"]);
+
+        // The blocker is done: the stored state follows on the next sync.
+        issues[0].blocked_by[0].state_type = "completed".into();
+        issues[0].children = vec![linked("ENG-2", "unstarted")];
+        let report = sync_issues(&store, &cfg, &issues, no_state).unwrap();
+        assert_eq!(report.updated.len(), 1);
+        let t = store.get_task_by_key("ENG-1").unwrap().unwrap();
+        assert!(t.pending_blockers().is_empty());
+        assert!(t.is_container() && t.is_waiting(), "sub-issues make it a container");
+        let events = store.events_for_task(t.id, 10).unwrap();
+        assert!(
+            events.iter().any(|e| e.kind == "task.updated" && e.message.contains("blocked_by") && e.message.contains("children"))
+        );
+    }
+
+    #[test]
+    fn blocked_tasks_are_cancelled_when_closed() {
+        let store = Store::open_in_memory().unwrap();
+        let cfg = LinearConfig::default();
+        sync_issues(&store, &cfg, &[issue("u1", "ENG-1", "One")], no_state).unwrap();
+        let mut t = store.get_task_by_key("ENG-1").unwrap().unwrap();
+        t.state = TaskState::Blocked;
+        store.update_task(&t).unwrap();
+        let report = sync_issues(&store, &cfg, &[], |_| Some("completed".into())).unwrap();
+        assert_eq!(report.cancelled.len(), 1);
+    }
 
     fn issue(id: &str, ident: &str, title: &str) -> LinearIssue {
         LinearIssue {
@@ -253,6 +314,9 @@ mod tests {
             project: Some("Launch".into()),
             assignee_id: None,
             cycle: Some(CycleInfo { number: 7, name: Some("Sprint 7".into()), status: CycleStatus::Active }),
+            blocked_by: Vec::new(),
+            children: Vec::new(),
+            parent: None,
             created_at: Utc::now() - chrono::Duration::hours(5),
             updated_at: Utc::now(),
         }

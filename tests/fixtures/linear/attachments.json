@@ -1,0 +1,27 @@
+{
+  "data": {
+    "issue": {
+      "attachments": {
+        "nodes": [
+          {
+            "url": "https://linear.app/aceros-vs/document/spec",
+            "sourceType": "api",
+            "metadata": {}
+          },
+          {
+            "url": "https://github.com/AcerosVSEngineering/application/pull/1064",
+            "sourceType": "github",
+            "metadata": {
+              "id": 2890000000,
+              "number": 1064,
+              "status": "merged",
+              "draft": false,
+              "branch": "edgarcabrera/avs-1713",
+              "targetBranch": "main"
+            }
+          }
+        ]
+      }
+    }
+  }
+}

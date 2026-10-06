@@ -132,6 +132,7 @@ pub fn state_style(state: TaskState) -> Style {
         TaskState::Idle => Style::default().fg(Color::Yellow),
         TaskState::Crashed | TaskState::Failed => Style::default().fg(Color::Red),
         TaskState::Throttled | TaskState::Paused => Style::default().fg(Color::Magenta),
+        TaskState::Blocked => Style::default().fg(Color::Blue),
         TaskState::NeedsAttention => Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD),
         TaskState::Completed => Style::default().fg(Color::LightGreen),
         TaskState::Cancelled => Style::default().fg(Color::DarkGray),
@@ -280,9 +281,11 @@ fn draw_header(frame: &mut Frame, app: &DashboardApp, area: Rect) {
 
 fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) {
     let rows = app.rows();
-    let title_width = area.width.saturating_sub(2 + 12 + 11 + 9 + 13 + 7 + 5 + 9 + 7 + 8).max(10);
-    let header = Row::new(["KEY", "STATE", "CRIT", "MODEL", "WTOK", "CPU", "RSS", "AGE", "TITLE"].map(|h| Cell::from(h).bold()))
-        .style(Style::default().fg(Color::DarkGray));
+    let title_width = area.width.saturating_sub(2 + 12 + 11 + 9 + 13 + 7 + 5 + 9 + 7 + 13 + 8).max(10);
+    let header = Row::new(
+        ["KEY", "STATE", "CRIT", "MODEL", "WTOK", "CPU", "RSS", "AGE", "WAITING ON", "TITLE"].map(|h| Cell::from(h).bold()),
+    )
+    .style(Style::default().fg(Color::DarkGray));
     let body = rows.iter().map(|r| {
         Row::new(vec![
             Cell::from(r.key.clone()),
@@ -293,6 +296,11 @@ fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) 
             Cell::from(r.cpu.clone()),
             Cell::from(r.rss.clone()),
             Cell::from(r.age.clone()),
+            Cell::from(sym.truncate(&r.waiting, 12)).style(if r.waiting == "-" {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                state_style(TaskState::Blocked)
+            }),
             Cell::from(sym.truncate(&r.title, title_width as usize)),
         ])
     });
@@ -310,6 +318,7 @@ fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) 
             Constraint::Length(4),
             Constraint::Length(8),
             Constraint::Length(6),
+            Constraint::Length(12),
             Constraint::Min(10),
         ],
     )
