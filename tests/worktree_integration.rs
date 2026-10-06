@@ -176,3 +176,99 @@ fn run_commands_stops_at_first_failure() {
     assert!(!err.contains("never"), "{err}");
     assert_eq!(run_commands(dir.path(), &[], &[]).unwrap(), "");
 }
+
+fn rev(cwd: &Path, rev: &str) -> String {
+    let out = Command::new("git").args(["rev-parse", rev]).current_dir(cwd).output().expect("git runs");
+    assert!(out.status.success(), "git rev-parse {rev}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// `repo` gets a bare `origin`; returns a second clone that plays "GitHub
+/// merged a PR": commits pushed from it land on `origin/main` only.
+fn with_remote(dir: &TempDir, repo: &Repo) -> PathBuf {
+    let bare = dir.path().join("origin.git");
+    let out = Command::new("git").args(["init", "-q", "--bare", "-b", "main"]).arg(&bare).output().unwrap();
+    assert!(out.status.success());
+    git(&repo.path, &["remote", "add", "origin", &bare.to_string_lossy()]);
+    git(&repo.path, &["push", "-q", "-u", "origin", "main"]);
+    let other = dir.path().join("other");
+    let out = Command::new("git").args(["clone", "-q"]).arg(&bare).arg(&other).output().unwrap();
+    assert!(out.status.success());
+    other
+}
+
+#[test]
+fn new_branch_starts_from_fetched_origin_not_stale_local_base() {
+    let Some((dir, repo)) = fixture() else { return };
+    let other = with_remote(&dir, &repo);
+    commit_file(&other, "merged.txt", "blocker merged");
+    git(&other, &["push", "-q", "origin", "main"]);
+    let merged = rev(&other, "HEAD");
+
+    repo.fetch().unwrap();
+    assert_ne!(rev(&repo.path, "main"), merged, "fetch alone leaves the local main behind");
+    let start = repo.start_point("main", true).unwrap();
+    assert_eq!((start.reference.as_str(), start.sha.as_str()), ("origin/main", merged.as_str()));
+    // Without a fresh fetch (or with fetch_before_start off) the local branch is used.
+    let local = repo.start_point("main", false).unwrap();
+    assert_eq!((local.reference.as_str(), local.sha), ("main", rev(&repo.path, "main")));
+
+    let wt = dir.path().join("wt").join("next");
+    repo.add_worktree(&wt, "pq/next", &start.sha).unwrap();
+    assert!(wt.join("merged.txt").exists(), "the next task's branch holds the merged commit");
+    assert_eq!(rev(&wt, "HEAD"), merged);
+    // The new branch does not track the base: a bare push/pull can't hit main.
+    let upstream = Command::new("git").args(["config", "branch.pq/next.merge"]).current_dir(&repo.path).output().unwrap();
+    assert!(!upstream.status.success(), "pq/next must not track origin/main");
+}
+
+#[test]
+fn start_point_without_remote_branch_uses_local_base() {
+    let Some((_dir, repo)) = fixture() else { return };
+    let start = repo.start_point("main", true).unwrap();
+    assert_eq!(start.reference, "main");
+    assert!(repo.start_point("nope", true).is_err());
+}
+
+#[test]
+fn fast_forwards_clean_checkout_and_skips_unsafe_cases() {
+    use powerqueue::worktree::FastForward;
+    let Some((dir, repo)) = fixture() else { return };
+    let other = with_remote(&dir, &repo);
+    assert_eq!(repo.fast_forward_branch("main").unwrap(), FastForward::UpToDate);
+
+    commit_file(&other, "one.txt", "one");
+    git(&other, &["push", "-q", "origin", "main"]);
+    repo.fetch().unwrap();
+    // Uncommitted change to a tracked file in the main checkout: left alone.
+    std::fs::write(repo.path.join("README.md"), "edited\n").unwrap();
+    assert!(matches!(repo.fast_forward_branch("main").unwrap(), FastForward::Skipped(why) if why.contains("uncommitted")));
+    git(&repo.path, &["checkout", "-q", "--", "README.md"]);
+    // Untracked files do not block it.
+    std::fs::write(repo.path.join("scratch.txt"), "x\n").unwrap();
+    let before = rev(&repo.path, "main");
+    assert_eq!(
+        repo.fast_forward_branch("main").unwrap(),
+        FastForward::Updated { from: before, to: rev(&repo.path, "origin/main") }
+    );
+    assert!(repo.path.join("one.txt").exists(), "the checkout's files moved too");
+
+    // Not checked out anywhere: the ref moves.
+    git(&repo.path, &["checkout", "-q", "-b", "elsewhere"]);
+    commit_file(&other, "two.txt", "two");
+    git(&other, &["push", "-q", "origin", "main"]);
+    repo.fetch().unwrap();
+    assert!(matches!(repo.fast_forward_branch("main").unwrap(), FastForward::Updated { .. }));
+    assert_eq!(rev(&repo.path, "main"), rev(&repo.path, "origin/main"));
+
+    // Local commits the remote lacks: never rewritten.
+    git(&repo.path, &["checkout", "-q", "main"]);
+    commit_file(&repo.path, "local.txt", "local only");
+    commit_file(&other, "three.txt", "three");
+    git(&other, &["push", "-q", "origin", "main"]);
+    repo.fetch().unwrap();
+    let local = rev(&repo.path, "main");
+    assert!(matches!(repo.fast_forward_branch("main").unwrap(), FastForward::Skipped(why) if why.contains("lacks")));
+    assert_eq!(rev(&repo.path, "main"), local);
+    assert!(matches!(repo.fast_forward_branch("missing").unwrap(), FastForward::Skipped(_)));
+}

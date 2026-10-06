@@ -306,6 +306,44 @@ fn task_runs_to_completion_with_usage_and_cleanup() {
     assert!(kinds.contains(&"cleanup.kept"));
 }
 
+/// A commit merged on the remote (a blocker's PR) is in the next task's
+/// branch even though the local `main` is behind; the base is recorded and
+/// the clean main checkout is fast-forwarded.
+#[test]
+fn new_task_branch_starts_from_fetched_origin() {
+    let Some(mut env) = Env::new("complete", "") else { return };
+    let repo = env.root.path().join("repo");
+    let bare = env.root.path().join("origin.git");
+    git(env.root.path(), &["init", "-q", "--bare", "-b", "main", &bare.to_string_lossy()]);
+    git(&repo, &["remote", "add", "origin", &bare.to_string_lossy()]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let other = env.root.path().join("other");
+    git(env.root.path(), &["clone", "-q", &bare.to_string_lossy(), &other.to_string_lossy()]);
+    std::fs::write(other.join("blocker.txt"), "merged\n").unwrap();
+    git(&other, &["add", "."]);
+    git(&other, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "blocker merged"]);
+    git(&other, &["push", "-q", "origin", "main"]);
+    let merged =
+        String::from_utf8_lossy(&Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&other).output().unwrap().stdout)
+            .trim()
+            .to_string();
+
+    let key = add_task(&env, "Build on the blocker", &[]);
+    env.start_daemon();
+    let v = env.wait_for_show(&key, |v| has_event(v, "worktree.ready"));
+    assert_eq!(v["base"]["base"].as_str(), Some("origin/main"), "show: {v}\nlog:\n{}", env.daemon_log());
+    assert_eq!(v["base"]["base_sha"].as_str(), Some(merged.as_str()));
+    let contains = Command::new("git")
+        .args(["merge-base", "--is-ancestor", &merged, &format!("pq/{key}")])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    assert!(contains.success(), "pq/{key} holds the merged commit");
+    assert!(repo.join("blocker.txt").exists(), "the clean main checkout was fast-forwarded");
+    let text = env.run_ok(&["task", "show", &key]);
+    assert!(text.contains(&format!("origin/main at {merged}")), "{text}");
+}
+
 #[test]
 fn crashed_session_is_resumed_and_completes() {
     let Some(mut env) = Env::new("crash-once", "") else { return };

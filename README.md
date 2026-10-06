@@ -295,8 +295,21 @@ state machine allows it. `complete` and `block` always write directly.
 
 1. The daemon picks the highest-scoring schedulable task and asks the budget
    policy for a model (see [docs/budget.md](docs/budget.md)).
-2. It creates `<worktree_root>/<slug>` on branch `pq/<slug>` (configurable)
-   and runs `repo.setup` commands there.
+2. It runs `git fetch --prune origin` (`repo.fetch_before_start`) and creates
+   `<worktree_root>/<slug>` on branch `pq/<slug>` (configurable), then runs
+   `repo.setup` commands there. A new branch starts from the freshly fetched
+   `origin/<default_branch>`, not the local branch, so work merged on GitHub
+   (a `blocked by` blocker's PR) is in it even when the main checkout's
+   `main` lags; it does not track the base, so a bare `git push` never
+   targets `main`. Without an `origin` (or with the fetch turned off) the
+   local branch is used. If the fetch fails the branch starts from the local
+   base and a `worktree.stale_base` warning is logged (`doctor` counts them).
+   An existing branch (a relaunch, a review round) is reused as is. The
+   `worktree.ready` event and `powerqueue task show` record the base
+   (`base: origin/main at <sha>`). After the fetch the local default branch
+   is fast-forwarded to `origin/<default_branch>` (`repo.fast_forward_base`)
+   when that loses nothing: it has no commits of its own and, if checked out,
+   that checkout has no uncommitted changes to tracked files.
 3. It writes a per-task directory under `<state>/tasks/<task-id>/`:
 
    | File | Content |
@@ -483,7 +496,8 @@ anything else uses the explicit `codex:<name>` form.
 | `default_branch` | detect | base for new worktrees (`origin/HEAD`, then `main`/`master`) |
 | `worktree_root` | `<data>/worktrees/<repo-name>` | where worktrees live |
 | `branch_template` | `"pq/{key}"` | `{key}` = task key slug, `{id}` = short task id |
-| `fetch_before_start` | `true` | `git fetch` before creating a worktree |
+| `fetch_before_start` | `true` | `git fetch` before creating a worktree; new branches then start from `origin/<default_branch>` |
+| `fast_forward_base` | `true` | after that fetch, fast-forward the local default branch to `origin/<default_branch>` when it is safe (no local commits, clean checkout) |
 | `setup` | `[]` | commands run (`sh -c`) in a fresh worktree before Claude starts |
 
 ### `[linear]`

@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- New task branches start from `origin/<default_branch>` right after
+  `repo.fetch_before_start`'s fetch instead of the local default branch, so a
+  blocker merged on GitHub is in the next task's branch even when the VPS's
+  local `main` lags. New branches no longer track their base. The base ref
+  and SHA are recorded on `worktree.ready` and shown by `task show`
+  (`base`, also in `--json`). A failed fetch falls back to the local branch
+  and logs `worktree.stale_base`, which `doctor` reports ("worktree base").
+  New `repo.fast_forward_base` (default `true`) fast-forwards the local
+  default branch after the fetch when it has no commits of its own and its
+  checkout has no uncommitted changes to tracked files.
+
 - Linear dependencies. Each poll reads an issue's `blocked by` relations,
   sub-issues and parent (stored on the task: `blocked_by`, `children`,
   `parent`; schema v4). A task with a pending blocker is moved to the new

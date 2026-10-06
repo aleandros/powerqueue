@@ -22,6 +22,26 @@ pub struct WorktreeEntry {
     pub prunable: bool,
 }
 
+/// The commit a new branch starts from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartPoint {
+    /// What was resolved: `origin/<base>` or the local `<base>`.
+    pub reference: String,
+    /// Full SHA of that commit.
+    pub sha: String,
+}
+
+/// What [`Repo::fast_forward_branch`] did to the local base branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FastForward {
+    /// Moved from `from` to `to`.
+    Updated { from: String, to: String },
+    /// Already at `origin/<base>`.
+    UpToDate,
+    /// Left alone, with the reason (no remote branch, diverged, dirty checkout, ...).
+    Skipped(String),
+}
+
 /// Operations on one repository.
 #[derive(Debug, Clone)]
 pub struct Repo {
@@ -137,6 +157,67 @@ impl Repo {
         self.git_succeeds(None, &["show-ref", "--verify", "--quiet", &r])
     }
 
+    /// Full SHA of the commit `rev` names; fails when it does not resolve.
+    pub fn rev_sha(&self, rev: &str) -> Result<String> {
+        let spec = format!("{rev}^{{commit}}");
+        Ok(self.git(None, &["rev-parse", "--verify", "--quiet", &spec])?.trim().to_string())
+    }
+
+    /// Where a new branch off `base` starts: `origin/<base>` when
+    /// `prefer_remote` and that ref exists (call it right after a successful
+    /// [`Repo::fetch`]), else the local `base`. Fails when neither resolves.
+    pub fn start_point(&self, base: &str, prefer_remote: bool) -> Result<StartPoint> {
+        if prefer_remote && self.remote_branch_exists(base)? {
+            let reference = format!("origin/{base}");
+            let sha = self.rev_sha(&reference).with_context(|| format!("resolve {reference}"))?;
+            return Ok(StartPoint { reference, sha });
+        }
+        let sha = self.rev_sha(base).with_context(|| format!("resolve base branch `{base}` in {}", self.path.display()))?;
+        Ok(StartPoint { reference: base.to_string(), sha })
+    }
+
+    /// Fast-forward the local `base` branch to `origin/<base>`, never
+    /// rewriting history: skipped when the remote branch is missing, the local
+    /// one is missing or has commits the remote lacks, or (when `base` is
+    /// checked out) that checkout has uncommitted changes to tracked files.
+    /// Errors only when git itself fails.
+    pub fn fast_forward_branch(&self, base: &str) -> Result<FastForward> {
+        if !self.remote_branch_exists(base)? {
+            return Ok(FastForward::Skipped(format!("origin/{base} does not exist")));
+        }
+        if !self.branch_exists(base)? {
+            return Ok(FastForward::Skipped(format!("no local branch `{base}`")));
+        }
+        let remote = format!("origin/{base}");
+        let from = self.rev_sha(base)?;
+        let to = self.rev_sha(&remote)?;
+        if from == to {
+            return Ok(FastForward::UpToDate);
+        }
+        if !self.git_succeeds(None, &["merge-base", "--is-ancestor", &from, &to])? {
+            return Ok(FastForward::Skipped(format!("`{base}` has commits {remote} lacks")));
+        }
+        let checkout = self.list_worktrees()?.into_iter().find(|w| w.branch.as_deref() == Some(base));
+        match checkout {
+            Some(wt) => {
+                let status = self.git(Some(&wt.path), &["status", "--porcelain", "--untracked-files=no"])?;
+                if status.lines().any(|l| !l.trim().is_empty()) {
+                    return Ok(FastForward::Skipped(format!(
+                        "`{base}` is checked out in {} with uncommitted changes",
+                        wt.path.display()
+                    )));
+                }
+                self.git(Some(&wt.path), &["merge", "--ff-only", "--quiet", &to])?;
+            }
+            None => {
+                let r = format!("refs/heads/{base}");
+                self.git(None, &["update-ref", "-m", "powerqueue: fast-forward", &r, &to, &from])?;
+            }
+        }
+        tracing::info!(repo = %self.path.display(), base, from, to, "fast-forwarded base branch");
+        Ok(FastForward::Updated { from, to })
+    }
+
     /// Parse `git worktree list --porcelain`.
     pub fn list_worktrees(&self) -> Result<Vec<WorktreeEntry>> {
         let text = self.git(None, &["worktree", "list", "--porcelain"])?;
@@ -144,8 +225,11 @@ impl Repo {
     }
 
     /// Create `path` as a worktree on `branch`, creating the branch from
-    /// `base` if it does not exist. Idempotent: an existing worktree on the
-    /// same branch is reused; one on a different branch is an error.
+    /// `base` (a branch, `origin/<branch>` or a SHA) if it does not exist; a
+    /// new branch does not track `base`, so a bare `git push`/`git pull` in
+    /// the worktree never targets the base branch. Idempotent: an existing
+    /// worktree on the same branch is reused; one on a different branch is an
+    /// error.
     pub fn add_worktree(&self, path: &Path, branch: &str, base: &str) -> Result<()> {
         let wanted = normalize(path);
         if let Some(existing) = self.list_worktrees()?.into_iter().find(|w| normalize(&w.path) == wanted) {
@@ -168,7 +252,7 @@ impl Repo {
         if self.branch_exists(branch)? {
             self.git(None, &["worktree", "add", &path_s, branch])?;
         } else {
-            self.git(None, &["worktree", "add", "-b", branch, &path_s, base])?;
+            self.git(None, &["worktree", "add", "--no-track", "-b", branch, &path_s, base])?;
         }
         tracing::info!(path = %path.display(), branch, base, "created worktree");
         Ok(())

@@ -38,7 +38,7 @@ use crate::session::{
 };
 use crate::store::{JevCached, PendingHookEvent, Store};
 use crate::tmux::Tmux;
-use crate::worktree::{Repo, branch_name, run_commands};
+use crate::worktree::{FastForward, Repo, branch_name, run_commands};
 
 use super::lifecycle::{cleanup_task, pick_next, worktree_dir};
 use super::review;
@@ -1930,18 +1930,6 @@ impl Daemon {
             serde_json::json!({ "model": model, "attempt": attempt, "reasons": decision.reasons, "prediction": decision.prediction }),
         );
 
-        if self.cfg.repo.fetch_before_start
-            && let Err(e) = self.rt.repo.fetch()
-        {
-            self.log(
-                Some(task.id),
-                None,
-                EventLevel::Warn,
-                "repo.fetch_failed",
-                &format!("git fetch failed; continuing: {e:#}"),
-                serde_json::json!({}),
-            );
-        }
         let branch =
             task.branch.clone().unwrap_or_else(|| branch_name(&self.cfg.repo.branch_template, &task.slug(), &task.id.short()));
         let root = self.cfg.worktree_root(&self.paths);
@@ -2106,15 +2094,77 @@ impl Daemon {
         Ok(())
     }
 
+    /// Fast-forward the local `base` to `origin/<base>` so people working in
+    /// the main checkout see merged work too. Never fails the task.
+    fn fast_forward_base(&self, task: &Task, base: &str) {
+        match self.rt.repo.fast_forward_branch(base) {
+            Ok(FastForward::Updated { from, to }) => self.log(
+                Some(task.id),
+                None,
+                EventLevel::Info,
+                "repo.fast_forward",
+                &format!("fast-forwarded {base} from {} to {}", short_sha(&from), short_sha(&to)),
+                serde_json::json!({ "branch": base, "from": from, "to": to }),
+            ),
+            Ok(FastForward::UpToDate) => {}
+            Ok(FastForward::Skipped(why)) => tracing::debug!(task = %task.key, base, reason = %why, "base not fast-forwarded"),
+            Err(e) => tracing::warn!(task = %task.key, base, error = %format!("{e:#}"), "fast-forward of the base branch failed"),
+        }
+    }
+
+    /// Fetch, create (or reuse) the worktree and run `repo.setup`. A new
+    /// branch starts from `origin/<base>` after a successful fetch, so work
+    /// merged on the remote (a finished blocker's PR) is in it even when the
+    /// local base branch lags; when the fetch fails it starts from the local
+    /// base and a `worktree.stale_base` warning is logged. An existing
+    /// branch (relaunch, review round) is reused as is.
     fn prepare_worktree(&self, task: &Task, root: &Path, worktree: &Path, branch: &str) -> Result<()> {
         std::fs::create_dir_all(root).with_context(|| format!("create worktree root {}", root.display()))?;
+        let new_branch = !self.rt.repo.branch_exists(branch).with_context(|| format!("look up branch {branch}"))?;
+        let fetch_error =
+            if self.cfg.repo.fetch_before_start { self.rt.repo.fetch().err().map(|e| format!("{e:#}")) } else { None };
+        if let (Some(e), false) = (&fetch_error, new_branch) {
+            self.log(
+                Some(task.id),
+                None,
+                EventLevel::Warn,
+                "repo.fetch_failed",
+                &format!("git fetch failed; continuing: {e}"),
+                serde_json::json!({}),
+            );
+        }
         let base = match &self.cfg.repo.default_branch {
             Some(b) => b.clone(),
             None => self.rt.repo.default_branch().context("detect the default branch (set repo.default_branch)")?,
         };
+        let fetched = self.cfg.repo.fetch_before_start && fetch_error.is_none();
+        if fetched && self.cfg.repo.fast_forward_base {
+            self.fast_forward_base(task, &base);
+        }
+        let start = if new_branch {
+            let start = self.rt.repo.start_point(&base, fetched)?;
+            if let Some(e) = &fetch_error {
+                self.log(
+                    Some(task.id),
+                    None,
+                    EventLevel::Warn,
+                    "worktree.stale_base",
+                    &format!(
+                        "git fetch failed; {branch} starts from the local {} at {}, which may lack merged work: {e}",
+                        start.reference,
+                        short_sha(&start.sha)
+                    ),
+                    serde_json::json!({ "branch": branch, "base": start.reference, "base_sha": start.sha, "error": e }),
+                );
+            }
+            Some(start)
+        } else {
+            None
+        };
+        let from = start.as_ref().map(|s| s.sha.as_str()).unwrap_or(&base);
         self.rt
             .repo
-            .add_worktree(worktree, branch, &base)
+            .add_worktree(worktree, branch, from)
             .with_context(|| format!("create worktree {} on {branch}", worktree.display()))?;
         if !self.cfg.repo.setup.is_empty() {
             let env = vec![
@@ -2131,11 +2181,31 @@ impl Daemon {
             None,
             EventLevel::Info,
             "worktree.ready",
-            &format!("worktree {} on {branch}", worktree.display()),
-            serde_json::json!({ "path": worktree, "branch": branch, "base": base }),
+            &match &start {
+                Some(s) => format!(
+                    "worktree {} on new branch {branch} from {} at {}",
+                    worktree.display(),
+                    s.reference,
+                    short_sha(&s.sha)
+                ),
+                None => format!("worktree {} on existing branch {branch}", worktree.display()),
+            },
+            serde_json::json!({
+                "path": worktree,
+                "branch": branch,
+                "new_branch": new_branch,
+                "base": start.as_ref().map(|s| s.reference.as_str()),
+                "base_sha": start.as_ref().map(|s| s.sha.as_str()),
+                "stale_base": new_branch && fetch_error.is_some(),
+            }),
         );
         Ok(())
     }
+}
+
+/// First 12 characters of a SHA, for messages.
+fn short_sha(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
 }
 
 /// How to start the next attempt: `(session id, resume?, provider session id)`.
