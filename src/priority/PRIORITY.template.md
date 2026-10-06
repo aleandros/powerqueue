@@ -41,7 +41,10 @@ with ` and `.
 
 ## Models
 <!-- Preferred models per criticality, most wanted first. Alternatives may belong to
-     other providers (enable them in config.toml): `critical: fable | gpt-6.1-sol` -->
+     other providers (enable them in config.toml): `critical: fable | gpt-6.1-sol`.
+     Conditional rows pick by label (or any condition) and beat the criticality row;
+     the first match wins. Linear child labels are `group/name`:
+     - if label: model/fable: fable -->
 - critical: fable
 - high: opus
 - normal: sonnet

@@ -240,7 +240,7 @@ state machine allows it. `complete` and `block` always write directly.
 | Command | What it does |
 |---------|--------------|
 | `priority show` | print the parsed rules (model preference lists joined with ` \| `) |
-| `priority check [--file PATH]` | validate `PRIORITY.md` (or a draft), report problems with line numbers and print the `## Models` lists |
+| `priority check [--file PATH]` | validate `PRIORITY.md` (or a draft), report problems with line numbers and print the `## Models` lists (conditional `if` rows included) |
 | `priority edit` | open `PRIORITY.md` in `$EDITOR` |
 | `priority explain <task>` | show how the rules score one task |
 | `priority simulate [--file PATH] [--config PATH] [-a] [--linear] [--reasons] [--no-budget] [-n N]` | dry-run: re-score every open task with the live rules (or a draft `--file`), rank them the way the scheduler would, and show what the budget policy would run for each (`▶` = would start now); nothing is written. `--config` tries a draft `config.toml` (budget, concurrency) too, `--linear` also ranks queued issues not yet in the queue, `-a` includes finished tasks, `--reasons` prints every rule that fired |
@@ -413,8 +413,9 @@ Which provider a task lands on: a `task model` / `add --model` override is a
 hard choice (it never crosses providers; the CLI warns when that provider is
 disabled). Otherwise the task's **preference list** is tried in order: the
 `## Overrides` model list in `PRIORITY.md` (`ENG-1: model = fable |
-gpt-6.1-sol`), else the `## Models` entry for its criticality (`critical:
-fable | gpt-6.1-sol`), each alternative through its provider's downgrade
+gpt-6.1-sol`), else the first matching conditional `## Models` row (`if
+label: model/fable: fable`), else the `## Models` entry for its criticality
+(`critical: fable | gpt-6.1-sol`), each alternative through its provider's downgrade
 chain. When nothing on the list is eligible, the first eligible model in
 `budget.provider_order` (default `["claude", "codex", "gemini"]`) runs it, so
 a provider that is out of budget or rate-limited falls back to the next one.
@@ -798,6 +799,7 @@ headings; rules are bullets. A ticket's criticality is the first section
 - ENG-300: skip
 
 ## Models
+- if label: model/fable: fable
 - critical: fable | gpt-6.1-sol
 - high: opus | gpt-6-astra
 - normal: sonnet
@@ -810,7 +812,12 @@ first; alternatives may belong to other enabled providers); the policy tries
 each one through its provider's downgrade chain and falls back to
 `budget.provider_order` when none fits. Only `task model` and `add --model`
 set a hard override, and even that is downgraded (within its provider) when
-the model is out of budget. Conditions can use `label`, `priority`,
+the model is out of budget. An `if <conditions>: <models>` row under
+`## Models` picks models by label (or any condition) and beats the
+criticality row; `priority explain` shows `model: fable (if label:
+model/fable)`. Linear child labels are stored as `parent/name`
+(`model/fable`), so they are distinct from a loose `fable` label; an
+unqualified `label: fable` still matches both. Conditions can use `label`, `priority`,
 `estimate`, `project`, `cycle` (`active`, `next`, `past`, `future`),
 `cycle_number`, `team`, `title`, `description`, `source` and `key`; the two
 `cycle` lines above are the "prefer the current cycle" idiom. Full grammar,

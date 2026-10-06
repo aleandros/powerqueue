@@ -716,6 +716,7 @@ mod tests {
                 score: 300.0,
                 skip: false,
                 preferred_models: vec![],
+                model_source: None,
                 model: None,
                 policy: String::new(),
                 would_start_now: true,

@@ -546,6 +546,8 @@ pub struct Task {
     pub criticality: Criticality,
     /// Scheduling score; higher first. Derived from criticality, rules, Jev and age.
     pub score: f64,
+    /// Label names; a Linear child label is stored qualified as
+    /// `parent/name` (`model/fable`), see [`label_matches`].
     pub labels: Vec<String>,
     /// Linear priority 0..=4 (0 = none, 1 = urgent) if known.
     pub linear_priority: Option<u8>,
@@ -635,6 +637,36 @@ impl Task {
     pub fn slug(&self) -> String {
         slugify(&self.key)
     }
+}
+
+/// Separator between a Linear label group and its child label
+/// (`model/fable`).
+pub const LABEL_PARENT_SEPARATOR: char = '/';
+
+/// The stored form of a label: `parent/name` for a child label in a Linear
+/// label group, `name` otherwise.
+pub fn qualified_label(name: &str, parent: Option<&str>) -> String {
+    match parent.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(parent) => format!("{parent}{LABEL_PARENT_SEPARATOR}{}", name.trim()),
+        None => name.trim().to_string(),
+    }
+}
+
+/// True if the stored label `stored` satisfies the label `wanted` written in
+/// config or `PRIORITY.md`. Case-insensitive. A qualified `wanted`
+/// (`model/fable`) only matches that exact child label; an unqualified one
+/// (`fable`) matches a plain `fable` label and, so configurations written
+/// before labels were qualified keep working, the child part of any group
+/// (`model/fable`).
+pub fn label_matches(stored: &str, wanted: &str) -> bool {
+    let (stored, wanted) = (stored.trim(), wanted.trim());
+    if stored.eq_ignore_ascii_case(wanted) {
+        return true;
+    }
+    if wanted.contains(LABEL_PARENT_SEPARATOR) {
+        return false;
+    }
+    stored.rsplit_once(LABEL_PARENT_SEPARATOR).is_some_and(|(_, child)| child.trim().eq_ignore_ascii_case(wanted))
 }
 
 /// Lower-case, `[a-z0-9-]` only, trimmed, max 48 chars.
@@ -940,6 +972,19 @@ pub const BLOCKED_MARKER: &str = "[[POWERQUEUE:BLOCKED]]";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn labels_are_qualified_and_matched() {
+        assert_eq!(qualified_label("fable", Some("model")), "model/fable");
+        assert_eq!(qualified_label("fable", None), "fable");
+        assert_eq!(qualified_label("fable", Some(" ")), "fable");
+        assert!(label_matches("model/fable", "Model/Fable"));
+        assert!(label_matches("model/fable", "fable"), "unqualified matches the child part");
+        assert!(label_matches("fable", "fable"));
+        assert!(!label_matches("fable", "model/fable"), "qualified never matches a loose label");
+        assert!(!label_matches("other/fable", "model/fable"));
+        assert!(!label_matches("model/fable", "model"));
+    }
 
     #[test]
     fn criticality_orders_most_important_first() {
