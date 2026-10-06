@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use sysinfo::{Pid, ProcessesToUpdate};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate};
 
 use crate::domain::{ResourceSample, Session};
 use crate::tmux::Tmux;
@@ -57,14 +57,24 @@ pub fn probe_session(tmux: &Tmux, session: &Session) -> Result<SessionProbe> {
 /// CPU% and RSS summed over the pane's process tree (the pane shell, Claude
 /// Code and every tool it spawned). `None` when the session has no pid or the
 /// root process no longer exists. CPU is relative to one core, as sysinfo
-/// reports it, and is meaningful from the second sample on.
+/// reports it, and is meaningful from the second sample on. Linux threads
+/// share their process's RSS and are excluded from all tree totals.
 pub fn sample_resources(system: &mut sysinfo::System, session: &Session) -> Option<ResourceSample> {
     let root = Pid::from_u32(session.pid?);
-    system.refresh_processes(ProcessesToUpdate::All, true);
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_cpu().with_memory().without_tasks(),
+    );
     system.process(root)?;
 
     let mut children: HashMap<Pid, Vec<Pid>> = HashMap::new();
     for (pid, proc_) in system.processes() {
+        // Also exclude thread entries in a System previously populated by
+        // another caller. Their memory/CPU is already in the owning process.
+        if proc_.thread_kind().is_some() {
+            continue;
+        }
         if let Some(parent) = proc_.parent() {
             children.entry(parent).or_default().push(*pid);
         }
@@ -78,6 +88,9 @@ pub fn sample_resources(system: &mut sysinfo::System, session: &Session) -> Opti
             continue;
         }
         let Some(p) = system.process(pid) else { continue };
+        if p.thread_kind().is_some() {
+            continue;
+        }
         cpu += p.cpu_usage();
         rss += p.memory();
         count += 1;
@@ -135,6 +148,60 @@ mod tests {
         // A second sample must still find the tree (and not double count).
         let again = sample_resources(&mut system, &s).unwrap();
         assert!(again.process_count >= 1);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn threads_do_not_multiply_process_tree_resources() {
+        // Hold worker threads alive throughout both refreshes. A default
+        // sysinfo refresh sees them as separate entries with the same RSS.
+        let barrier = std::sync::Barrier::new(17);
+        let memory = vec![7u8; 8 * 1024 * 1024];
+        std::hint::black_box(&memory);
+        std::thread::scope(|scope| {
+            let mut releases = Vec::new();
+            for _ in 0..16 {
+                let barrier = &barrier;
+                let (release, wait) = std::sync::mpsc::channel::<()>();
+                releases.push(release);
+                scope.spawn(move || {
+                    barrier.wait();
+                    let _ = wait.recv();
+                });
+            }
+            barrier.wait();
+            let root = Pid::from_u32(std::process::id());
+            let mut system = sysinfo::System::new();
+            system.refresh_processes(ProcessesToUpdate::All, true);
+            let threads = system.process(root).unwrap().tasks().unwrap().len();
+            let sample = sample_resources(&mut system, &session(Some(root.as_u32()), None)).unwrap();
+            // Calculate the expected total from real descendant processes,
+            // including children spawned by other concurrently running tests.
+            let mut queue = VecDeque::from([root]);
+            let mut seen = HashSet::new();
+            let (mut rss, mut cpu) = (0, 0.0f32);
+            while let Some(pid) = queue.pop_front() {
+                if !seen.insert(pid) {
+                    continue;
+                }
+                let process = system.process(pid).unwrap();
+                rss += process.memory();
+                cpu += process.cpu_usage();
+                queue.extend(
+                    system
+                        .processes()
+                        .iter()
+                        .filter(|(_, p)| p.thread_kind().is_none() && p.parent() == Some(pid))
+                        .map(|(pid, _)| *pid),
+                );
+            }
+            // Dropping these also releases workers if a probe above panics.
+            drop(releases);
+            assert!(threads >= 16, "fixture must expose Linux threads");
+            assert_eq!(sample.process_count as usize, seen.len());
+            assert_eq!(sample.rss_bytes, rss);
+            assert!((sample.cpu_percent - cpu).abs() < 0.001);
+        });
     }
 
     #[test]

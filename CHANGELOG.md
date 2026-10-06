@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-10-05
+
+### Fixed
+
+- Linux resource sampling counted threads as separate processes, multiplying
+  RSS (and CPU) by the number of threads. Refresh only real processes and
+  exclude thread entries from session tree totals. A 36 MB process with 32
+  worker threads previously appeared as 1.19 GB. Historical samples already
+  stored in the database are unchanged; new live samples use the corrected sum.
+
 ## [0.4.2] - 2026-10-05
 
 ### Fixed
@@ -306,7 +316,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/aleandros/powerqueue/releases/tag/v0.4.3
 [0.4.2]: https://github.com/aleandros/powerqueue/releases/tag/v0.4.2
 [0.4.1]: https://github.com/aleandros/powerqueue/releases/tag/v0.4.1
 [0.4.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.4.0

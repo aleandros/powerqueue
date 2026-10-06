@@ -346,6 +346,15 @@ with your own Markdown (see [`[prompt]`](#prompt)); `powerqueue task prompt
 - A `StopFailure` with `rate_limit`, `overloaded`, `usage_limit` or `quota`
   puts the tier on cooldown and the task in `throttled`.
 
+### Reading session memory
+
+The dashboard's RSS column sums resident memory for the session process and
+its child processes. Threads share their process's memory and count only once.
+RSS is not virtual/reserved memory or whole-machine usage; separate processes
+can still share pages, so their summed RSS need not match htop's host total.
+Versions before 0.4.3 counted Linux threads repeatedly. Upgrade and restart the
+daemon to correct live samples; previously stored peaks retain the old values.
+
 ### Responding to attention requests
 
 Keep `powerqueue dashboard` open for a terminal bell when a task newly enters
