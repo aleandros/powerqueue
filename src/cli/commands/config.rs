@@ -535,6 +535,12 @@ mod tests {
         assert_eq!(Config::from_toml(&out).unwrap().linear.in_progress_state.as_deref(), Some("In Progress"));
         let out = set_in_toml(BASE, "linear.in_progress_state", "\"Doing\"").unwrap();
         assert_eq!(Config::from_toml(&out).unwrap().linear.in_progress_state.as_deref(), Some("Doing"));
+
+        // `post_comments` takes a boolean or "questions".
+        let out = set_in_toml(BASE, "linear.post_comments", "questions").unwrap();
+        assert_eq!(Config::from_toml(&out).unwrap().linear.post_comments, crate::config::PostComments::Questions);
+        let out = set_in_toml(BASE, "linear.post_comments", "false").unwrap();
+        assert_eq!(Config::from_toml(&out).unwrap().linear.post_comments, crate::config::PostComments::Off);
     }
 
     #[test]

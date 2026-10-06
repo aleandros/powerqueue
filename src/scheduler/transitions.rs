@@ -52,6 +52,10 @@ pub enum Effect {
     LinearComment { body: String },
     /// Delete the task's local branch (its PR was merged).
     DeleteBranch,
+    /// Relay the agent's question to the Linear issue (best effort, once
+    /// per session and text; see [`crate::scheduler::relay`]). `reason` is
+    /// what `task block` or the blocked marker said.
+    Question { text: String, reason: Option<String> },
 }
 
 impl Effect {
@@ -184,7 +188,7 @@ pub fn on_hook_outcome(
                 )),
             });
         }
-        HookOutcome::Blocked { reason } => {
+        HookOutcome::Blocked { reason, message } => {
             task.state = TaskState::NeedsAttention;
             task.last_error = Some(reason.clone());
             session.state = SessionState::Idle;
@@ -194,16 +198,17 @@ pub fn on_hook_outcome(
                 format!("the agent reports a blocker: {reason}"),
                 serde_json::json!({ "reason": reason }),
             ));
-            effects.push(Effect::Linear {
-                target: LinearTarget::Blocked,
-                comment: Some(format!(
-                    "powerqueue needs a human on this task (branch `{}`):\n\n{reason}",
-                    task.branch.as_deref().unwrap_or("?")
-                )),
-            });
+            // The question itself is posted by `Effect::Question`.
+            effects.push(Effect::Linear { target: LinearTarget::Blocked, comment: None });
+            effects.extend(question_effect(message, Some(reason)));
         }
         HookOutcome::TurnEnded { last_message } => {
             session.state = SessionState::Idle;
+            if task.state == TaskState::NeedsAttention && blocked_by_agent(task) {
+                // `powerqueue task block` without the marker: the turn's
+                // final message carries the question.
+                effects.extend(question_effect(last_message, task.last_error.as_deref()));
+            }
             if matches!(task.state, TaskState::Running | TaskState::Starting)
                 || (task.state == TaskState::NeedsAttention && waiting_for_permission(task))
             {
@@ -293,7 +298,7 @@ pub fn on_hook_outcome(
         HookOutcome::Notification { kind, message } => match kind.as_str() {
             "permission_prompt" => {
                 task.state = TaskState::NeedsAttention;
-                task.last_error = Some(format!("waiting for permission: {message}"));
+                task.last_error = Some(format!("{PERMISSION_PREFIX} {message}"));
                 effects.push(Effect::log(
                     EventLevel::Warn,
                     "session.permission_prompt",
@@ -347,8 +352,26 @@ pub fn on_progress(task: &mut Task, session: &mut Session) -> Vec<Effect> {
     resume_after_activity(task, session)
 }
 
+/// [`Effect::Question`] for the last paragraph of `message` (or `reason`
+/// when the message has nothing left); nothing when both are empty.
+fn question_effect(message: &str, reason: Option<&str>) -> Option<Effect> {
+    let text = crate::scheduler::relay::question_text(message, reason)?;
+    Some(Effect::Question { text, reason: reason.map(str::to_string).filter(|r| !r.trim().is_empty()) })
+}
+
+/// `needs_attention` because the agent said so (`task block`), not because
+/// the daemon decided it (permission prompt, idle after a nudge, failed
+/// authentication).
+fn blocked_by_agent(task: &Task) -> bool {
+    !waiting_for_permission(task)
+        && !task.last_error.as_deref().is_some_and(|r| r.starts_with("idle for ") || r.starts_with("authentication_failed:"))
+}
+
+/// `last_error` prefix of a task waiting at a permission prompt.
+pub const PERMISSION_PREFIX: &str = "waiting for permission:";
+
 fn waiting_for_permission(task: &Task) -> bool {
-    task.last_error.as_deref().is_some_and(|reason| reason.starts_with("waiting for permission:"))
+    task.last_error.as_deref().is_some_and(|reason| reason.starts_with(PERMISSION_PREFIX))
 }
 
 fn resume_after_activity(task: &mut Task, session: &mut Session) -> Vec<Effect> {
@@ -846,6 +869,7 @@ mod tests {
                 Effect::ReleaseForReview => "release_for_review".into(),
                 Effect::LinearComment { .. } => "linear_comment".into(),
                 Effect::DeleteBranch => "delete_branch".into(),
+                Effect::Question { .. } => "question".into(),
             })
             .collect()
     }
@@ -931,12 +955,47 @@ mod tests {
     fn blocked_needs_attention_and_notifies_linear() {
         let mut t = task(TaskState::Running, 1);
         let mut s = session(SessionState::Running, 1);
-        let fx =
-            on_hook_outcome(&mut t, &mut s, &HookOutcome::Blocked { reason: "need creds".into() }, &cfg(), now(), period_end());
+        let out = HookOutcome::Blocked {
+            reason: "need creds".into(),
+            message: "Tried staging.\n\nWhere are the staging creds?\n[[POWERQUEUE:BLOCKED]] need creds".into(),
+        };
+        let fx = on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), period_end());
         assert_eq!(t.state, TaskState::NeedsAttention);
         assert_eq!(t.last_error.as_deref(), Some("need creds"));
         assert_eq!(s.state, SessionState::Idle);
-        assert_eq!(kinds(&fx), vec!["task.blocked", "linear(Blocked)"]);
+        assert_eq!(kinds(&fx), vec!["task.blocked", "linear(Blocked)", "question"]);
+        assert_eq!(fx[1], Effect::Linear { target: LinearTarget::Blocked, comment: None }, "the question is the comment");
+        assert_eq!(
+            fx[2],
+            Effect::Question { text: "Where are the staging creds?\nneed creds".into(), reason: Some("need creds".into()) }
+        );
+    }
+
+    #[test]
+    fn turn_ended_after_task_block_relays_the_final_message() {
+        let mut t = task(TaskState::NeedsAttention, 1);
+        t.last_error = Some("which schema?".into());
+        let mut s = session(SessionState::Running, 1);
+        let out = HookOutcome::TurnEnded { last_message: "I ran `powerqueue task block`.\n\nShould I use schema A or B".into() };
+        let fx = on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), period_end());
+        assert_eq!(t.state, TaskState::NeedsAttention, "still waiting for the reply");
+        assert!(
+            fx.contains(&Effect::Question { text: "Should I use schema A or B".into(), reason: Some("which schema?".into()) })
+        );
+
+        // Attention the daemon raised itself is no question.
+        for reason in ["waiting for permission: Bash", "idle for 900s after a nudge"] {
+            let mut t = task(TaskState::NeedsAttention, 1);
+            t.last_error = Some(reason.into());
+            let mut s = session(SessionState::Running, 1);
+            let fx = on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), period_end());
+            assert!(!kinds(&fx).contains(&"question".to_string()), "{reason}");
+        }
+        // A plain turn end of a running task neither.
+        let mut t = task(TaskState::Running, 1);
+        let mut s = session(SessionState::Running, 1);
+        let fx = on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), period_end());
+        assert!(!kinds(&fx).contains(&"question".to_string()));
     }
 
     #[test]

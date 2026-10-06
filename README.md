@@ -436,8 +436,37 @@ powerqueue attach ENG-123                   # interact with permission dialogs
 Use `task send` for text replies and `attach` for permission menus. The daemon
 clears attention after it observes resumed activity, not merely when text is
 sent. `task resume` remains available for explicitly resuming a task.
-Existing Linear blocker comments respect `linear.post_comments`; incoming
-Linear comments and email replies are not consumed as session input.
+
+### Answering from Linear
+
+For tasks that come from Linear you can answer on the issue itself (unless
+`linear.post_comments = false`):
+
+1. When the agent asks something — it runs `powerqueue task block`, prints the
+   blocked marker, or ends its turn with a question — the daemon posts a
+   comment on the issue: `🤖 Pregunta del agente`, the last paragraph of the
+   agent's final message (plus the `task block` reason when it adds
+   something) and a hidden `<!-- powerqueue:question -->` marker. Each
+   question is posted once per session.
+2. On the Linear poll cadence (`linear.poll_interval_secs`) the daemon reads
+   new comments of tasks that wait for a reply (`needs_attention`, or
+   `in_review` with an unanswered question). The first comments newer than
+   the question that powerqueue did not post are the answer: they are typed
+   into the live session (as with `task send`) and the task goes back to
+   `running`. When the session is gone (in review, parked) the task is
+   re-queued and the next launch resumes the same session (`--resume`) with
+   the answer as its prompt.
+3. Comments on a `running` / `idle` task are typed into its session as a
+   mid-flight hint.
+
+Every comment powerqueue posts carries a hidden `<!-- powerqueue -->` marker
+and its id is remembered, so the daemon never relays its own comments. A
+comment the agent itself posts on the issue (e.g. through a Linear MCP server)
+looks like a human one and is relayed as a hint; the hint says to ignore it
+in that case. Replies are collapsed to one line before they are typed.
+`doctor` lists the questions waiting for a reply and failed relays
+(`relay.error`); events: `relay.question_posted`, `relay.answer_sent`,
+`relay.answer_queued`, `relay.hint_sent`. Email replies are not consumed.
 
 ### Cleanup
 
@@ -521,7 +550,7 @@ anything else uses the explicit `codex:<name>` form.
 | `blocked_state` | none | state set when a task fails permanently or is blocked |
 | `done_state_parent` | `"Done"` | state a parent issue (one with sub-issues) is moved to once every sub-issue is completed or canceled (at least one completed); a comment lists the sub-issues. `""` = no change. See [Dependencies](#dependencies-blocked-by-and-parent-issues) |
 | `manage_states` | `true` | let powerqueue move issues between workflow states at all. Set it to `false` when your own Claude skills or CI move issues: the daemon then never changes an issue's state, while comments still follow `post_comments` |
-| `post_comments` | `true` | post progress comments on the issue |
+| `post_comments` | `true` | which comments to post on the issue: `true` (progress comments plus everything below), `"questions"` (only agent questions, parent auto-close and PR merge/hold/review-round notices) or `false` (none). Anything but `false` also relays replies on the issue back to the session (see [Answering from Linear](#answering-from-linear)) |
 | `poll_interval_secs` | `60` | how often to poll |
 | `max_issues` | `100` | cap per poll |
 | `endpoint` | `https://api.linear.app/graphql` | GraphQL endpoint (tests) |

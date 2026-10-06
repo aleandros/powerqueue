@@ -1068,6 +1068,59 @@ fn check_worktree_base(store: &Store) -> CheckResult {
     worktree_base_status(stale, ff)
 }
 
+/// The question relay through Linear comments: whether it is on
+/// (`linear.post_comments` not `false`), which tasks wait for a reply to a
+/// question posted on Linear (`waiting`), and failures typing replies or
+/// hints into a session (`relay_errors`: `relay.error` events in the last day).
+pub fn question_relay_status(
+    mode: crate::config::PostComments,
+    linear_enabled: bool,
+    waiting: &[String],
+    relay_errors: u64,
+) -> CheckResult {
+    const NAME: &str = "question relay";
+    if !linear_enabled || !mode.questions() {
+        return CheckResult::ok(
+            STATE,
+            NAME,
+            "off (Linear disabled or `linear.post_comments = false`); answer questions with `task send` or `attach`",
+        );
+    }
+    if relay_errors > 0 {
+        return CheckResult::warn(
+            STATE,
+            NAME,
+            format!("{relay_errors} Linear comment(s) could not be typed into a session in the last 24h"),
+            "see `powerqueue logs --events`, kind `relay.error`; a lost reply can be sent with `powerqueue task send <key> \"...\"`",
+        );
+    }
+    if waiting.is_empty() {
+        CheckResult::ok(STATE, NAME, "on; no question waiting for a reply on Linear")
+    } else {
+        CheckResult::ok(
+            STATE,
+            NAME,
+            format!("{} question(s) waiting for a reply on Linear: {}", waiting.len(), waiting.join(", ")),
+        )
+    }
+}
+
+fn check_question_relay(cfg: &Config, store: &Store) -> CheckResult {
+    use crate::scheduler::relay::{RelayState, relay_key};
+    let tasks = match store.list_open_tasks() {
+        Ok(t) => t,
+        Err(e) => return CheckResult::fail(STATE, "question relay", format!("{e:#}"), "check the database"),
+    };
+    let waiting: Vec<String> = tasks
+        .iter()
+        .filter(|t| matches!(t.state, TaskState::NeedsAttention | TaskState::InReview))
+        .filter(|t| store.kv_get::<RelayState>(&relay_key(t.id)).ok().flatten().is_some_and(|r| r.open_question().is_some()))
+        .map(|t| t.key.clone())
+        .collect();
+    let errors = store.count_events_of_kind("relay.error", Utc::now() - Duration::hours(24)).unwrap_or(0);
+    question_relay_status(cfg.linear.post_comments, cfg.linear.enabled, &waiting, errors)
+}
+
 fn pane_ids(tmux: &Tmux, session: &str) -> Option<Vec<crate::tmux::PaneInfo>> {
     tmux.list_panes(session).ok()
 }
@@ -1521,6 +1574,7 @@ pub async fn run_all(
     results.push(check_dependencies(cfg, store));
     results.push(check_reviews(cfg, store));
     results.push(check_worktree_base(store));
+    results.push(check_question_relay(cfg, store));
     results.push(check_orphan_worktrees(cfg, paths, store, fix));
     results.push(check_orphan_windows(cfg, store, fix));
     results.push(check_stale_lock(paths, store, fix));
@@ -1686,6 +1740,20 @@ mod tests {
         let r = worktree_base_status(0, 3);
         assert_eq!(r.status, Status::Warn);
         assert!(r.detail.contains("3 failed fast-forward"), "{}", r.detail);
+    }
+
+    #[test]
+    fn question_relay_status_reports_mode_waiting_and_errors() {
+        use crate::config::PostComments;
+        let r = question_relay_status(PostComments::Off, true, &[], 3);
+        assert_eq!(r.status, Status::Ok);
+        assert!(r.detail.starts_with("off"), "{}", r.detail);
+        let r = question_relay_status(PostComments::Questions, true, &["ENG-1".into()], 0);
+        assert_eq!(r.status, Status::Ok);
+        assert!(r.detail.contains("1 question(s) waiting for a reply on Linear: ENG-1"), "{}", r.detail);
+        let r = question_relay_status(PostComments::All, true, &[], 2);
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("2 Linear comment(s)"), "{}", r.detail);
     }
 
     #[test]
