@@ -76,6 +76,14 @@ pub struct RelayState {
     /// An answer waiting for the next launch (the session was gone).
     #[serde(default)]
     pub pending_answer: Option<String>,
+    /// Session that asked the question `pending_answer` replies to; the
+    /// answer is only used to resume that session.
+    #[serde(default)]
+    pub pending_session: Option<uuid::Uuid>,
+    /// Session whose agent ran `powerqueue task block` itself (set by the
+    /// CLI from `POWERQUEUE_SESSION_ID`); its final message is a question.
+    #[serde(default)]
+    pub agent_blocked: Option<uuid::Uuid>,
 }
 
 impl RelayState {
@@ -91,9 +99,19 @@ impl RelayState {
         }
     }
 
-    /// True when `text` from `session` was already posted as the latest question.
+    /// True when `text` from `session` is the latest question and still
+    /// waits for a reply (asked again after a reply, it is a new question).
     pub fn already_asked(&self, session: uuid::Uuid, text: &str) -> bool {
-        self.question.as_ref().is_some_and(|q| q.session_id == session && q.text == text)
+        self.open_question().is_some_and(|q| q.session_id == session && q.text == text)
+    }
+
+    /// The pending answer, if it replies to a question of `session`.
+    pub fn answer_for(&self, session: Option<uuid::Uuid>) -> Option<&str> {
+        let answer = self.pending_answer.as_deref()?;
+        match self.pending_session {
+            Some(asked) if Some(asked) != session => None,
+            _ => Some(answer),
+        }
     }
 
     /// The posted question still waiting for a reply.
@@ -294,6 +312,12 @@ mod tests {
         assert!(state.open_question().is_some());
         state.question.as_mut().unwrap().answered = true;
         assert!(state.open_question().is_none());
+        assert!(!state.already_asked(s1, "Which?"), "asked again after a reply: a new question");
+
+        state.pending_answer = Some("Use B".into());
+        state.pending_session = Some(s1);
+        assert_eq!(state.answer_for(Some(s1)), Some("Use B"));
+        assert_eq!(state.answer_for(Some(uuid::Uuid::new_v4())), None, "never replayed into another session");
     }
 
     #[test]

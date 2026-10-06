@@ -447,13 +447,17 @@ For tasks that come from Linear you can answer on the issue itself (unless
    comment on the issue: `🤖 Pregunta del agente`, the last paragraph of the
    agent's final message (plus the `task block` reason when it adds
    something) and a hidden `<!-- powerqueue:question -->` marker. Each
-   question is posted once per session.
+   question is posted once while it is open; asked again after a reply, it is
+   posted again. `task block` counts only when the agent runs it from its own
+   session (`POWERQUEUE_SESSION_ID`); a human's `task block` posts nothing.
 2. On the Linear poll cadence (`linear.poll_interval_secs`) the daemon reads
    new comments of tasks that wait for a reply (`needs_attention`, or
    `in_review` with an unanswered question). The first comments newer than
    the question that powerqueue did not post are the answer: they are typed
-   into the live session (as with `task send`) and the task goes back to
-   `running`. When the session is gone (in review, parked) the task is
+   into the live session (as with `task send`), the task goes back to
+   `running` and an issue moved to `linear.blocked_state` returns to
+   `linear.in_progress_state`. If typing fails, the question stays open and
+   the next poll tries again. When the session is gone (in review, parked) the task is
    re-queued and the next launch resumes the same session (`--resume`) with
    the answer as its prompt.
 3. Comments on a `running` / `idle` task are typed into its session as a

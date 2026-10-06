@@ -13,9 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`task block`, the blocked marker, or a final message that reads like a
   question) the daemon posts `🤖 Pregunta del agente` with the last
   paragraph of its final message and a hidden `<!-- powerqueue:question -->`
-  marker on the issue, once per session and question. On the Linear poll
+  marker on the issue, once while the question is open (only for a
+  `task block` the agent ran from its own session). On the Linear poll
   cadence it reads new comments: a reply to an open question is typed into
-  the live session and the task goes back to `running`, or, when the session
+  the live session and the task goes back to `running` (and the issue back
+  to `linear.in_progress_state` if it was moved to `blocked_state`), or, when the session
   is gone (`in_review`, parked), the task is re-queued and the next launch
   resumes the session with the reply as its prompt; comments on a
   `running` / `idle` task are typed in as hints. powerqueue's own comments

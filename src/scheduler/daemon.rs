@@ -537,7 +537,10 @@ impl Daemon {
                 task.not_before = None;
                 self.store.update_task(&task)?;
                 // A retry starts over: a relayed answer is not replayed.
-                self.update_relay(&task, |state| state.pending_answer = None);
+                self.update_relay(&task, |state| {
+                    state.pending_answer = None;
+                    state.pending_session = None;
+                });
                 self.log(Some(task.id), None, EventLevel::Info, "task.retried", "re-queued by user", serde_json::json!({}));
             }
             DaemonCommand::SetModel { task_id, model } => {
@@ -1055,7 +1058,12 @@ impl Daemon {
             );
             if self.cfg.linear.post_comments.questions() {
                 let body = relay::tag_own(&container_comment(&parent.children, state.as_deref()));
-                if let Err(e) = client.comment(&parent.id, &body).await {
+                let posted = client.post_comment(&parent.id, &body).await;
+                // A parent that is a task too must never get this relayed back.
+                if let (Ok(Some(c)), Some(t)) = (&posted, task.as_ref()) {
+                    self.update_relay(t, |state| state.record_posted(&c.id));
+                }
+                if let Err(e) = posted {
                     self.log(
                         task.as_ref().map(|t| t.id),
                         None,
@@ -1264,12 +1272,18 @@ impl Daemon {
 
     /// Post the agent's question on the task's Linear issue (when
     /// `linear.post_comments` is not `false`), once per session and text,
-    /// and start waiting for a reply ([`Daemon::relay_comments`]).
-    async fn post_question(&mut self, task: &Task, session_id: uuid::Uuid, text: &str, reason: Option<&str>) {
+    /// and start waiting for a reply ([`Daemon::relay_comments`]). An
+    /// unconfirmed question (a turn that ended in `needs_attention`) is
+    /// posted only when the session's agent ran `task block` itself.
+    async fn post_question(&mut self, task: &Task, session_id: uuid::Uuid, text: &str, reason: Option<&str>, confirmed: bool) {
         if task.linear_issue_id().is_none() || !self.cfg.linear.post_comments.questions() {
             return;
         }
         let state = self.store.kv_get::<RelayState>(&relay_key(task.id)).ok().flatten().unwrap_or_default();
+        if !confirmed && state.agent_blocked != Some(session_id) {
+            tracing::debug!(task = %task.key, session = %session_id, "needs_attention not raised by the agent; no question");
+            return;
+        }
         if state.already_asked(session_id, text) {
             tracing::debug!(task = %task.key, session = %session_id, "question already relayed");
             return;
@@ -1286,6 +1300,8 @@ impl Daemon {
             state.seen_until = Some(state.seen_until.map_or(posted_at, |t| t.max(posted_at)));
             state.question = Some(question);
             state.pending_answer = None;
+            state.pending_session = None;
+            state.agent_blocked = None;
         });
         self.log(
             Some(task.id),
@@ -1342,14 +1358,14 @@ impl Daemon {
                 _ => None,
             };
             if let Some((mode, since)) = target {
-                watched.push((task, live, state, mode, since));
+                watched.push((task, mode, since));
             }
         }
         if watched.is_empty() {
             return Ok(());
         }
         let Some(client) = self.linear_client() else { return Ok(()) };
-        for (task, live, mut state, mode, since) in watched {
+        for (task, mode, since) in watched {
             let Some(issue_id) = task.linear_issue_id() else { continue };
             let comments = match client.comments_since(issue_id, since).await {
                 Ok(c) => c,
@@ -1358,6 +1374,13 @@ impl Daemon {
                     return Ok(());
                 }
             };
+            // The hook process and the CLI write tasks and the relay state
+            // too: decide on fresh copies, and leave a task that changed
+            // during the request to the next poll.
+            let Some(task) = self.store.get_task(task.id)?.filter(|t| t.state == task.state) else { continue };
+            let live = self.store.latest_session(task.id)?.filter(|s| s.state.is_live());
+            let mut state = self.store.kv_get::<RelayState>(&relay_key(task.id))?.unwrap_or_default();
+            let previous_seen = state.seen_until;
             let (human, newest) = state.human_comments(&comments, since);
             if let Some(newest) = newest {
                 state.seen_until = Some(state.seen_until.map_or(newest, |t| t.max(newest)));
@@ -1376,16 +1399,22 @@ impl Daemon {
                     RelayMode::Hint => self.relay_hint(&task, live.as_ref(), &relay::hint_text(&human), &ids),
                     RelayMode::Answer => {
                         let text = relay::answer_text(&human);
-                        if let Some(q) = state.question.as_mut() {
-                            q.answered = true;
-                        }
-                        match self.send_answer(&task, live.as_ref(), &text, &ids, now)? {
-                            Delivery::Sent => {}
-                            // The probe notices a broken pane; the relaunch
-                            // after the crash picks the answer up.
-                            Delivery::Failed => state.pending_answer = Some(text),
+                        match self.send_answer(&task, live.as_ref(), &text, &ids, now).await? {
+                            Delivery::Sent => {
+                                if let Some(q) = state.question.as_mut() {
+                                    q.answered = true;
+                                }
+                            }
+                            // The question stays open and the comments
+                            // unseen: the next poll tries again.
+                            Delivery::Failed => state.seen_until = previous_seen,
                             Delivery::NoSession => {
+                                let asked = state.question.as_mut().map(|q| {
+                                    q.answered = true;
+                                    q.session_id
+                                });
                                 state.pending_answer = Some(text);
+                                state.pending_session = asked;
                                 requeue = Some(ids);
                             }
                         }
@@ -1427,7 +1456,7 @@ impl Daemon {
     /// Type a reply into the live session of a `needs_attention` task and
     /// set it running again. Without a live session (`in_review`, parked)
     /// or when typing fails, the caller keeps the answer for the next launch.
-    fn send_answer(
+    async fn send_answer(
         &mut self,
         task: &Task,
         session: Option<&Session>,
@@ -1465,6 +1494,11 @@ impl Daemon {
             "relayed the Linear reply to the session; task running again",
             serde_json::json!({ "comments": ids, "text": text }),
         );
+        // Undo the move to `linear.blocked_state` (a relaunch does the same
+        // when it starts the session).
+        if self.cfg.linear.blocked_state.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+            self.update_linear(&task, LinearTarget::InProgress, None).await;
+        }
         Ok(Delivery::Sent)
     }
 
@@ -1649,9 +1683,9 @@ impl Daemon {
                 Effect::LinearComment { body } => {
                     self.comment_linear(task, body, CommentKind::Notice).await;
                 }
-                Effect::Question { text, reason } => {
+                Effect::Question { text, reason, confirmed } => {
                     if let Some(s) = session {
-                        self.post_question(task, s.id, &text, reason.as_deref()).await;
+                        self.post_question(task, s.id, &text, reason.as_deref(), confirmed).await;
                     }
                 }
                 Effect::DeleteBranch => {
@@ -2231,7 +2265,8 @@ impl Daemon {
         let relaunch = task.review_relaunch().cloned();
         // A reply relayed from Linear while the session was gone: resume
         // the session with it as the prompt.
-        let answer = self.store.kv_get::<RelayState>(&relay_key(task.id))?.and_then(|r| r.pending_answer);
+        let latest = self.store.latest_session(task.id)?.map(|s| s.id);
+        let answer = self.store.kv_get::<RelayState>(&relay_key(task.id))?.and_then(|r| r.answer_for(latest).map(str::to_string));
         if (relaunch.is_some() || answer.is_some())
             && let Some(watch) = task.review.as_mut()
         {
@@ -2384,7 +2419,10 @@ impl Daemon {
         task.started_at = task.started_at.or(Some(now));
         self.store.update_task(&task)?;
         if answer.is_some() {
-            self.update_relay(&task, |state| state.pending_answer = None);
+            self.update_relay(&task, |state| {
+                state.pending_answer = None;
+                state.pending_session = None;
+            });
         }
         self.log(
             Some(task.id),
@@ -3111,6 +3149,11 @@ mod tests {
     struct CommentState {
         comments: std::sync::Mutex<Vec<serde_json::Value>>,
         posted: std::sync::Mutex<Vec<String>>,
+        /// `issueUpdate` state ids, in order.
+        state_updates: std::sync::Mutex<Vec<String>>,
+        /// Runs while a `comments(...)` request is in flight (another
+        /// process writing the store meanwhile).
+        on_fetch: std::sync::Mutex<Option<Box<dyn Fn() + Send>>>,
     }
 
     impl CommentState {
@@ -3140,8 +3183,17 @@ mod tests {
                 self.0.posted.lock().unwrap().push(text);
                 serde_json::json!({ "commentCreate": { "success": true, "comment": node } })
             } else if query.contains("issueUpdate") {
+                self.0.state_updates.lock().unwrap().push(vars["stateId"].as_str().unwrap_or_default().to_string());
                 serde_json::json!({ "issueUpdate": { "success": true } })
+            } else if query.contains("workflowStates") {
+                serde_json::json!({ "workflowStates": { "nodes": [
+                    { "id": "state-progress", "name": "In Progress", "type": "started", "team": { "key": "DEP" } },
+                    { "id": "state-blocked", "name": "Blocked", "type": "started", "team": { "key": "DEP" } }
+                ] } })
             } else if query.contains("comments(") {
+                if let Some(hook) = self.0.on_fetch.lock().unwrap().as_ref() {
+                    hook();
+                }
                 let since: DateTime<Utc> = vars["since"].as_str().unwrap().parse().unwrap();
                 let nodes: Vec<serde_json::Value> = self
                     .0
@@ -3153,6 +3205,9 @@ mod tests {
                     .cloned()
                     .collect();
                 serde_json::json!({ "issue": { "comments": { "nodes": nodes } } })
+            } else if query.contains("issue(id:") {
+                let issue = LinearMock(std::sync::Arc::new(MockState::default())).issue("REL-1");
+                serde_json::json!({ "issue": issue })
             } else {
                 return wiremock::ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({ "errors": [{ "message": format!("unexpected query: {query}") }] }));
@@ -3291,7 +3346,7 @@ mod tests {
         session.pane_id = Some(window.pane_id.clone());
         store.update_session(&session).unwrap();
 
-        daemon.post_question(&task, session.id, "Which schema, A or B?", Some("schema unclear")).await;
+        daemon.post_question(&task, session.id, "Which schema, A or B?", Some("schema unclear"), true).await;
         mock.add_human("c-1", "Use B", Utc::now() + Duration::seconds(1));
         daemon.relay_comments(Utc::now() + Duration::seconds(2)).await.unwrap();
         let running = store.get_task(task.id).unwrap().unwrap();
@@ -3316,5 +3371,110 @@ mod tests {
         let since = Utc::now() - Duration::hours(1);
         assert_eq!(store.count_events_of_kind("relay.answer_sent", since).unwrap(), 1);
         assert_eq!(store.count_events_of_kind("relay.hint_sent", since).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_turn_end_is_a_question_only_after_the_agent_ran_task_block() {
+        use crate::domain::HookEvent;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut daemon, store, task, session, mock, _server) =
+            relay_fixture(dir.path(), TaskState::NeedsAttention, SessionState::Running, None).await;
+        let stop = serde_json::json!({ "last_assistant_message": "Refactored the parser.\n\nIt is ready for review." });
+        // A human ran `task block` (nothing recorded): no question.
+        store.insert_hook_event(task.id, Some(session.id), HookEvent::Stop, &stop).unwrap();
+        daemon.process_hooks(Utc::now()).await.unwrap();
+        assert!(mock.posted.lock().unwrap().is_empty());
+
+        // The agent ran it from its own session.
+        let id = task.id.to_string();
+        let sid = session.id.to_string();
+        assert!(crate::cli::commands::task::record_agent_block(&store, &task, Some(&id), Some(&sid)).unwrap());
+        store.insert_hook_event(task.id, Some(session.id), HookEvent::Stop, &stop).unwrap();
+        daemon.process_hooks(Utc::now()).await.unwrap();
+        let posted = mock.posted.lock().unwrap().clone();
+        assert_eq!(posted.len(), 1, "{posted:?}");
+        assert!(posted[0].contains("> It is ready for review."), "{}", posted[0]);
+        let state: RelayState = store.kv_get(&relay_key(task.id)).unwrap().unwrap();
+        assert_eq!(state.agent_blocked, None, "consumed by the question");
+    }
+
+    #[tokio::test]
+    async fn the_same_question_after_a_reply_is_asked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut daemon, store, task, session, mock, _server) =
+            relay_fixture(dir.path(), TaskState::NeedsAttention, SessionState::Idle, None).await;
+        daemon.post_question(&task, session.id, "Proceed?", None, true).await;
+        daemon.post_question(&task, session.id, "Proceed?", None, true).await;
+        assert_eq!(mock.posted.lock().unwrap().len(), 1, "idempotent while open");
+        let key = relay_key(task.id);
+        let mut state: RelayState = store.kv_get(&key).unwrap().unwrap();
+        state.question.as_mut().unwrap().answered = true;
+        store.kv_set(&key, &state).unwrap();
+        daemon.post_question(&task, session.id, "Proceed?", None, true).await;
+        assert_eq!(mock.posted.lock().unwrap().len(), 2, "a new question once the old one was answered");
+        assert!(store.kv_get::<RelayState>(&key).unwrap().unwrap().open_question().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_failed_delivery_keeps_the_question_open_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        // Live session without a pane: typing fails.
+        let (mut daemon, store, task, session, mock, _server) =
+            relay_fixture(dir.path(), TaskState::NeedsAttention, SessionState::Idle, None).await;
+        daemon.post_question(&task, session.id, "Which?", None, true).await;
+        mock.add_human("c-1", "B", Utc::now() + Duration::seconds(1));
+        daemon.relay_comments(Utc::now() + Duration::seconds(2)).await.unwrap();
+        let state: RelayState = store.kv_get(&relay_key(task.id)).unwrap().unwrap();
+        assert!(state.open_question().is_some(), "still waiting");
+        assert_eq!(state.pending_answer, None, "nothing to replay into a later relaunch");
+        assert_eq!(store.get_task(task.id).unwrap().unwrap().state, TaskState::NeedsAttention);
+        // The reply is still unseen: the next poll reads it again.
+        let since = state.seen_until.unwrap();
+        assert!(since < Utc::now() + Duration::seconds(1), "{since}");
+    }
+
+    #[tokio::test]
+    async fn a_task_changed_during_the_request_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut daemon, store, task, mut session, mock, _server) =
+            relay_fixture(dir.path(), TaskState::NeedsAttention, SessionState::Idle, None).await;
+        daemon.post_question(&task, session.id, "Which?", None, true).await;
+        session.state = SessionState::Exited;
+        store.update_session(&session).unwrap();
+        mock.add_human("c-1", "B", Utc::now() + Duration::seconds(1));
+        // `task complete` lands while the comments are being read.
+        let (hook_store, id) = (store.clone(), task.id);
+        *mock.on_fetch.lock().unwrap() = Some(Box::new(move || {
+            let mut t = hook_store.get_task(id).unwrap().unwrap();
+            t.state = TaskState::Completed;
+            hook_store.update_task(&t).unwrap();
+        }));
+        daemon.relay_comments(Utc::now() + Duration::seconds(2)).await.unwrap();
+        assert_eq!(store.get_task(task.id).unwrap().unwrap().state, TaskState::Completed, "not re-queued");
+        let state: RelayState = store.kv_get(&relay_key(task.id)).unwrap().unwrap();
+        assert_eq!(state.pending_answer, None);
+    }
+
+    #[tokio::test]
+    async fn an_answer_moves_the_issue_out_of_the_blocked_state() {
+        if which::which("tmux").is_err() {
+            eprintln!("skipping: tmux is not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (mut daemon, store, task, mut session, mock, _server) =
+            relay_fixture(dir.path(), TaskState::NeedsAttention, SessionState::Idle, None).await;
+        daemon.cfg.linear.blocked_state = Some("Blocked".into());
+        let tmux = daemon.rt.tmux.clone();
+        tmux.ensure_session("pq-relay", dir.path()).unwrap();
+        let window = tmux.new_window("pq-relay", "agent", dir.path(), "cat", false).unwrap();
+        session.pane_id = Some(window.pane_id.clone());
+        store.update_session(&session).unwrap();
+        daemon.post_question(&task, session.id, "Which?", None, true).await;
+        mock.add_human("c-1", "B", Utc::now() + Duration::seconds(1));
+        daemon.relay_comments(Utc::now() + Duration::seconds(2)).await.unwrap();
+        let _ = tmux.kill_session("pq-relay");
+        assert_eq!(store.get_task(task.id).unwrap().unwrap().state, TaskState::Running);
+        assert_eq!(*mock.state_updates.lock().unwrap(), vec!["state-progress".to_string()]);
     }
 }
