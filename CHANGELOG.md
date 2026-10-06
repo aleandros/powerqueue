@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-06
+
+Upgrade every machine that reads a `PRIORITY.md` before adding `if` rows to
+it: older versions reject them and fail to load the whole file.
+
 ### Added
 
 - `## Models` in `PRIORITY.md` accepts conditional rows, `- if <conditions>:
@@ -345,7 +350,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.5.0
 [0.4.3]: https://github.com/aleandros/powerqueue/releases/tag/v0.4.3
 [0.4.2]: https://github.com/aleandros/powerqueue/releases/tag/v0.4.2
 [0.4.1]: https://github.com/aleandros/powerqueue/releases/tag/v0.4.1
