@@ -302,14 +302,18 @@ state machine allows it. `complete` and `block` always write directly.
    (a `blocked by` blocker's PR) is in it even when the main checkout's
    `main` lags; it does not track the base, so a bare `git push` never
    targets `main`. Without an `origin` (or with the fetch turned off) the
-   local branch is used. If the fetch fails the branch starts from the local
-   base and a `worktree.stale_base` warning is logged (`doctor` counts them).
-   An existing branch (a relaunch, a review round) is reused as is. The
-   `worktree.ready` event and `powerqueue task show` record the base
-   (`base: origin/main at <sha>`). After the fetch the local default branch
-   is fast-forwarded to `origin/<default_branch>` (`repo.fast_forward_base`)
-   when that loses nothing: it has no commits of its own and, if checked out,
-   that checkout has no uncommitted changes to tracked files.
+   local branch is used. If the fetch fails the branch starts from the newer
+   of the last fetched `origin/<default_branch>` and the local branch, and a
+   `worktree.stale_base` warning is logged (`doctor` counts them). An
+   existing branch (a relaunch, a review round) is reused as is. The base is
+   recorded when the branch is created (`worktree.branch_created`, also on
+   `worktree.ready`) and `powerqueue task show` prints it
+   (`base  origin/main at <sha>`). Before creating a branch, the local
+   default branch is fast-forwarded to `origin/<default_branch>`
+   (`repo.fast_forward_base`) when that loses nothing: it has no commits of
+   its own, no rebase or bisect of it is in progress, and, if checked out,
+   that checkout has no uncommitted changes to tracked files. The repository's
+   git hooks do not run for it.
 3. It writes a per-task directory under `<state>/tasks/<task-id>/`:
 
    | File | Content |
@@ -497,7 +501,7 @@ anything else uses the explicit `codex:<name>` form.
 | `worktree_root` | `<data>/worktrees/<repo-name>` | where worktrees live |
 | `branch_template` | `"pq/{key}"` | `{key}` = task key slug, `{id}` = short task id |
 | `fetch_before_start` | `true` | `git fetch` before creating a worktree; new branches then start from `origin/<default_branch>` |
-| `fast_forward_base` | `true` | after that fetch, fast-forward the local default branch to `origin/<default_branch>` when it is safe (no local commits, clean checkout) |
+| `fast_forward_base` | `true` | after that fetch, before creating a branch, fast-forward the local default branch to `origin/<default_branch>` when it is safe (no local commits, no rebase/bisect, clean checkout; hooks off) |
 | `setup` | `[]` | commands run (`sh -c`) in a fresh worktree before Claude starts |
 
 ### `[linear]`

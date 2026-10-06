@@ -1101,6 +1101,22 @@ pub struct Event {
     pub data: serde_json::Value,
 }
 
+/// Event kind logged when powerqueue creates a task's branch; its data
+/// carries `branch`, `base` (`origin/main` or `main`), `base_sha` and
+/// `stale_base`.
+pub const BRANCH_CREATED_EVENT: &str = "worktree.branch_created";
+
+impl Event {
+    /// `(base ref, base sha)` of a [`BRANCH_CREATED_EVENT`]; `None` for any
+    /// other event.
+    pub fn branch_base(&self) -> Option<(String, String)> {
+        if self.kind != BRANCH_CREATED_EVENT {
+            return None;
+        }
+        Some((self.data["base"].as_str()?.to_string(), self.data["base_sha"].as_str()?.to_string()))
+    }
+}
+
 /// Commands queued by CLI/dashboard for the running daemon (consumed in order).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]

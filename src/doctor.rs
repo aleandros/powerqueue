@@ -1034,26 +1034,38 @@ fn check_dependencies(cfg: &Config, store: &Store) -> CheckResult {
     dependency_status(&tasks, errors, closing)
 }
 
-/// Branches created from a possibly outdated local base because `git fetch`
-/// failed (`stale_bases`: `worktree.stale_base` events in the last day).
-pub fn stale_base_status(stale_bases: u64) -> CheckResult {
+/// Problems keeping task branches on a fresh base over the last day:
+/// `stale_bases` branches created after `git fetch` failed
+/// (`worktree.stale_base`), `ff_failures` failed fast-forwards of the local
+/// default branch (`repo.fast_forward_failed`).
+pub fn worktree_base_status(stale_bases: u64, ff_failures: u64) -> CheckResult {
     const NAME: &str = "worktree base";
     if stale_bases > 0 {
         return CheckResult::warn(
             STATE,
             NAME,
-            format!(
-                "{stale_bases} branch(es) created from the local base branch in the last 24h because `git fetch` failed; they may lack merged work"
-            ),
+            format!("{stale_bases} branch(es) created in the last 24h after `git fetch` failed; they may lack merged work"),
             "run `git -C <repo.path> fetch origin` to see the error (credentials, network); see `powerqueue logs --events`, kind `worktree.stale_base`",
+        );
+    }
+    if ff_failures > 0 {
+        return CheckResult::warn(
+            STATE,
+            NAME,
+            format!(
+                "{ff_failures} failed fast-forward(s) of the local default branch in the last 24h (task branches are unaffected)"
+            ),
+            "see `powerqueue logs --events`, kind `repo.fast_forward_failed`; or set `repo.fast_forward_base = false`",
         );
     }
     CheckResult::ok(STATE, NAME, "new branches start from a freshly fetched base")
 }
 
-fn check_stale_bases(store: &Store) -> CheckResult {
-    let stale = store.count_events_of_kind("worktree.stale_base", Utc::now() - Duration::hours(24)).unwrap_or(0);
-    stale_base_status(stale)
+fn check_worktree_base(store: &Store) -> CheckResult {
+    let since = Utc::now() - Duration::hours(24);
+    let stale = store.count_events_of_kind("worktree.stale_base", since).unwrap_or(0);
+    let ff = store.count_events_of_kind("repo.fast_forward_failed", since).unwrap_or(0);
+    worktree_base_status(stale, ff)
 }
 
 fn pane_ids(tmux: &Tmux, session: &str) -> Option<Vec<crate::tmux::PaneInfo>> {
@@ -1508,7 +1520,7 @@ pub async fn run_all(
     results.push(check_stuck_tasks(cfg, store, fix));
     results.push(check_dependencies(cfg, store));
     results.push(check_reviews(cfg, store));
-    results.push(check_stale_bases(store));
+    results.push(check_worktree_base(store));
     results.push(check_orphan_worktrees(cfg, paths, store, fix));
     results.push(check_orphan_windows(cfg, store, fix));
     results.push(check_stale_lock(paths, store, fix));
@@ -1666,11 +1678,14 @@ mod tests {
     }
 
     #[test]
-    fn stale_base_status_warns_on_recent_fetch_failures() {
-        assert_eq!(stale_base_status(0).status, Status::Ok);
-        let r = stale_base_status(2);
+    fn worktree_base_status_warns_on_recent_fetch_and_fast_forward_failures() {
+        assert_eq!(worktree_base_status(0, 0).status, Status::Ok);
+        let r = worktree_base_status(2, 1);
         assert_eq!(r.status, Status::Warn);
         assert!(r.detail.contains("2 branch(es)"), "{}", r.detail);
+        let r = worktree_base_status(0, 3);
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("3 failed fast-forward"), "{}", r.detail);
     }
 
     #[test]

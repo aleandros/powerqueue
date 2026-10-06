@@ -328,11 +328,24 @@ fn new_task_branch_starts_from_fetched_origin() {
             .trim()
             .to_string();
 
+    // repo.setup fails on the first attempt only: the retry reuses the
+    // branch, and the base recorded at creation still shows.
+    let marker = env.root.path().join("setup-failed-once");
+    std::fs::write(
+        repo.join(".powerqueue.toml"),
+        format!("setup = [\"test -f {m} || {{ touch {m}; exit 1; }}\"]\n", m = marker.display()),
+    )
+    .unwrap();
     let key = add_task(&env, "Build on the blocker", &[]);
     env.start_daemon();
     let v = env.wait_for_show(&key, |v| has_event(v, "worktree.ready"));
-    assert_eq!(v["base"]["base"].as_str(), Some("origin/main"), "show: {v}\nlog:\n{}", env.daemon_log());
-    assert_eq!(v["base"]["base_sha"].as_str(), Some(merged.as_str()));
+    let ready: Vec<&serde_json::Value> =
+        v["events"].as_array().unwrap().iter().filter(|e| e["kind"] == "worktree.ready").collect();
+    assert_eq!(ready.len(), 1, "{ready:?}");
+    assert_eq!(ready[0]["data"]["new_branch"].as_bool(), Some(false), "the retry reused the branch");
+    assert_eq!(ready[0]["data"]["base_sha"].as_str(), Some(merged.as_str()));
+    assert_eq!(v["base"]["ref"].as_str(), Some("origin/main"), "show: {v}\nlog:\n{}", env.daemon_log());
+    assert_eq!(v["base"]["sha"].as_str(), Some(merged.as_str()));
     let contains = Command::new("git")
         .args(["merge-base", "--is-ancestor", &merged, &format!("pq/{key}")])
         .current_dir(&repo)
