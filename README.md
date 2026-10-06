@@ -50,6 +50,9 @@ rate limits, and `doctor` tells you when the pacing is off.
  Linear state + comment ◀── cleanup ◀── DONE / BLOCKED ◀── Claude Code hooks ──▶ powerqueue hook
                             push, rm worktree,            + transcript usage     (hook_events table)
                             close window
+                                 ▲
+ task complete --pr ──▶ in_review ──gh poll──▶ merged: completed · conflict / failed check / review:
+                        (no slot)               claude --resume <same session> "/ship-pr <n> --reason …"
 ```
 
 ## Requirements
@@ -61,6 +64,7 @@ rate limits, and `doctor` tells you when the pacing is off.
 | Claude Code | ≥ 2.1.2xx, logged in | `claude auth status` must succeed |
 | Codex CLI | optional | `codex login status` must succeed; adds OpenAI's weekly budget (see [Providers](#providers)) |
 | Antigravity CLI (`agy`) | optional, experimental | signed in to Google AI Pro/Ultra |
+| GitHub CLI (`gh`) | optional, logged in | needed for the PR watcher (`task complete --pr`); `gh auth status` must succeed |
 | Linear API key | personal key | stored in the OS keychain by `init` |
 | Jev (TypeSafe) API key | optional | adds a model-based urgency score |
 
@@ -217,12 +221,12 @@ Global flags work on every command.
 | `add "title" [-d DESC\|-] [-c CRIT] [-m MODEL] [-k KEY] [-l LABEL]... [--paused]` | enqueue a manual task; `-d -` reads stdin |
 | `task show <task>` | details and timeline |
 | `task list [-a]` | same as `status` |
-| `task complete <task> [-s SUMMARY]` | mark completed (Claude calls this from inside the session) |
+| `task complete <task> [-s SUMMARY] [--pr URL]` | mark completed (Claude calls this from inside the session); with `--pr` hand it off for review instead: `in_review`, slot and worktree released, the daemon watches the PR (see [Review](#review-pull-requests)) |
 | `task block <task> [-r REASON]` | mark blocked / needs a human |
 | `task cancel <task>` | cancel and release resources |
 | `task pause <task>` | do not schedule; a running session stops after its turn |
-| `task resume <task>` | resume a paused or needs-attention task |
-| `task retry <task>` | re-queue a failed, cancelled or completed task (also crashed, throttled, paused, needs-attention) |
+| `task resume <task>` | resume a paused or needs-attention task; one the PR watcher parked goes back to `in_review` |
+| `task retry <task>` | re-queue a failed, cancelled or completed task (also crashed, throttled, paused, needs-attention); one parked with its review rounds used up runs one more round |
 | `task explain <task>` | current score and model decision, with reasons; for Linear tasks also what it waits on (pending `blocked by` issues, open sub-issues of a parent) |
 | `task model <task> <model\|auto>` | force (or clear) the model for the next attempt (`fable`, `opus`, `sonnet`, `haiku`, or another provider's model such as `gpt-6.1-sol`, `gemini-3-pro`, `codex:<name>`); the policy may still downgrade it within the same provider when the model is out of budget |
 | `task prompt <task>` | print the prompt the next attempt would receive (renders `prompt.template` with attempt = attempts + 1, the task's last error and its forced/last model); nothing is launched. `--json` prints `{"task", "template", "prompt", "warnings"}` |
@@ -345,6 +349,49 @@ with your own Markdown (see [`[prompt]`](#prompt)); `powerqueue task prompt
   `scheduler.max_attempts` the task is `failed`.
 - A `StopFailure` with `rate_limit`, `overloaded`, `usage_limit` or `quota`
   puts the tier on cooldown and the task in `throttled`.
+- **Review**: a session that opens a pull request and arms its merge runs
+  `powerqueue task complete <id> --pr <url>` instead (then the done marker).
+  The task becomes `in_review` and the session ends; see below.
+
+### Review (pull requests)
+
+`task complete --pr https://github.com/<owner>/<repo>/pull/<n>` moves the task
+to `in_review`, not `completed`. Its session is ended, its tmux window closed
+and its worktree released (see [Cleanup](#cleanup)); the branch `pq/<slug>`,
+the agent session id and the PR URL are kept. An `in_review` task holds no
+slot, so `max_concurrent` is free for the next task.
+
+Every `scheduler.pr_poll_secs` (default 120) the daemon asks GitHub about the
+PR with `gh api graphql` (state, mergeability, the head commit's checks, review
+threads) and acts on the first rule that matches:
+
+| The PR | powerqueue |
+|--------|------------|
+| merged | `completed`; local branch deleted. Linear is not touched (GitHub's integration moves the issue) |
+| closed without merging | `needs_attention` |
+| `CONFLICTING` | relaunch with reason `conflict` |
+| a required check failed | relaunch with reason `ci_failed <check names>` |
+| unresolved review threads with a comment newer than the hand-off | relaunch with reason `review` |
+| `BLOCKED` and labelled `scheduler.merge_hold_label` (`merge/hold`) | wait for a human to merge; status and dashboard say "waiting for manual merge" |
+| unchanged for `scheduler.review_stale_hours` (24) | Linear comment + `needs_attention` |
+
+A relaunch re-queues the task. When a slot and budget allow, the daemon
+recreates the worktree at the **same path** from the kept branch (`git
+worktree add <path> pq/<slug>`), runs `repo.setup` and resumes the **same**
+session (`claude --resume <session id>`) with `scheduler.review_prompt` as the
+prompt — by default `/ship-pr <n> --reason <reason> <detail>`. The issue stays
+in Linear's review state; only a comment says why the session was resumed.
+Relaunches count against `scheduler.review_rounds_max` (5), not
+`max_attempts`: each round gets its own `max_attempts` for crashes. Past the
+cap the task goes to `needs_attention`; `task retry` runs one more round,
+`task resume` just watches the PR again. If the previous session cannot be
+resumed (other provider, no transcript) a fresh session gets the full task
+prompt with the review prompt as its first step.
+
+`task show` lists the PR's timeline (`review.*` events: every status change
+the watcher saw, relaunches, the merge); `status` and the dashboard count
+`in review` apart from `running`. The watcher needs the GitHub CLI logged in
+as the daemon's user (`gh auth login`); `doctor` checks it.
 
 ### Reading session memory
 
@@ -382,6 +429,12 @@ tmux window, moves the Linear issue to `linear.done_state` and posts a comment
 with the summary. Unpushed work is never deleted: if the push fails or there is
 no remote, the worktree stays and an event says why. Failed tasks keep their
 worktree when `cleanup.keep_failed` is true.
+
+A task handed off for review (`task complete --pr`) is cleaned up the same way
+when it enters `in_review` (`cleanup.run` commands, push, worktree removal),
+except that the local branch is always kept for later review rounds, the tmux
+window is always closed, and Linear is not moved. When the PR is merged the
+local branch is deleted (and a worktree that had been kept is removed).
 
 ## Configuration
 
@@ -549,6 +602,12 @@ without it the session has no way to tell powerqueue it is done.
 | `restart_backoff_secs` | `[30, 120, 600]` | backoff after a crash, per attempt (last value repeats) |
 | `max_session_secs` | `14400` | wall-clock cap per attempt; `0` disables |
 | `resource_sample_secs` | `30` | CPU/RSS sampling interval |
+| `pr_poll_secs` | `120` | how often the PR of each `in_review` task is checked with `gh`; `0` turns the watcher off |
+| `review_rounds_max` | `5` | relaunches of one task for its PR (conflict, failed check, review) before `needs_attention`; separate from `max_attempts` |
+| `review_stale_hours` | `24` | a PR unchanged this long gets a Linear comment and the task goes to `needs_attention`; `0` disables |
+| `merge_hold_label` | `"merge/hold"` | PR label meaning "a human merges this": while the PR is `BLOCKED` with it, the watcher waits and never reports it stale |
+| `review_prompt` | `"/ship-pr {pr} --reason {reason} {detail}"` | prompt of a resumed review session; placeholders `{pr}`, `{url}`, `{reason}` (`conflict`, `ci_failed`, `review`), `{detail}` |
+| `gh_binary` | `"gh"` | GitHub CLI the watcher runs |
 
 ### `[claude]`
 

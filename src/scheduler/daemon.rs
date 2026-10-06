@@ -20,8 +20,10 @@ use crate::budget::{
 };
 use crate::config::Config;
 use crate::domain::{
-    DaemonCommand, EventLevel, ModelTier, Provider, Session, SessionState, Task, TaskId, TaskState, is_closed_state_type,
+    DaemonCommand, EventLevel, ModelTier, Provider, ReviewWatch, Session, SessionState, Task, TaskId, TaskState,
+    is_closed_state_type,
 };
+use crate::github::{Gh, PrRef};
 use crate::jev::{JevClient, JevQuestion, content_hash};
 use crate::linear::{
     IssueFilter, LinearClient, LinearIssue, WATCHED_PARENTS_KEY, WatchedParents, container_comment, container_finished,
@@ -39,6 +41,7 @@ use crate::tmux::Tmux;
 use crate::worktree::{Repo, branch_name, run_commands};
 
 use super::lifecycle::{cleanup_task, pick_next, worktree_dir};
+use super::review;
 use super::transitions::{self, CRASH_TAIL_LINES, Effect, LinearTarget, ProbeContext};
 
 /// `last_error` marker for tasks paused by a PRIORITY.md `skip` override.
@@ -275,6 +278,8 @@ impl Daemon {
         self.report_phase("probes", r);
         let r = self.finalize_terminal(now).await;
         self.report_phase("finalize", r);
+        let r = self.watch_reviews(now).await;
+        self.report_phase("reviews", r);
         let r = self.sample_resources(now);
         self.report_phase("resources", r);
         self.run_usage_probes(now);
@@ -417,7 +422,15 @@ impl Daemon {
                 if task.last_error.as_deref() == Some(SKIP_REASON) {
                     task.last_error = None;
                 }
-                task.state = if live.is_some() { TaskState::Running } else { TaskState::Queued };
+                task.state = if live.is_some() {
+                    TaskState::Running
+                } else if task.parked_in_review() {
+                    // Back to watching the PR, with a fresh staleness clock.
+                    rearm_watch(&mut task, now);
+                    TaskState::InReview
+                } else {
+                    TaskState::Queued
+                };
                 self.store.update_task(&task)?;
                 self.log(
                     Some(task.id),
@@ -602,7 +615,7 @@ impl Daemon {
             if changed {
                 task.score_reasons = eval.reasons.clone();
             }
-            if eval.skip && task.state != TaskState::Paused && !task.state.is_terminal() {
+            if eval.skip && task.state != TaskState::Paused && !task.state.is_handed_off() {
                 task.state = TaskState::Paused;
                 task.last_error = Some(SKIP_REASON.to_string());
                 task.not_before = None;
@@ -1140,27 +1153,36 @@ impl Daemon {
                 ),
             }
         }
-        if self.cfg.linear.post_comments
-            && let Some(body) = comment
-        {
-            match client.comment(&issue_id, &body).await {
-                Ok(()) => self.log(
-                    Some(task.id),
-                    None,
-                    EventLevel::Debug,
-                    "linear.comment",
-                    "posted comment",
-                    serde_json::json!({ "body": body }),
-                ),
-                Err(e) => self.log(
-                    Some(task.id),
-                    None,
-                    EventLevel::Warn,
-                    "linear.error",
-                    &format!("could not post comment: {e:#}"),
-                    serde_json::json!({}),
-                ),
-            }
+        if let Some(body) = comment {
+            self.comment_linear(task, body).await;
+        }
+    }
+
+    /// Best-effort comment on the task's Linear issue (when comments are
+    /// enabled); never moves the issue.
+    async fn comment_linear(&mut self, task: &Task, body: String) {
+        let Some(issue_id) = task.linear_issue_id().map(str::to_string) else { return };
+        if !self.cfg.linear.post_comments {
+            return;
+        }
+        let Some(client) = self.linear_client() else { return };
+        match client.comment(&issue_id, &body).await {
+            Ok(()) => self.log(
+                Some(task.id),
+                None,
+                EventLevel::Debug,
+                "linear.comment",
+                "posted comment",
+                serde_json::json!({ "body": body }),
+            ),
+            Err(e) => self.log(
+                Some(task.id),
+                None,
+                EventLevel::Warn,
+                "linear.error",
+                &format!("could not post comment: {e:#}"),
+                serde_json::json!({}),
+            ),
         }
     }
 
@@ -1235,7 +1257,7 @@ impl Daemon {
             match effect {
                 Effect::Log { level, kind, message, data } => self.log(Some(task.id), session_id, level, &kind, &message, data),
                 Effect::Cleanup { succeeded } => {
-                    if let Err(e) = cleanup_task(&self.cfg, &self.store, &self.rt.repo, &self.rt.tmux, task, succeeded) {
+                    if let Err(e) = cleanup_task(&self.cfg, &self.store, &self.rt.repo, &self.rt.tmux, task, succeeded, false) {
                         self.log(
                             Some(task.id),
                             session_id,
@@ -1287,6 +1309,70 @@ impl Daemon {
                     self.rt.rate_limits.mark_provider(&self.cfg.budget, provider, until);
                     if let Err(e) = self.store.kv_set(RATE_LIMITS_KEY, &self.rt.rate_limits) {
                         tracing::warn!(error = %e, "cannot persist rate limits");
+                    }
+                }
+                Effect::ReleaseForReview => {
+                    if let Some(s) = session
+                        && let Err(e) = self.rt.tmux.kill_window(&s.tmux_window)
+                    {
+                        tracing::debug!(task = %task.key, window = %s.tmux_window, error = %format!("{e:#}"), "kill window for review");
+                    }
+                    if let Some(watch) = task.review.as_mut()
+                        && watch.worktree_path.is_none()
+                    {
+                        watch.worktree_path = task.worktree_path.clone();
+                    }
+                    if let Err(e) = cleanup_task(&self.cfg, &self.store, &self.rt.repo, &self.rt.tmux, task, true, true) {
+                        self.log(
+                            Some(task.id),
+                            session_id,
+                            EventLevel::Warn,
+                            "cleanup.error",
+                            &format!("cleanup for review failed: {e:#}"),
+                            serde_json::json!({}),
+                        );
+                    }
+                    if let Some(id) = session_id {
+                        self.forget_session(id);
+                    }
+                }
+                Effect::LinearComment { body } => self.comment_linear(task, body).await,
+                Effect::DeleteBranch => {
+                    let Some(branch) = task.branch.clone() else { continue };
+                    if let Some(wt) = task.worktree_path.clone() {
+                        // Kept earlier (e.g. nothing was pushed); the PR is merged now.
+                        match self.rt.repo.remove_worktree(Path::new(&wt), false) {
+                            Ok(()) => task.worktree_path = None,
+                            Err(e) => {
+                                self.log(
+                                    Some(task.id),
+                                    session_id,
+                                    EventLevel::Warn,
+                                    "cleanup.remove_failed",
+                                    &format!("PR merged but the worktree {wt} could not be removed; keeping {branch}: {e:#}"),
+                                    serde_json::json!({ "path": wt }),
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    match self.rt.repo.delete_branch(&branch, true) {
+                        Ok(()) => self.log(
+                            Some(task.id),
+                            session_id,
+                            EventLevel::Info,
+                            "cleanup.branch_deleted",
+                            &format!("deleted local branch {branch} (its PR was merged)"),
+                            serde_json::json!({ "branch": branch }),
+                        ),
+                        Err(e) => self.log(
+                            Some(task.id),
+                            session_id,
+                            EventLevel::Warn,
+                            "cleanup.branch_delete_failed",
+                            &format!("could not delete {branch}: {e:#}"),
+                            serde_json::json!({ "branch": branch }),
+                        ),
                     }
                 }
             }
@@ -1507,7 +1593,7 @@ impl Daemon {
                 && sc.stale_session_secs > 0
                 && silent > Duration::seconds(sc.stale_session_secs as i64);
             let timeout = sc.max_session_secs > 0 && now - session.started_at > Duration::seconds(sc.max_session_secs as i64);
-            let dying = !(probe.is_alive() || task.state.is_terminal() || task.state == TaskState::Paused);
+            let dying = !(probe.is_alive() || task.state.is_handed_off() || task.state == TaskState::Paused);
             let pane_tail = if dying || stale || timeout {
                 session.pane_id.as_deref().and_then(|p| self.rt.tmux.capture_pane(p, CRASH_TAIL_LINES).ok())
             } else {
@@ -1542,9 +1628,31 @@ impl Daemon {
 
     /// Tasks finished outside the hook path (`powerqueue task complete`,
     /// cancelled by Linear sync, ...) still have a live session: release it.
+    /// A task handed off `in_review` gives up its window, slot and worktree
+    /// but keeps its branch.
     async fn finalize_terminal(&mut self, now: DateTime<Utc>) -> Result<()> {
         for mut session in self.store.list_live_sessions()? {
             let Some(mut task) = self.store.get_task(session.task_id)? else { continue };
+            if task.state == TaskState::InReview {
+                session.state = SessionState::Exited;
+                session.ended_at = Some(now);
+                self.store.update_session(&session)?;
+                let effects = vec![
+                    Effect::Log {
+                        level: EventLevel::Info,
+                        kind: "session.released".into(),
+                        message: format!(
+                            "task is in review ({}); releasing its slot and worktree",
+                            task.pr_url.as_deref().unwrap_or("no PR")
+                        ),
+                        data: serde_json::json!({ "pr": task.pr_url }),
+                    },
+                    Effect::ReleaseForReview,
+                ];
+                self.apply_effects(&mut task, Some(&session), effects).await;
+                self.store.update_task(&task)?;
+                continue;
+            }
             if !task.state.is_terminal() {
                 continue;
             }
@@ -1582,6 +1690,73 @@ impl Daemon {
             self.apply_effects(&mut task, Some(&session), effects).await;
             self.store.update_task(&task)?;
             self.forget_session(session.id);
+        }
+        Ok(())
+    }
+
+    // -------------------------------------------------------------- reviews
+
+    /// Poll the pull request of every `in_review` task that is due
+    /// (`scheduler.pr_poll_secs`; 0 disables the watcher) and apply
+    /// [`review::on_pr_status`]. A failed `gh` call never changes the task:
+    /// it is noted in `last_error` (logged as `review.error` when the message
+    /// changes) and retried at the next interval.
+    async fn watch_reviews(&mut self, now: DateTime<Utc>) -> Result<()> {
+        let interval = self.cfg.scheduler.pr_poll_secs;
+        if interval == 0 {
+            return Ok(());
+        }
+        let gh = Gh::new(&self.cfg.scheduler.gh_binary);
+        for mut task in self.store.list_tasks_in_states(&[TaskState::InReview])? {
+            let due =
+                task.review.as_ref().and_then(|r| r.last_polled_at).is_none_or(|t| now - t >= Duration::seconds(interval as i64));
+            if !due {
+                continue;
+            }
+            // Handed off since this tick's finalize phase: release the
+            // session first (next tick), so a merge seen now never races it.
+            if self.store.latest_session(task.id)?.is_some_and(|s| s.state.is_live()) {
+                continue;
+            }
+            let url = task.pr_url.clone().unwrap_or_default();
+            let pr = match url.parse::<PrRef>() {
+                Ok(pr) => pr,
+                Err(e) => {
+                    task.state = TaskState::NeedsAttention;
+                    task.last_error = Some(format!("in review without a usable pull request: {e}"));
+                    self.store.update_task(&task)?;
+                    self.log(Some(task.id), None, EventLevel::Warn, "review.error", &e, serde_json::json!({ "pr": url }));
+                    continue;
+                }
+            };
+            let status = match gh.pr_status(&pr) {
+                Ok(status) => status,
+                Err(e) => {
+                    let message = format!("{WATCHER_ERROR_PREFIX} cannot read {pr}: {e:#}");
+                    let changed = task.last_error.as_deref() != Some(message.as_str());
+                    task.review.get_or_insert_with(|| ReviewWatch::armed(now, None)).last_polled_at = Some(now);
+                    task.last_error = Some(message.clone());
+                    self.store.update_task(&task)?;
+                    if changed {
+                        self.log(
+                            Some(task.id),
+                            None,
+                            EventLevel::Warn,
+                            "review.error",
+                            &message,
+                            serde_json::json!({ "pr": url }),
+                        );
+                    }
+                    continue;
+                }
+            };
+            if task.last_error.as_deref().is_some_and(|e| e.starts_with(WATCHER_ERROR_PREFIX)) {
+                task.last_error = None;
+            }
+            let effects = review::on_pr_status(&mut task, &status, &self.cfg.scheduler, now);
+            self.store.update_task(&task)?;
+            self.apply_effects(&mut task, None, effects).await;
+            self.store.update_task(&task)?;
         }
         Ok(())
     }
@@ -1734,6 +1909,15 @@ impl Daemon {
     /// Create the worktree, run setup, launch Claude and record the session.
     async fn start_task(&mut self, mut task: Task, model: ModelTier, decision: &Decision, now: DateTime<Utc>) -> Result<()> {
         let attempt = task.attempts + 1;
+        // A review round resumes the session that armed the merge, in the
+        // same worktree path, told only what changed on the PR.
+        let relaunch = task.review_relaunch().cloned();
+        if relaunch.is_some()
+            && let Some(watch) = task.review.as_mut()
+        {
+            // `task retry` of a task parked with its rounds used up.
+            watch.parked = false;
+        }
         task.state = TaskState::Starting;
         task.model = Some(model.clone());
         self.store.update_task(&task)?;
@@ -1761,7 +1945,12 @@ impl Daemon {
         let branch =
             task.branch.clone().unwrap_or_else(|| branch_name(&self.cfg.repo.branch_template, &task.slug(), &task.id.short()));
         let root = self.cfg.worktree_root(&self.paths);
-        let worktree = task.worktree_path.clone().map(PathBuf::from).unwrap_or_else(|| worktree_dir(&root, &task));
+        let worktree = task
+            .worktree_path
+            .clone()
+            .or_else(|| task.review.as_ref().and_then(|r| r.worktree_path.clone()))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| worktree_dir(&root, &task));
         task.branch = Some(branch.clone());
         task.worktree_path = Some(worktree.display().to_string());
         task.attempts = attempt;
@@ -1799,8 +1988,25 @@ impl Daemon {
                 serde_json::json!({ "previous": p.id, "transcript_path": p.transcript_path }),
             );
         }
-        let (session_id, resume, resume_id) = resume_plan(previous.as_ref(), &model, transcript_present);
-        let prepared = self.rt.launcher.prepare_with_resume_id(
+        let (session_id, resume, resume_id) = resume_plan(previous.as_ref(), &model, transcript_present, relaunch.is_some());
+        let review_prompt = relaunch
+            .as_ref()
+            .map(|r| review::review_prompt(&self.cfg.scheduler.review_prompt, r, task.pr_url.as_deref().unwrap_or_default()));
+        // Resumed: the session knows the task, so it only gets the review
+        // prompt. Started over (other provider, no transcript): the full task
+        // prompt, with the review prompt as what to do first.
+        let (prompt_override, previous_error) = match &review_prompt {
+            Some(text) if resume => (Some(text.clone()), task.last_error.clone()),
+            Some(text) => (
+                None,
+                Some(format!(
+                    "the pull request {} needs work; the previous session cannot be resumed. Start with: {text}",
+                    task.pr_url.as_deref().unwrap_or("?")
+                )),
+            ),
+            None => (None, task.last_error.clone()),
+        };
+        let prepared = self.rt.launcher.prepare_with_prompt(
             &self.cfg,
             &task,
             session_id,
@@ -1808,7 +2014,8 @@ impl Daemon {
             attempt,
             resume,
             resume_id.as_deref(),
-            task.last_error.as_deref(),
+            previous_error.as_deref(),
+            prompt_override.as_deref(),
         );
         let launched = match prepared {
             Ok(plan) => {
@@ -1866,22 +2073,36 @@ impl Daemon {
             EventLevel::Info,
             "session.launched",
             &format!(
-                "launched {model} session (attempt {attempt}{}) in window {}",
+                "launched {model} session (attempt {attempt}{}{}) in window {}",
                 if resume { ", resumed" } else { "" },
+                relaunch.as_ref().map(|r| format!(", review: {}", r.reason)).unwrap_or_default(),
                 session.tmux_window
             ),
             serde_json::json!({
                 "model": model,
                 "attempt": attempt,
                 "resume": resume,
+                "review": relaunch,
+                "prompt": review_prompt,
                 "branch": branch,
                 "worktree": worktree,
                 "window": session.tmux_window,
                 "pane": session.pane_id,
             }),
         );
-        let comment = format!("powerqueue started attempt {attempt} on branch `{branch}` with model {model}.");
-        self.update_linear(&task, LinearTarget::InProgress, Some(comment)).await;
+        match (&relaunch, &review_prompt) {
+            // The issue stays where the PR put it (In Review); only say why.
+            (Some(r), Some(prompt)) => {
+                let detail = if r.detail.is_empty() { String::new() } else { format!(" ({})", r.detail) };
+                let comment =
+                    format!("powerqueue resumed the session for PR #{}: {}{detail}. Prompt: `{prompt}`", r.pr_number, r.reason);
+                self.comment_linear(&task, comment).await;
+            }
+            _ => {
+                let comment = format!("powerqueue started attempt {attempt} on branch `{branch}` with model {model}.");
+                self.update_linear(&task, LinearTarget::InProgress, Some(comment)).await;
+            }
+        }
         Ok(())
     }
 
@@ -1919,16 +2140,24 @@ impl Daemon {
 
 /// How to start the next attempt: `(session id, resume?, provider session id)`.
 ///
-/// A crashed previous session is resumed when it ran on the same provider
-/// and, for CLIs that generate their own ids, its id was discovered;
-/// otherwise the attempt starts fresh with a new session id.
+/// A crashed previous session — or, for a review round (`review`), the
+/// session that armed the merge, whatever its state — is resumed when it ran
+/// on the same provider and, for CLIs that generate their own ids, its id
+/// was discovered; otherwise the attempt starts fresh with a new session id.
 /// `transcript_present` says whether the crashed session left the transcript
 /// its provider resumes from. A session that died before its first prompt
 /// has nothing to resume: `--resume` would fail on every remaining attempt
 /// ("No conversation found with session ID"), so it starts over instead.
-fn resume_plan(previous: Option<&Session>, model: &ModelTier, transcript_present: bool) -> (uuid::Uuid, bool, Option<String>) {
+fn resume_plan(
+    previous: Option<&Session>,
+    model: &ModelTier,
+    transcript_present: bool,
+    review: bool,
+) -> (uuid::Uuid, bool, Option<String>) {
     match previous {
-        Some(p) if p.state == SessionState::Crashed && p.model.provider() == model.provider() && transcript_present => {
+        Some(p)
+            if (p.state == SessionState::Crashed || review) && p.model.provider() == model.provider() && transcript_present =>
+        {
             if agent_for(model.provider()).accepts_session_id() {
                 (p.id, true, None)
             } else if let Some(id) = &p.agent_session_id {
@@ -1939,6 +2168,17 @@ fn resume_plan(previous: Option<&Session>, model: &ModelTier, transcript_present
         }
         _ => (uuid::Uuid::new_v4(), false, None),
     }
+}
+
+/// `last_error` prefix of a PR watcher failure (gh missing, no access, ...).
+const WATCHER_ERROR_PREFIX: &str = "PR watcher:";
+
+/// Watch the PR again from `now` (see [`ReviewWatch::rearm`]).
+fn rearm_watch(task: &mut Task, now: DateTime<Utc>) {
+    if let Some(watch) = task.review.as_mut() {
+        watch.rearm(now);
+    }
+    task.last_error = None;
 }
 
 /// Count a predicted cost against the in-memory ledger of the model's
@@ -2399,22 +2639,25 @@ mod tests {
             agent_session_id: agent.map(str::to_string),
         };
         let claude = crashed(ModelTier::opus(), None);
-        assert_eq!(resume_plan(Some(&claude), &ModelTier::sonnet(), true), (claude.id, true, None));
-        let (id, resume, _) = resume_plan(Some(&claude), &ModelTier::sonnet(), false);
+        assert_eq!(resume_plan(Some(&claude), &ModelTier::sonnet(), true, false), (claude.id, true, None));
+        let (id, resume, _) = resume_plan(Some(&claude), &ModelTier::sonnet(), false, false);
         assert!(!resume && id != claude.id, "no transcript to resume from: start fresh");
         let codex = ModelTier::new("gpt-6-astra");
-        let (id, resume, _) = resume_plan(Some(&claude), &codex, true);
+        let (id, resume, _) = resume_plan(Some(&claude), &codex, true, false);
         assert!(!resume && id != claude.id, "never resume across providers");
         let found = crashed(codex.clone(), Some("thread-1"));
-        assert_eq!(resume_plan(Some(&found), &codex, true), (found.id, true, Some("thread-1".into())));
-        assert!(!resume_plan(Some(&found), &codex, false).1);
+        assert_eq!(resume_plan(Some(&found), &codex, true, false), (found.id, true, Some("thread-1".into())));
+        assert!(!resume_plan(Some(&found), &codex, false, false).1);
         let unknown = crashed(codex.clone(), None);
-        let (id, resume, _) = resume_plan(Some(&unknown), &codex, true);
+        let (id, resume, _) = resume_plan(Some(&unknown), &codex, true, false);
         assert!(!resume && id != unknown.id, "no discovered id: start fresh");
         let mut exited = found.clone();
         exited.state = SessionState::Exited;
-        assert!(!resume_plan(Some(&exited), &codex, true).1);
-        assert!(!resume_plan(None, &codex, true).1);
+        assert!(!resume_plan(Some(&exited), &codex, true, false).1);
+        assert!(!resume_plan(None, &codex, true, false).1);
+        // A review round resumes the session that armed the merge, even though it exited.
+        assert_eq!(resume_plan(Some(&exited), &codex, true, true), (exited.id, true, Some("thread-1".into())));
+        assert!(!resume_plan(Some(&exited), &ModelTier::sonnet(), true, true).1, "still never across providers");
     }
 
     #[test]

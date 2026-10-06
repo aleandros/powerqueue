@@ -25,7 +25,9 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// * v3: `tasks.cycle` and `tasks.cycle_number` (the Linear cycle an issue is in).
 /// * v4: `tasks.blocked_by`, `tasks.children` and `tasks.parent` (Linear
 ///   dependencies; see [`crate::domain::LinkedIssue`]).
-pub const SCHEMA_VERSION: i64 = 4;
+/// * v5: `tasks.pr_url` and `tasks.review` (the PR watcher; see
+///   [`crate::domain::ReviewWatch`]).
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// kv key of the Claude calibration before schema v2.
 const LEGACY_CALIBRATION_KEY: &str = "budget.calibration";
@@ -78,6 +80,7 @@ pub struct QueueCounts {
     pub paused: usize,
     pub blocked: usize,
     pub needs_attention: usize,
+    pub in_review: usize,
     pub completed: usize,
     pub failed: usize,
     pub cancelled: usize,
@@ -192,6 +195,21 @@ impl Store {
                 tracing::info!(from = version, to = SCHEMA_VERSION, columns_added = ?added, "migrated database schema to v4");
             }
         }
+        if version < 5 {
+            let cols = columns_of("tasks")?;
+            let mut added = Vec::new();
+            for (name, sql) in
+                [("pr_url", "ALTER TABLE tasks ADD COLUMN pr_url TEXT"), ("review", "ALTER TABLE tasks ADD COLUMN review TEXT")]
+            {
+                if !cols.iter().any(|c| c == name) {
+                    conn.execute(sql, []).with_context(|| format!("add tasks.{name}"))?;
+                    added.push(name);
+                }
+            }
+            if !added.is_empty() {
+                tracing::info!(from = version, to = SCHEMA_VERSION, columns_added = ?added, "migrated database schema to v5");
+            }
+        }
         if version < SCHEMA_VERSION {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
@@ -223,9 +241,9 @@ impl Store {
             "INSERT INTO tasks (id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score,
                 labels, linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts,
                 not_before, last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number,
-                blocked_by, children, parent)
+                blocked_by, children, parent, pr_url, review)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-                ?31, ?32, ?33)",
+                ?31, ?32, ?33, ?34, ?35)",
             params![
                 task.id.to_string(),
                 task.key,
@@ -260,6 +278,8 @@ impl Store {
                 json(&task.blocked_by),
                 json(&task.children),
                 task.parent,
+                task.pr_url,
+                task.review.as_ref().map(json),
             ],
         )
         .with_context(|| format!("insert task {}", task.key))?;
@@ -274,7 +294,7 @@ impl Store {
                 criticality=?9, score=?10, labels=?11, linear_priority=?12, estimate=?13, project=?14, model_override=?15,
                 model=?16, worktree_path=?17, branch=?18, attempts=?19, max_attempts=?20, not_before=?21, last_error=?22,
                 summary=?23, score_reasons=?24, updated_at=?25, started_at=?26, completed_at=?27, cycle=?28, cycle_number=?29,
-                blocked_by=?30, children=?31, parent=?32
+                blocked_by=?30, children=?31, parent=?32, pr_url=?33, review=?34
              WHERE id=?1",
             params![
                 task.id.to_string(),
@@ -309,6 +329,8 @@ impl Store {
                 json(&task.blocked_by),
                 json(&task.children),
                 task.parent,
+                task.pr_url,
+                task.review.as_ref().map(json),
             ],
         )?;
         if n == 0 {
@@ -331,6 +353,7 @@ impl Store {
         let updated_at: String = row.get("updated_at")?;
         let blocked_by: String = row.get("blocked_by")?;
         let children: String = row.get("children")?;
+        let review: Option<String> = row.get("review")?;
         Ok(Task {
             id: TaskId::from_str(&id).map_err(|e| conv(e.into()))?,
             key: row.get("key")?,
@@ -363,6 +386,8 @@ impl Store {
             updated_at: parse_ts(&updated_at).map_err(conv)?,
             started_at: opt_ts(row.get("started_at")?).map_err(conv)?,
             completed_at: opt_ts(row.get("completed_at")?).map_err(conv)?,
+            pr_url: row.get("pr_url")?,
+            review: review.as_deref().map(from_json).transpose().map_err(conv)?,
         })
     }
 
@@ -370,7 +395,7 @@ impl Store {
         "id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score, labels,
         linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts, not_before,
         last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number,
-        blocked_by, children, parent";
+        blocked_by, children, parent, pr_url, review";
 
     pub fn get_task(&self, id: TaskId) -> Result<Option<Task>> {
         let conn = self.lock();
@@ -448,6 +473,7 @@ impl Store {
                 TaskState::Paused => c.paused += 1,
                 TaskState::Blocked => c.blocked += 1,
                 TaskState::NeedsAttention => c.needs_attention += 1,
+                TaskState::InReview => c.in_review += 1,
                 TaskState::Completed => c.completed += 1,
                 TaskState::Failed => c.failed += 1,
                 TaskState::Cancelled => c.cancelled += 1,
@@ -1594,6 +1620,52 @@ mod tests {
             assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
             let t = store.get_task_by_key("ENG-2").unwrap().unwrap();
             assert!(t.blocked_by.is_empty() && t.children.is_empty() && t.parent.is_none());
+        }
+    }
+
+    #[test]
+    fn review_fields_round_trip_and_migrate_from_v4() {
+        let store = Store::open_in_memory().unwrap();
+        let mut t = linear_task("A-5");
+        t.state = TaskState::InReview;
+        t.pr_url = Some("https://github.com/o/r/pull/7".into());
+        let mut watch = ReviewWatch::armed(Utc::now(), None);
+        watch.rounds = 2;
+        watch.relaunch =
+            Some(ReviewRelaunch { pr_number: 7, reason: "conflict".into(), detail: String::new(), requested_at: Utc::now() });
+        t.review = Some(watch.clone());
+        store.insert_task(&t).unwrap();
+        let back = store.get_task(t.id).unwrap().unwrap();
+        assert_eq!(back.state, TaskState::InReview);
+        assert_eq!(back.pr_url, t.pr_url);
+        assert_eq!(back.review.as_ref().map(|r| r.rounds), Some(2));
+        assert_eq!(back.review_relaunch().map(|r| r.reason.as_str()), Some("conflict"));
+        assert_eq!(store.counts().unwrap().in_review, 1);
+        t.review = None;
+        t.pr_url = None;
+        store.update_task(&t).unwrap();
+        let back = store.get_task(t.id).unwrap().unwrap();
+        assert!(back.review.is_none() && back.pr_url.is_none());
+
+        // A v4 file gains the review columns, empty.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pq.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V2_SCHEMA).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE tasks ADD COLUMN cycle TEXT; ALTER TABLE tasks ADD COLUMN cycle_number INTEGER;
+                 ALTER TABLE tasks ADD COLUMN blocked_by TEXT NOT NULL DEFAULT '[]';
+                 ALTER TABLE tasks ADD COLUMN children TEXT NOT NULL DEFAULT '[]';
+                 ALTER TABLE tasks ADD COLUMN parent TEXT; PRAGMA user_version = 4;",
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+            let t = store.get_task_by_key("ENG-2").unwrap().unwrap();
+            assert!(t.pr_url.is_none() && t.review.is_none());
         }
     }
 }

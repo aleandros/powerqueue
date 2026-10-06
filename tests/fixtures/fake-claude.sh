@@ -172,6 +172,26 @@ case "$mode" in
     fire SessionEnd "\"reason\":\"other\""
     exit 0
     ;;
+  pr)
+    # Hand the task off for review the way /ship-pr does: commit, arm the
+    # merge (`task complete --pr`), print the done marker, then sit at the
+    # prompt like a real session until the daemon closes the window. The PR
+    # number comes from $state_dir/pr-<task key> (default 7). A resumed
+    # session records its prompt and "resolves" the PR: pr-<n>.next.json, if
+    # present, becomes what the fake gh reports.
+    pr_number="$(cat "$state_dir/pr-${POWERQUEUE_TASK_KEY:-none}" 2>/dev/null || echo 7)"
+    if [ "$resume" = 1 ]; then
+      printf '%s\n' "$prompt" > "$state_dir/resume-prompt-$session.txt"
+      [ -f "$state_dir/pr-$pr_number.next.json" ] && mv "$state_dir/pr-$pr_number.next.json" "$state_dir/pr-$pr_number.json"
+    fi
+    usage_line "msg_${session:0:8}_pr$runs" 400 "Opened the PR"
+    echo "fake change $(date +%s) run $runs" >> FAKE_CLAUDE_TOUCHED.txt
+    git add -A >/dev/null 2>&1 && git -c user.name=fake -c user.email=fake@example.com commit -qm "fake-claude: run $runs" >/dev/null 2>&1 || true
+    "${POWERQUEUE_BIN:-powerqueue}" task complete "$task_id" --pr "https://github.com/o/r/pull/$pr_number" --summary "fake-claude armed the merge" >/dev/null 2>&1 || true
+    fire Stop "\"last_assistant_message\":\"Merge armed.\\n[[POWERQUEUE:DONE]] fake-claude armed the merge\",\"stop_hook_active\":false"
+    sleep "${FAKE_CLAUDE_IDLE_SECS:-120}"
+    exit 0
+    ;;
   ratelimit)
     fire StopFailure "\"error_type\":\"rate_limit\",\"error_message\":\"Rate limit exceeded\""
     sleep 1

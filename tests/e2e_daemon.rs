@@ -476,3 +476,71 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     }
     out
 }
+
+/// GraphQL response of the fake `gh` for PR `number`.
+fn gh_pr(number: u64, state: &str, mergeable: &str) -> String {
+    serde_json::json!({ "data": { "repository": { "pullRequest": {
+        "number": number, "state": state, "mergeable": mergeable, "mergeStateStatus": "CLEAN", "headRefOid": "abc1234",
+        "autoMergeRequest": { "enabledAt": "2026-10-06T10:00:00Z" },
+        "labels": { "nodes": [] },
+        "reviewThreads": { "nodes": [] },
+        "commits": { "nodes": [] }
+    } } } })
+    .to_string()
+}
+
+#[test]
+fn review_hand_off_frees_the_slot_and_a_conflict_resumes_the_same_session() {
+    let gh = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-gh.sh");
+    let extra = format!("max_concurrent = 1\npr_poll_secs = 1\ngh_binary = \"{}\"", gh.display());
+    let Some(mut env) = Env::new("pr", &extra) else { return };
+    let state = env.root.path().join("fakestate");
+    std::fs::create_dir_all(&state).unwrap();
+    env.vars.push(("FAKE_GH_DIR".into(), state.display().to_string()));
+    std::fs::write(state.join("pr-7.json"), gh_pr(7, "OPEN", "MERGEABLE")).unwrap();
+    std::fs::write(state.join("pr-8.json"), gh_pr(8, "OPEN", "MERGEABLE")).unwrap();
+    let a = add_task(&env, "Ship A", &[]);
+    std::fs::write(state.join(format!("pr-{a}")), "7").unwrap();
+    let b = add_task(&env, "Ship B", &[]);
+    std::fs::write(state.join(format!("pr-{b}")), "8").unwrap();
+    env.start_daemon();
+
+    assert_eq!(env.wait_for_state(&a, "in_review", Duration::from_secs(60)), "in_review", "{}", env.daemon_log());
+    // max_concurrent = 1: B can only run because A in review holds no slot.
+    assert_eq!(env.wait_for_state(&b, "in_review", Duration::from_secs(60)), "in_review", "{}", env.daemon_log());
+    let v = env.wait_for_show(&a, |v| has_event(v, "session.released") && has_event(v, "review.status"));
+    assert_eq!(v["task"]["pr_url"].as_str(), Some("https://github.com/o/r/pull/7"));
+    assert!(v["sessions"][0]["session"]["state"] == "exited", "{}", v["sessions"]);
+
+    // A's PR now conflicts. The resumed session "resolves" it (the next gh
+    // answer is MERGED), re-arms, and the watcher completes the task.
+    std::fs::write(state.join("pr-7.next.json"), gh_pr(7, "MERGED", "UNKNOWN")).unwrap();
+    std::fs::write(state.join("pr-7.json"), gh_pr(7, "OPEN", "CONFLICTING")).unwrap();
+    let v = env.wait_for_show(&a, |v| v["task"]["state"] == "completed" && has_event(v, "cleanup.branch_deleted"));
+    assert_eq!(v["task"]["state"].as_str(), Some("completed"), "{}", env.daemon_log());
+    let kinds = event_kinds(&v);
+    for expected in ["task.in_review", "review.relaunch", "review.merged", "cleanup.branch_deleted"] {
+        assert!(kinds.iter().any(|k| k == expected), "missing event {expected} in {kinds:?}");
+    }
+    let sessions = v["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1, "the review round resumed the original session row");
+    let session_id = sessions[0]["session"]["id"].as_str().unwrap().to_string();
+    let prompt = std::fs::read_to_string(state.join(format!("resume-prompt-{session_id}.txt"))).unwrap_or_default();
+    assert_eq!(prompt.trim(), "/ship-pr 7 --reason conflict", "resumed with the review prompt");
+    let launched: Vec<&str> = v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "session.launched")
+        .filter_map(|e| e["message"].as_str())
+        .collect();
+    assert!(launched.last().is_some_and(|m| m.contains("resumed") && m.contains("review: conflict")), "{launched:?}");
+    assert_eq!(v["task"]["review"]["rounds"].as_u64(), Some(1));
+    let branches = Command::new("git")
+        .args(["branch", "--list", &format!("pq/{a}")])
+        .current_dir(env.root.path().join("repo"))
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&branches.stdout).trim().is_empty(), "local branch deleted after the merge");
+    assert_eq!(env.task_state(&b), "in_review", "B's PR is still open");
+}

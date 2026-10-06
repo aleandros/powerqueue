@@ -19,6 +19,7 @@ src/
   linear/            GraphQL client; issue → task sync
   priority/          PRIORITY.md parser/evaluator; file watcher
   jev.rs             Jev "score" client (optional)
+github.rs          `gh api graphql` PR status (state, mergeability, checks, threads)
   budget/            period clock, ledger, estimator, policy
   worktree.rs        git worktree ops (shell out to git)
   tmux.rs            tmux ops (shell out to tmux)
@@ -127,6 +128,11 @@ stateDiagram-v2
     running --> idle: Stop without marker
     running --> needs_attention: BLOCKED / question / permission prompt / auth failure
     running --> completed: DONE / task complete
+    running --> in_review: task complete --pr (session, slot, worktree released)
+    in_review --> completed: PR merged (branch deleted; Linear untouched)
+    in_review --> queued: conflict / required check failed / new review threads (review round)
+    in_review --> needs_attention: PR closed, stale, review_rounds_max used up
+    needs_attention --> in_review: task resume (parked by the watcher)
     running --> crashed: pane died / stale / max_session_secs
     running --> throttled: StopFailure rate_limit
     idle --> running: UserPromptSubmit (nudge, task send, attach)
@@ -145,6 +151,8 @@ stateDiagram-v2
 ```
 
 Helper predicates: `is_terminal` (completed, failed, cancelled),
+`is_handed_off` (terminal or in_review: a live session is released and late
+hooks never revive the task),
 `has_live_session` (starting, running, idle, needs_attention),
 `is_schedulable` (queued, crashed, throttled). `Task::is_waiting` (a pending
 `blocked by` issue, or sub-issues) additionally keeps `pick_next` from
@@ -223,7 +231,18 @@ still runs):
    session stayed alive goes back to `running`;
 7. release sessions of tasks that became terminal outside the hook path
    (`task complete` on the CLI, cancelled by sync): `cleanup_task`, then the
-   Linear update and comment;
+   Linear update and comment; a task handed off `in_review` gets its window
+   killed and `cleanup_task(.., for_review)` (branch kept, Linear untouched);
+7b. every `pr_poll_secs`, for each `in_review` task without a live session:
+   `Gh::pr_status`, then `review::on_pr_status` (merged ⇒ completed + local
+   branch deleted; closed ⇒ needs_attention; conflict / failed required
+   check / new unresolved threads ⇒ `queued` with a pending
+   `ReviewRelaunch`; hold label ⇒ wait; unchanged for `review_stale_hours`
+   ⇒ Linear comment + needs_attention). A pending relaunch makes step 9
+   recreate the worktree at the remembered path, resume the previous session
+   even though it exited (`resume_plan(.., review)`), pass
+   `scheduler.review_prompt` instead of the task prompt, and comment on
+   Linear instead of moving the issue;
 8. sample CPU/RSS every `resource_sample_secs`; prune samples older than 7
    days once an hour;
 9. while live sessions `< max_concurrent`: `pick_next`, `Estimator::predict`,

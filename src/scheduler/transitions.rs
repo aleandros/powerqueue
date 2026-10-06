@@ -45,6 +45,13 @@ pub enum Effect {
     RateLimit { tier: ModelTier, until: DateTime<Utc> },
     /// Record a cooldown for every model of a provider (account-wide limits).
     RateLimitProvider { provider: Provider, until: DateTime<Utc> },
+    /// The task went `in_review`: kill the session's window and release the
+    /// worktree, keeping the branch for a later review round.
+    ReleaseForReview,
+    /// Post a comment on the Linear issue without moving it (best effort).
+    LinearComment { body: String },
+    /// Delete the task's local branch (its PR was merged).
+    DeleteBranch,
 }
 
 impl Effect {
@@ -97,7 +104,7 @@ pub fn on_hook_outcome(
     let mut effects = Vec::new();
     // Late activity/notifications must not resurrect finished or paused work.
     if !matches!(outcome, HookOutcome::Started { .. } | HookOutcome::Completed { .. } | HookOutcome::SessionEnded { .. })
-        && (task.state.is_terminal() || task.state == TaskState::Paused || !session.state.is_live())
+        && (task.state.is_handed_off() || task.state == TaskState::Paused || !session.state.is_live())
     {
         return effects;
     }
@@ -113,7 +120,7 @@ pub fn on_hook_outcome(
             // `running` forever instead of being relaunched. A resumed
             // attempt reuses the row as `launching`, which is live.
             let live = session.state.is_live();
-            if live && !task.state.is_terminal() && task.state != TaskState::Paused {
+            if live && !task.state.is_handed_off() && task.state != TaskState::Paused {
                 session.state = SessionState::Running;
             }
             if live
@@ -135,6 +142,12 @@ pub fn on_hook_outcome(
             ));
         }
         HookOutcome::Completed { summary } => {
+            if task.state == TaskState::InReview {
+                // `task complete --pr` already handed the task to the PR
+                // watcher; the done marker only ends the session.
+                effects.extend(end_review_session(session, "the agent printed the done marker", now));
+                return effects;
+            }
             if !session.state.is_live() && task.state == TaskState::Completed {
                 effects.push(Effect::log(
                     EventLevel::Debug,
@@ -254,7 +267,9 @@ pub fn on_hook_outcome(
             ));
         }
         HookOutcome::SessionEnded { reason } => {
-            if task.state.is_terminal() || task.state == TaskState::Paused {
+            if task.state == TaskState::InReview {
+                effects.extend(end_review_session(session, &format!("session ended ({reason})"), now));
+            } else if task.state.is_terminal() || task.state == TaskState::Paused {
                 session.state = SessionState::Exited;
                 session.ended_at = Some(now);
                 effects.push(Effect::log(
@@ -372,6 +387,10 @@ pub fn on_probe(
         return effects;
     }
     if !probe.is_alive() {
+        if task.state == TaskState::InReview {
+            session.exit_code = probe.exit_status;
+            return end_review_session(session, "pane gone", now);
+        }
         if task.state.is_terminal() || task.state == TaskState::Paused {
             session.state = SessionState::Exited;
             session.ended_at = Some(now);
@@ -412,7 +431,8 @@ pub fn on_probe(
     let running = matches!(task.state, TaskState::Running | TaskState::Starting);
     let stale = running && cfg.stale_session_secs > 0 && since_activity > Duration::seconds(cfg.stale_session_secs as i64);
     let age = now - session.started_at;
-    let timed_out = cfg.max_session_secs > 0 && !task.state.is_terminal() && age > Duration::seconds(cfg.max_session_secs as i64);
+    let timed_out =
+        cfg.max_session_secs > 0 && !task.state.is_handed_off() && age > Duration::seconds(cfg.max_session_secs as i64);
 
     // An agent waiting in-session for its usage limit to reset is not hung:
     // while its provider is on cooldown, park the task as throttled instead
@@ -518,8 +538,12 @@ pub fn on_crash(
     }
     task.last_error = Some(reason.to_string());
     let max = task.max_attempts.unwrap_or(cfg.max_attempts).max(1);
+    // A review round gets its own `max_attempts`: attempts used before the
+    // watcher relaunched the task do not count.
+    let base = task.review_relaunch().and(task.review.as_ref()).map_or(0, |r| r.attempt_base);
+    let used = attempt.saturating_sub(base);
     let data = serde_json::json!({ "reason": reason, "exit_status": exit_status, "attempt": attempt, "max_attempts": max, "pane_tail": pane_tail });
-    if attempt >= max {
+    if used >= max {
         task.state = TaskState::Failed;
         task.completed_at = Some(now);
         task.not_before = None;
@@ -538,17 +562,42 @@ pub fn on_crash(
             )),
         });
     } else {
-        let backoff = Duration::seconds(cfg.backoff_for_attempt(attempt) as i64);
+        let backoff = Duration::seconds(cfg.backoff_for_attempt(used) as i64);
         task.state = TaskState::Crashed;
         task.not_before = Some(now + backoff);
         effects.push(Effect::log(
             EventLevel::Warn,
             "session.crashed",
-            format!("{reason}; retrying in {}s (attempt {attempt} of {max})", backoff.num_seconds()),
+            format!("{reason}; retrying in {}s (attempt {used} of {max})", backoff.num_seconds()),
             data,
         ));
     }
     effects
+}
+
+/// The session of a task that went `in_review` ended (done marker, exit,
+/// pane gone). The first time it is seen live, its resources are released
+/// for the review; later signals only log.
+fn end_review_session(session: &mut Session, why: &str, now: DateTime<Utc>) -> Vec<Effect> {
+    if !session.state.is_live() {
+        return vec![Effect::log(
+            EventLevel::Debug,
+            "hook.duplicate",
+            "session already released for review",
+            serde_json::json!({ "why": why }),
+        )];
+    }
+    session.state = SessionState::Exited;
+    session.ended_at = Some(now);
+    vec![
+        Effect::log(
+            EventLevel::Info,
+            "session.released",
+            format!("{why}; task is in review, releasing its slot and worktree"),
+            serde_json::json!({ "why": why }),
+        ),
+        Effect::ReleaseForReview,
+    ]
 }
 
 /// Move a task between `queued` and `blocked` from its Linear dependencies
@@ -730,6 +779,59 @@ mod tests {
         SessionProbe { pane_exists: true, pane_dead: true, exit_status: status, pane_pid: None, current_command: None }
     }
 
+    #[test]
+    fn a_session_handed_off_to_review_is_released_once() {
+        use crate::session::HookOutcome;
+        let mut t = task(TaskState::InReview, 1);
+        let mut s = session(SessionState::Idle, 1);
+        let done = HookOutcome::Completed { summary: "shipped".into() };
+        let fx = on_hook_outcome(&mut t, &mut s, &done, &cfg(), now(), period_end());
+        assert_eq!(t.state, TaskState::InReview, "the done marker does not complete a task in review");
+        assert_eq!(s.state, SessionState::Exited);
+        assert_eq!(kinds(&fx), vec!["session.released", "release_for_review"]);
+        // The SessionEnd that follows (window killed) is no crash and releases nothing twice.
+        let ended = HookOutcome::SessionEnded { reason: "other".into() };
+        let fx = on_hook_outcome(&mut t, &mut s, &ended, &cfg(), now(), period_end());
+        assert_eq!((t.state, kinds(&fx)), (TaskState::InReview, vec!["hook.duplicate".to_string()]));
+        // Late activity never revives it.
+        let late = HookOutcome::TurnEnded { last_message: "x".into() };
+        assert!(on_hook_outcome(&mut t, &mut s, &late, &cfg(), now(), period_end()).is_empty());
+
+        // A dead pane of a task in review is released, not counted as a crash.
+        let mut t = task(TaskState::InReview, 1);
+        let mut s = session(SessionState::Running, 1);
+        let fx = on_probe(&mut t, &mut s, &dead(Some(0)), &cfg().scheduler, &ProbeContext { now: now(), ..Default::default() });
+        assert_eq!((t.state, s.state), (TaskState::InReview, SessionState::Exited));
+        assert_eq!(kinds(&fx), vec!["session.released", "release_for_review"]);
+        // An old live session of a task in review is not timed out.
+        let mut t = task(TaskState::InReview, 1);
+        let mut s = session(SessionState::Running, 1);
+        s.started_at = now() - Duration::hours(10);
+        let fx = on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ProbeContext { now: now(), ..Default::default() });
+        assert!(fx.is_empty(), "{fx:?}");
+    }
+
+    #[test]
+    fn crashes_in_a_review_round_count_from_the_round() {
+        let sc = cfg().scheduler;
+        let mut t = task(TaskState::Running, 3);
+        let mut watch = crate::domain::ReviewWatch::armed(now(), None);
+        watch.attempt_base = 2;
+        watch.relaunch = Some(crate::domain::ReviewRelaunch {
+            pr_number: 7,
+            reason: "conflict".into(),
+            detail: String::new(),
+            requested_at: now(),
+        });
+        t.review = Some(watch);
+        let mut s = session(SessionState::Running, 3);
+        on_crash(&mut t, Some(&mut s), "boom", Some(1), &sc, now(), None);
+        assert_eq!(t.state, TaskState::Crashed, "attempt 3 is the round's first; max_attempts = 3 is not used up");
+        let mut s = session(SessionState::Running, 5);
+        on_crash(&mut t, Some(&mut s), "boom", Some(1), &sc, now(), None);
+        assert_eq!(t.state, TaskState::Failed, "third attempt of the round");
+    }
+
     fn kinds(effects: &[Effect]) -> Vec<String> {
         effects
             .iter()
@@ -741,6 +843,9 @@ mod tests {
                 Effect::KillWindow => "kill".into(),
                 Effect::RateLimit { .. } => "ratelimit".into(),
                 Effect::RateLimitProvider { provider, .. } => format!("ratelimit({provider})"),
+                Effect::ReleaseForReview => "release_for_review".into(),
+                Effect::LinearComment { .. } => "linear_comment".into(),
+                Effect::DeleteBranch => "delete_branch".into(),
             })
             .collect()
     }

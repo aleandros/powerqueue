@@ -134,6 +134,7 @@ pub fn state_style(state: TaskState) -> Style {
         TaskState::Throttled | TaskState::Paused => Style::default().fg(Color::Magenta),
         TaskState::Blocked => Style::default().fg(Color::Blue),
         TaskState::NeedsAttention => Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD),
+        TaskState::InReview => Style::default().fg(Color::LightBlue),
         TaskState::Completed => Style::default().fg(Color::LightGreen),
         TaskState::Cancelled => Style::default().fg(Color::DarkGray),
     }
@@ -250,6 +251,13 @@ fn draw_header(frame: &mut Frame, app: &DashboardApp, area: Rect) {
         daemon,
         Span::raw(format!("  slots {}/{}", s.slots_used(), s.max_concurrent)),
     ];
+    let (review, manual) = s.in_review();
+    if review > 0 {
+        spans.push(Span::styled(format!("  in review {review}"), state_style(TaskState::InReview)));
+        if manual > 0 {
+            spans.push(Span::styled(format!(" ({manual} waiting for manual merge)"), Style::default().fg(Color::DarkGray)));
+        }
+    }
     let ledgers = s.ordered_ledgers();
     if ledgers.is_empty() {
         spans.push(Span::styled("  budget: n/a", Style::default().fg(Color::DarkGray)));

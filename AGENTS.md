@@ -27,11 +27,12 @@ src/
   linear/            GraphQL client + issue→task sync
   priority/          PRIORITY.md parser/evaluator + live reload
   jev.rs             TypeSafe Jev "score" client (optional scoring)
+  github.rs          `gh api graphql` PR status for the PR watcher
   budget/            period clock, ledger (one per provider: Ledgers), probe.rs (observed usage + UsageProbe), cost estimator, model policy
   worktree.rs        git worktree ops (shell out to git)
   tmux.rs            tmux ops (shell out to tmux)
   session/           agent.rs (AgentCli trait, agent_for, shared helpers), claude.rs, codex.rs, gemini.rs (one per CLI), launcher (prompt, launch.sh), transcript tailing, probes
-  scheduler/         daemon loop (daemon.rs), pure transitions (transitions.rs), pick_next + cleanup (lifecycle.rs)
+  scheduler/         daemon loop (daemon.rs), pure transitions (transitions.rs), pick_next + cleanup (lifecycle.rs), PR watcher decisions (review.rs)
   hook.rs            `powerqueue hook` (called by Claude Code hooks)
   dashboard/         ratatui TUI
   doctor.rs          diagnostics + tuning advice
@@ -51,7 +52,7 @@ docs/                user docs (priority grammar, budget algorithm, troubleshoot
 5. `session::Launcher::prepare` writes `<state>/tasks/<id>/{prompt.md,launch.sh,env}` plus whatever `session::agent_for(model.provider()).prepare` asks for (`settings.json` for Claude); `launch` runs the provider's `pre_launch` and opens a tmux window running `launch.sh`.
 6. Claude Code hooks (`SessionStart`, `Stop`, `StopFailure`, `SessionEnd`, `Notification`, ...) call `powerqueue hook`, which stores the payload in `hook_events`.
 7. The daemon drains hook events + tails the transcript JSONL for usage (dedupe by `message.id`), samples CPU/RSS via sysinfo, probes tmux panes.
-8. Completion: Claude runs `powerqueue task complete <id> --summary ...` and/or prints `[[POWERQUEUE:DONE]]` (either suffices). Dead pane without completion ⇒ `crashed` ⇒ backoff ⇒ relaunch with `--resume <same session id>`.
+8. Completion: Claude runs `powerqueue task complete <id> --summary ...` and/or prints `[[POWERQUEUE:DONE]]` (either suffices). Dead pane without completion ⇒ `crashed` ⇒ backoff ⇒ relaunch with `--resume <same session id>`. With `--pr <url>` the task goes `in_review` instead: session and slot released, worktree removed, branch kept; `scheduler::review` watches the PR via `gh` and re-queues a review round (same worktree path, `--resume` of the same session, `scheduler.review_prompt`) on conflict / failed required check / new review threads, or completes it when merged.
 9. `cleanup_task`: push branch, remove worktree, close window (per config + repo overrides), update Linear state, post comment.
 
 ## Conventions
@@ -76,7 +77,7 @@ Module ownership is coarse so agents can work on branches without conflicts:
 |------|-------|
 | linear + priority + jev | `src/linear/**`, `src/priority/**`, `src/jev.rs`, `src/cli/commands/{linear,priority}.rs` |
 | runtime | `src/tmux.rs`, `src/worktree.rs`, `src/session/**` (incl. `session/{agent,claude,codex,gemini}.rs`, the provider trait and its CLIs), `src/cli/commands/attach.rs` |
-| budget + scheduler | `src/budget/**` (incl. `budget/probe.rs`, observed usage), `src/scheduler/**`, `src/hook.rs`, `src/cli/commands/{run,budget,hook}.rs` |
+| budget + scheduler | `src/budget/**` (incl. `budget/probe.rs`, observed usage), `src/scheduler/**`, `src/github.rs`, `src/hook.rs`, `src/cli/commands/{run,budget,hook}.rs` |
 | ux | `src/dashboard/**`, `src/doctor.rs`, `src/tune.rs`, `src/cli/commands/{init,status,add,task,logs,config,secrets,doctor,tune}.rs` |
 
 Shared files (`domain.rs`, `config.rs`, `store/**`, `cli/mod.rs`, `Cargo.toml`) may be

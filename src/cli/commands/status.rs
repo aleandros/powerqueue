@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::cli::output::{self, human_bytes, human_duration, human_f64};
 use crate::cli::{Context, StatusArgs};
-use crate::domain::{Provider, ResourceSample, Session, Task, TokenUsage};
+use crate::domain::{Provider, ResourceSample, Session, Task, TaskState, TokenUsage};
 use crate::store::{QueueCounts, Store};
 
 /// Heartbeats older than this mean the daemon is not running.
@@ -113,10 +113,24 @@ pub fn cpu_rss(sample: Option<&ResourceSample>) -> String {
 
 /// The "waiting on" column: pending blocker keys, or the open sub-issues
 /// of a container (`parent (done)` once they are all done, `parent (all
-/// canceled)` when none was completed); `-` otherwise.
+/// canceled)` when none was completed); for a task in review its PR
+/// (`PR #7`, `PR #7 (waiting for manual merge)`), for a pending review round
+/// the reason (`PR #7: conflict`); `-` otherwise.
 pub fn waiting_on(task: &Task) -> String {
     let keys = task.waiting_on();
-    if !keys.is_empty() {
+    let pr = || {
+        let url = task.pr_url.as_deref().unwrap_or_default();
+        url.parse::<crate::github::PrRef>().map(|p| format!("PR #{}", p.number)).unwrap_or_else(|_| url.to_string())
+    };
+    if task.state == TaskState::InReview {
+        if task.review.as_ref().is_some_and(|r| r.waiting_manual_merge) {
+            format!("{} (waiting for manual merge)", pr())
+        } else {
+            pr()
+        }
+    } else if let Some(r) = task.review_relaunch().filter(|_| matches!(task.state, TaskState::Queued | TaskState::Starting)) {
+        format!("{}: {}", pr(), r.reason)
+    } else if !keys.is_empty() {
         keys.join(", ")
     } else if task.container_all_canceled() {
         "parent (all canceled)".to_string()
@@ -130,6 +144,7 @@ pub fn waiting_on(task: &Task) -> String {
 fn counts_line(c: &QueueCounts) -> String {
     let mut parts = vec![format!("queued {}", c.queued), format!("running {}", c.running)];
     for (label, n) in [
+        ("in review", c.in_review),
         ("idle", c.idle),
         ("attention", c.needs_attention),
         ("crashed", c.crashed),
@@ -174,7 +189,7 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
             "counts": {
                 "queued": counts.queued, "running": counts.running, "idle": counts.idle,
                 "crashed": counts.crashed, "throttled": counts.throttled, "paused": counts.paused, "blocked": counts.blocked,
-                "needs_attention": counts.needs_attention, "completed": counts.completed,
+                "needs_attention": counts.needs_attention, "in_review": counts.in_review, "completed": counts.completed,
                 "failed": counts.failed, "cancelled": counts.cancelled,
             },
             "tasks": rows,
@@ -210,7 +225,9 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
     }
 
     let width = terminal_width();
-    let waiting = rows.iter().any(|r| r.task.is_waiting() || !r.task.blocked_by.is_empty());
+    let waiting = rows
+        .iter()
+        .any(|r| r.task.is_waiting() || !r.task.blocked_by.is_empty() || r.task.pr_url.is_some() && !r.task.state.is_terminal());
     let title_max = width.saturating_sub(if waiting { 92 } else { 78 }).clamp(16, 80);
     let mut table = output::table();
     table.set_width(width as u16);
@@ -330,6 +347,21 @@ mod tests {
             c.state_type = "canceled".into();
         }
         assert_eq!(waiting_on(&t), "parent (all canceled)");
+
+        let mut r = task("r", TaskState::InReview, 1.0);
+        r.pr_url = Some("https://github.com/o/r/pull/7".into());
+        r.review = Some(crate::domain::ReviewWatch::armed(Utc::now(), None));
+        assert_eq!(waiting_on(&r), "PR #7");
+        r.review.as_mut().unwrap().waiting_manual_merge = true;
+        assert_eq!(waiting_on(&r), "PR #7 (waiting for manual merge)");
+        r.state = TaskState::Queued;
+        r.review.as_mut().unwrap().relaunch = Some(crate::domain::ReviewRelaunch {
+            pr_number: 7,
+            reason: "conflict".into(),
+            detail: String::new(),
+            requested_at: Utc::now(),
+        });
+        assert_eq!(waiting_on(&r), "PR #7: conflict");
     }
 
     #[test]

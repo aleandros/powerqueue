@@ -7,8 +7,11 @@
 //! 4. drain hook events and transcript usage for live sessions, update states;
 //! 5. probe tmux panes: dead pane + not completed ⇒ crashed (backoff, resume);
 //! 6. detect stale/idle sessions (nudge once, then `needs_attention`);
-//! 7. finish completed tasks: cleanup worktree, update Linear;
-//! 8. while slots are free: pick the best schedulable task, ask the budget
+//! 7. finish completed tasks: cleanup worktree, update Linear; release the
+//!    sessions of tasks handed off `in_review`;
+//! 8. watch the pull requests of `in_review` tasks ([`review`]): merged ⇒
+//!    completed, conflict / failed check / new review ⇒ relaunch;
+//! 9. while slots are free: pick the best schedulable task, ask the budget
 //!    policy for a model, launch it.
 //!
 //! State transitions are logged as events so `task show` reconstructs the story.
@@ -17,6 +20,7 @@
 
 pub mod daemon;
 pub mod lifecycle;
+pub mod review;
 pub mod transitions;
 
 pub use daemon::{Daemon, DaemonHandle, SKIP_REASON};

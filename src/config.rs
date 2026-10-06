@@ -280,6 +280,10 @@ impl Default for JevConfig {
     }
 }
 
+/// Default `scheduler.review_prompt`: the `/ship-pr` skill picks the PR up
+/// again with the reason the watcher found.
+pub const DEFAULT_REVIEW_PROMPT: &str = "/ship-pr {pr} --reason {reason} {detail}";
+
 /// Daemon behaviour.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -299,6 +303,23 @@ pub struct SchedulerConfig {
     pub max_session_secs: u64,
     /// How often to sample CPU/RSS of sessions.
     pub resource_sample_secs: u64,
+    /// How often the PR of each `in_review` task is checked with `gh`; 0
+    /// stops the watcher (tasks then stay `in_review` until handled by hand).
+    pub pr_poll_secs: u64,
+    /// Relaunches of one task for its PR (conflict, failed check, review)
+    /// before it goes to `needs_attention`. Independent of `max_attempts`.
+    pub review_rounds_max: u32,
+    /// A PR whose status has not changed for this long is reported in a
+    /// Linear comment and the task goes to `needs_attention`; 0 disables.
+    pub review_stale_hours: u64,
+    /// Label of a PR that a human merges by hand: while the PR is blocked
+    /// and carries it, the watcher waits (no stale report).
+    pub merge_hold_label: String,
+    /// Prompt of a resumed review session. Placeholders: `{pr}` (number),
+    /// `{url}`, `{reason}` (`conflict`, `ci_failed`, `review`), `{detail}`.
+    pub review_prompt: String,
+    /// GitHub CLI used by the PR watcher.
+    pub gh_binary: String,
 }
 
 impl Default for SchedulerConfig {
@@ -312,6 +333,12 @@ impl Default for SchedulerConfig {
             restart_backoff_secs: vec![30, 120, 600],
             max_session_secs: 4 * 3600,
             resource_sample_secs: 30,
+            pr_poll_secs: 120,
+            review_rounds_max: 5,
+            review_stale_hours: 24,
+            merge_hold_label: "merge/hold".to_string(),
+            review_prompt: DEFAULT_REVIEW_PROMPT.to_string(),
+            gh_binary: "gh".to_string(),
         }
     }
 }
@@ -1322,6 +1349,12 @@ impl Config {
         }
         if self.scheduler.tick_secs == 0 {
             problems.push("scheduler.tick_secs must be >= 1".to_string());
+        }
+        if self.scheduler.review_prompt.trim().is_empty() {
+            problems.push("scheduler.review_prompt is empty (it is what a resumed review session is told)".to_string());
+        }
+        if self.scheduler.gh_binary.trim().is_empty() {
+            problems.push("scheduler.gh_binary is empty (the PR watcher runs it)".to_string());
         }
         for conflict in &self.budget.migration_conflicts {
             problems.push(format!("legacy budget key {conflict}"));
