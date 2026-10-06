@@ -23,8 +23,14 @@ pub mod probe;
 pub mod probes;
 
 pub use estimator::{Estimator, Prediction, Sample};
-pub use ledger::{CALIBRATION_KEY, Calibration, Ledger, Ledgers, TierLedger, calibration_key, tier_share, tier_weight};
+pub use ledger::{
+    CALIBRATION_KEY, LearnedRate, Ledger, Ledgers, MIN_MEASURED_DELTA, MIN_OBSERVED_DELTA, RateEstimate, TierLedger,
+    WINDOW_LEARN_SPAN, calibration_key, learn_rate, tier_share, tier_weight,
+};
 pub use period::{AnchorSource, Period, PeriodClock};
 pub use policy::{Decision, OBSERVED_EXHAUSTED_TTL, Policy, RATE_LIMITS_KEY, RateLimitState, WINDOW_RECHECK};
-pub use probe::{NoProbe, ObservedUsage, UsageProbe, apply_observed, load_observed, observed_key, save_observed};
+pub use probe::{
+    NoProbe, ObservationSample, ObservedUsage, UsageProbe, apply_observed, load_observations, load_observed, observations_key,
+    observed_key, record_observation, save_observed, thin_samples,
+};
 pub use probes::{ProbeStatus, load_probe_status, probe_all, probe_providers};

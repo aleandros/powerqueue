@@ -251,6 +251,9 @@ fn draw_header(frame: &mut Frame, app: &DashboardApp, area: Rect) {
         daemon,
         Span::raw(format!("  slots {}/{}", s.slots_used(), s.max_concurrent)),
     ];
+    if let Some(p) = &s.scheduling_pause {
+        spans.push(Span::styled(format!("  scheduling {}", p.describe()), Style::default().fg(Color::Yellow)));
+    }
     let (review, manual) = s.in_review();
     if review > 0 {
         spans.push(Span::styled(format!("  in review {review}"), state_style(TaskState::InReview)));

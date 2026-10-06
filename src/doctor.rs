@@ -23,7 +23,8 @@ use anyhow::{Context as _, Result, anyhow};
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::budget::{Estimator, Ledger, Ledgers, load_observed, load_probe_status};
+use crate::budget::{Estimator, Ledger, Ledgers, load_observations, load_observed, load_probe_status, tier_weight};
+use crate::cli::output::human_f64;
 use crate::config::{Config, REPO_CONFIG_FILE, RepoOverrides};
 use crate::domain::{EventLevel, ModelTier, Provider, SessionState, Task, TaskState};
 use crate::jev::JevClient;
@@ -875,6 +876,20 @@ fn check_daemon(store: &Store) -> CheckResult {
     }
 }
 
+/// `powerqueue pause` in effect: nothing launches until `resume`.
+fn check_scheduling_pause(store: &Store) -> CheckResult {
+    match crate::domain::SchedulingPause::load(store) {
+        Ok(Some(p)) => CheckResult::warn(
+            STATE,
+            "scheduling",
+            format!("{}; queued tasks wait and crashed sessions are not relaunched", p.describe()),
+            "`powerqueue resume` when you want new sessions again",
+        ),
+        Ok(None) => CheckResult::ok(STATE, "scheduling", "not paused"),
+        Err(e) => CheckResult::fail(STATE, "scheduling", format!("{e:#}"), "check the database"),
+    }
+}
+
 /// Linear dependencies: which tasks are `blocked` and on what, `blocked by`
 /// cycles between open tasks (they would wait forever), and failed attempts
 /// to close parent issues (`parent_errors`, `linear.parent_error` events in
@@ -1483,7 +1498,7 @@ fn check_probes(cfg: &Config, store: &Store) -> Vec<CheckResult> {
 /// Pacing of a provider's most capable enabled model (`<model> reservation`)
 /// and its window pressure (`window pressure` for Claude, `<p> window
 /// pressure` otherwise).
-fn ledger_checks(cfg: &Config, ledger: &Ledger) -> Vec<CheckResult> {
+fn ledger_checks(cfg: &Config, ledger: &Ledger, readings: usize, typical_weighted: f64) -> Vec<CheckResult> {
     let p = ledger.provider;
     let mut out = Vec::new();
     let elapsed = ledger.elapsed_fraction();
@@ -1501,22 +1516,116 @@ fn ledger_checks(cfg: &Config, ledger: &Ledger) -> Vec<CheckResult> {
     }
     let name = if p == Provider::Claude { "window pressure".to_string() } else { format!("{p} window pressure") };
     let window = ledger.window_fraction();
-    let window_hours = cfg.budget.provider(p).window_hours;
-    if !ledger.window_enabled {
-        out.push(CheckResult::ok(ALGO, &name, format!("no rolling window configured (budget.providers.{p}.window_hours = 0)")));
+    let source = ledger.window_fraction_source();
+    if !ledger.has_window() {
+        out.push(CheckResult::ok(
+            ALGO,
+            &name,
+            format!("no rolling window (budget.providers.{p}.window_hours = 0 and the provider reports none)"),
+        ));
     } else if window > MAX_WINDOW_FRACTION {
         out.push(CheckResult::warn(
             ALGO,
             &name,
-            format!("{:.0}% of the {p} {window_hours}h window budget is spent", window * 100.0),
-            format!(
-                "lower scheduler.max_concurrent or raise budget.providers.{p}.window_weighted_tokens if the provider shows headroom"
-            ),
+            format!("{:.0}% of the {p} window used ({source})", window * 100.0),
+            "lower scheduler.max_concurrent, or wait for the window to roll over",
         ));
     } else {
-        out.push(CheckResult::ok(ALGO, &name, format!("{:.0}% of the {p} {window_hours}h window budget spent", window * 100.0)));
+        out.push(CheckResult::ok(ALGO, &name, format!("{:.0}% of the {p} window used ({source})", window * 100.0)));
+    }
+    out.push(rate_check(ledger, readings));
+    if let Some(top) = cfg.budget.provider(p).enabled_models().into_iter().next() {
+        out.push(affordability_check(cfg, ledger, &top, typical_weighted));
     }
     out
+}
+
+/// Ratio between the configured and the learned period budget above which
+/// `doctor` asks for the config to be updated.
+pub const MAX_RATE_MISMATCH: f64 = 2.0;
+
+/// Whether the exchange rate between our weighted tokens and the provider's
+/// percentages is known, and whether the configured budget is far from it.
+fn rate_check(ledger: &Ledger, readings: usize) -> CheckResult {
+    let p = ledger.provider;
+    let name = format!("{p} usage rate");
+    let key = format!("budget.providers.{p}.period_weighted_tokens");
+    match ledger.learned.period {
+        Some(r) => {
+            let configured = ledger.configured_period_budget.max(1.0);
+            let ratio = (r.budget / configured).max(configured / r.budget);
+            let detail = format!(
+                "100% of the period ≈ {} weighted tokens, learned from {} readings ({:.1} points over {}); {key} = {}",
+                human_f64(r.budget),
+                r.samples,
+                r.observed_delta * 100.0,
+                crate::cli::output::human_duration((r.to - r.from).num_seconds()),
+                human_f64(configured)
+            );
+            if ratio > MAX_RATE_MISMATCH {
+                CheckResult::warn(
+                    ALGO,
+                    &name,
+                    format!("{detail}: the configured budget is {ratio:.1}× off"),
+                    format!("set {key} = {:.0} so pacing is right before the period's first readings arrive", r.budget.round()),
+                )
+            } else {
+                CheckResult::ok(ALGO, &name, detail)
+            }
+        }
+        None if ledger.observed.is_some() => CheckResult::ok(
+            ALGO,
+            &name,
+            format!(
+                "not learned yet ({readings} reading(s) this period; needs two at least {:.0} points and {} weighted tokens apart); pacing starts from the provider's latest reading and counts new usage at {key} = {}",
+                crate::budget::MIN_OBSERVED_DELTA * 100.0,
+                human_f64(crate::budget::MIN_MEASURED_DELTA),
+                human_f64(ledger.configured_period_budget)
+            ),
+        ),
+        None => CheckResult::ok(
+            ALGO,
+            &name,
+            format!(
+                "no reading from {p} yet; pacing uses {key} = {} as the whole allowance",
+                human_f64(ledger.configured_period_budget)
+            ),
+        ),
+    }
+}
+
+/// Whether the provider's most capable model can hold a typical task at all:
+/// a share that is smaller than one task (after the model's cost weight)
+/// means the model can never lend itself to less critical work.
+fn affordability_check(cfg: &Config, ledger: &Ledger, top: &ModelTier, typical_weighted: f64) -> CheckResult {
+    let p = ledger.provider;
+    let name = format!("{} share", top.alias());
+    let weight = tier_weight(&cfg.budget, top);
+    let cost = typical_weighted * weight;
+    let share = ledger.tier(top).period_budget;
+    let key = format!("budget.providers.{p}.models.{}", top.alias());
+    if share <= 0.0 {
+        return CheckResult::ok(ALGO, &name, format!("{top} has no share; only `task model {top}` overrides use it"));
+    }
+    if cost > share * (1.0 - cfg.budget.safety_margin) {
+        CheckResult::warn(
+            ALGO,
+            &name,
+            format!(
+                "{top}'s share ({}) is smaller than one typical task ({} × weight {weight} = {}): it can never lend itself to less critical work",
+                human_f64(share),
+                human_f64(typical_weighted),
+                human_f64(cost)
+            ),
+            format!("raise {key}.share or lower {key}.weight (work {top} is reserved for is not capped by the share)"),
+        )
+    } else {
+        CheckResult::ok(
+            ALGO,
+            &name,
+            format!("{top}'s share ({}) holds about {:.0} typical tasks", human_f64(share), share / cost.max(1.0)),
+        )
+    }
 }
 
 fn check_ledger(cfg: &Config, store: &Store) -> Vec<CheckResult> {
@@ -1535,7 +1644,20 @@ fn check_ledger(cfg: &Config, store: &Store) -> Vec<CheckResult> {
             "set budget.providers.claude.enabled = true (or enable codex / gemini)",
         )];
     }
-    ledgers.ordered(&cfg.budget.provider_order).into_iter().flat_map(|l| ledger_checks(cfg, l)).collect()
+    // A typical task: what the estimator predicts with no history-specific
+    // features (the global median, or the default guess).
+    let typical = Estimator::from_summaries(&store.task_usage_summaries().unwrap_or_default())
+        .predict(&crate::domain::Task::new("doctor", "typical", crate::domain::TaskSource::Manual))
+        .weighted_tokens;
+    ledgers
+        .ordered(&cfg.budget.provider_order)
+        .into_iter()
+        .flat_map(|l| {
+            let readings =
+                load_observations(store, l.provider).map(|h| h.iter().filter(|s| l.period.contains(s.at)).count()).unwrap_or(0);
+            ledger_checks(cfg, l, readings, typical)
+        })
+        .collect()
 }
 
 /// Run every check. `fix` applies safe repairs. `online` allows network calls.
@@ -1570,6 +1692,7 @@ pub async fn run_all(
 
     results.push(check_db(store));
     results.push(check_daemon(store));
+    results.push(check_scheduling_pause(store));
     results.push(check_stuck_tasks(cfg, store, fix));
     results.push(check_dependencies(cfg, store));
     results.push(check_reviews(cfg, store));
@@ -1688,6 +1811,54 @@ mod tests {
     }
 
     #[test]
+    fn rate_and_share_checks_explain_what_blocks_fable() {
+        use crate::budget::{ObservedUsage, save_observed};
+        use crate::domain::{Task, TaskSource, TokenUsage, UsageRecord};
+        let store = Store::open_in_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.budget.providers.claude.period_anchor = Some("2026-09-28T00:00:00Z".into());
+        cfg.budget.providers.claude.period_weighted_tokens = 80_000_000;
+        let now = Utc::now();
+        let task = Task::new("ENG-1", "t", TaskSource::Manual);
+        store.insert_task(&task).unwrap();
+        // Two readings 5 points apart with 50M weighted tokens between them: 1B per period.
+        let first = ObservedUsage { period_used: Some(0.30), ..ObservedUsage::empty(now - Duration::hours(3)) };
+        save_observed(&store, Provider::Claude, &first).unwrap();
+        let rec = UsageRecord {
+            session_id: uuid::Uuid::new_v4(),
+            task_id: task.id,
+            message_id: "m1".into(),
+            model_id: "claude-sonnet-5".into(),
+            tier: ModelTier::sonnet(),
+            usage: TokenUsage {
+                input_tokens: 0,
+                output_tokens: 10_000_000,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+            timestamp: now - Duration::hours(2),
+        };
+        assert!(store.record_usage(&rec).unwrap());
+        let second = ObservedUsage { period_used: Some(0.35), ..ObservedUsage::empty(now - Duration::hours(1)) };
+        save_observed(&store, Provider::Claude, &second).unwrap();
+        let results = check_ledger(&cfg, &store);
+        let rate = results.iter().find(|r| r.name == "claude usage rate").unwrap();
+        assert_eq!(rate.status, Status::Warn, "{}", rate.detail);
+        assert!(rate.detail.contains("1.0B weighted tokens") && rate.detail.contains("12.5× off"), "{}", rate.detail);
+        let hint = rate.fix_hint.clone().unwrap_or_default();
+        assert!(hint.contains("period_weighted_tokens = 1000000000"), "{hint}");
+
+        // A fable share too small for one typical task.
+        cfg.budget.providers.claude.models.get_mut(&ModelTier::fable()).unwrap().share = 0.001;
+        let results = check_ledger(&cfg, &store);
+        let share = results.iter().find(|r| r.name == "fable share").unwrap();
+        assert_eq!(share.status, Status::Warn, "{}", share.detail);
+        assert!(share.detail.contains("smaller than one typical task"), "{}", share.detail);
+        let hint = share.fix_hint.clone().unwrap_or_default();
+        assert!(hint.contains("models.fable.share"), "{hint}");
+    }
+
+    #[test]
     fn ledger_checks_per_provider() {
         let store = Store::open_in_memory().unwrap();
         let mut cfg = Config::default();
@@ -1695,8 +1866,23 @@ mod tests {
         cfg.budget.providers.codex.window_hours = 0;
         let results = check_ledger(&cfg, &store);
         let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["fable reservation", "window pressure", "gpt-6.1-sol reservation", "codex window pressure"]);
-        assert!(results[3].detail.contains("no rolling window"), "{}", results[3].detail);
+        assert_eq!(
+            names,
+            vec![
+                "fable reservation",
+                "window pressure",
+                "claude usage rate",
+                "fable share",
+                "gpt-6.1-sol reservation",
+                "codex window pressure",
+                "codex usage rate",
+                "gpt-6.1-sol share"
+            ]
+        );
+        assert!(results[5].detail.contains("no rolling window"), "{}", results[5].detail);
+        assert!(results[2].detail.contains("no reading from claude yet"), "{}", results[2].detail);
+        assert_eq!(results[3].status, Status::Ok, "{}", results[3].detail);
+        assert!(results[3].detail.contains("holds about 8 typical tasks"), "{}", results[3].detail);
         cfg.budget.providers.claude.enabled = false;
         cfg.budget.providers.codex.enabled = false;
         let results = check_ledger(&cfg, &store);

@@ -181,10 +181,12 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
     let rows = load_rows(&store, args.all)?;
     let daemon = daemon_status(&store, now)?;
     let counts = store.counts()?;
+    let pause = crate::domain::SchedulingPause::load(&store)?;
 
     if ctx.json {
         let out = serde_json::json!({
             "daemon": daemon,
+            "scheduling_paused": pause,
             "tmux_session": cfg.tmux.session_name,
             "counts": {
                 "queued": counts.queued, "running": counts.running, "idle": counts.idle,
@@ -213,7 +215,14 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
             if color { s.if_supports_color(Stream::Stdout, |t| t.red()).to_string() } else { s }
         }
     };
-    println!("daemon {daemon_text}  ·  {}  ·  tmux session {}", counts_line(&counts), cfg.tmux.session_name);
+    let pause_text = match &pause {
+        Some(p) => {
+            let s = format!("  ·  scheduling {} (`powerqueue resume`)", p.describe());
+            if color { s.if_supports_color(Stream::Stdout, |t| t.yellow()).to_string() } else { s }
+        }
+        None => String::new(),
+    };
+    println!("daemon {daemon_text}  ·  {}  ·  tmux session {}{pause_text}", counts_line(&counts), cfg.tmux.session_name);
 
     if rows.is_empty() {
         println!(

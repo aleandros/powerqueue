@@ -1,10 +1,7 @@
-//! Spend so far, per model, for the current period and window of one
-//! provider; [`Ledgers`] holds one ledger per enabled provider.
-
 use std::collections::BTreeMap;
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::config::BudgetConfig;
@@ -12,16 +9,30 @@ use crate::domain::{ModelTier, Provider, TokenUsage};
 use crate::store::Store;
 
 use super::period::{AnchorSource, Period, PeriodClock};
-use super::probe::{ObservedUsage, apply_observed, load_observed};
+use super::probe::{ObservationSample, ObservedUsage, apply_observed, load_observations, load_observed};
 
-/// kv key under which Claude's [`Calibration`] is stored (the name kept from
-/// before budgets were per provider; see [`calibration_key`]).
+/// kv key of the pre-0.7 Claude calibration (an additive offset). No longer
+/// read: the ledger learns a rate from the observation history instead.
 pub const CALIBRATION_KEY: &str = "budget.calibration.claude";
 
-/// kv key under which a provider's [`Calibration`] is stored.
+/// kv key of a provider's pre-0.7 calibration (see [`CALIBRATION_KEY`]).
 pub fn calibration_key(provider: Provider) -> String {
     format!("budget.calibration.{provider}")
 }
+
+/// Two readings must differ by at least this much (2 points) before a rate
+/// is learned from them.
+pub const MIN_OBSERVED_DELTA: f64 = 0.02;
+/// At least this many weighted tokens must have been measured between the two
+/// readings: a rate learned from a trickle of tokens against a jump caused by
+/// usage outside powerqueue would be absurdly small.
+pub const MIN_MEASURED_DELTA: f64 = 1_000_000.0;
+/// Window rates are learned from readings at most this far apart, so what
+/// rolled out of the window in between stays small.
+pub const WINDOW_LEARN_SPAN: Duration = Duration::hours(1);
+/// A window reading without a reset instant is trusted for this long after
+/// it was taken (the provider windows this code knows are 5 hours).
+pub const OBSERVED_WINDOW_TTL: Duration = Duration::hours(5);
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct TierLedger {
@@ -31,7 +42,8 @@ pub struct TierLedger {
     /// Weighted tokens spent this period (usage.weighted() × tier weight).
     pub period_weighted: f64,
     pub window_weighted: f64,
-    /// Weighted budget for this tier in the period (`share × period_weighted_tokens`).
+    /// Weighted budget for this tier in the period (`share × period_budget`,
+    /// the effective, learned-or-configured budget).
     pub period_budget: f64,
     pub messages: u64,
 }
@@ -42,6 +54,122 @@ impl TierLedger {
     }
     pub fn period_remaining(&self) -> f64 {
         (self.period_budget - self.period_weighted).max(0.0)
+    }
+}
+
+/// How many weighted tokens one whole allowance (100%) is worth, learned
+/// from two readings of the provider's own percentage and what we measured
+/// in between: `budget = Δmeasured / Δobserved`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RateEstimate {
+    /// Weighted tokens per 100% of the allowance.
+    pub budget: f64,
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    /// Change of the provider's percentage between `from` and `to` (fraction).
+    pub observed_delta: f64,
+    /// Weighted tokens we recorded between `from` and `to`.
+    pub measured_delta: f64,
+    /// Readings available in the span.
+    pub samples: usize,
+}
+
+/// The learned exchange rates of a provider (`None` = not enough readings
+/// yet; the configured budgets apply).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct LearnedRate {
+    pub period: Option<RateEstimate>,
+    pub window: Option<RateEstimate>,
+}
+
+/// Learn one rate from readings (oldest first). Every pair of readings
+/// whose percentage grew by at least [`MIN_OBSERVED_DELTA`] with at least
+/// [`MIN_MEASURED_DELTA`] weighted tokens recorded between them is a
+/// candidate (`budget = Δmeasured / Δobserved`); the pair with the
+/// **largest** budget wins. Usage powerqueue cannot see (another terminal)
+/// only ever moves the percentage *more* than we measured, so every
+/// candidate is a lower bound on the true allowance and the largest one is
+/// the least contaminated. Readings after a reset (percentage went down)
+/// never pair with earlier ones. With `max_span`, only pairs at most that
+/// far apart count (window learning). Pure apart from `measured`.
+pub fn learn_rate(
+    samples: &[ObservationSample],
+    value: impl Fn(&ObservationSample) -> Option<f64>,
+    max_span: Option<Duration>,
+    measured: impl Fn(DateTime<Utc>, DateTime<Utc>) -> f64,
+) -> Option<RateEstimate> {
+    let with: Vec<(DateTime<Utc>, f64)> = samples.iter().filter_map(|s| value(s).map(|v| (s.at, v))).collect();
+    let mut best: Option<RateEstimate> = None;
+    for (j, &(to, later)) in with.iter().enumerate() {
+        // Walk back through the readings while the percentage never went
+        // down: a decrease is a reset, and tokens burned before it must not
+        // be paired with the percentage after it.
+        for i in (0..j).rev() {
+            let (from, earlier) = with[i];
+            if earlier > with[i + 1].1 {
+                break;
+            }
+            if max_span.is_some_and(|span| to - from > span) {
+                break;
+            }
+            let observed_delta = later - earlier;
+            if observed_delta < MIN_OBSERVED_DELTA {
+                continue;
+            }
+            let measured_delta = measured(from, to);
+            if measured_delta < MIN_MEASURED_DELTA {
+                continue;
+            }
+            let budget = measured_delta / observed_delta;
+            if best.is_none_or(|b| budget > b.budget) {
+                best = Some(RateEstimate {
+                    budget,
+                    from,
+                    to,
+                    observed_delta,
+                    measured_delta,
+                    samples: with.iter().filter(|(at, _)| *at >= from && *at <= to).count(),
+                });
+            }
+        }
+    }
+    best
+}
+
+/// Tier-weighted spend of one provider as a running total per minute, so
+/// the spend between any two instants is two lookups.
+pub struct SpendSeries {
+    /// `(minute start, cumulative weighted tokens through the end of that minute)`, oldest first.
+    points: Vec<(DateTime<Utc>, f64)>,
+}
+
+impl SpendSeries {
+    /// Build from per-minute usage rows of `provider`'s models (any order).
+    pub fn new(cfg: &BudgetConfig, provider: Provider, rows: &[(DateTime<Utc>, crate::store::TierUsage)]) -> Self {
+        let mut per_minute: BTreeMap<DateTime<Utc>, f64> = BTreeMap::new();
+        for (at, row) in rows.iter().filter(|(_, r)| r.tier.provider() == provider) {
+            *per_minute.entry(*at).or_default() += row.usage.weighted() * tier_weight(cfg, &row.tier);
+        }
+        let mut total = 0.0;
+        let points = per_minute
+            .into_iter()
+            .map(|(at, w)| {
+                total += w;
+                (at, total)
+            })
+            .collect();
+        Self { points }
+    }
+
+    /// Weighted tokens recorded in minutes that start before `at`.
+    pub fn until(&self, at: DateTime<Utc>) -> f64 {
+        let n = self.points.partition_point(|(start, _)| *start < at);
+        if n == 0 { 0.0 } else { self.points[n - 1].1 }
+    }
+
+    /// Weighted tokens recorded in `[from, to)` at minute granularity.
+    pub fn between(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> f64 {
+        (self.until(to) - self.until(from)).max(0.0)
     }
 }
 
@@ -57,18 +185,31 @@ pub struct Ledger {
     pub tiers: Vec<TierLedger>,
     pub total_period_weighted: f64,
     pub total_window_weighted: f64,
+    /// Effective period budget in weighted tokens: learned when the
+    /// observation history allows it, else `period_weighted_tokens`.
     pub period_budget: f64,
+    /// Effective window budget (learned, else `window_weighted_tokens`).
     pub window_budget: f64,
-    /// False when the provider has no rolling window (`window_hours = 0`):
-    /// `window_fraction()` is 0 and window checks pass.
+    /// `budget.providers.<p>.period_weighted_tokens` as configured.
+    #[serde(default)]
+    pub configured_period_budget: f64,
+    #[serde(default)]
+    pub configured_window_budget: f64,
+    /// False when the provider has no rolling window (`window_hours = 0`
+    /// and no observation reports one): `window_fraction()` is 0 and
+    /// window checks pass.
     #[serde(default = "default_true")]
     pub window_enabled: bool,
-    /// Observed usage percentage (from `budget set-observed` or a probe), if
-    /// taken inside the current period.
-    pub calibration: Option<Calibration>,
+    /// Rates learned from the observation history (see [`LearnedRate`]).
+    #[serde(default)]
+    pub learned: LearnedRate,
     /// The provider's latest self-reported usage, if a probe stored one.
     #[serde(default)]
     pub observed: Option<ObservedUsage>,
+    /// Weighted tokens recorded at or after `observed.observed_at` (the part
+    /// of our measurement the observation does not cover yet).
+    #[serde(default)]
+    pub spent_since_observation: f64,
     /// Where the period boundaries came from.
     #[serde(default)]
     pub anchor_source: AnchorSource,
@@ -76,24 +217,6 @@ pub struct Ledger {
 
 fn default_true() -> bool {
     true
-}
-
-/// User-reported usage (`powerqueue budget set-observed 43%`) so pacing can
-/// correct for usage outside powerqueue (interactive sessions, other tools).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct Calibration {
-    pub observed_fraction: f64,
-    pub at: DateTime<Utc>,
-    /// Our own measured period fraction at the time, to compute an offset.
-    pub measured_fraction: f64,
-}
-
-impl Calibration {
-    /// `observed - measured` at calibration time: the share of the period
-    /// budget consumed outside powerqueue (negative when our weights overestimate).
-    pub fn offset(&self) -> f64 {
-        self.observed_fraction - self.measured_fraction
-    }
 }
 
 /// Cost weight for a model: the configured one, else 1.0 (Sonnet-equivalent)
@@ -107,18 +230,38 @@ pub fn tier_share(cfg: &BudgetConfig, tier: &ModelTier) -> f64 {
     cfg.model_budget(tier).filter(|m| m.enabled).map(|m| m.share.max(0.0)).unwrap_or(0.0)
 }
 
+/// Tier-weighted tokens of `provider`'s models recorded in `[since, until)`.
+fn weighted_between(
+    store: &Store,
+    cfg: &BudgetConfig,
+    provider: Provider,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+) -> anyhow::Result<f64> {
+    if until <= since {
+        return Ok(0.0);
+    }
+    Ok(store
+        .usage_by_tier(since, until)
+        .context("read usage")?
+        .into_iter()
+        .filter(|r| r.tier.provider() == provider)
+        .map(|r| r.usage.weighted() * tier_weight(cfg, &r.tier))
+        .sum())
+}
+
 impl Ledger {
     /// Aggregate usage rows into a ledger for one provider.
     ///
     /// Builds the period clock from `cfg.providers.<provider>` (an observed
     /// `period_resets_at` in kv `budget.observed.<provider>` overrides the
     /// configured anchor), reads `usage` rows of the provider's models for
-    /// the current period and the rolling window, applies the per-model cost
-    /// weights and shares, and attaches the `budget.calibration.<provider>`
-    /// kv entry when it was taken inside the current period (an older
-    /// calibration refers to a different allowance and is ignored). A stored
-    /// observation is folded in last ([`apply_observed`]). Fails only when
-    /// the database cannot be read.
+    /// the current period and the rolling window, learns the exchange rates
+    /// from kv `budget.observations.<provider>` ([`learn_rate`]: the
+    /// effective budgets are the learned ones when available), applies the
+    /// per-model cost weights and shares, and folds in the latest
+    /// observation ([`apply_observed`]). Fails only when the database cannot
+    /// be read.
     pub fn load(store: &Store, cfg: &BudgetConfig, provider: Provider, now: DateTime<Utc>) -> anyhow::Result<Ledger> {
         let budget = cfg.provider(provider);
         let observed = load_observed(store, provider)?;
@@ -142,7 +285,20 @@ impl Ledger {
             .into_iter()
             .filter(|r| r.tier.provider() == provider)
             .collect();
-        let period_budget = budget.period_weighted_tokens as f64;
+
+        let history: Vec<ObservationSample> =
+            load_observations(store, provider)?.into_iter().filter(|s| period.contains(s.at) && s.at <= now).collect();
+        let series =
+            SpendSeries::new(cfg, provider, &store.usage_by_minute(period.start, period.end).context("read usage per minute")?);
+        let measured = |from, to| series.between(from, to);
+        let learned = LearnedRate {
+            period: learn_rate(&history, |s| s.period_used, None, measured),
+            window: learn_rate(&history, |s| s.window_used, Some(WINDOW_LEARN_SPAN), measured),
+        };
+        let configured_period_budget = budget.period_weighted_tokens as f64;
+        let configured_window_budget = budget.window_weighted_tokens as f64;
+        let period_budget = learned.period.map(|r| r.budget).unwrap_or(configured_period_budget);
+        let window_budget = learned.window.map(|r| r.budget).unwrap_or(configured_window_budget);
 
         let mut models = cfg.models_for(provider);
         for row in &period_rows {
@@ -168,11 +324,10 @@ impl Ledger {
             })
             .collect();
 
-        let calibration = store
-            .kv_get::<Calibration>(&calibration_key(provider))
-            .context("read budget calibration")?
-            .filter(|c| period.contains(c.at));
-
+        let spent_since_observation = match &observed {
+            Some(obs) => weighted_between(store, cfg, provider, obs.observed_at, period.end)?,
+            None => 0.0,
+        };
         let mut ledger = Ledger {
             provider,
             now,
@@ -182,10 +337,13 @@ impl Ledger {
             total_window_weighted: tiers.iter().map(|t| t.window_weighted).sum(),
             tiers,
             period_budget,
-            window_budget: budget.window_weighted_tokens as f64,
+            window_budget,
+            configured_period_budget,
+            configured_window_budget,
             window_enabled: clock.has_window(),
-            calibration,
+            learned,
             observed: None,
+            spent_since_observation,
             anchor_source: clock.anchor_source,
         };
         if let Some(obs) = &observed {
@@ -194,42 +352,124 @@ impl Ledger {
         Ok(ledger)
     }
 
+    /// An empty ledger with the given clock (tests and simulations): no
+    /// tiers, nothing spent, zero budgets, window enabled, nothing learned.
+    pub fn blank(provider: Provider, now: DateTime<Utc>, period: Period, window: Period) -> Ledger {
+        Ledger {
+            provider,
+            now,
+            period,
+            window,
+            tiers: Vec::new(),
+            total_period_weighted: 0.0,
+            total_window_weighted: 0.0,
+            period_budget: 0.0,
+            window_budget: 0.0,
+            configured_period_budget: 0.0,
+            configured_window_budget: 0.0,
+            window_enabled: true,
+            learned: LearnedRate::default(),
+            observed: None,
+            spent_since_observation: 0.0,
+            anchor_source: AnchorSource::Config,
+        }
+    }
+
     /// The entry for a model (zeroed when the model has no entry).
     pub fn tier(&self, tier: &ModelTier) -> TierLedger {
         self.tiers.iter().find(|t| t.tier == *tier).cloned().unwrap_or(TierLedger { tier: tier.clone(), ..Default::default() })
     }
 
-    /// Period spend as a fraction of the total budget, without calibration.
-    /// A zero budget counts as fully spent.
+    /// Count a cost against this ledger as if it had been spent now (the
+    /// daemon reserves predicted costs so several launches in one tick do
+    /// not each think they are the only one).
+    pub fn add_spend(&mut self, tier: &ModelTier, weighted_cost: f64) {
+        if let Some(t) = self.tiers.iter_mut().find(|t| t.tier == *tier) {
+            t.period_weighted += weighted_cost;
+            t.window_weighted += weighted_cost;
+        }
+        self.total_period_weighted += weighted_cost;
+        self.total_window_weighted += weighted_cost;
+        self.spent_since_observation += weighted_cost;
+    }
+
+    /// Period spend as a fraction of the effective budget, from our usage
+    /// rows alone. A zero budget counts as fully spent.
     pub fn measured_period_fraction(&self) -> f64 {
         if self.period_budget <= 0.0 { 1.0 } else { (self.total_period_weighted / self.period_budget).max(0.0) }
     }
 
-    /// Period spend as a fraction of the total budget, corrected by calibration.
-    ///
-    /// When the user reported `/usage` showing X% at a time we had measured
-    /// m, the difference `X - m` is usage we cannot see (other tools,
-    /// interactive sessions) or a systematic error in our weights. That offset
-    /// is added to the current measurement. The result is clamped to `[0, 2]`
-    /// so a stale or mistyped calibration cannot produce nonsense.
-    pub fn period_fraction(&self) -> f64 {
-        let measured = self.measured_period_fraction();
-        let corrected = match self.calibration {
-            Some(c) => measured + c.offset(),
-            None => measured,
-        };
-        corrected.clamp(0.0, 2.0)
+    /// The observation this period's fractions start from, if there is one
+    /// taken inside the period.
+    fn observation_in_period(&self) -> Option<&ObservedUsage> {
+        self.observed.as_ref().filter(|o| self.period.contains(o.observed_at))
     }
 
-    /// Window spend as a fraction of the window budget; 0 without a window.
+    /// Period spend as a fraction of the allowance.
+    ///
+    /// With an observation from this period that carries `period_used`, that
+    /// percentage is the truth and only what we measured after it is added,
+    /// converted at the effective budget. Without one, our own measurement
+    /// against the effective budget. Clamped to `[0, 2]`.
+    pub fn period_fraction(&self) -> f64 {
+        let f = match self.observation_in_period().and_then(|o| o.period_used) {
+            Some(used) => used + self.spent_since_observation / self.period_budget.max(1.0),
+            None => self.measured_period_fraction(),
+        };
+        f.clamp(0.0, 2.0)
+    }
+
+    /// Where `period_fraction` comes from, for displays: `observed` or `measured`.
+    pub fn period_fraction_source(&self) -> &'static str {
+        if self.observation_in_period().and_then(|o| o.period_used).is_some() { "observed" } else { "measured" }
+    }
+
+    /// The latest observation's window reading while it is still current:
+    /// its reset is ahead, or (no reset known) it is younger than
+    /// [`OBSERVED_WINDOW_TTL`]. A reading from a window that has already
+    /// rolled over must not keep blocking launches when no session is
+    /// around to refresh it.
+    pub fn observed_window_used(&self) -> Option<f64> {
+        let obs = self.observed.as_ref()?;
+        let current = match obs.window_resets_at {
+            Some(reset) => reset > self.now,
+            None => self.now - obs.observed_at < OBSERVED_WINDOW_TTL,
+        };
+        if current { obs.window_used } else { None }
+    }
+
+    /// Whether a rolling window applies: configured (`window_hours > 0`)
+    /// or reported by a current observation ([`Self::observed_window_used`]).
+    pub fn has_window(&self) -> bool {
+        self.window_enabled || self.observed_window_used().is_some()
+    }
+
+    /// What a cost is divided by to express it as a window fraction: the
+    /// effective window budget, or infinity when none is configured or
+    /// learned (the window is then judged on the observation alone).
+    pub fn window_divisor(&self) -> f64 {
+        if self.window_budget > 0.0 { self.window_budget } else { f64::INFINITY }
+    }
+
+    /// Window spend as a fraction of the window allowance; 0 without a
+    /// window ([`Self::has_window`]). With an observation that carries
+    /// `window_used`, that plus what we measured since (at the effective
+    /// window budget); else our rolling-window sum against the effective
+    /// window budget.
     pub fn window_fraction(&self) -> f64 {
-        if !self.window_enabled {
-            0.0
-        } else if self.window_budget <= 0.0 {
-            1.0
-        } else {
-            self.total_window_weighted / self.window_budget
+        if !self.has_window() {
+            return 0.0;
         }
+        match self.observed_window_used() {
+            Some(used) => (used + self.spent_since_observation / self.window_divisor()).clamp(0.0, 2.0),
+            None if self.window_budget <= 0.0 => 1.0,
+            None => self.total_window_weighted / self.window_budget,
+        }
+    }
+
+    /// Where `window_fraction` comes from, for displays.
+    pub fn window_fraction_source(&self) -> &'static str {
+        if self.observed_window_used().is_some() { "observed" } else { "measured" }
     }
 
     pub fn elapsed_fraction(&self) -> f64 {
@@ -372,8 +612,9 @@ mod tests {
         assert_eq!(ledger.anchor_source, AnchorSource::Config);
         assert!((ledger.tier(&ModelTier::fable()).period_budget - 20_000_000.0).abs() < 1e-6);
         assert!((ledger.tier(&ModelTier::haiku()).period_budget - 4_000_000.0).abs() < 1e-6);
-        assert!(ledger.calibration.is_none());
+        assert!(ledger.learned.period.is_none() && ledger.learned.window.is_none());
         assert!(ledger.observed.is_none());
+        assert_eq!(ledger.configured_period_budget, 80_000_000.0);
         assert_eq!(ledger.tier(&ModelTier::fable()).period_remaining(), 20_000_000.0);
         // The JSON shape keeps the fields `budget show --json` consumers know.
         let json = serde_json::to_value(&ledger).unwrap();
@@ -428,37 +669,171 @@ mod tests {
         assert_eq!(ledger.tiers.last().unwrap().tier, ModelTier::haiku());
     }
 
-    #[test]
-    fn calibration_applies_only_inside_the_current_period() {
-        let (store, task) = store_with_task();
-        let now = at("2026-10-01T12:00:00Z");
-        let cfg = cfg();
-        usage(&store, task, "m1", ModelTier::sonnet(), 1_600_000, now - Duration::hours(1)); // 8M weighted = 10%
-        store
-            .kv_set(
-                CALIBRATION_KEY,
-                &Calibration { observed_fraction: 0.35, at: now - Duration::hours(2), measured_fraction: 0.05 },
-            )
-            .unwrap();
-        let ledger = Ledger::load(&store, &cfg, Provider::Claude, now).unwrap();
-        assert!(ledger.calibration.is_some());
-        assert!((ledger.measured_period_fraction() - 0.10).abs() < 1e-9);
-        // offset = 0.35 - 0.05 = 0.30 → corrected 0.40
-        assert!((ledger.period_fraction() - 0.40).abs() < 1e-9);
-
-        store
-            .kv_set(
-                &calibration_key(Provider::Claude),
-                &Calibration { observed_fraction: 0.9, at: now - Duration::days(10), measured_fraction: 0.0 },
-            )
-            .unwrap();
-        let ledger = Ledger::load(&store, &cfg, Provider::Claude, now).unwrap();
-        assert!(ledger.calibration.is_none(), "stale calibration from a previous period is ignored");
-        assert!((ledger.period_fraction() - 0.10).abs() < 1e-9);
+    fn observe(store: &Store, at: DateTime<Utc>, period_used: f64, window_used: Option<f64>) {
+        let obs = ObservedUsage { period_used: Some(period_used), window_used, ..ObservedUsage::empty(at) };
+        save_observed(store, Provider::Claude, &obs).unwrap();
     }
 
     #[test]
-    fn observed_usage_moves_the_period_and_calibrates() {
+    fn an_observation_is_the_truth_and_only_later_usage_is_added() {
+        let (store, task) = store_with_task();
+        let now = at("2026-10-01T12:00:00Z");
+        let cfg = cfg();
+        // 8M weighted before the reading, 4M after it.
+        usage(&store, task, "m1", ModelTier::sonnet(), 1_600_000, now - Duration::hours(2));
+        observe(&store, now - Duration::hours(1), 0.35, None);
+        usage(&store, task, "m2", ModelTier::sonnet(), 800_000, now - Duration::minutes(30));
+        let ledger = Ledger::load(&store, &cfg, Provider::Claude, now).unwrap();
+        assert!((ledger.measured_period_fraction() - 0.15).abs() < 1e-9, "12M of 80M");
+        assert!((ledger.spent_since_observation - 4_000_000.0).abs() < 1e-6);
+        // 35% reported + 4M / 80M (configured: one reading cannot teach a rate).
+        assert!((ledger.period_fraction() - 0.40).abs() < 1e-9);
+        assert_eq!(ledger.period_fraction_source(), "observed");
+        assert!(ledger.learned.period.is_none());
+        assert_eq!(ledger.period_budget, 80_000_000.0);
+    }
+
+    #[test]
+    fn the_rate_is_learned_from_two_readings_and_what_was_measured_between() {
+        let (store, task) = store_with_task();
+        let now = at("2026-10-01T12:00:00Z");
+        let cfg = cfg();
+        observe(&store, now - Duration::hours(3), 0.30, Some(0.10));
+        // 10M weighted between the readings; the provider moved 5 points.
+        usage(&store, task, "m1", ModelTier::sonnet(), 2_000_000, now - Duration::hours(2));
+        observe(&store, now - Duration::hours(1), 0.35, Some(0.15));
+        // 1M after the last reading.
+        usage(&store, task, "m2", ModelTier::sonnet(), 200_000, now - Duration::minutes(10));
+        let ledger = Ledger::load(&store, &cfg, Provider::Claude, now).unwrap();
+        let rate = ledger.learned.period.expect("rate learned");
+        assert!((rate.budget - 200_000_000.0).abs() < 1.0, "10M per 5 points = 200M per period, got {}", rate.budget);
+        assert!((rate.observed_delta - 0.05).abs() < 1e-9);
+        assert!((rate.measured_delta - 10_000_000.0).abs() < 1e-6);
+        assert_eq!((rate.from, rate.to, rate.samples), (now - Duration::hours(3), now - Duration::hours(1), 2));
+        assert_eq!(ledger.period_budget, rate.budget);
+        assert_eq!(ledger.configured_period_budget, 80_000_000.0);
+        // 35% + 1M / 200M.
+        assert!((ledger.period_fraction() - 0.355).abs() < 1e-9);
+        // Shares follow the learned budget: fable 25% of 200M.
+        assert!((ledger.tier(&ModelTier::fable()).period_budget - 50_000_000.0).abs() < 1e-6);
+        // The window rate too: same 10M for 5 window points, readings 2h apart
+        // are farther than WINDOW_LEARN_SPAN, so nothing is learned for it.
+        assert!(ledger.learned.window.is_none());
+        assert_eq!(ledger.window_budget, 12_000_000.0);
+        assert!((ledger.window_fraction() - (0.15 + 1_000_000.0 / 12_000_000.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn window_rate_uses_readings_close_together() {
+        let (store, task) = store_with_task();
+        let now = at("2026-10-01T12:00:00Z");
+        let cfg = cfg();
+        observe(&store, now - Duration::minutes(50), 0.30, Some(0.10));
+        usage(&store, task, "m1", ModelTier::sonnet(), 400_000, now - Duration::minutes(30)); // 2M
+        observe(&store, now - Duration::minutes(5), 0.31, Some(0.14));
+        let ledger = Ledger::load(&store, &cfg, Provider::Claude, now).unwrap();
+        let w = ledger.learned.window.expect("window rate learned");
+        assert!((w.budget - 50_000_000.0).abs() < 1.0, "2M per 4 points = 50M per window");
+        assert!(ledger.learned.period.is_none(), "1 point is below MIN_OBSERVED_DELTA");
+        assert!((ledger.window_budget - 50_000_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn learning_ignores_tiny_measurements_resets_and_other_periods() {
+        let now = at("2026-10-01T12:00:00Z");
+        let s = |h: i64, p: f64| ObservationSample { at: now - Duration::hours(h), period_used: Some(p), window_used: None };
+        // A jump of 20 points with only 1k tokens measured: outside usage, no rate.
+        let r = learn_rate(&[s(3, 0.1), s(1, 0.3)], |x| x.period_used, None, |_, _| 1_000.0);
+        assert!(r.is_none());
+        // Enough tokens: the pair with the largest budget wins (the 0.5 reading
+        // before the reset never pairs with later ones: its delta is negative).
+        let r = learn_rate(&[s(5, 0.5), s(3, 0.1), s(2, 0.11), s(1, 0.3)], |x| x.period_used, None, |_, _| 4_000_000.0).unwrap();
+        assert_eq!((r.from, r.to), (now - Duration::hours(2), now - Duration::hours(1)), "4M / 0.19 beats 4M / 0.20");
+        assert!((r.budget - 4_000_000.0 / 0.19).abs() < 1.0);
+        assert_eq!(r.samples, 2);
+        // Usage outside powerqueue contaminates a span: the clean span wins.
+        let m = |from: DateTime<Utc>, to: DateTime<Utc>| -> f64 {
+            // 4M between 5h and 3h ago, 1M between 3h and 1h ago.
+            let clean = if from <= now - Duration::hours(5) && to >= now - Duration::hours(3) { 4_000_000.0 } else { 0.0 };
+            let dirty = if from <= now - Duration::hours(3) && to >= now - Duration::hours(1) { 1_000_000.0 } else { 0.0 };
+            clean + dirty
+        };
+        let r = learn_rate(&[s(5, 0.10), s(3, 0.20), s(1, 0.30)], |x| x.period_used, None, m).unwrap();
+        assert_eq!((r.from, r.to), (now - Duration::hours(5), now - Duration::hours(3)));
+        assert!((r.budget - 40_000_000.0).abs() < 1.0, "the 10 points moved by someone else's 1M do not win: {}", r.budget);
+        // Nothing with a value: nothing learned.
+        assert!(learn_rate(&[], |x| x.period_used, None, |_, _| 1e9).is_none());
+        assert!(learn_rate(&[s(1, 0.3)], |x| x.window_used, None, |_, _| 1e9).is_none());
+        // A reset inside the readings: pairs never span the decrease, so the
+        // tokens burned before it cannot inflate the budget (0.02 → 0.60,
+        // reset, 0.05 → 0.10: pairs on either side are candidates, the one
+        // across the reset never is).
+        let s2 = |m: i64, p: f64| ObservationSample { at: now - Duration::minutes(m), period_used: None, window_used: Some(p) };
+        let readings = [s2(55, 0.02), s2(35, 0.60), s2(10, 0.05), s2(0, 0.10)];
+        let measured = |from: DateTime<Utc>, to: DateTime<Utc>| {
+            let before = if from <= now - Duration::minutes(35) { 60_000_000.0 } else { 0.0 };
+            let after = if to >= now { 2_000_000.0 } else { 0.0 };
+            before + after
+        };
+        let r = learn_rate(&readings, |x| x.window_used, Some(Duration::hours(1)), measured).unwrap();
+        assert_eq!((r.from, r.to), (now - Duration::minutes(55), now - Duration::minutes(35)), "a pair on one side of the reset");
+        assert!((r.budget - 60_000_000.0 / 0.58).abs() < 1.0, "{}", r.budget);
+        assert!(r.budget < 500_000_000.0, "the cross-reset pair (62M for 8 points = 775M) must never be a candidate");
+        // max_span keeps only pairs close together.
+        let r = learn_rate(&[s(5, 0.0), s(1, 0.3)], |x| x.period_used, Some(Duration::hours(2)), |_, _| 1e9);
+        assert!(r.is_none(), "the only pair is 4h apart");
+    }
+
+    #[test]
+    fn a_window_reading_expires_with_its_reset_or_after_five_hours() {
+        let now = at("2026-10-01T12:00:00Z");
+        let period = Period { start: now - Duration::days(1), end: now + Duration::days(6) };
+        let mut l = Ledger::blank(Provider::Claude, now, period, Period { start: now - Duration::hours(5), end: now });
+        l.window_enabled = false;
+        l.window_budget = 100.0;
+        l.observed = Some(ObservedUsage {
+            window_used: Some(0.9),
+            window_resets_at: Some(now + Duration::minutes(5)),
+            ..ObservedUsage::empty(now - Duration::hours(4))
+        });
+        assert!(l.has_window() && (l.window_fraction() - 0.9).abs() < 1e-9);
+        l.observed.as_mut().unwrap().window_resets_at = Some(now - Duration::minutes(1));
+        assert!(!l.has_window(), "the window it described has rolled over");
+        assert_eq!(l.window_fraction(), 0.0);
+        assert_eq!(l.window_fraction_source(), "measured");
+        l.observed.as_mut().unwrap().window_resets_at = None;
+        assert!(l.has_window(), "no reset known: trusted for five hours");
+        l.observed.as_mut().unwrap().observed_at = now - Duration::hours(6);
+        assert!(!l.has_window());
+        // No budget at all: the observation alone is judged, costs convert to nothing.
+        l.observed.as_mut().unwrap().observed_at = now;
+        l.window_budget = 0.0;
+        l.spent_since_observation = 1e9;
+        assert_eq!(l.window_divisor(), f64::INFINITY);
+        assert!((l.window_fraction() - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn spend_series_sums_minutes_between_instants() {
+        let (store, task) = store_with_task();
+        let cfg = cfg();
+        let t = at("2026-10-01T12:00:30Z");
+        usage(&store, task, "m1", ModelTier::sonnet(), 100, t); // 500 weighted, minute 12:00
+        usage(&store, task, "m2", ModelTier::fable(), 100, t + Duration::minutes(1)); // 2500, minute 12:01
+        usage(&store, task, "m3", ModelTier::new("gpt-6.1-sol"), 100, t + Duration::minutes(2)); // not claude
+        let rows = store.usage_by_minute(t - Duration::hours(1), t + Duration::hours(1)).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].0, at("2026-10-01T12:00:00Z"));
+        let series = SpendSeries::new(&cfg, Provider::Claude, &rows);
+        assert_eq!(series.until(at("2026-10-01T12:00:00Z")), 0.0);
+        assert_eq!(series.until(at("2026-10-01T12:00:45Z")), 500.0, "a minute counts once a reading is inside it");
+        assert_eq!(series.until(at("2026-10-01T13:00:00Z")), 3000.0);
+        assert_eq!(series.between(at("2026-10-01T12:00:45Z"), at("2026-10-01T12:01:30Z")), 2500.0);
+        assert_eq!(series.between(at("2026-10-01T13:00:00Z"), at("2026-10-01T12:00:00Z")), 0.0);
+    }
+
+    #[test]
+    fn observed_usage_moves_the_period() {
         let (store, task) = store_with_task();
         let now = at("2026-10-01T12:00:00Z");
         let cfg = cfg();
@@ -473,7 +848,7 @@ mod tests {
         assert_eq!(ledger.period.end, at("2026-10-03T08:00:00Z"));
         assert_eq!(ledger.period.start, at("2026-09-26T08:00:00Z"));
         assert_eq!(ledger.anchor_source, AnchorSource::Observed);
-        assert!((ledger.period_fraction() - 0.5).abs() < 1e-9, "observed period usage calibrates");
+        assert!((ledger.period_fraction() - 0.5).abs() < 1e-9, "the reading is the truth; nothing measured after it");
         assert_eq!(ledger.observed, Some(obs));
     }
 
@@ -520,30 +895,28 @@ mod tests {
     }
 
     #[test]
-    fn period_fraction_is_clamped() {
+    fn period_fraction_is_clamped_and_spend_is_reserved() {
         let now = at("2026-10-01T12:00:00Z");
         let period = Period { start: now - Duration::days(1), end: now + Duration::days(6) };
-        let mut ledger = Ledger {
-            provider: Provider::Claude,
-            now,
-            period,
-            window: Period { start: now - Duration::hours(5), end: now },
-            tiers: vec![],
-            total_period_weighted: 10.0,
-            total_window_weighted: 0.0,
-            period_budget: 100.0,
-            window_budget: 100.0,
-            window_enabled: true,
-            calibration: Some(Calibration { observed_fraction: 0.0, at: now, measured_fraction: 0.5 }),
-            observed: None,
-            anchor_source: AnchorSource::Default,
-        };
-        assert_eq!(ledger.period_fraction(), 0.0, "negative offsets cannot go below zero");
-        ledger.calibration = Some(Calibration { observed_fraction: 5.0, at: now, measured_fraction: 0.0 });
-        assert_eq!(ledger.period_fraction(), 2.0);
+        let mut ledger = Ledger::blank(Provider::Claude, now, period, Period { start: now - Duration::hours(5), end: now });
+        ledger.tiers.push(TierLedger { tier: ModelTier::opus(), period_budget: 50.0, ..Default::default() });
+        ledger.total_period_weighted = 10.0;
+        ledger.period_budget = 100.0;
+        ledger.window_budget = 100.0;
+        assert!((ledger.period_fraction() - 0.1).abs() < 1e-9);
+        ledger.observed = Some(ObservedUsage { period_used: Some(5.0), ..ObservedUsage::empty(now) });
+        assert_eq!(ledger.period_fraction(), 2.0, "a nonsense reading is clamped");
+        ledger.observed = None;
         ledger.period_budget = 0.0;
-        ledger.calibration = None;
         assert_eq!(ledger.period_fraction(), 1.0, "zero budget counts as spent");
+        ledger.period_budget = 100.0;
+        ledger.add_spend(&ModelTier::opus(), 30.0);
+        assert_eq!(ledger.tier(&ModelTier::opus()).period_weighted, 30.0);
+        assert_eq!(ledger.total_period_weighted, 40.0);
+        assert_eq!(ledger.total_window_weighted, 30.0);
+        assert_eq!(ledger.spent_since_observation, 30.0);
+        assert_eq!(ledger.period_fraction_source(), "measured");
+        assert_eq!(ledger.window_fraction_source(), "measured");
         assert_eq!(tier_weight(&BudgetConfig::default(), &ModelTier::new("codex:custom")), 1.0);
         assert_eq!(tier_share(&BudgetConfig::default(), &ModelTier::new("codex:custom")), 0.0);
         assert_eq!(tier_weight(&BudgetConfig::default(), &ModelTier::fable()), 5.0);

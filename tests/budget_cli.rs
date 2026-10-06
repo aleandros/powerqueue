@@ -5,8 +5,9 @@ use std::path::Path;
 
 use assert_cmd::Command;
 use chrono::Utc;
-use powerqueue::budget::{CALIBRATION_KEY, Calibration, RATE_LIMITS_KEY, RateLimitState};
+use powerqueue::budget::{ObservedUsage, RATE_LIMITS_KEY, RateLimitState, load_observations, load_observed};
 use powerqueue::config::Config;
+use powerqueue::domain::Provider;
 use powerqueue::domain::{DONE_MARKER, ModelTier, Task, TaskSource, TaskState, TokenUsage, UsageRecord};
 use powerqueue::paths::Paths;
 use powerqueue::store::Store;
@@ -259,10 +260,15 @@ fn budget_set_reset_and_observed_and_clear_limits() {
 
     home.cmd().args(["budget", "set-observed", "43%"]).assert().success().stdout(predicate::str::contains("43%"));
     let store = home.store();
-    let cal: Calibration = store.kv_get(CALIBRATION_KEY).unwrap().expect("calibration stored");
-    assert!((cal.observed_fraction - 0.43).abs() < 1e-9);
-    assert_eq!(cal.measured_fraction, 0.0);
+    let obs: ObservedUsage = load_observed(&store, Provider::Claude).unwrap().expect("observation stored");
+    assert_eq!(obs.period_used, Some(0.43));
+    assert_eq!(load_observations(&store, Provider::Claude).unwrap().len(), 1, "and kept as a reading");
     home.cmd().args(["budget", "set-observed", "300"]).assert().failure();
+    home.cmd()
+        .args(["budget", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("43% of the period allowance (observed)"));
 
     let mut limits = RateLimitState::default();
     limits.mark(ModelTier::fable(), Utc::now() + chrono::Duration::hours(1));

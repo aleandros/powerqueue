@@ -1,8 +1,10 @@
 //! `powerqueue budget ...`.
 //!
 //! `show` prints one section per enabled provider (in `provider_order`):
-//! period, spend, calibration, observed usage with its age, anchor source,
-//! cooldowns and the model table, then what the policy would run now.
+//! period, spend, the learned exchange rate, observed usage with its age,
+//! anchor source, cooldowns and the model table, then what the policy would
+//! run now: one row per criticality for a typical task, and one row per
+//! task actually waiting in the queue.
 //! `probe` asks providers for their remaining allowance. `set-reset`,
 //! `set-observed` and `clear-limits` take `--provider <p>` (default `claude`).
 
@@ -12,13 +14,14 @@ use owo_colors::{OwoColorize, Stream};
 
 use crate::budget::probes::describe;
 use crate::budget::{
-    Calibration, Estimator, Ledger, Ledgers, PeriodClock, Policy, RATE_LIMITS_KEY, RateLimitState, TierLedger, calibration_key,
-    load_probe_status, probe_providers, tier_weight,
+    Estimator, Ledger, Ledgers, ObservedUsage, PeriodClock, Policy, RATE_LIMITS_KEY, RateLimitState, TierLedger,
+    load_observations, load_observed, load_probe_status, probe_providers, save_observed, tier_weight,
 };
 use crate::cli::output::{human_duration, human_f64, model_colored, table};
 use crate::cli::{BudgetCommand, Context};
 use crate::config::Config;
 use crate::domain::{Criticality, ModelTier, Provider, Task, TaskSource};
+use crate::priority::PriorityRules;
 
 pub fn run(ctx: &mut Context, cmd: BudgetCommand) -> Result<i32> {
     match cmd {
@@ -182,16 +185,22 @@ fn show(ctx: &mut Context) -> Result<i32> {
     let store = ctx.store()?.clone();
     let ordered = ledgers.ordered(&cfg.budget.provider_order);
     let policy = Policy::new(&cfg.budget, &ledgers, &limits);
+    let estimator = Estimator::from_summaries(&store.task_usage_summaries()?);
     if ctx.json {
         let mut providers = serde_json::Map::new();
         for ledger in &ordered {
             providers.insert(ledger.provider.to_string(), provider_json(&cfg, &store, ledger, &limits, now)?);
         }
-        let next = policy.decide(&probe_task(Criticality::Normal), crate::budget::Prediction::default_guess(), &[]);
+        let next = policy.decide(&probe_task(Criticality::Normal), estimator.predict(&probe_task(Criticality::Normal)), &[]);
+        let queued: Vec<serde_json::Value> = queued_decisions(&cfg, &ctx.paths, &store, &ledgers, &limits, &estimator, now)?
+            .into_iter()
+            .map(|q| serde_json::json!({ "key": q.task.key, "criticality": q.task.criticality, "state": q.task.state, "preferred": q.preferred, "decision": q.decision }))
+            .collect();
         let out = serde_json::json!({
             "providers": providers,
             "provider_order": cfg.budget.enabled_providers_in_order(),
             "next": next,
+            "queued": queued,
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(0);
@@ -216,21 +225,111 @@ fn show(ctx: &mut Context) -> Result<i32> {
         );
     }
 
-    println!("\n{} (default-cost task, no overrides)", "what would run now".if_supports_color(Stream::Stdout, |t| t.bold()));
+    let typical = estimator.predict(&probe_task(Criticality::Normal));
+    println!(
+        "\n{} (a typical task: {} weighted tokens, {}; no overrides)",
+        "what would run now".if_supports_color(Stream::Stdout, |t| t.bold()),
+        human_f64(typical.weighted_tokens),
+        typical.basis
+    );
     let mut t = table();
     t.set_header(["criticality", "model", "why"]);
     for crit in Criticality::ALL {
-        let d = policy.decide(&probe_task(crit), crate::budget::Prediction::default_guess(), &[]);
-        let why = match d.model {
-            Some(_) => d.reasons.last().cloned().unwrap_or_default(),
-            None => {
-                format!("throttled until {}", d.retry_at.map(|r| r.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default())
-            }
-        };
-        t.add_row([crit.to_string(), model_colored(d.model.as_ref()), why]);
+        let task = probe_task(crit);
+        let d = policy.decide(&task, estimator.predict(&task), &[]);
+        t.add_row([crit.to_string(), model_colored(d.model.as_ref()), decision_why(&d)]);
     }
     println!("{t}");
+
+    let queued = queued_decisions(&cfg, &ctx.paths, &store, &ledgers, &limits, &estimator, now)?;
+    if !queued.is_empty() {
+        println!(
+            "\n{} (in the daemon's order, each start reserving its predicted cost; tasks it would skip last)",
+            "queued tasks".if_supports_color(Stream::Stdout, |t| t.bold())
+        );
+        let mut t = table();
+        t.set_header(["task", "crit", "state", "predicted", "wants", "model", "why"]);
+        for q in &queued {
+            let wants = if q.preferred.is_empty() {
+                "-".to_string()
+            } else {
+                q.preferred.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(" | ")
+            };
+            t.add_row([
+                q.task.key.clone(),
+                q.task.criticality.to_string(),
+                q.task.state.to_string(),
+                human_f64(q.decision.prediction.weighted_tokens),
+                wants,
+                model_colored(q.decision.model.as_ref()),
+                decision_why(&q.decision),
+            ]);
+        }
+        println!("{t}");
+    }
     Ok(0)
+}
+
+/// The last reason of a decision, or when a throttled task is looked at again.
+fn decision_why(d: &crate::budget::Decision) -> String {
+    match d.model {
+        Some(_) => d.reasons.last().cloned().unwrap_or_default(),
+        None => format!("throttled until {}", d.retry_at.map(|r| r.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default()),
+    }
+}
+
+/// A waiting task with the rules' preference and the policy's answer.
+struct QueuedDecision {
+    task: Task,
+    preferred: Vec<ModelTier>,
+    decision: crate::budget::Decision,
+}
+
+/// The policy's answer for every schedulable open task (queued, throttled,
+/// crashed), in the order the daemon's next pass would take them
+/// (`pick_next`: score, criticality, age; a started task's predicted cost
+/// is reserved before the next one is judged), followed by the tasks that
+/// pass skips (waiting on a dependency, or a retry time still ahead). Each
+/// task gets its own prediction and the rules' preferred models (`task
+/// model` overrides are read by the policy itself). Fails when PRIORITY.md
+/// cannot be parsed or the store cannot be read.
+fn queued_decisions(
+    cfg: &Config,
+    paths: &crate::paths::Paths,
+    store: &crate::store::Store,
+    ledgers: &Ledgers,
+    limits: &RateLimitState,
+    estimator: &Estimator,
+    now: DateTime<Utc>,
+) -> Result<Vec<QueuedDecision>> {
+    use crate::scheduler::pick_next;
+    let path = cfg.priority_file(paths);
+    let rules = if path.exists() { PriorityRules::load(&path)? } else { PriorityRules::default() };
+    let tasks: Vec<Task> = store.list_open_tasks()?.into_iter().filter(|t| t.state.is_schedulable()).collect();
+    let mut ledgers = ledgers.clone();
+    let mut out = Vec::new();
+    let mut considered: std::collections::HashSet<crate::domain::TaskId> = std::collections::HashSet::new();
+    let decide = |task: Task, ledgers: &mut Ledgers| {
+        let evaluated = rules.evaluate(&task, now, None, 0.0, 0.0).models;
+        let preferred = if evaluated.is_empty() { rules.model_for(task.criticality).to_vec() } else { evaluated };
+        let decision = Policy::new(&cfg.budget, ledgers, limits).decide(&task, estimator.predict(&task), &preferred);
+        if let Some(model) = &decision.model
+            && let Some(ledger) = ledgers.for_model_mut(model)
+        {
+            ledger.add_spend(model, decision.prediction.weighted_tokens * tier_weight(&cfg.budget, model));
+        }
+        QueuedDecision { task, preferred, decision }
+    };
+    loop {
+        let candidates: Vec<Task> = tasks.iter().filter(|t| !considered.contains(&t.id)).cloned().collect();
+        let Some(task) = pick_next(&candidates, now).cloned() else { break };
+        considered.insert(task.id);
+        out.push(decide(task, &mut ledgers));
+    }
+    for task in tasks.into_iter().filter(|t| !considered.contains(&t.id)) {
+        out.push(decide(task, &mut ledgers));
+    }
+    Ok(out)
 }
 
 /// Print one provider's section of `budget show`.
@@ -262,41 +361,62 @@ fn show_provider(
         human_duration(ledger.period.remaining(now).num_seconds()),
         anchor_note
     );
-    let window_text = if ledger.window_enabled {
+    let window_text = if ledger.has_window() {
         format!(
-            "; window {} of {} ({:.0}%)",
+            "; window {:.0}% ({}, {} of {} weighted tokens measured in it)",
+            ledger.window_fraction() * 100.0,
+            ledger.window_fraction_source(),
             human_f64(ledger.total_window_weighted),
             human_f64(ledger.window_budget),
-            ledger.window_fraction() * 100.0
         )
     } else {
         "; no rolling window".to_string()
     };
     println!(
-        "{} {} of {} weighted tokens ({:.0}% measured{}){}",
+        "{} {:.0}% of the period allowance ({}){}",
+        "used  ".if_supports_color(Stream::Stdout, |t| t.bold()),
+        ledger.period_fraction() * 100.0,
+        ledger.period_fraction_source(),
+        window_text
+    );
+    println!(
+        "{} {} of {} weighted tokens ({:.0}% of the {} budget)",
         "spent ".if_supports_color(Stream::Stdout, |t| t.bold()),
         human_f64(ledger.total_period_weighted),
         human_f64(ledger.period_budget),
         ledger.measured_period_fraction() * 100.0,
-        match ledger.calibration {
-            Some(_) => format!(", {:.0}% calibrated", ledger.period_fraction() * 100.0),
-            None => String::new(),
-        },
-        window_text
+        if ledger.learned.period.is_some() { "learned" } else { "configured" },
     );
-    match ledger.calibration {
-        Some(c) => println!(
-            "{} observed {:.0}% at {} when we measured {:.0}% (offset {:+.0} points)",
-            "calibration".if_supports_color(Stream::Stdout, |t| t.bold()),
-            c.observed_fraction * 100.0,
-            c.at.format("%Y-%m-%d %H:%M UTC"),
-            c.measured_fraction * 100.0,
-            c.offset() * 100.0
+    let readings = load_observations(store, provider)?.iter().filter(|r| ledger.period.contains(r.at)).count();
+    match ledger.learned.period {
+        Some(r) => println!(
+            "{} 100% of the period ≈ {} weighted tokens (configured {}): {:.1} points moved for {} tokens between {} and {}, {} readings",
+            "rate  ".if_supports_color(Stream::Stdout, |t| t.bold()),
+            human_f64(r.budget),
+            human_f64(ledger.configured_period_budget),
+            r.observed_delta * 100.0,
+            human_f64(r.measured_delta),
+            r.from.format("%m-%d %H:%M"),
+            r.to.format("%m-%d %H:%M UTC"),
+            r.samples
         ),
         None => println!(
-            "{} none this period (use `powerqueue budget set-observed <percent>` after checking /usage)",
-            "calibration".if_supports_color(Stream::Stdout, |t| t.bold())
+            "{} not learned yet ({readings} reading(s) this period; needs two at least {:.0} points and {} tokens apart); using the configured {} weighted tokens",
+            "rate  ".if_supports_color(Stream::Stdout, |t| t.bold()),
+            crate::budget::MIN_OBSERVED_DELTA * 100.0,
+            human_f64(crate::budget::MIN_MEASURED_DELTA),
+            human_f64(ledger.configured_period_budget)
         ),
+    }
+    if let Some(w) = ledger.learned.window {
+        println!(
+            "       100% of the window ≈ {} weighted tokens (configured {}): {:.1} points for {} tokens over {}",
+            human_f64(w.budget),
+            human_f64(ledger.configured_window_budget),
+            w.observed_delta * 100.0,
+            human_f64(w.measured_delta),
+            human_duration((w.to - w.from).num_seconds())
+        );
     }
     match &ledger.observed {
         Some(obs) => {
@@ -406,21 +526,34 @@ pub fn parse_percent(s: &str) -> Result<f64> {
 fn set_observed(ctx: &mut Context, percent: &str, provider: Provider) -> Result<i32> {
     let observed = parse_percent(percent)?;
     let now = Utc::now();
-    let (_, ledgers, _) = load_ledgers(ctx, now)?;
-    let ledger = ledgers
-        .get(provider)
-        .ok_or_else(|| anyhow!("provider {provider} is not enabled (budget.providers.{provider}.enabled = false)"))?;
-    let cal = Calibration { observed_fraction: observed, at: now, measured_fraction: ledger.measured_period_fraction() };
-    ctx.store()?.kv_set(&calibration_key(provider), &cal)?;
+    let cfg = ctx.config_cloned()?;
+    if !cfg.budget.provider(provider).enabled {
+        bail!("provider {provider} is not enabled (budget.providers.{provider}.enabled = false)");
+    }
+    let store = ctx.store()?.clone();
+    // A manual reading keeps what the last probe knew (resets, the window,
+    // a blocked flag); only the period percentage and the instant change.
+    let previous = load_observed(&store, provider)?;
+    let obs =
+        ObservedUsage { period_used: Some(observed), observed_at: now, ..previous.unwrap_or_else(|| ObservedUsage::empty(now)) };
+    save_observed(&store, provider, &obs)?;
+    let ledger = Ledger::load(&store, &cfg.budget, provider, now)?;
     if ctx.json {
-        println!("{}", serde_json::to_string(&cal)?);
-    } else {
-        println!(
-            "calibrated {provider}: /usage shows {:.0}%, powerqueue measured {:.0}% → offset {:+.0} points applied for the rest of this period",
+        println!("{}", serde_json::json!({ "provider": provider, "observed": obs, "learned": ledger.learned }));
+        return Ok(0);
+    }
+    match ledger.learned.period {
+        Some(r) => println!(
+            "recorded {provider} at {:.0}%; rate learned: 100% ≈ {} weighted tokens (configured {})",
             observed * 100.0,
-            cal.measured_fraction * 100.0,
-            cal.offset() * 100.0
-        );
+            human_f64(r.budget),
+            human_f64(ledger.configured_period_budget)
+        ),
+        None => println!(
+            "recorded {provider} at {:.0}%; pacing starts from that reading (a second one at least {:.0} points later teaches the rate)",
+            observed * 100.0,
+            crate::budget::MIN_OBSERVED_DELTA * 100.0
+        ),
     }
     Ok(0)
 }

@@ -1144,6 +1144,43 @@ pub enum DaemonCommand {
     Reload,
     /// Stop the daemon gracefully (sessions keep running in tmux).
     Shutdown,
+    /// Stop launching sessions (running ones continue; crashed ones are
+    /// not relaunched) until `ResumeScheduling`.
+    PauseScheduling {
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// Launch sessions again.
+    ResumeScheduling,
+}
+
+/// kv key under which [`SchedulingPause`] is stored while scheduling is paused.
+pub const SCHEDULING_PAUSE_KEY: &str = "daemon.paused";
+
+/// Daemon-wide pause (`powerqueue pause`): the daemon keeps monitoring,
+/// cleaning up and syncing, but launches no session until `powerqueue
+/// resume`. Persisted in kv so it survives a daemon restart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchedulingPause {
+    pub since: DateTime<Utc>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl SchedulingPause {
+    /// Read the pause, if scheduling is paused. Fails only when the
+    /// database cannot be read.
+    pub fn load(store: &crate::store::Store) -> anyhow::Result<Option<SchedulingPause>> {
+        store.kv_get(SCHEDULING_PAUSE_KEY)
+    }
+
+    /// One line for status headers: `paused since 2026-10-06 21:40 UTC (reason)`.
+    pub fn describe(&self) -> String {
+        match &self.reason {
+            Some(r) if !r.trim().is_empty() => format!("paused since {} ({})", self.since.format("%Y-%m-%d %H:%M UTC"), r.trim()),
+            _ => format!("paused since {}", self.since.format("%Y-%m-%d %H:%M UTC")),
+        }
+    }
 }
 
 /// Hook events Claude Code sends to `powerqueue hook`.

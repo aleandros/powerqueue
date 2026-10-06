@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-06
+
+Budget pacing now trusts the provider's own usage readings and learns the
+exchange rate between powerqueue's weighted tokens and those percentages;
+the configured `period_weighted_tokens` / `window_weighted_tokens` are only
+the fallback until the rate is learned. The pre-0.7 additive calibration
+(kv `budget.calibration.<provider>`) is no longer read. New kv keys:
+`budget.observations.<provider>` (reading history) and `daemon.paused`.
+
+### Added
+
+- `powerqueue pause [--reason TEXT]` / `powerqueue resume`: stop launching
+  sessions daemon-wide while running ones continue and the daemon keeps
+  monitoring, cleaning up and syncing. Crashed sessions are not relaunched
+  while paused. The pause survives a daemon restart; `status`, the
+  dashboard header and `doctor` show it (`daemon.paused` / `daemon.resumed`
+  events).
+- The ledger learns the period rate from pairs of readings at least 2
+  points apart with at least 1M weighted tokens recorded between them
+  (`period_budget = Δmeasured / Δobserved`, the largest candidate wins
+  because usage outside powerqueue can only make a pair read low; pairs
+  never span a reset), and the window rate from pairs at most an hour
+  apart. A pre-0.7 `set-observed` calibration counts as a reading. Tier
+  shares, pacing and the policy's cost checks use the learned budgets.
+  `budget show` prints the rate line; `doctor` has a `<provider> usage
+  rate` check that warns when the configured budget is more than 2× off and
+  prints the value to set.
+- `budget show` lists every task waiting in the queue with the model it
+  would get and why (`--json`: `queued`), and the "what would run now"
+  table uses the estimator's typical task instead of a fixed 500k guess.
+- `doctor`: `<top model> share` warns when the most capable model's share
+  is smaller than one typical task after its cost weight (it could never
+  lend itself to less critical work); `scheduling` warns while paused.
+
+### Changed
+
+- A model's share caps only *borrowed* use (tasks less critical than its
+  `min_criticality`, admitted through relaxation). Work the model is
+  reserved for is bounded by the whole allowance, never by the share: an
+  empty Fable share no longer sends a critical task to Sonnet.
+- Period and window fractions start from the provider's latest reading
+  (status line, probe, `budget set-observed`) and add only what was
+  measured since, at the effective budget. Policy reasons say which:
+  `period allowance: 43% used (observed), this task would push it to 46%`.
+- The observed 5-hour window counts even with `window_hours = 0`; when it
+  is the blocker the retry waits for its reported reset if that comes
+  before the 15-minute recheck. A window reading expires with its reset
+  (or after five hours), so it cannot block launches once no session is
+  left to refresh it.
+- `pause` / `resume` flip the switch in the database at once (a live
+  daemon only logs the event), so `resume` right after `pause` works.
+- `budget set-observed <percent>` records a reading instead of an offset.
+- The daemon tick syncs Linear before evaluating the rules, so a ticket
+  created this tick is scored (criticality, preferred model) before the
+  scheduler sees it. It used to be scheduled first as `normal`.
+
+### Fixed
+
+- A critical ticket was throttled by a 5-hour window ledger that read 103%
+  while Claude's own meter said 10%, then launched on Sonnet because
+  Fable's share (`weight` 5 × `share` 0.15) could not hold one task. Both
+  paths are covered by tests.
+
 ## [0.6.1] - 2026-10-06
 
 ### Fixed
@@ -478,7 +541,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.7.0
 [0.6.1]: https://github.com/aleandros/powerqueue/releases/tag/v0.6.1
 [0.6.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.6.0
 [0.5.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.5.0

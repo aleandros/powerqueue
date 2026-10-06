@@ -306,8 +306,9 @@ in a pull request, and read by the agent itself. Live reload makes the edit
 loop immediate.
 
 **Weighted tokens, not dollars.** Subscriptions are capped in usage, not
-spend, and the cap is unpublished. Pacing on a weighted token model with user
-calibration (`budget set-observed`) and rate-limit signals is the most honest
+spend, and the cap is unpublished. Pacing on a weighted token model whose
+exchange rate is learned from the provider's own readings (status line,
+probes, `budget set-observed`), plus rate-limit signals, is the most honest
 approximation available.
 
 **XDG paths and `POWERQUEUE_HOME`.** Short, predictable paths that show well

@@ -20,6 +20,9 @@ pub struct Snapshot {
     pub taken_at: Option<DateTime<Utc>>,
     pub daemon_alive: bool,
     pub daemon_pid: Option<u32>,
+    /// Set while `powerqueue pause` is in effect.
+    #[serde(default)]
+    pub scheduling_pause: Option<crate::domain::SchedulingPause>,
     pub tasks: Vec<Task>,
     pub sessions: Vec<Session>,
     /// One ledger per enabled provider; `None` when they could not be loaded.
@@ -97,10 +100,12 @@ impl Snapshot {
         let max_age = Duration::seconds(3 * cfg.scheduler.tick_secs.max(1) as i64);
         let daemon_alive = store.daemon_alive(max_age)?;
         let daemon_pid = store.daemon_heartbeat()?.map(|(pid, _)| pid);
+        let scheduling_pause = crate::domain::SchedulingPause::load(store)?;
         Ok(Snapshot {
             taken_at: Some(now),
             daemon_alive,
             daemon_pid,
+            scheduling_pause,
             tasks,
             sessions,
             ledgers,

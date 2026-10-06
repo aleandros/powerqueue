@@ -183,7 +183,7 @@ Checks:
 ```sh
 powerqueue budget show                 # spend per tier, window, cooldowns
 powerqueue task explain ENG-123        # why each tier was rejected
-powerqueue doctor                      # anchor, calibration, throttling rate
+powerqueue doctor                      # anchor, usage rate, throttling rate
 ```
 
 Fixes:
@@ -292,8 +292,9 @@ deleted.
 - Local `pq/*` branches stay unless you pass `--delete-branches` (the default
   branch and anything not matching `repo.branch_template` are always kept;
   remote branches are never deleted).
-- Budget calibration, rate-limit cooldowns and probe results (the `kv` table)
-  survive so pacing keeps its learning; `--everything` clears them too.
+- Usage readings, rate-limit cooldowns, probe results and a scheduling pause
+  (the `kv` table) survive so pacing keeps its learning; `--everything`
+  clears them too.
 - Linear issues are left as they are; `--revert-linear` moves the issues of
   open tasks back to the first `linear.queued_states` entry (needs the Linear
   key; failures are reported per issue).

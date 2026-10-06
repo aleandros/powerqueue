@@ -559,13 +559,9 @@ fn load_policy_input(cfg: &Config, store: &Store, now: DateTime<Utc>) -> Result<
 /// Mirror of the daemon's reservation: count a planned start against the
 /// ledgers so the next row sees a slightly fuller budget.
 fn reserve(ledgers: &mut Ledgers, tier: &ModelTier, weighted_cost: f64) {
-    let Some(ledger) = ledgers.for_model_mut(tier) else { return };
-    if let Some(t) = ledger.tiers.iter_mut().find(|t| t.tier == *tier) {
-        t.period_weighted += weighted_cost;
-        t.window_weighted += weighted_cost;
+    if let Some(ledger) = ledgers.for_model_mut(tier) {
+        ledger.add_spend(tier, weighted_cost);
     }
-    ledger.total_period_weighted += weighted_cost;
-    ledger.total_window_weighted += weighted_cost;
 }
 
 /// Queued Linear issues that have no task yet, as unsaved tasks.

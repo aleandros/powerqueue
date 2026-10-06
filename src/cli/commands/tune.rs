@@ -629,8 +629,24 @@ pub fn context_markdown(
             ledger.period.start.format("%Y-%m-%d %H:%M"),
             ledger.period.end.format("%Y-%m-%d %H:%M"),
         );
-        if ledger.window_enabled && ledger.window_budget > 0.0 {
-            let _ = write!(md, ", window {:.0}% spent", ledger.total_window_weighted / ledger.window_budget * 100.0);
+        if ledger.has_window() {
+            let _ = write!(md, ", window {:.0}% used ({})", ledger.window_fraction() * 100.0, ledger.window_fraction_source());
+        }
+        match ledger.learned.period {
+            Some(r) => {
+                let _ = write!(
+                    md,
+                    ", learned rate: 100% of the period ≈ {:.0} weighted tokens (configured {:.0})",
+                    r.budget, ledger.configured_period_budget
+                );
+            }
+            None => {
+                let _ = write!(
+                    md,
+                    ", rate not learned yet (configured {:.0} weighted tokens per period)",
+                    ledger.configured_period_budget
+                );
+            }
         }
         if let Some(obs) = &ledger.observed {
             if let Some(p) = obs.period_used {

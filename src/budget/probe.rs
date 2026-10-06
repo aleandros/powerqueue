@@ -3,24 +3,120 @@
 //! Where a CLI can tell us the remaining allowance (Codex's
 //! `account/rateLimits/read`, Claude Code's status-line `rate_limits`,
 //! Antigravity's `/usage`), a [`UsageProbe`] turns it into an
-//! [`ObservedUsage`] stored in kv `budget.observed.<provider>`. The ledger
-//! uses it two ways ([`apply_observed`]): `period_used` becomes the
-//! calibration (same mechanism as `budget set-observed`), and
-//! `period_resets_at` overrides the configured anchor for that period. A
-//! `blocked` provider, or one whose window is fully used, is on cooldown
-//! until the matching reset ([`ObservedUsage::cooldown_until`]).
+//! [`ObservedUsage`] stored in kv `budget.observed.<provider>` (latest
+//! wins) plus one [`ObservationSample`] appended to kv
+//! `budget.observations.<provider>` (the history the ledger learns the
+//! exchange rate from; see `ledger::LearnedRate`). The ledger uses the
+//! latest observation as the truth for the period and window fractions and
+//! only adds what it measured since ([`apply_observed`]);
+//! `period_resets_at` overrides the configured anchor. A `blocked`
+//! provider, or one whose window is fully used, is on cooldown until the
+//! matching reset ([`ObservedUsage::cooldown_until`]).
 //!
 //! This module holds the types, the trait and the kv helpers. The real
 //! probes live with their provider CLIs; [`NoProbe`] is the stand-in.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::Provider;
 use crate::store::Store;
 
-use super::ledger::{Calibration, Ledger};
+use super::ledger::Ledger;
+
+/// One reading kept for learning the exchange rate between our weighted
+/// tokens and the provider's own percentages.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ObservationSample {
+    pub at: DateTime<Utc>,
+    pub period_used: Option<f64>,
+    pub window_used: Option<f64>,
+}
+
+impl ObservationSample {
+    pub fn of(obs: &ObservedUsage) -> Self {
+        Self { at: obs.observed_at, period_used: obs.period_used, window_used: obs.window_used }
+    }
+}
+
+/// Samples younger than this are kept at most one per [`SAMPLE_SPACING_RECENT`];
+/// older ones one per [`SAMPLE_SPACING_OLD`].
+pub const SAMPLE_RECENT: Duration = Duration::hours(2);
+pub const SAMPLE_SPACING_RECENT: Duration = Duration::seconds(60);
+pub const SAMPLE_SPACING_OLD: Duration = Duration::minutes(10);
+/// Samples older than this are dropped (longer than any period we pace).
+pub const SAMPLE_MAX_AGE: Duration = Duration::days(9);
+
+/// kv key under which a provider's observation history is stored.
+pub fn observations_key(provider: Provider) -> String {
+    format!("budget.observations.{provider}")
+}
+
+/// The stored observation history of a provider, oldest first. A pre-0.7
+/// calibration (kv `budget.calibration.<p>`: `observed_fraction` at `at`)
+/// is folded in as one more reading when the history has none at that
+/// instant, so an upgrade keeps the reading it had. Fails only when the
+/// database cannot be read or the stored JSON is unreadable.
+pub fn load_observations(store: &Store, provider: Provider) -> Result<Vec<ObservationSample>> {
+    let mut samples = store
+        .kv_get::<Vec<ObservationSample>>(&observations_key(provider))
+        .with_context(|| format!("read observation history of {provider}"))?
+        .unwrap_or_default();
+    #[derive(Deserialize)]
+    struct Legacy {
+        observed_fraction: f64,
+        at: DateTime<Utc>,
+    }
+    if let Ok(Some(legacy)) = store.kv_get::<Legacy>(&super::ledger::calibration_key(provider))
+        && !samples.iter().any(|s| (s.at - legacy.at).num_seconds().abs() < 1)
+    {
+        samples.push(ObservationSample { at: legacy.at, period_used: Some(legacy.observed_fraction), window_used: None });
+        samples.sort_by_key(|s| s.at);
+    }
+    Ok(samples)
+}
+
+/// Append a sample to the history and thin it ([`thin_samples`]). A sample
+/// that only repeats the newest reading within [`SAMPLE_SPACING_RECENT`]
+/// is not stored (the status line fires after every response).
+pub fn record_observation(store: &Store, provider: Provider, obs: &ObservedUsage) -> Result<()> {
+    let sample = ObservationSample::of(obs);
+    if sample.period_used.is_none() && sample.window_used.is_none() {
+        return Ok(());
+    }
+    let mut samples = load_observations(store, provider)?;
+    if let Some(last) = samples.last()
+        && sample.at - last.at < SAMPLE_SPACING_RECENT
+        && last.period_used == sample.period_used
+        && last.window_used == sample.window_used
+    {
+        return Ok(());
+    }
+    samples.push(sample);
+    samples.sort_by_key(|s| s.at);
+    let thinned = thin_samples(&samples, sample.at);
+    store.kv_set(&observations_key(provider), &thinned).with_context(|| format!("store observation history of {provider}"))
+}
+
+/// Keep the newest sample, at most one per minute for the last two hours,
+/// one per ten minutes before that, nothing older than [`SAMPLE_MAX_AGE`].
+/// Input oldest first; output oldest first.
+pub fn thin_samples(samples: &[ObservationSample], now: DateTime<Utc>) -> Vec<ObservationSample> {
+    let mut kept: Vec<ObservationSample> = Vec::new();
+    for s in samples.iter().rev() {
+        if now - s.at > SAMPLE_MAX_AGE {
+            break;
+        }
+        let spacing = if now - s.at <= SAMPLE_RECENT { SAMPLE_SPACING_RECENT } else { SAMPLE_SPACING_OLD };
+        match kept.last() {
+            Some(newer) if newer.at - s.at < spacing => continue,
+            _ => kept.push(*s),
+        }
+    }
+    kept.reverse();
+    kept
+}
 
 /// A provider's own view of its allowance at `observed_at`. Fractions are
 /// `0.0..=1.0` of the allowance used; `None` = the probe could not tell.
@@ -97,22 +193,22 @@ pub fn load_observed(store: &Store, provider: Provider) -> Result<Option<Observe
     store.kv_get(&observed_key(provider)).with_context(|| format!("read observed usage of {provider}"))
 }
 
-/// Store a provider's observation (latest wins).
+/// Store a provider's observation (latest wins) and append it to the
+/// history ([`record_observation`]).
 pub fn save_observed(store: &Store, provider: Provider, observed: &ObservedUsage) -> Result<()> {
-    store.kv_set(&observed_key(provider), observed).with_context(|| format!("store observed usage of {provider}"))
+    store.kv_set(&observed_key(provider), observed).with_context(|| format!("store observed usage of {provider}"))?;
+    record_observation(store, provider, observed)
 }
 
 /// Fold an observation into a ledger that was loaded for the same provider.
 ///
-/// * `period_used` becomes the ledger's calibration, like `budget
-///   set-observed`: the offset between what the provider reports and what we
-///   measured is applied to the period fraction. The observation must fall
-///   inside the ledger's period and be newer than an existing manual
-///   calibration, otherwise it is ignored.
 /// * `period_resets_at` moves the period so it ends at that instant when the
 ///   ledger's period does not already (the ledger keeps its usage sums; the
 ///   daemon reloads ledgers every tick so the sums catch up).
-/// * The observation itself is attached as `ledger.observed`.
+/// * The observation is attached as `ledger.observed`; from then on
+///   `Ledger::period_fraction` / `window_fraction` start from what the
+///   provider reported and add only what was measured since
+///   (`spent_since_observation`, which the caller fills in).
 pub fn apply_observed(ledger: &mut Ledger, observed: &ObservedUsage) {
     if let Some(reset) = observed.period_resets_at
         && reset > ledger.now
@@ -121,16 +217,6 @@ pub fn apply_observed(ledger: &mut Ledger, observed: &ObservedUsage) {
         let len = ledger.period.len();
         ledger.period = super::period::Period { start: reset - len, end: reset };
         ledger.anchor_source = super::period::AnchorSource::Observed;
-    }
-    if let Some(used) = observed.period_used
-        && ledger.period.contains(observed.observed_at)
-        && ledger.calibration.is_none_or(|c| c.at <= observed.observed_at)
-    {
-        ledger.calibration = Some(Calibration {
-            observed_fraction: used.clamp(0.0, 2.0),
-            at: observed.observed_at,
-            measured_fraction: ledger.measured_period_fraction(),
-        });
     }
     ledger.observed = Some(observed.clone());
 }
@@ -149,21 +235,16 @@ mod tests {
     fn ledger(now: DateTime<Utc>) -> Ledger {
         let start = now - Duration::days(2);
         let period = Period { start, end: start + Duration::days(7) };
-        Ledger {
-            provider: Provider::Claude,
-            now,
-            period,
-            window: Period { start: now - Duration::hours(5), end: now },
-            tiers: vec![],
-            total_period_weighted: 10.0,
-            total_window_weighted: 0.0,
-            period_budget: 100.0,
-            window_budget: 100.0,
-            window_enabled: true,
-            calibration: None,
-            observed: None,
-            anchor_source: AnchorSource::Config,
-        }
+        let mut l = Ledger::blank(Provider::Claude, now, period, Period { start: now - Duration::hours(5), end: now });
+        l.total_period_weighted = 10.0;
+        l.period_budget = 100.0;
+        l.window_budget = 100.0;
+        l.window_enabled = true;
+        l
+    }
+
+    fn sample(at: DateTime<Utc>, period_used: f64) -> ObservationSample {
+        ObservationSample { at, period_used: Some(period_used), window_used: None }
     }
 
     #[test]
@@ -172,11 +253,87 @@ mod tests {
         assert!(load_observed(&store, Provider::Codex).unwrap().is_none());
         let obs = ObservedUsage { period_used: Some(0.3), ..ObservedUsage::empty(at("2026-10-01T12:00:00Z")) };
         save_observed(&store, Provider::Codex, &obs).unwrap();
-        assert_eq!(load_observed(&store, Provider::Codex).unwrap(), Some(obs));
+        assert_eq!(load_observed(&store, Provider::Codex).unwrap(), Some(obs.clone()));
+        assert_eq!(load_observations(&store, Provider::Codex).unwrap(), vec![ObservationSample::of(&obs)]);
         assert!(load_observed(&store, Provider::Claude).unwrap().is_none());
+        assert!(load_observations(&store, Provider::Claude).unwrap().is_empty());
         assert_eq!(observed_key(Provider::Gemini), "budget.observed.gemini");
+        assert_eq!(observations_key(Provider::Gemini), "budget.observations.gemini");
         assert!(NoProbe(Provider::Gemini).probe().unwrap().is_none());
         assert_eq!(NoProbe(Provider::Gemini).provider(), Provider::Gemini);
+    }
+
+    #[test]
+    fn history_skips_repeats_and_empty_readings_and_stays_sorted() {
+        let store = Store::open_in_memory().unwrap();
+        let t0 = at("2026-10-01T12:00:00Z");
+        let base = ObservedUsage { period_used: Some(0.3), window_used: Some(0.1), ..ObservedUsage::empty(t0) };
+        save_observed(&store, Provider::Claude, &base).unwrap();
+        // Same reading 20s later: not stored. Same reading 2 min later: stored.
+        save_observed(&store, Provider::Claude, &ObservedUsage { observed_at: t0 + Duration::seconds(20), ..base.clone() })
+            .unwrap();
+        assert_eq!(load_observations(&store, Provider::Claude).unwrap().len(), 1);
+        save_observed(&store, Provider::Claude, &ObservedUsage { observed_at: t0 + Duration::minutes(2), ..base.clone() })
+            .unwrap();
+        assert_eq!(load_observations(&store, Provider::Claude).unwrap().len(), 2);
+        // A changed reading 10s later replaces the one just before it (one per minute is kept).
+        let changed = ObservedUsage {
+            period_used: Some(0.31),
+            observed_at: t0 + Duration::minutes(2) + Duration::seconds(10),
+            ..base.clone()
+        };
+        save_observed(&store, Provider::Claude, &changed).unwrap();
+        let h = load_observations(&store, Provider::Claude).unwrap();
+        assert_eq!(h.len(), 2);
+        assert_eq!(h.last().map(|s| s.period_used), Some(Some(0.31)));
+        // Nothing to learn from: not stored.
+        save_observed(&store, Provider::Claude, &ObservedUsage::empty(t0 + Duration::minutes(5))).unwrap();
+        let h = load_observations(&store, Provider::Claude).unwrap();
+        assert_eq!(h.len(), 2);
+        assert!(h.windows(2).all(|w| w[0].at <= w[1].at));
+    }
+
+    #[test]
+    fn a_pre_0_7_calibration_counts_as_a_reading() {
+        let store = Store::open_in_memory().unwrap();
+        let t0 = at("2026-10-01T12:00:00Z");
+        store
+            .kv_set(
+                &super::super::ledger::calibration_key(Provider::Claude),
+                &serde_json::json!({ "observed_fraction": 0.43, "at": t0, "measured_fraction": 0.57 }),
+            )
+            .unwrap();
+        let h = load_observations(&store, Provider::Claude).unwrap();
+        assert_eq!(h, vec![ObservationSample { at: t0, period_used: Some(0.43), window_used: None }]);
+        // Later readings come after it; the legacy one is not duplicated.
+        let obs = ObservedUsage { period_used: Some(0.5), ..ObservedUsage::empty(t0 + Duration::hours(1)) };
+        save_observed(&store, Provider::Claude, &obs).unwrap();
+        let h = load_observations(&store, Provider::Claude).unwrap();
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].at, t0);
+        assert_eq!(h[1].period_used, Some(0.5));
+    }
+
+    #[test]
+    fn thinning_keeps_recent_minutes_and_older_ten_minute_steps() {
+        let now = at("2026-10-01T12:00:00Z");
+        let mut samples = Vec::new();
+        // One sample every 10 s for the last 3 hours, plus one ancient sample.
+        samples.push(sample(now - Duration::days(10), 0.0));
+        let mut t = now - Duration::hours(3);
+        while t <= now {
+            samples.push(sample(t, 0.5));
+            t += Duration::seconds(10);
+        }
+        let thinned = thin_samples(&samples, now);
+        assert_eq!(thinned.last().map(|s| s.at), Some(now), "the newest sample is always kept");
+        assert!(thinned.first().unwrap().at >= now - Duration::hours(3), "ancient samples dropped");
+        let recent = thinned.iter().filter(|s| now - s.at <= SAMPLE_RECENT).count();
+        let old = thinned.len() - recent;
+        assert!((118..=121).contains(&recent), "about one per minute over 2h, got {recent}");
+        assert!((5..=7).contains(&old), "about one per 10 min over the older hour, got {old}");
+        assert!(thinned.windows(2).all(|w| w[1].at - w[0].at >= SAMPLE_SPACING_RECENT));
+        assert!(thin_samples(&[], now).is_empty());
     }
 
     #[test]
@@ -200,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_sets_calibration_and_moves_the_period() {
+    fn apply_moves_the_period_and_makes_the_observation_the_truth() {
         let now = at("2026-10-01T12:00:00Z");
         let mut l = ledger(now);
         let obs = ObservedUsage {
@@ -212,33 +369,26 @@ mod tests {
         assert_eq!(l.period.end, now + Duration::days(1));
         assert_eq!(l.period.len(), Duration::days(7));
         assert_eq!(l.anchor_source, AnchorSource::Observed);
-        let cal = l.calibration.unwrap();
-        assert_eq!(cal.observed_fraction, 0.4);
-        assert_eq!(cal.measured_fraction, 0.1);
-        assert!((l.period_fraction() - 0.4).abs() < 1e-9);
+        assert!((l.period_fraction() - 0.4).abs() < 1e-9, "the observation replaces our 10% measurement");
+        l.spent_since_observation = 5.0;
+        assert!((l.period_fraction() - 0.45).abs() < 1e-9, "plus what was measured since, at the effective budget");
         assert_eq!(l.observed, Some(obs));
     }
 
     #[test]
-    fn apply_respects_newer_manual_calibration_and_stale_observations() {
+    fn apply_enables_the_window_when_the_provider_reports_one() {
         let now = at("2026-10-01T12:00:00Z");
         let mut l = ledger(now);
-        let manual = Calibration { observed_fraction: 0.7, at: now, measured_fraction: 0.1 };
-        l.calibration = Some(manual);
-        let obs = ObservedUsage { period_used: Some(0.4), ..ObservedUsage::empty(now - Duration::hours(1)) };
+        l.window_enabled = false;
+        let obs = ObservedUsage { window_used: Some(0.25), ..ObservedUsage::empty(now) };
         apply_observed(&mut l, &obs);
-        assert_eq!(l.calibration, Some(manual), "a newer manual calibration wins");
-        assert_eq!(l.anchor_source, AnchorSource::Config);
+        assert!(!l.window_enabled && l.has_window(), "config says no window, but the provider has one");
+        assert!((l.window_fraction() - 0.25).abs() < 1e-9);
+        assert_eq!(l.anchor_source, AnchorSource::Config, "no reset known: the period stays");
 
         let mut l = ledger(now);
-        let stale = ObservedUsage { period_used: Some(0.4), ..ObservedUsage::empty(now - Duration::days(10)) };
-        apply_observed(&mut l, &stale);
-        assert!(l.calibration.is_none(), "an observation from another period is ignored");
-        assert!(l.observed.is_some());
-
-        let mut l = ledger(now);
-        let past_reset = ObservedUsage { period_resets_at: Some(now - Duration::hours(1)), ..ObservedUsage::empty(now) };
         let before = l.period;
+        let past_reset = ObservedUsage { period_resets_at: Some(now - Duration::hours(1)), ..ObservedUsage::empty(now) };
         apply_observed(&mut l, &past_reset);
         assert_eq!(l.period, before, "a reset in the past does not move the period");
     }

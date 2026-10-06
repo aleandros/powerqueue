@@ -5,8 +5,10 @@ Both are shared by every model, and Fable is the most capable and the scarcest.
 powerqueue wants critical work on Fable immediately, routine work on cheaper
 tiers, and no Fable capacity wasted at the end of the week. It measures what
 it spends, reads what the providers report about their own allowance
-(usage probes, below), lets you calibrate against `/usage`, and treats
-rate-limit errors as a hard signal.
+(usage probes, below) and treats those readings as the truth, learns the
+exchange rate between its own token counts and the provider's percentages
+(see [Learning the rate](#learning-the-rate)), and treats rate-limit errors
+as a hard signal.
 
 The code lives in `src/budget/`: `period.rs` (where we are in the period),
 `ledger.rs` (what was spent; one `Ledger` per enabled provider in `Ledgers`),
@@ -98,10 +100,16 @@ multi-block responses count once). The ledger sums rows per tier for the
 current period and window and reports:
 
 - `period_weighted` / `window_weighted` per tier,
-- `period_budget = share × period_weighted_tokens` per tier,
-- totals across tiers against `period_weighted_tokens` and `window_weighted_tokens`.
+- `period_budget = share × period_budget` per tier, where the ledger's
+  `period_budget` is the *effective* one: learned from the provider's
+  readings when possible, else `period_weighted_tokens`,
+- totals across tiers against the effective period and window budgets.
 
-`powerqueue budget show` prints this table.
+`powerqueue budget show` prints this table. The weights are a guess at how
+the provider meters usage; they are wrong by some factor (for Claude Code
+sessions, which re-read a large context from cache on every turn, by a
+large one), which is why the configured budgets are only a starting point
+and the rate is learned.
 
 ## Shares and minimum criticality
 
@@ -116,17 +124,21 @@ downgrade chain is "next higher rank of the same provider"):
 | sonnet | 30 | 0.35 | low | 0.0 | 1.0 |
 | haiku | 40 | 0.05 | low | 0.0 | 0.2 |
 
-With the defaults Fable may spend 20M weighted tokens per week, and only
-`critical` tasks may use it early on. Shares of enabled tiers must sum to at
-most 1.0 (`config validate` checks); a tier with `enabled = false` or share 0
-is never chosen. Tasks of criticality `low` with no preference go to
+With the defaults Fable may *lend* 20M weighted tokens per week (25% of the
+configured 80M) to work it is not reserved for, and only `critical` tasks
+may use it early on. A share caps borrowed use only: work a model is
+reserved for (`task.criticality` at or above its `min_criticality`) is
+limited by the whole allowance, never by the share, so an empty Fable share
+cannot stop a critical task. Shares of enabled tiers must sum to at most 1.0
+(`config validate` checks); a tier with `enabled = false` or share 0 is
+never chosen. Tasks of criticality `low` with no preference go to
 `budget.low_model` (Sonnet), `normal` ones to `budget.default_model`, and
 `critical`/`high` ones to the most capable eligible tier.
 
 ## Providers
 
 Each enabled provider (`budget.providers.<p>.enabled`) has its own ledger:
-its own period clock and anchor, window, calibration, observed usage and
+its own period clock and anchor, window, learned rate, observed usage and
 model table. Usage rows count against the provider that runs the model
 (`ModelTier::provider()`: `fable|opus|sonnet|haiku` → claude, `gpt-*` →
 codex, `gemini-*` → gemini).
@@ -139,7 +151,8 @@ codex, `gemini-*` → gemini).
 
 `budget.provider_order` (default `["claude", "codex", "gemini"]`) is the
 fallback order between enabled providers; enabled providers it does not list
-come after it. A provider with `window_hours = 0` has no window check at all.
+come after it. A provider with `window_hours = 0` has no window check unless
+its readings report one (Claude's status line always does).
 
 ## Usage probes and observed anchors
 
@@ -166,12 +179,18 @@ runs them now and prints what came back.
   means blocked). The output shape comes from community reports; anything
   unexpected is ignored.
 
-What a probe learns is stored in kv `budget.observed.<provider>` and used in
-three ways:
+What a probe learns is stored in kv `budget.observed.<provider>` (latest
+wins) and appended to kv `budget.observations.<provider>` (the reading
+history, thinned to one per minute for the last two hours and one per ten
+minutes before that, nothing older than nine days). It is used in three
+ways:
 
-1. **Calibration.** The reported period usage becomes the provider's
-   calibration, exactly like `budget set-observed` (a newer manual
-   calibration wins).
+1. **Truth.** The reported period and window percentages are where the
+   ledger's fractions start; only usage recorded after the reading is added
+   on top, converted at the effective budget (`period_fraction = used +
+   spent_since_observation / period_budget`). `budget set-observed 43%`
+   stores a manual reading the same way. The history teaches the rate (see
+   [Learning the rate](#learning-the-rate)).
 2. **Anchor.** The reported weekly reset (`period_resets_at`) moves the
    period so it ends there; `budget show` then says `anchor learned from the
    provider` and you never need `budget set-reset`.
@@ -236,13 +255,21 @@ first failing gate gives the reason:
      levels lower qualify regardless of pacing.
    Reason when blocked: `reserved for critical (relaxed to high); task is low
    (20% of its budget spent at 68% of the period)`.
-4. **Tier budget.** `predicted × weight` must fit the tier's remaining share
-   times `1 - safety_margin` (default 5% of what is left stays unspent).
-5. **Overall period budget.** The provider's calibrated period fraction plus
-   this task's cost must stay below `1 - safety_margin`.
-6. **Window** (only when the provider has one). `total_window_weighted +
-   cost` must fit `window_weighted_tokens` (`window: 10000000 of 12000000
-   weighted tokens used, needs 3000000 more`).
+4. **Tier share, for borrowed use only.** When the task is less critical
+   than the model's `min_criticality` (it got in through relaxation),
+   `predicted × weight` must fit the tier's remaining share times
+   `1 - safety_margin` (`opus's share: needs 3868619 weighted tokens,
+   1964258 left after the safety margin`). Work the model is reserved for
+   skips this step.
+5. **Period allowance.** The provider's period fraction (from its own
+   reading when there is one, else measured) plus this task's cost at the
+   effective budget must stay below `1 - safety_margin` (`period allowance:
+   43% used (observed), this task would push it to 46%`).
+6. **Window** (when the provider has one, configured or reported). The
+   window fraction plus the cost at the effective window budget must stay
+   below `1 - safety_margin` (`window: 91% used (observed), this task would
+   push it to 97%`); the retry waits for the reported window reset when it
+   comes sooner than the 15-minute recheck.
 
 An eligible tier reads `eligible; 20% of its budget spent at 68% of the
 period` (or `eligible (relaxed to high); ...`).
@@ -286,25 +313,56 @@ neither marked stale (`scheduler.stale_session_secs`) nor killed for
 (event `session.waiting_for_reset`). If no hook reported the limit, the pane
 text itself starts the provider's cooldown.
 
-## Calibration
+## Learning the rate
 
-powerqueue only sees its own sessions. Interactive work in another terminal
-also drains the same allowance. Two commands feed outside knowledge in:
+`period_weighted_tokens` says how many weighted tokens one whole allowance
+is worth. Nobody knows that number: the weights are an approximation of how
+the provider meters usage, and interactive work in other terminals drains
+the same allowance. So the ledger learns it (`ledger::learn_rate`,
+`LearnedRate` in `budget show --json`):
+
+- Take the readings of the current period (kv `budget.observations.<p>`;
+  a pre-0.7 `budget set-observed` calibration counts as one reading).
+- Every pair of readings is a candidate when the percentage grew by at
+  least `MIN_OBSERVED_DELTA` = 2 points between them, the two never pair
+  across a decrease (a reset), and at least `MIN_MEASURED_DELTA` = 1M
+  tier-weighted tokens were recorded between the two instants (less means
+  the jump came from usage powerqueue cannot see). The spend between two
+  instants comes from a per-minute series of the usage table
+  (`Store::usage_by_minute`), so hundreds of readings cost one query.
+- Each candidate gives `Δmeasured / Δobserved`; the **largest** wins and
+  becomes the effective `period_budget`. Usage outside powerqueue (another
+  terminal) only ever moves the percentage *more* than we measured, so
+  every candidate is a lower bound on the true allowance and the largest is
+  the least contaminated. The tier shares, the pacing comparisons and the
+  policy's cost checks all use it; without a candidate the configured
+  budget stays in force.
+
+The window rate is learned the same way from pairs at most
+`WINDOW_LEARN_SPAN` = 1 hour apart, so what rolled out of the window in
+between stays small; without one, `window_weighted_tokens` applies, and
+with neither the window is judged on the reading alone. A window reading
+is trusted until its reported reset (or for five hours when none is
+known), so a reading from a window that has rolled over cannot keep
+blocking launches after the last session ended.
+
+Claude's status line delivers a reading after every response, so the rate
+is usually known within the first hour of a period and refines itself as
+the mix of cache reads and output changes. `budget show` prints the rate
+(`100% of the period ≈ 540.0M weighted tokens (configured 80.0M): 2.1
+points moved for 11.3M tokens between …`), `doctor` warns when the
+configured budget is more than 2× off and tells you the value to put in
+`period_weighted_tokens` so pacing is right before a period's first readings.
+
+Two commands feed outside knowledge in by hand:
 
 - `budget set-reset <when>` stores `period_anchor` so period boundaries are
-  right.
-- `budget set-observed 43%` records what `/usage` shows. The ledger stores the
-  observed fraction, the time, and powerqueue's own measured fraction at that
-  moment (`kv` key `budget.calibration.claude`, `CALIBRATION_KEY`;
-  `calibration_key(provider)` for the others). From then on the
-  period fraction used by the policy's overall-budget gate is
-  `measured + (observed - measured)`, clamped to 0..2, so pacing accounts for
-  usage it cannot see. A calibration taken in an earlier period is ignored;
-  `budget show` says `calibration none this period` until you run it again.
-  Re-run it whenever the numbers drift.
+  right (unnecessary once a probe has reported the reset).
+- `budget set-observed 43%` records what `/usage` shows as a reading, for
+  providers without a probe or before a session has answered.
 
-If `/usage` shows you are consistently ahead of powerqueue's estimate, lower
-`period_weighted_tokens`; if you never get close to the limit, raise it.
+The pre-0.7 additive calibration (kv `budget.calibration.<p>`) is no longer
+read.
 
 ## The estimator
 
@@ -404,11 +462,14 @@ raises the chore to `normal` on Fridays (edit PRIORITY.md; it reloads live).
 | cost estimator | fewer than 5 samples, or leave-one-out error above 60% | let tasks finish; add Linear estimates and consistent labels so buckets form |
 | fable reservation | under-used: > 70% of the period gone with < 30% of Fable's share spent | lower `models.fable.relax_after_fraction` or `min_criticality` |
 | fable reservation | over-paced: spent fraction more than 25 points ahead of elapsed | raise `models.fable.min_criticality` or lower its share |
-| window pressure | more than 90% of the window budget spent | lower `scheduler.max_concurrent` or raise `window_weighted_tokens` if `/usage` shows headroom |
+| window pressure | more than 90% of the window used (observed when the provider reports it) | lower `scheduler.max_concurrent` or wait for the roll-over |
+| `<provider>` usage rate | the learned rate says the configured `period_weighted_tokens` is more than 2× off | set it to the learned value (printed) |
+| fable share | Fable's share is smaller than one typical task × its weight: it could never lend itself to less critical work | raise `models.fable.share` or lower `models.fable.weight` |
+| scheduling (*state*) | `powerqueue pause` is in effect | `powerqueue resume` |
 | throttling | more than 10 `task.throttled` events in 24 h | raise `period_weighted_tokens` / `window_weighted_tokens` or lower expensive shares |
 | crash rate | `session.crashed` over `session.launched` above 30% in 7 days | check `claude.permission_mode` and `repo.setup`; raise `stale_session_secs` if work is just slow |
 | idle / attention rate | `session.nudged` + `task.needs_attention` + `task.blocked` + `session.permission_prompt` events over launches above 30% | tighten the completion protocol (always run `task complete`) or use a less interactive permission mode |
 
-There is no staleness check for the calibration; `budget show` tells you
-whether one exists for the current period. `doctor --json` includes the
-detail text of each finding so you can track it.
+`budget show` tells you whether the rate is learned for the current period
+and from how many readings. `doctor --json` includes the detail text of
+each finding so you can track it.
