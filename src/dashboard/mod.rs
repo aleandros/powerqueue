@@ -144,7 +144,7 @@ pub fn run(cfg: &Config, paths: &Paths, store: &Store, options: Options) -> Resu
     // the terminal is sane even when a panic happens before/after that.
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        ratatui::restore();
+        restore_and_clear_terminal();
         previous_hook(info);
     }));
     let mut terminal = ratatui::try_init().context("initialise terminal (raw mode + alternate screen)")?;
@@ -152,11 +152,26 @@ pub fn run(cfg: &Config, paths: &Paths, store: &Store, options: Options) -> Resu
     // whatever the terminal showed before (shell history, a tmux pane that
     // ignores the alternate screen) would stay visible behind the dashboard.
     // Clearing forces a full redraw of the very first frame.
-    terminal.clear().context("clear terminal")?;
-    let result = event_loop(&mut terminal, &mut app, cfg, store);
-    ratatui::restore();
+    let result = terminal.clear().context("clear terminal").and_then(|()| event_loop(&mut terminal, &mut app, cfg, store));
+    restore_and_clear_terminal();
     let _ = std::panic::take_hook();
     result
+}
+
+/// Clear both the dashboard buffer and the restored shell screen. Clearing
+/// before leaving also works in tmux panes with alternate-screen disabled.
+/// Best effort so cleanup cannot hide the original error or panic.
+fn restore_and_clear_terminal() {
+    use ratatui::crossterm::{
+        cursor::MoveTo,
+        execute,
+        style::ResetColor,
+        terminal::{Clear, ClearType},
+    };
+    let mut stdout = std::io::stdout();
+    let _ = execute!(stdout, ResetColor, Clear(ClearType::All), MoveTo(0, 0));
+    ratatui::restore();
+    let _ = execute!(stdout, ResetColor, Clear(ClearType::All), MoveTo(0, 0));
 }
 
 /// Draw one frame of `snapshot` into a `width`×`height` buffer and return it
@@ -213,7 +228,14 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut DashboardApp, c
         }
         if last_refresh.elapsed() >= REFRESH_EVERY {
             match Snapshot::load(store, cfg, Utc::now()) {
-                Ok(s) => app.set_snapshot(s),
+                Ok(s) => {
+                    if s.has_new_attention_since(&app.snapshot) {
+                        // The terminal decides whether BEL is audible, visual,
+                        // or ignored. No external notification service needed.
+                        let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::style::Print('\u{7}'));
+                    }
+                    app.set_snapshot(s);
+                }
                 Err(e) => app.status_line = Some(format!("refresh failed: {e:#}")),
             }
             last_refresh = Instant::now();
@@ -257,7 +279,7 @@ fn attach(app: &mut DashboardApp, cfg: &Config, terminal: &mut ratatui::DefaultT
         }
         return;
     }
-    ratatui::restore();
+    restore_and_clear_terminal();
     // On unix this replaces the process and never returns on success.
     let outcome = tmux.attach(&session.tmux_session, Some(&session.tmux_window));
     match ratatui::try_init() {
@@ -268,7 +290,7 @@ fn attach(app: &mut DashboardApp, cfg: &Config, terminal: &mut ratatui::DefaultT
         }
         Err(e) => {
             // Without a terminal there is nothing left to draw on.
-            ratatui::restore();
+            restore_and_clear_terminal();
             eprintln!("cannot re-initialise the terminal after attach: {e}");
             std::process::exit(crate::cli::commands::dashboard::EXIT_NO_TTY);
         }

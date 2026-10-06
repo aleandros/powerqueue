@@ -113,11 +113,20 @@ Fixes:
 
 ## Stuck in `needs_attention`
 
+The dashboard rings the terminal bell once per newly observed attention state.
+Select the task and press Enter to respond. A reply clears attention automatically;
+permission requests also clear on a finished tool call or new assistant response.
+Explicit blockers still require a reply. Older sessions
+without the new tool hooks recover on fresh assistant output or prompt submission.
+After updating the binary, restart the daemon to load the fix. New sessions get
+the ordered hooks; running Claude sessions retain their original hook settings.
+
+
 **Symptom**: the task is waiting for a human.
 
 Why it happens: Claude printed `[[POWERQUEUE:BLOCKED]]` or ran
 `task block`, its last message read like a question (ends with `?`, "should
-I", "let me know", ...), it hit a permission prompt (`Notification` hook with
+I", "please confirm", ...), it hit a permission prompt (`Notification` hook with
 `permission_prompt`), a `StopFailure` reported `authentication_failed`, or
 it was idle longer than `scheduler.idle_timeout_secs` after a nudge.
 
@@ -125,7 +134,7 @@ it was idle longer than `scheduler.idle_timeout_secs` after a nudge.
 powerqueue task show ENG-123           # the reason is the last event / "last error"
 powerqueue attach ENG-123              # answer in the session
 powerqueue task send ENG-123 "Use the v2 endpoint, then finish."
-powerqueue task resume ENG-123         # back to running (queued if the session is gone)
+powerqueue task resume ENG-123         # explicit recovery if needed
 ```
 
 `task send` types into the pane and presses Enter; it refuses when the
@@ -439,3 +448,15 @@ or a "Do you want to proceed?" prompt, and the task is `needs_attention`.
   (`powerqueue attach ENG-123`, choose "don't ask again" where sensible), add
   the commands your repo needs to `claude.allowed_tools`, or switch
   `claude.permission_mode` to `auto` or `bypassPermissions` for unattended runs.
+
+## Token counts look much larger than Claude's percentage
+
+`WTOK` / `WEIGHTED TOKENS` is cumulative estimated consumption, not context
+occupancy or subscription utilization. `task show <task>` breaks down raw tokens;
+`task show <task> --json` includes exact per-task and per-session usage. Cache reads
+can count the same context on each API call. Weighted output tokens count 5x,
+cache writes 1.25x and cache reads 0.1x. Compare matching units and time ranges;
+there is no fixed conversion from "1M weighted tokens" to Claude's "27%".
+The same message id is counted once even if its content spans several transcript
+lines or the daemon restarts. Provider quota percentages appear separately in
+`powerqueue budget` when an observed usage probe is available.

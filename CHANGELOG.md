@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Clear the dashboard and restored shell screen on exit, including `q`, Ctrl+C
+  and tmux panes with alternate-screen disabled, without purging scrollback.
+- Clear stale `needs_attention` and its reason after prompt submission; permission
+  requests also clear on tool completion or newer assistant output. Preserve
+  explicit blockers and paused/finished tasks and
+  ignore historical transcript replay as a recovery signal.
+- Preserve Claude hook ordering so delayed permission notifications do not
+  overwrite subsequent activity; register `PostToolUse` / `PostToolUseFailure`.
+- Do not classify courtesy "let me know" closings or requests quoted earlier
+  in an answer as blockers.
+
+### Changed
+
+- Verify token accounting against a captured real Claude Code 2.1.289 session
+  (text, tool calls and resume), including incremental reads and daemon replay.
+- Label weighted token estimates explicitly (`WTOK` in the dashboard) and
+  show the raw token breakdown in `task show`.
+- Ring the live dashboard's terminal bell on new attention states, show a
+  current attention notice and an attach-to-respond hint.
+
 ## [0.4.1] - 2026-10-05
 
 ### Fixed

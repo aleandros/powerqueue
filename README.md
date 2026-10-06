@@ -311,7 +311,7 @@ state machine allows it. `complete` and `block` always write directly.
    first message. The session is interactive, so `powerqueue attach` drops
    you into it at any time.
 6. Hooks (`SessionStart`, `Stop`, `StopFailure`, `SessionEnd`, `Notification`,
-   `PreCompact`, `UserPromptSubmit`) call `powerqueue hook`, which stores the
+   `PreCompact`, `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`) call `powerqueue hook`, which stores the
    payload in SQLite. The daemon drains these, tails the transcript JSONL for
    token usage (deduplicated by message id), and samples CPU/RSS.
 
@@ -329,9 +329,11 @@ with your own Markdown (see [`[prompt]`](#prompt)); `powerqueue task prompt
   its own completes the task; text after the marker becomes the summary.
 - **Blocked**: run `powerqueue task block <id> --reason "..."` and print
   `[[POWERQUEUE:BLOCKED]]`. The task moves to `needs_attention` and waits for a
-  human (`powerqueue attach`, then `task resume`). A final message that reads
-  like a question (ends with `?`, or says "should I", "let me know", ...) is
-  treated the same way.
+  human (`powerqueue attach <task>` or `task send <task> "reply"`). A direct
+  question on the final line is treated the same way; courtesy closings such
+  as "let me know" are not blockers. A submitted reply clears attention and
+  its old reason. Permission requests also clear on a completed tool call or
+  newer assistant response; explicit blockers still require a reply.
 - Attempts after the first add an `## Attempt N` section saying how the
   previous one ended.
 - A turn that ends without a marker leaves the task `idle`. After
@@ -343,6 +345,26 @@ with your own Markdown (see [`[prompt]`](#prompt)); `powerqueue task prompt
   `scheduler.max_attempts` the task is `failed`.
 - A `StopFailure` with `rate_limit`, `overloaded`, `usage_limit` or `quota`
   puts the tier on cooldown and the task in `throttled`.
+
+### Responding to attention requests
+
+Keep `powerqueue dashboard` open for a terminal bell when a task newly enters
+`needs_attention` (sound/visual behavior depends on the terminal's bell settings).
+Its footer shows the current number waiting; select a task and press Enter to
+attach and answer. The notice disappears when no tasks need attention.
+
+```sh
+powerqueue task show ENG-123                 # reason and timeline
+powerqueue task output ENG-123 -n 80         # inspect the actual prompt
+powerqueue task send ENG-123 "Use the v2 endpoint, then finish."
+powerqueue attach ENG-123                   # interact with permission dialogs
+```
+
+Use `task send` for text replies and `attach` for permission menus. The daemon
+clears attention after it observes resumed activity, not merely when text is
+sent. `task resume` remains available for explicitly resuming a task.
+Existing Linear blocker comments respect `linear.post_comments`; incoming
+Linear comments and email replies are not consumed as session input.
 
 ### Cleanup
 
@@ -827,6 +849,16 @@ rules cannot satisfy (for example an order decided by the budget policy) come
 back as an explanation with no change.
 
 ## Budget pacing
+
+Task tables label their cumulative estimate **WEIGHTED TOKENS** (`WTOK` in the
+dashboard). It sums every API call across all attempts, with the weighting below;
+`task show` also displays raw input, output, cache-write and cache-read totals.
+These are not the tokens currently held in Claude's context window, and are not
+a subscription percentage. A task can exceed 1M weighted tokens while Claude
+shows 27% context or quota usage. Reused context can be read on many calls.
+Per-task totals exclude the model multiplier used by the budget ledger.
+Usage records are deduplicated by message id, including after daemon restarts.
+
 
 Every API call's usage is weighted (`input + 1.25·cache_write + 0.1·cache_read + 5·output`),
 multiplied by the model's weight, and charged against its provider's period

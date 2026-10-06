@@ -30,16 +30,22 @@ Settings shape (file passed via `--settings`):
 ```json
 {
   "hooks": {
-    "SessionStart": [{ "hooks": [{ "type": "command", "command": "/abs/powerqueue hook --task <id> --session <sid> --event SessionStart", "timeout": 10, "async": true }] }],
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "/abs/powerqueue hook --task <id> --session <sid> --event SessionStart", "timeout": 10 }] }],
     "Stop":         [{ "hooks": [{ "type": "command", "command": "... --event Stop", "timeout": 10 }] }],
     "StopFailure":  [{ "hooks": [{ "type": "command", "command": "... --event StopFailure", "timeout": 10 }] }],
     "SessionEnd":   [{ "hooks": [{ "type": "command", "command": "... --event SessionEnd", "timeout": 10 }] }],
-    "Notification": [{ "hooks": [{ "type": "command", "command": "... --event Notification", "timeout": 10, "async": true }] }],
+    "Notification": [{ "hooks": [{ "type": "command", "command": "... --event Notification", "timeout": 10 }] }],
     "PreCompact":   [{ "hooks": [{ "type": "command", "command": "... --event PreCompact", "timeout": 10, "async": true }] }],
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "... --event UserPromptSubmit", "timeout": 10, "async": true }] }]
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "... --event UserPromptSubmit", "timeout": 10 }] }],
+    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "... --event PostToolUse", "timeout": 10 }] }],
+    "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "... --event PostToolUseFailure", "timeout": 10 }] }]
   }
 }
 ```
+
+State-changing hooks run synchronously to preserve ordering; only `PreCompact`
+runs asynchronously. Tool completion and prompt submission clear stale attention
+when the task and session are still live.
 
 Hook input arrives on **stdin** as JSON. Common fields: `session_id`, `transcript_path`, `cwd`, `hook_event_name`, `permission_mode`. Event-specific:
 

@@ -199,7 +199,7 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
     if !color {
         table.force_no_tty();
     }
-    table.set_header(vec!["KEY", "STATE", "CRIT", "MODEL", "ATTEMPT", "TOKENS", "CPU/RSS", "AGE/RUNTIME", "TITLE"]);
+    table.set_header(vec!["KEY", "STATE", "CRIT", "MODEL", "ATTEMPT", "WEIGHTED TOKENS", "CPU/RSS", "AGE/RUNTIME", "TITLE"]);
     for row in &rows {
         let t = &row.task;
         let state = if color { output::state_colored(t.state) } else { t.state.to_string() };

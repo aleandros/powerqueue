@@ -160,9 +160,14 @@ case "$mode" in
       exit 1
     fi
     ;;
-  idle)
+  idle|attention-reply)
     usage_line "msg_${session:0:8}_idle" 50 "Should I continue?"
     fire Stop "\"last_assistant_message\":\"I made some changes. Should I continue?\",\"stop_hook_active\":false"
+    if [ "$mode" = attention-reply ]; then
+      IFS= read -r reply
+      fire UserPromptSubmit '"prompt":"continue"'
+      usage_line "msg_${session:0:8}_reply" 25 "Continuing after your answer"
+    fi
     sleep "${FAKE_CLAUDE_IDLE_SECS:-120}"
     fire SessionEnd "\"reason\":\"other\""
     exit 0

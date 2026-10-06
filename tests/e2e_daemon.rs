@@ -330,6 +330,21 @@ fn blocked_session_needs_attention() {
 }
 
 #[test]
+fn terminal_reply_clears_attention_in_status_and_dashboard() {
+    let Some(mut env) = Env::new("attention-reply", "") else { return };
+    let key = add_task(&env, "Wait for my answer", &[]);
+    env.start_daemon();
+    assert_eq!(env.wait_for_state(&key, "needs_attention", Duration::from_secs(60)), "needs_attention");
+    env.run_ok(&["task", "send", &key, "Continue"]);
+    assert_eq!(env.wait_for_state(&key, "running", Duration::from_secs(30)), "running", "{}", env.daemon_log());
+    let show = env.wait_for_show(&key, |v| has_event(v, "task.attention_resolved"));
+    assert!(show["task"]["last_error"].is_null());
+    let dashboard: serde_json::Value = serde_json::from_str(&env.run_ok(&["dashboard", "--once", "--json"])).unwrap();
+    let task = dashboard["tasks"].as_array().unwrap().iter().find(|t| t["key"] == key).unwrap();
+    assert_eq!(task["state"], "running");
+}
+
+#[test]
 fn task_runs_on_codex_when_selected() {
     let Some(mut env) = Env::codex("complete") else { return };
     let key = add_task(&env, "Say hello on codex", &["--model", "gpt-6-astra"]);

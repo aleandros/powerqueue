@@ -162,7 +162,7 @@ mod tests {
         assert_eq!(launch.files[0].0, dir.path().join("settings.json"));
         assert_eq!(launch.files[0].2, 0o644);
         let settings: serde_json::Value = serde_json::from_str(&launch.files[0].1).unwrap();
-        assert_eq!(settings["hooks"].as_object().unwrap().len(), 7);
+        assert_eq!(settings["hooks"].as_object().unwrap().len(), HookEvent::ALL.len());
         assert_eq!(launch.argv[0], "claude");
         assert_eq!(launch.argv[1], "--session-id");
         assert!(launch.argv.contains(&"opus".to_string()));

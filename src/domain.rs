@@ -890,10 +890,12 @@ pub enum HookEvent {
     Notification,
     PreCompact,
     UserPromptSubmit,
+    PostToolUse,
+    PostToolUseFailure,
 }
 
 impl HookEvent {
-    pub const ALL: [HookEvent; 7] = [
+    pub const ALL: [HookEvent; 9] = [
         HookEvent::SessionStart,
         HookEvent::SessionEnd,
         HookEvent::Stop,
@@ -901,6 +903,8 @@ impl HookEvent {
         HookEvent::Notification,
         HookEvent::PreCompact,
         HookEvent::UserPromptSubmit,
+        HookEvent::PostToolUse,
+        HookEvent::PostToolUseFailure,
     ];
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -911,6 +915,8 @@ impl HookEvent {
             HookEvent::Notification => "Notification",
             HookEvent::PreCompact => "PreCompact",
             HookEvent::UserPromptSubmit => "UserPromptSubmit",
+            HookEvent::PostToolUse => "PostToolUse",
+            HookEvent::PostToolUseFailure => "PostToolUseFailure",
         }
     }
 }

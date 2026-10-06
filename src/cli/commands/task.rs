@@ -295,6 +295,15 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
             format!("{} weighted ({} raw)", human_f64(usage.weighted()), human_f64(usage.total() as f64))
         },
     );
+    if !usage.is_zero() {
+        kv(
+            "token breakdown",
+            format!(
+                "{} input + {} output + {} cache write + {} cache read (all calls, all attempts)",
+                usage.input_tokens, usage.output_tokens, usage.cache_creation_input_tokens, usage.cache_read_input_tokens
+            ),
+        );
+    }
     kv("created", opt_ts(Some(task.created_at)));
     kv("updated", opt_ts(Some(task.updated_at)));
     kv("started", opt_ts(task.started_at));
@@ -315,7 +324,18 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
         if !color {
             table.force_no_tty();
         }
-        table.set_header(vec!["ATTEMPT", "MODEL", "STATE", "PID", "STARTED", "ENDED", "EXIT", "TOKENS", "PEAK RSS", "AVG CPU"]);
+        table.set_header(vec![
+            "ATTEMPT",
+            "MODEL",
+            "STATE",
+            "PID",
+            "STARTED",
+            "ENDED",
+            "EXIT",
+            "WEIGHTED TOKENS",
+            "PEAK RSS",
+            "AVG CPU",
+        ]);
         for (s, u, stats) in &session_rows {
             table.add_row(vec![
                 Cell::new(s.attempt),

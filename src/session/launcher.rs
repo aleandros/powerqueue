@@ -69,9 +69,9 @@ fn default_provider() -> Provider {
     Provider::Claude
 }
 
-/// Hooks that only record activity and may run in the background.
-const ASYNC_HOOKS: [HookEvent; 4] =
-    [HookEvent::SessionStart, HookEvent::Notification, HookEvent::PreCompact, HookEvent::UserPromptSubmit];
+/// Compaction is informational. State-changing hooks stay ordered: an async
+/// permission notification could otherwise arrive after the tool has finished.
+const ASYNC_HOOKS: [HookEvent; 1] = [HookEvent::PreCompact];
 
 /// Seconds a hook may take before Claude Code gives up on it.
 const HOOK_TIMEOUT_SECS: u64 = 10;
@@ -305,10 +305,9 @@ pub fn render_template(template: &str, vars: &BTreeMap<&'static str, String>) ->
 /// Claude Code settings JSON wiring every relevant hook to `powerqueue hook`.
 ///
 /// Each event runs `<bin> hook --task <id> --session <sid> --event <Event>`
-/// with a 10 s timeout. Activity-only events (`SessionStart`, `Notification`,
-/// `PreCompact`, `UserPromptSubmit`) are `async`; `Stop`, `StopFailure` and
-/// `SessionEnd` run synchronously so they are recorded before Claude moves
-/// on. The settings carry hooks only: environment goes into `launch.sh`.
+/// with a 10 s timeout. Only `PreCompact` is asynchronous; state-changing
+/// events run synchronously to preserve their order. The settings carry
+/// hooks only: environment goes into `launch.sh`.
 pub fn hook_settings(
     powerqueue_bin: &Path,
     task_id: TaskId,
@@ -675,7 +674,7 @@ mod tests {
         let sid = uuid::Uuid::new_v4();
         let v = hook_settings(Path::new("/opt/power queue/bin/powerqueue"), t.id, sid, &ClaudeConfig::default());
         let hooks = v["hooks"].as_object().unwrap();
-        assert_eq!(hooks.len(), 7);
+        assert_eq!(hooks.len(), HookEvent::ALL.len());
         for event in HookEvent::ALL {
             let entry = &hooks[event.as_str()][0]["hooks"][0];
             assert_eq!(entry["type"], "command");
@@ -687,10 +686,7 @@ mod tests {
                 "{event:?}"
             );
             let is_async = entry.get("async").and_then(|a| a.as_bool()).unwrap_or(false);
-            let expected = matches!(
-                event,
-                HookEvent::SessionStart | HookEvent::Notification | HookEvent::PreCompact | HookEvent::UserPromptSubmit
-            );
+            let expected = event == HookEvent::PreCompact;
             assert_eq!(is_async, expected, "{event:?}");
         }
         assert!(v.get("env").is_none());
@@ -787,7 +783,7 @@ mod tests {
         assert!(prompt.contains("# ENG-123") && prompt.contains("attempt 2"));
 
         let settings: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&plan.settings_path).unwrap()).unwrap();
-        assert_eq!(settings["hooks"].as_object().unwrap().len(), 7);
+        assert_eq!(settings["hooks"].as_object().unwrap().len(), HookEvent::ALL.len());
         assert!(
             settings["hooks"]["Stop"][0]["hooks"][0]["command"]
                 .as_str()

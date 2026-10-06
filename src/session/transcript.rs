@@ -86,6 +86,8 @@ pub struct TranscriptReader {
     pub last_text: Option<String>,
     /// Timestamp of the newest line read.
     pub last_line_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Newest timestamped assistant response, excluding bookkeeping lines.
+    pub last_progress_at: Option<DateTime<Utc>>,
     /// Which CLI wrote the transcript.
     pub provider: Provider,
     /// The model the session was launched with (fallback for usage lines
@@ -117,6 +119,7 @@ impl TranscriptReader {
             task_id,
             last_text: None,
             last_line_at: None,
+            last_progress_at: None,
             provider,
             launched_model,
             state: TranscriptState::default(),
@@ -190,6 +193,11 @@ impl TranscriptReader {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
         if let Some(ts) = v.get("timestamp").or_else(|| v.get("created_at")).and_then(|t| t.as_str()).and_then(parse_timestamp) {
             self.last_line_at = Some(ts);
+            if v.get("type").and_then(|t| t.as_str()) == Some("assistant")
+                && v.get("isSidechain").and_then(|v| v.as_bool()) != Some(true)
+            {
+                self.last_progress_at = Some(self.last_progress_at.map_or(ts, |previous| previous.max(ts)));
+            }
         }
         if v.get("type").and_then(|t| t.as_str()) == Some("assistant")
             && let Some(text) = newest_text_block(&v)
@@ -338,6 +346,7 @@ mod tests {
         assert_eq!(recs[0].message_id, "msg_1");
         assert_eq!(reader.last_text.as_deref(), Some("first answer"));
         assert_eq!(reader.last_line_at.unwrap().to_rfc3339(), "2026-10-01T23:16:00+00:00");
+        assert_eq!(reader.last_progress_at, parse_timestamp(TS), "user/bookkeeping lines are not assistant progress");
         assert_eq!(reader.offset, std::fs::metadata(&path).unwrap().len());
 
         // Nothing new: nothing returned.
@@ -352,6 +361,29 @@ mod tests {
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].message_id, "msg_2");
         assert_eq!(reader.last_text.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn usage_is_not_multiplied_by_content_blocks_or_reader_restarts() {
+        let (sid, tid) = ids();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let line = assistant_line("msg_repeat", r#"{"type":"text","text":"answer"}"#, TS);
+        std::fs::write(&path, format!("{line}\n{line}\n{line}\n")).unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        for _ in 0..2 {
+            let mut reader = TranscriptReader::new(path.clone(), sid, tid);
+            for record in reader.read_new().unwrap() {
+                store.record_usage(&record).unwrap();
+            }
+        }
+        let usage = store.usage_for_task(tid).unwrap();
+        assert_eq!(
+            usage,
+            TokenUsage { input_tokens: 2, output_tokens: 100, cache_creation_input_tokens: 500, cache_read_input_tokens: 1000 }
+        );
+        assert_eq!(usage.total(), 1602);
+        assert_eq!(usage.weighted(), 1227.0);
     }
 
     #[test]

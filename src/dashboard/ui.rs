@@ -281,9 +281,8 @@ fn draw_header(frame: &mut Frame, app: &DashboardApp, area: Rect) {
 fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) {
     let rows = app.rows();
     let title_width = area.width.saturating_sub(2 + 12 + 11 + 9 + 13 + 7 + 5 + 9 + 7 + 8).max(10);
-    let header =
-        Row::new(["KEY", "STATE", "CRIT", "MODEL", "TOKENS", "CPU", "RSS", "AGE", "TITLE"].map(|h| Cell::from(h).bold()))
-            .style(Style::default().fg(Color::DarkGray));
+    let header = Row::new(["KEY", "STATE", "CRIT", "MODEL", "WTOK", "CPU", "RSS", "AGE", "TITLE"].map(|h| Cell::from(h).bold()))
+        .style(Style::default().fg(Color::DarkGray));
     let body = rows.iter().map(|r| {
         Row::new(vec![
             Cell::from(r.key.clone()),
@@ -437,6 +436,9 @@ fn draw_detail(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols)
     if let Some(e) = &task.last_error {
         lines.push(Line::from(Span::styled(format!("error {e}"), Style::default().fg(Color::Red))));
     }
+    if task.state == TaskState::NeedsAttention {
+        lines.push(Line::from(Span::styled("press Enter to attach and respond", Style::default().fg(Color::Yellow))));
+    }
     match app.snapshot.latest_session(task.id) {
         Some(s) => {
             let started = s.started_at.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string();
@@ -472,7 +474,9 @@ fn draw_detail(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols)
 
 fn draw_footer(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) {
     let keys = sym.keys;
-    let line = match &app.status_line {
+    let attention = app.snapshot.tasks.iter().filter(|t| t.state == TaskState::NeedsAttention).count();
+    let notice = (attention > 0).then(|| format!("{attention} need attention: select task + Enter to respond"));
+    let line = match app.status_line.as_ref().or(notice.as_ref()) {
         Some(s) => Line::from(vec![
             Span::styled(format!(" {s}"), Style::default().fg(Color::Yellow)),
             Span::styled(format!("   {keys}"), Style::default().fg(Color::DarkGray)),
@@ -503,6 +507,7 @@ fn draw_add_modal(frame: &mut Frame, input: &str, area: Rect, sym: &Symbols) {
 
 fn draw_help(frame: &mut Frame, area: Rect, sym: &Symbols) {
     let lines = [
+        "WTOK: cumulative weighted tokens, not context or quota %".to_string(),
         format!("{} k/j  move selection      g/G  first/last", sym.arrows),
         "a/enter    attach to the task's tmux window".to_string(),
         "p / r      pause / resume      c    cancel".to_string(),

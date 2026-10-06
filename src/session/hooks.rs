@@ -33,11 +33,10 @@ const RATE_LIMIT_ERRORS: [&str; 4] = ["rate_limit", "overloaded", "usage_limit",
 
 /// Phrases (lower-case) that mark a message as a request for human input
 /// even without the explicit blocked marker. See [`looks_like_question`].
-const QUESTION_PHRASES: [&str; 8] = [
+const QUESTION_PHRASES: [&str; 7] = [
     "should i",
     "do you want me to",
     "would you like me to",
-    "let me know",
     "which option",
     "which one would you",
     "please confirm",
@@ -87,22 +86,23 @@ pub fn interpret_hook(event: HookEvent, payload: &serde_json::Value) -> HookOutc
             kind: field("notification_type").unwrap_or_else(|| "unknown".to_string()),
             message: field("message").unwrap_or_default(),
         },
-        HookEvent::PreCompact | HookEvent::UserPromptSubmit => HookOutcome::Activity { event },
+        HookEvent::PreCompact | HookEvent::UserPromptSubmit | HookEvent::PostToolUse | HookEvent::PostToolUseFailure => {
+            HookOutcome::Activity { event }
+        }
     }
 }
 
 /// Heuristic for "Claude stopped because it is waiting on a human": the last
-/// non-empty line ends with a question mark, or the message contains one of
-/// `QUESTION_PHRASES` (`should I`, `do you want me to`, `let me know`, ...).
-/// False positives only cost a `needs_attention` flag, so the bias is towards
-/// catching questions.
+/// non-empty line ends with a question mark, or starts with a direct request
+/// for a decision. Earlier quoted questions and courtesy closings such as
+/// "let me know" do not by themselves mean that work is blocked.
 pub fn looks_like_question(message: &str) -> bool {
     let last = last_line(message);
     if last.trim_end_matches(['*', '_', '`', ')', '"', '\'']).ends_with('?') {
         return true;
     }
-    let lower = message.to_ascii_lowercase();
-    QUESTION_PHRASES.iter().any(|p| lower.contains(p))
+    let lower = last.trim_start_matches(['*', '_', '`', ' ', '-', '>']).to_ascii_lowercase();
+    QUESTION_PHRASES.iter().any(|p| lower.strip_prefix(p).is_some_and(|rest| rest.starts_with([' ', '?', ':'])))
 }
 
 /// Last non-empty line of a message, trimmed (empty string if none).
@@ -180,7 +180,7 @@ mod tests {
         let out = stop("Should I also update the docs? I'll wait.");
         assert_eq!(out, HookOutcome::Blocked { reason: "Should I also update the docs? I'll wait.".into() });
         let out = stop("Done with part one. Let me know if you want more.");
-        assert!(matches!(out, HookOutcome::Blocked { .. }));
+        assert!(matches!(out, HookOutcome::TurnEnded { .. }));
         let out = stop("Do you want me to proceed with the migration?**");
         assert!(matches!(out, HookOutcome::Blocked { .. }));
     }
@@ -247,5 +247,8 @@ mod tests {
         assert!(!looks_like_question(""));
         assert!(!looks_like_question("Done."));
         assert!(looks_like_question("Please confirm the target branch."));
+        assert!(!looks_like_question("The template says 'please confirm'.\nMigration created and tested."));
+        assert!(!looks_like_question("Let me know if you want any changes."));
+        assert!(!looks_like_question("I documented which option the migration uses."));
     }
 }

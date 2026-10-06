@@ -95,17 +95,24 @@ pub fn on_hook_outcome(
     period_end: DateTime<Utc>,
 ) -> Vec<Effect> {
     let mut effects = Vec::new();
+    // Late activity/notifications must not resurrect finished or paused work.
+    if !matches!(outcome, HookOutcome::Started { .. } | HookOutcome::Completed { .. } | HookOutcome::SessionEnded { .. })
+        && (task.state.is_terminal() || task.state == TaskState::Paused || !session.state.is_live())
+    {
+        return effects;
+    }
     session.last_activity_at = now;
     match outcome {
         HookOutcome::Started { transcript_path, source } => {
             if transcript_path.is_some() {
                 session.transcript_path = transcript_path.clone();
             }
-            if session.state.is_live() {
+            if session.state.is_live() && !task.state.is_terminal() && task.state != TaskState::Paused {
                 session.state = SessionState::Running;
             }
             if matches!(task.state, TaskState::Starting | TaskState::Idle | TaskState::NeedsAttention | TaskState::Crashed) {
                 task.state = TaskState::Running;
+                task.last_error = None;
             }
             effects.push(Effect::log(
                 EventLevel::Info,
@@ -171,8 +178,11 @@ pub fn on_hook_outcome(
         }
         HookOutcome::TurnEnded { last_message } => {
             session.state = SessionState::Idle;
-            if matches!(task.state, TaskState::Running | TaskState::Starting) {
+            if matches!(task.state, TaskState::Running | TaskState::Starting)
+                || (task.state == TaskState::NeedsAttention && waiting_for_permission(task))
+            {
                 task.state = TaskState::Idle;
+                task.last_error = None;
             }
             effects.push(Effect::log(
                 EventLevel::Debug,
@@ -283,11 +293,10 @@ pub fn on_hook_outcome(
             )),
         },
         HookOutcome::Activity { event } => {
-            if *event == HookEvent::UserPromptSubmit && session.state == SessionState::Idle {
-                session.state = SessionState::Running;
-                if task.state == TaskState::Idle {
-                    task.state = TaskState::Running;
-                }
+            if *event == HookEvent::UserPromptSubmit {
+                effects.extend(resume_after_activity(task, session));
+            } else if matches!(event, HookEvent::PostToolUse | HookEvent::PostToolUseFailure) {
+                effects.extend(on_progress(task, session));
             }
             effects.push(Effect::log(
                 EventLevel::Debug,
@@ -298,6 +307,42 @@ pub fn on_hook_outcome(
         }
     }
     effects
+}
+
+/// Resume idle tasks and clear permission attention after agent progress.
+/// Explicit blockers still require a reply: finishing `task block` or writing
+/// its explanation is not a resolution. No I/O or failure is possible.
+pub fn on_progress(task: &mut Task, session: &mut Session) -> Vec<Effect> {
+    if task.state == TaskState::NeedsAttention && !waiting_for_permission(task) {
+        return Vec::new();
+    }
+    resume_after_activity(task, session)
+}
+
+fn waiting_for_permission(task: &Task) -> bool {
+    task.last_error.as_deref().is_some_and(|reason| reason.starts_with("waiting for permission:"))
+}
+
+fn resume_after_activity(task: &mut Task, session: &mut Session) -> Vec<Effect> {
+    if !session.state.is_live()
+        || !matches!(task.state, TaskState::Starting | TaskState::Running | TaskState::Idle | TaskState::NeedsAttention)
+    {
+        return Vec::new();
+    }
+    let attention = task.state == TaskState::NeedsAttention;
+    task.state = TaskState::Running;
+    task.last_error = None;
+    session.state = SessionState::Running;
+    if attention {
+        vec![Effect::log(
+            EventLevel::Info,
+            "task.attention_resolved",
+            "agent activity resumed; attention cleared",
+            serde_json::json!({}),
+        )]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Apply a liveness probe for a live session.
@@ -593,6 +638,15 @@ mod tests {
         let mut paused = task(TaskState::Paused, 1);
         on_hook_outcome(&mut paused, &mut s, &out, &cfg(), now(), period_end());
         assert_eq!(paused.state, TaskState::Paused, "a paused task is not resumed by a hook");
+
+        // A fast `task complete` can beat draining SessionStart. We still
+        // need its real transcript path to collect the final usage.
+        let mut completed = task(TaskState::Completed, 1);
+        let mut exited = session(SessionState::Exited, 1);
+        on_hook_outcome(&mut completed, &mut exited, &out, &cfg(), now(), period_end());
+        assert_eq!(completed.state, TaskState::Completed);
+        assert_eq!(exited.state, SessionState::Exited);
+        assert_eq!(exited.transcript_path.as_deref(), Some("/tmp/x.jsonl"));
     }
 
     #[test]
@@ -799,6 +853,76 @@ mod tests {
         assert_eq!(s.state, SessionState::Crashed);
         assert_eq!(t.not_before, Some(now() + Duration::seconds(30)));
         assert_eq!(kinds(&fx), vec!["session.crashed"]);
+    }
+
+    #[test]
+    fn answering_or_finishing_a_tool_clears_attention_and_error() {
+        for event in [HookEvent::UserPromptSubmit, HookEvent::PostToolUse, HookEvent::PostToolUseFailure] {
+            for state in [SessionState::Idle, SessionState::Running] {
+                let mut t = task(TaskState::NeedsAttention, 1);
+                t.last_error = Some("waiting for permission: Bash".into());
+                let mut s = session(state, 1);
+                let out = HookOutcome::Activity { event };
+                let fx = on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), period_end());
+                assert_eq!(t.state, TaskState::Running, "{event:?} / {state:?}");
+                assert_eq!(s.state, SessionState::Running);
+                assert_eq!(t.last_error, None);
+                assert!(kinds(&fx).contains(&"task.attention_resolved".to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn housekeeping_and_late_events_do_not_resume_tasks() {
+        let mut t = task(TaskState::NeedsAttention, 1);
+        let mut s = session(SessionState::Idle, 1);
+        let out = HookOutcome::Activity { event: HookEvent::PreCompact };
+        on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), period_end());
+        assert_eq!(t.state, TaskState::NeedsAttention);
+        for state in [TaskState::Paused, TaskState::Completed, TaskState::Cancelled, TaskState::Failed] {
+            let mut t = task(state, 1);
+            for out in [
+                HookOutcome::Activity { event: HookEvent::PostToolUse },
+                HookOutcome::Notification { kind: "permission_prompt".into(), message: "old prompt".into() },
+            ] {
+                on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), period_end());
+                assert_eq!(t.state, state);
+            }
+        }
+        let mut t = task(TaskState::NeedsAttention, 1);
+        let mut s = session(SessionState::Exited, 1);
+        assert!(on_progress(&mut t, &mut s).is_empty());
+        assert_eq!(t.state, TaskState::NeedsAttention);
+    }
+
+    #[test]
+    fn a_new_unblocked_turn_end_clears_old_attention() {
+        let mut t = task(TaskState::NeedsAttention, 1);
+        t.last_error = Some("waiting for permission: Bash".into());
+        let mut s = session(SessionState::Running, 1);
+        let out = HookOutcome::TurnEnded { last_message: "Migration created.".into() };
+        on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), period_end());
+        assert_eq!(t.state, TaskState::Idle);
+        assert_eq!(t.last_error, None);
+    }
+
+    #[test]
+    fn explicit_blocker_survives_tool_completion_until_a_reply() {
+        let mut t = task(TaskState::NeedsAttention, 1);
+        t.last_error = Some("need staging credentials".into());
+        let mut s = session(SessionState::Running, 1);
+        for out in [
+            HookOutcome::Activity { event: HookEvent::PostToolUse },
+            HookOutcome::TurnEnded { last_message: "Waiting for credentials.".into() },
+        ] {
+            on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), period_end());
+            assert_eq!(t.state, TaskState::NeedsAttention);
+        }
+        assert!(on_progress(&mut t, &mut s).is_empty());
+        let reply = HookOutcome::Activity { event: HookEvent::UserPromptSubmit };
+        on_hook_outcome(&mut t, &mut s, &reply, &cfg(), now(), period_end());
+        assert_eq!(t.state, TaskState::Running);
+        assert_eq!(t.last_error, None);
     }
 
     #[test]

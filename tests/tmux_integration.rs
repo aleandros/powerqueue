@@ -78,6 +78,49 @@ fn wait_for_output(tmux: &Tmux, pane_id: &str, needle: &str) -> String {
 }
 
 #[test]
+fn dashboard_exit_clears_the_screen_with_and_without_alternate_screen() {
+    use powerqueue::tmux::shell_quote;
+    use std::process::Command;
+
+    let Some(srv) = Server::start() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config");
+    std::fs::create_dir(&config).unwrap();
+    std::fs::write(config.join("config.toml"), format!("[repo]\npath = {:?}\n", root.path())).unwrap();
+    srv.tmux.ensure_session("pq", root.path()).unwrap();
+    let bin = shell_quote(&assert_cmd::cargo::cargo_bin("powerqueue").to_string_lossy());
+    let home = shell_quote(&root.path().to_string_lossy());
+    for alternate in ["on", "off"] {
+        for key in ["q", "C-c"] {
+            let output = Command::new("tmux")
+                .args(["-L", &srv.socket, "set-option", "-gw", "alternate-screen", alternate])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let command = format!(
+                "env -u NO_COLOR POWERQUEUE_HOME={home} POWERQUEUE_SECRETS=file TERM=xterm-256color {bin} dashboard; printf 'DASHBOARD_EXIT:%s\\n' $?; sleep 30"
+            );
+            let window = srv.tmux.new_window("pq", "dashboard", root.path(), &command, true).unwrap();
+            let screen = wait_for_output(&srv.tmux, &window.pane_id, "daemon not running");
+            assert!(screen.contains("daemon not running"), "dashboard did not render: {screen}");
+            let output =
+                Command::new("tmux").args(["-L", &srv.socket, "send-keys", "-t", &window.pane_id, key]).output().unwrap();
+            assert!(output.status.success());
+            let screen = wait_for_output(&srv.tmux, &window.pane_id, "DASHBOARD_EXIT:");
+            assert!(screen.contains("DASHBOARD_EXIT:0"), "dashboard did not exit successfully: {screen}");
+            // capture_pane includes scrollback. Check only the visible screen;
+            // leaving the dashboard must not erase the user's shell history.
+            let output =
+                Command::new("tmux").args(["-L", &srv.socket, "capture-pane", "-p", "-t", &window.pane_id]).output().unwrap();
+            assert!(output.status.success());
+            let screen = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(screen.trim(), "DASHBOARD_EXIT:0", "alternate-screen={alternate}, exit={key}: {screen}");
+            srv.tmux.kill_window(&window.window_id).unwrap();
+        }
+    }
+}
+
+#[test]
 fn version_reports_tmux() {
     let Some(srv) = Server::start() else { return };
     let v = srv.tmux.version().unwrap();

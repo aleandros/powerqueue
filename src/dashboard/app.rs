@@ -48,6 +48,15 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Whether a task newly needs attention compared with the previous refresh.
+    /// Pure comparison; unchanged blockers do not trigger repeated alerts.
+    pub fn has_new_attention_since(&self, previous: &Self) -> bool {
+        self.tasks.iter().any(|task| {
+            task.state == TaskState::NeedsAttention
+                && !previous.tasks.iter().any(|old| old.id == task.id && old.state == TaskState::NeedsAttention)
+        })
+    }
+
     /// Read everything from the store. The ledger is optional: when it cannot
     /// be computed the budget panel says so instead of failing the frame.
     pub fn load(store: &Store, cfg: &Config, now: DateTime<Utc>) -> Result<Snapshot> {
@@ -416,6 +425,17 @@ mod tests {
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn attention_alerts_only_on_entry_and_rearm_after_resolution() {
+        let before = snapshot();
+        let mut blocked = before.clone();
+        blocked.tasks[1].state = TaskState::NeedsAttention;
+        assert!(blocked.has_new_attention_since(&before));
+        assert!(!blocked.has_new_attention_since(&blocked));
+        assert!(!before.has_new_attention_since(&blocked));
+        assert!(blocked.has_new_attention_since(&before));
     }
 
     #[test]

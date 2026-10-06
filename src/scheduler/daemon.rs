@@ -251,7 +251,7 @@ impl Daemon {
         self.report_phase("linear", r);
         let r = self.process_hooks(now).await;
         self.report_phase("hooks", r);
-        let r = self.tail_transcripts(now);
+        let r = self.tail_transcripts(now).await;
         self.report_phase("transcripts", r);
         let r = self.probe_sessions(now).await;
         self.report_phase("probes", r);
@@ -948,6 +948,9 @@ impl Daemon {
         let outcome = interpret_hook(ev.event, &ev.payload);
         tracing::debug!(task = %task.key, session = %session.id, event = ev.event.as_str(), ?outcome, "hook outcome");
         let effects = transitions::on_hook_outcome(&mut task, &mut session, &outcome, &self.cfg, now, period_end);
+        if task.state == TaskState::Running && session.state == SessionState::Running {
+            self.rt.nudged.remove(&session.id);
+        }
         self.store.update_session(&session)?;
         self.store.update_task(&task)?;
         self.apply_effects(&mut task, Some(&session), effects).await;
@@ -1032,7 +1035,7 @@ impl Daemon {
 
     // ---------------------------------------------------------- transcripts
 
-    fn tail_transcripts(&mut self, now: DateTime<Utc>) -> Result<()> {
+    async fn tail_transcripts(&mut self, now: DateTime<Utc>) -> Result<()> {
         if let Err(e) = self.discover_agent_sessions(now) {
             tracing::warn!(error = %format!("{e:#}"), "agent session discovery failed");
         }
@@ -1071,6 +1074,9 @@ impl Daemon {
             // New lines without usage (e.g. Antigravity transcripts) still count as activity.
             let advanced = reader.offset != offset_before;
             let newest_line = reader.last_line_at;
+            // A restart replays the whole transcript. Only responses newer
+            // than the last hook/activity may clear an outstanding blocker.
+            let progressed = advanced && reader.last_progress_at.is_some_and(|at| at > session.last_activity_at && at <= now);
             // A Codex rollout carries a rate-limit snapshot in every
             // `token_count`; treat it like a probe result so live sessions
             // keep the observed usage fresh between probe runs.
@@ -1104,6 +1110,14 @@ impl Daemon {
             }
             let newest = newest_line.unwrap_or(now).min(now);
             if session.state.is_live() {
+                if progressed && let Some(mut task) = self.store.get_task(session.task_id)? {
+                    let effects = transitions::on_progress(&mut task, &mut session);
+                    self.store.update_task(&task)?;
+                    self.apply_effects(&mut task, Some(&session), effects).await;
+                    if task.state == TaskState::Running {
+                        self.rt.nudged.remove(&session.id);
+                    }
+                }
                 session.last_activity_at = session.last_activity_at.max(newest);
                 if session.state == SessionState::Launching {
                     session.state = SessionState::Running;
@@ -1702,6 +1716,67 @@ async fn wait_for_signal() {
 mod tests {
     use super::*;
     use crate::budget::{AnchorSource, Ledger, Period, TierLedger};
+
+    #[tokio::test]
+    async fn only_fresh_assistant_output_recovers_attention_after_replay() {
+        use crate::domain::{Task, TaskSource};
+        use crate::secrets::FileBackend;
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        let store = Store::open_in_memory().unwrap();
+        let secrets = Secrets::with_backend(Box::new(FileBackend::new(paths.secrets_file())));
+        let mut daemon = Daemon::new(Config::default(), paths, store.clone(), secrets).unwrap();
+        let mut task = Task::new("ATTN-1", "Waiting", TaskSource::Manual);
+        task.state = TaskState::NeedsAttention;
+        task.last_error = Some("waiting for permission: Bash".into());
+        store.insert_task(&task).unwrap();
+        let at = Utc::now() - Duration::minutes(1);
+        let path = dir.path().join("transcript.jsonl");
+        let mut session = Session {
+            id: uuid::Uuid::new_v4(),
+            task_id: task.id,
+            attempt: 1,
+            model: ModelTier::sonnet(),
+            state: SessionState::Idle,
+            tmux_session: "pq".into(),
+            tmux_window: "@1".into(),
+            pane_id: None,
+            pid: None,
+            transcript_path: Some(path.display().to_string()),
+            exit_code: None,
+            started_at: at - Duration::minutes(1),
+            ended_at: None,
+            last_activity_at: at,
+            error: None,
+            agent_session_id: None,
+        };
+        store.insert_session(&session).unwrap();
+        let mut transcript = std::fs::File::create(&path).unwrap();
+        for (kind, timestamp) in [("assistant", at - Duration::seconds(1)), ("system", at + Duration::seconds(1))] {
+            writeln!(transcript, "{}", serde_json::json!({"type": kind, "timestamp": timestamp})).unwrap();
+        }
+        daemon.tail_transcripts(Utc::now()).await.unwrap();
+        assert_eq!(store.get_task(task.id).unwrap().unwrap().state, TaskState::NeedsAttention);
+        daemon.rt.nudged.insert(session.id);
+        writeln!(transcript, "{}", serde_json::json!({"type": "assistant", "timestamp": at + Duration::seconds(2)})).unwrap();
+        daemon.tail_transcripts(Utc::now()).await.unwrap();
+        let recovered = store.get_task(task.id).unwrap().unwrap();
+        assert_eq!(recovered.state, TaskState::Running);
+        assert_eq!(recovered.last_error, None);
+        assert_eq!(store.get_session(session.id).unwrap().unwrap().state, SessionState::Running);
+        assert!(!daemon.rt.nudged.contains(&session.id));
+        assert_eq!(store.count_events_of_kind("task.attention_resolved", at).unwrap(), 1);
+
+        // A later blocker must survive a daemon restart that rereads old output.
+        store.update_task(&task).unwrap();
+        session.last_activity_at = at + Duration::seconds(3);
+        store.update_session(&session).unwrap();
+        daemon.rt.readers.clear();
+        daemon.tail_transcripts(Utc::now()).await.unwrap();
+        assert_eq!(store.get_task(task.id).unwrap().unwrap().state, TaskState::NeedsAttention);
+    }
 
     #[test]
     fn reserve_counts_against_tier_and_totals() {
