@@ -32,6 +32,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   open tasks, failed parent closes (`linear.parent_error` events).
 - Events `task.blocked`, `task.unblocked`, `linear.parent_closed`,
   `linear.parent_error`.
+- Review hand-off and PR watcher. `task complete <id> --pr <url>` moves a
+  task to the new `in_review` state instead of `completed`: its session and
+  tmux window end, its slot is freed and its worktree released (cleanup as on
+  completion, but the local branch is kept and Linear is not moved); the PR
+  URL is stored in `tasks.pr_url` and the watcher's state in `tasks.review`
+  (schema v5). Every `scheduler.pr_poll_secs` (120) the daemon reads the PR
+  with `gh api graphql`: merged ⇒ `completed` and the local branch deleted,
+  without touching Linear; closed ⇒ `needs_attention`; `CONFLICTING`, a
+  failed required check or unresolved review threads newer than the
+  hand-off ⇒ a review round; blocked with `scheduler.merge_hold_label`
+  (`merge/hold`) ⇒ wait for a manual merge; unchanged for
+  `scheduler.review_stale_hours` (24) ⇒ Linear comment + `needs_attention`.
+  A review round recreates the worktree at the same path, runs `repo.setup`
+  and resumes the same agent session with `scheduler.review_prompt`
+  (default `/ship-pr {pr} --reason {reason} {detail}`); rounds count against
+  `scheduler.review_rounds_max` (5), not `max_attempts`. `task resume` on a
+  task the watcher parked watches the PR again; `task retry` runs one more
+  round. New config keys `scheduler.pr_poll_secs`, `review_rounds_max`,
+  `review_stale_hours`, `merge_hold_label`, `review_prompt`, `gh_binary`.
+- `task show` prints the PR and its timeline (`--json`: `pr_timeline`);
+  `status` and the dashboard count `in review` apart from `running`, and show
+  the PR (and "waiting for manual merge") in `WAITING ON`.
+- `doctor`: `gh` check (installed and logged in; a failure while tasks are in
+  review) and a `reviews` check (tasks parked by the watcher, `review.error`
+  events).
+- Events `task.in_review`, `session.released`, `review.status`,
+  `review.relaunch`, `review.merged`, `review.closed`, `review.hold`,
+  `review.stale`, `review.rounds_exhausted`, `review.error`,
+  `cleanup.branch_deleted`.
 
 ## [0.5.0] - 2026-10-06
 

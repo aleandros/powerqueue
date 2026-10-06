@@ -231,6 +231,39 @@ fn check_git() -> CheckResult {
     }
 }
 
+/// The GitHub CLI the PR watcher runs: installed and logged in. Missing is
+/// a failure only while tasks wait in review (nothing would ever advance
+/// them); otherwise a warning, since `task complete --pr` needs it.
+fn check_gh(cfg: &Config, store: &Store) -> CheckResult {
+    const NAME: &str = "gh";
+    if cfg.scheduler.pr_poll_secs == 0 {
+        return CheckResult::skipped(ENV, NAME, "PR watcher disabled (scheduler.pr_poll_secs = 0)");
+    }
+    let in_review = store.list_tasks_in_states(&[TaskState::InReview]).map(|t| t.len()).unwrap_or(0);
+    let bin = cfg.scheduler.gh_binary.as_str();
+    let problem = |detail: String, hint: &str| {
+        if in_review > 0 {
+            CheckResult::fail(ENV, NAME, format!("{detail}; {in_review} task(s) in review cannot advance"), hint)
+        } else {
+            CheckResult::warn(ENV, NAME, format!("{detail}; `task complete --pr` hand-offs would never be watched"), hint)
+        }
+    };
+    let version = match version_of(bin, "--version") {
+        Ok(v) => v,
+        Err(e) => {
+            return problem(format!("{e:#}"), "install the GitHub CLI (https://cli.github.com) or set scheduler.gh_binary");
+        }
+    };
+    match std::process::Command::new(bin).args(["auth", "status"]).stdin(std::process::Stdio::null()).output() {
+        Ok(out) if out.status.success() => CheckResult::ok(ENV, NAME, version),
+        Ok(out) => problem(
+            format!("`{bin} auth status` failed: {}", String::from_utf8_lossy(&out.stderr).trim()),
+            "run `gh auth login` as the user the daemon runs as",
+        ),
+        Err(e) => problem(format!("cannot run `{bin} auth status`: {e}"), "check scheduler.gh_binary"),
+    }
+}
+
 fn check_tmux(cfg: &Config) -> CheckResult {
     let tmux = Tmux::new(cfg.tmux.binary.clone(), cfg.tmux.socket_name.clone());
     match tmux.version() {
@@ -937,6 +970,60 @@ fn blocker_cycles(tasks: &[&Task]) -> Vec<String> {
     out
 }
 
+/// Tasks handed off for review: how many are watched, which the watcher
+/// parked for a human (PR closed, stale, review rounds used up), and
+/// whether the watcher itself failed (`watcher_errors`: `review.error`
+/// events in the last day).
+pub fn review_status(tasks: &[Task], watcher_errors: u64, rounds_max: u32) -> CheckResult {
+    const NAME: &str = "reviews";
+    let parked: Vec<String> = tasks
+        .iter()
+        .filter(|t| t.state == TaskState::NeedsAttention && t.pr_url.is_some() && t.review.is_some())
+        .map(|t| format!("{} ({})", t.key, t.last_error.as_deref().unwrap_or("needs a human")))
+        .collect();
+    if !parked.is_empty() {
+        return CheckResult::warn(
+            STATE,
+            NAME,
+            format!("{} task(s) parked by the PR watcher: {}", parked.len(), parked.join("; ")),
+            format!(
+                "look at the PR; `powerqueue task resume <key>` watches it again, `task retry <key>` runs one more review round (rounds max {rounds_max}: scheduler.review_rounds_max)"
+            ),
+        );
+    }
+    let review: Vec<&Task> = tasks.iter().filter(|t| t.state == TaskState::InReview).collect();
+    if watcher_errors > 0 {
+        return CheckResult::warn(
+            STATE,
+            NAME,
+            format!("{watcher_errors} PR watcher error(s) in the last 24h; {} task(s) in review", review.len()),
+            "see `powerqueue logs --events` (kind `review.error`); usually gh is not logged in or lacks access to the repository",
+        );
+    }
+    if review.is_empty() {
+        return CheckResult::ok(STATE, NAME, "no task in review");
+    }
+    let manual = review.iter().filter(|t| t.review.as_ref().is_some_and(|r| r.waiting_manual_merge)).count();
+    CheckResult::ok(
+        STATE,
+        NAME,
+        format!(
+            "{} task(s) in review{}",
+            review.len(),
+            if manual > 0 { format!(", {manual} waiting for a manual merge") } else { String::new() }
+        ),
+    )
+}
+
+fn check_reviews(cfg: &Config, store: &Store) -> CheckResult {
+    let tasks = match store.list_tasks() {
+        Ok(t) => t,
+        Err(e) => return CheckResult::fail(STATE, "reviews", format!("{e:#}"), "check the database"),
+    };
+    let errors = store.count_events_of_kind("review.error", Utc::now() - Duration::hours(24)).unwrap_or(0);
+    review_status(&tasks, errors, cfg.scheduler.review_rounds_max)
+}
+
 fn check_dependencies(cfg: &Config, store: &Store) -> CheckResult {
     let tasks = match store.list_tasks() {
         Ok(t) => t,
@@ -1376,6 +1463,7 @@ pub async fn run_all(
     let mut results = Vec::new();
     results.push(check_git());
     results.push(check_tmux(cfg));
+    results.push(check_gh(cfg, store));
     results.extend(check_claude(cfg));
     results.push(check_terminal());
 
@@ -1397,6 +1485,7 @@ pub async fn run_all(
     results.push(check_daemon(store));
     results.push(check_stuck_tasks(cfg, store, fix));
     results.push(check_dependencies(cfg, store));
+    results.push(check_reviews(cfg, store));
     results.push(check_orphan_worktrees(cfg, paths, store, fix));
     results.push(check_orphan_windows(cfg, store, fix));
     results.push(check_stale_lock(paths, store, fix));
@@ -1551,6 +1640,25 @@ mod tests {
         assert_eq!(c.detail, "Not logged in");
         let d = parse_claude_auth(true, "not json", "");
         assert!(d.logged_in);
+    }
+
+    #[test]
+    fn review_status_reports_parked_and_failing_watchers() {
+        let mut watched = Task::new("R-1", "R-1", crate::domain::TaskSource::Manual);
+        watched.state = TaskState::InReview;
+        watched.pr_url = Some("https://github.com/o/r/pull/1".into());
+        watched.review = Some(crate::domain::ReviewWatch::armed(Utc::now(), None));
+        let r = review_status(std::slice::from_ref(&watched), 0, 5);
+        assert_eq!((r.status, r.detail.as_str()), (Status::Ok, "1 task(s) in review"));
+        assert_eq!(review_status(std::slice::from_ref(&watched), 3, 5).status, Status::Warn);
+        let mut parked = watched.clone();
+        parked.key = "R-2".into();
+        parked.state = TaskState::NeedsAttention;
+        parked.last_error = Some("PR #1 has not changed".into());
+        let r = review_status(&[watched, parked], 0, 5);
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("R-2 (PR #1 has not changed)"), "{}", r.detail);
+        assert_eq!(review_status(&[], 0, 5).status, Status::Ok);
     }
 
     #[test]

@@ -91,6 +91,20 @@ and in `doctor`; the parent stays watched and is retried on the next poll.
 A parent powerqueue already closed is never handled again, even if you
 reopen it.
 
+## A task stays `in_review` / is not relaunched
+
+The PR watcher runs `gh` (`scheduler.gh_binary`) every
+`scheduler.pr_poll_secs`; `0` turns it off. `doctor` checks that gh is
+installed and logged in (`gh auth status` as the daemon's user) and lists
+`review.error` events; `task show <task>` prints the PR's timeline and the
+current review round. The watcher only relaunches for a conflict, a failed
+**required** check (branch protection) or unresolved review threads with a
+comment newer than the hand-off; anything else waits. A PR labelled
+`scheduler.merge_hold_label` and blocked waits for a manual merge and is never
+reported stale. After `scheduler.review_rounds_max` relaunches the task is
+parked in `needs_attention`: `task retry` runs one more round, `task resume`
+watches the PR again.
+
 ## A task keeps crashing
 
 **Symptom**: state cycles `starting` → `crashed`, then `failed` after

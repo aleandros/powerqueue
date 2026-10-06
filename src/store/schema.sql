@@ -35,7 +35,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
     started_at      TEXT,
-    completed_at    TEXT
+    completed_at    TEXT,
+    pr_url          TEXT,                      -- pull request handed off with `task complete --pr` (v5)
+    review          TEXT                       -- JSON ReviewWatch: PR watcher state (v5)
 );
 CREATE INDEX IF NOT EXISTS tasks_state_idx ON tasks(state);
 CREATE INDEX IF NOT EXISTS tasks_linear_idx ON tasks(linear_issue_id);

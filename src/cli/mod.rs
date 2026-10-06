@@ -7,7 +7,7 @@
 //! powerqueue dashboard            live TUI
 //! powerqueue status               one-shot table
 //! powerqueue add "title" [...]    enqueue a manual task
-//! powerqueue task <show|list|complete|block|cancel|pause|resume|retry|explain|model|prompt|output|send>
+//! powerqueue task <show|list|complete [--pr]|block|cancel|pause|resume|retry|explain|model|prompt|output|send>
 //! powerqueue attach <task>        open the task's tmux window
 //! powerqueue priority <show|check|edit|explain|simulate|path>
 //! powerqueue tune "what you expect" [-y] [--dry-run] [--scope priority|config|all]   let Claude edit PRIORITY.md / config.toml for you; --apply [DIR], --undo
@@ -208,11 +208,16 @@ pub enum TaskCommand {
     /// List tasks (same as `status`).
     List(StatusArgs),
     /// Mark a task completed (also used by Claude from inside the session).
+    /// With `--pr`, hand it off for review instead: `in_review`, slot and
+    /// worktree released, the daemon watches the PR.
     Complete {
         #[command(flatten)]
         task: TaskRef,
         #[arg(short, long)]
         summary: Option<String>,
+        /// GitHub pull request whose merge is armed (`https://github.com/OWNER/REPO/pull/N`)
+        #[arg(long, value_name = "URL")]
+        pr: Option<String>,
     },
     /// Mark a task blocked / needing a human.
     Block {

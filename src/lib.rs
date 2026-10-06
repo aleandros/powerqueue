@@ -27,6 +27,7 @@ pub mod config;
 pub mod dashboard;
 pub mod doctor;
 pub mod domain;
+pub mod github;
 pub mod hook;
 pub mod jev;
 pub mod linear;

@@ -1,0 +1,368 @@
+//! The PR watcher's decisions (pure).
+//!
+//! A task handed off with `powerqueue task complete --pr <url>` sits in
+//! `in_review` without a session. Every `scheduler.pr_poll_secs` the daemon
+//! asks GitHub for the PR ([`crate::github::Gh::pr_status`]) and
+//! [`on_pr_status`] decides, in this order:
+//!
+//! | PR | result |
+//! |----|--------|
+//! | merged | `completed`; local branch deleted; Linear untouched |
+//! | closed without merge | `needs_attention` |
+//! | `CONFLICTING` | relaunch, reason `conflict` |
+//! | a required check failed | relaunch, reason `ci_failed <names>` |
+//! | unresolved threads with comments newer than the arming | relaunch, reason `review` |
+//! | `BLOCKED` with the hold label | wait for a human to merge (no stale report) |
+//! | unchanged for `review_stale_hours` | Linear comment + `needs_attention` |
+//!
+//! A relaunch moves the task back to `queued` with a pending
+//! [`ReviewRelaunch`]; the scheduler then recreates the worktree at the same
+//! path and resumes the same agent session with `scheduler.review_prompt`.
+//! Relaunches count against `scheduler.review_rounds_max`, not `max_attempts`.
+
+use chrono::{DateTime, Duration, Utc};
+
+use crate::config::SchedulerConfig;
+use crate::domain::{EventLevel, ReviewRelaunch, ReviewWatch, Task, TaskState};
+use crate::github::PrStatus;
+
+use super::transitions::Effect;
+
+/// `last_error` of a task whose PR was closed without merging.
+pub const CLOSED_UNMERGED: &str = "the pull request was closed without merging";
+
+/// One-line summary of what GitHub reported; a change of this value is a
+/// change of the PR (staleness restarts).
+pub fn fingerprint(status: &PrStatus, armed_at: DateTime<Utc>) -> String {
+    let failed = status.failed_required_checks();
+    let finished = status.checks.iter().filter(|c| !c.conclusion.is_empty()).count();
+    format!(
+        "{} {} {} head {} checks {finished}/{} failed [{}] new threads {} labels [{}]",
+        status.state,
+        status.mergeable,
+        status.merge_state_status,
+        status.head_oid.as_deref().map(|h| &h[..h.len().min(7)]).unwrap_or("?"),
+        status.checks.len(),
+        failed.join(","),
+        status.new_unresolved_threads(armed_at),
+        status.labels.join(",")
+    )
+}
+
+/// Human summary for the timeline (`review.status` events).
+fn describe(status: &PrStatus, armed_at: DateTime<Utc>) -> String {
+    let failed = status.failed_required_checks();
+    let pending = status.checks.iter().filter(|c| c.conclusion.is_empty()).count();
+    let mut parts = vec![format!("PR #{} {}", status.number, status.state.to_lowercase())];
+    if status.state == "OPEN" {
+        parts.push(format!("{} / {}", status.mergeable.to_lowercase(), status.merge_state_status.to_lowercase()));
+        parts.push(if status.auto_merge { "auto-merge armed".to_string() } else { "auto-merge off".to_string() });
+        parts.push(format!("{} check(s), {pending} pending", status.checks.len()));
+        if !failed.is_empty() {
+            parts.push(format!("failed: {}", failed.join(", ")));
+        }
+        let threads = status.new_unresolved_threads(armed_at);
+        if threads > 0 {
+            parts.push(format!("{threads} new unresolved thread(s)"));
+        }
+    }
+    parts.join("; ")
+}
+
+/// Render `scheduler.review_prompt` for a relaunch.
+pub fn review_prompt(template: &str, relaunch: &ReviewRelaunch, pr_url: &str) -> String {
+    template
+        .replace("{pr}", &relaunch.pr_number.to_string())
+        .replace("{url}", pr_url)
+        .replace("{reason}", &relaunch.reason)
+        .replace("{detail}", &relaunch.detail)
+        .trim()
+        .to_string()
+}
+
+/// Apply one poll result to an `in_review` task. Mutates `task` (state,
+/// review bookkeeping) and returns the effects for the daemon: events, a
+/// Linear comment, branch deletion. Tasks in any other state are left alone.
+pub fn on_pr_status(task: &mut Task, status: &PrStatus, cfg: &SchedulerConfig, now: DateTime<Utc>) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    if task.state != TaskState::InReview {
+        return effects;
+    }
+    let mut watch = task.review.clone().unwrap_or_else(|| ReviewWatch::armed(now, None));
+    watch.last_polled_at = Some(now);
+    let print = fingerprint(status, watch.armed_at);
+    if watch.fingerprint.as_deref() != Some(print.as_str()) {
+        watch.fingerprint = Some(print.clone());
+        watch.last_change_at = now;
+        effects.push(Effect::Log {
+            level: EventLevel::Info,
+            kind: "review.status".into(),
+            message: describe(status, watch.armed_at),
+            data: serde_json::json!({ "pr": task.pr_url, "status": status, "fingerprint": print }),
+        });
+    }
+
+    let failed = status.failed_required_checks();
+    let threads = status.new_unresolved_threads(watch.armed_at);
+    let relaunch = if status.state == "MERGED" {
+        task.state = TaskState::Completed;
+        task.completed_at = Some(now);
+        task.last_error = None;
+        watch.waiting_manual_merge = false;
+        effects.push(log(EventLevel::Info, "review.merged", format!("PR #{} was merged; task completed", status.number)));
+        effects.push(Effect::DeleteBranch);
+        None
+    } else if status.state == "CLOSED" {
+        park(task, CLOSED_UNMERGED.to_string());
+        watch.waiting_manual_merge = false;
+        effects.push(log(EventLevel::Warn, "review.closed", format!("PR #{} was closed without merging", status.number)));
+        None
+    } else if status.mergeable == "CONFLICTING" {
+        Some(("conflict", String::new()))
+    } else if !failed.is_empty() {
+        Some(("ci_failed", failed.join(" ")))
+    } else if threads > 0 {
+        Some(("review", format!("{threads} unresolved thread(s)")))
+    } else {
+        let hold = status.merge_state_status == "BLOCKED" && status.has_label(&cfg.merge_hold_label);
+        if hold != watch.waiting_manual_merge {
+            watch.waiting_manual_merge = hold;
+            let message = if hold {
+                format!("PR #{} is blocked with `{}`: waiting for a manual merge", status.number, cfg.merge_hold_label)
+            } else {
+                format!("PR #{} is no longer held for a manual merge", status.number)
+            };
+            effects.push(log(EventLevel::Info, "review.hold", message));
+        }
+        let stale = cfg.review_stale_hours > 0 && now - watch.last_change_at >= Duration::hours(cfg.review_stale_hours as i64);
+        if stale && !hold {
+            let since = watch.last_change_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let reason =
+                format!("PR #{} has not changed since {since} (review_stale_hours = {})", status.number, cfg.review_stale_hours);
+            park(task, reason.clone());
+            effects.push(log(EventLevel::Warn, "review.stale", reason));
+            effects.push(Effect::LinearComment {
+                body: format!(
+                    "powerqueue: el PR {} no ha cambiado en {} h ({}). La tarea queda en `needs_attention`; \
+                     `powerqueue task resume {}` la vuelve a vigilar.",
+                    task.pr_url.as_deref().unwrap_or("?"),
+                    cfg.review_stale_hours,
+                    describe(status, watch.armed_at),
+                    task.key
+                ),
+            });
+        }
+        None
+    };
+
+    if let Some((reason, detail)) = relaunch {
+        let request = ReviewRelaunch { pr_number: status.number, reason: reason.to_string(), detail, requested_at: now };
+        let what =
+            format!("{reason}{}", if request.detail.is_empty() { String::new() } else { format!(" ({})", request.detail) });
+        watch.waiting_manual_merge = false;
+        if watch.rounds >= cfg.review_rounds_max {
+            park(
+                task,
+                format!("PR #{} needs work ({what}) but review_rounds_max = {} is used up", status.number, cfg.review_rounds_max),
+            );
+            effects.push(log(
+                EventLevel::Warn,
+                "review.rounds_exhausted",
+                format!(
+                    "{what}: {} review round(s) already used; a human must decide (`task retry` runs one more round)",
+                    watch.rounds
+                ),
+            ));
+            effects.push(Effect::LinearComment {
+                body: format!(
+                    "powerqueue: el PR {} necesita trabajo ({what}), pero ya se usaron las {} rondas de revisión. \
+                     La tarea queda en `needs_attention`.",
+                    task.pr_url.as_deref().unwrap_or("?"),
+                    cfg.review_rounds_max
+                ),
+            });
+        } else {
+            watch.rounds += 1;
+            watch.attempt_base = task.attempts;
+            task.state = TaskState::Queued;
+            task.not_before = None;
+            task.last_error = None;
+            effects.push(Effect::Log {
+                level: EventLevel::Info,
+                kind: "review.relaunch".into(),
+                message: format!(
+                    "PR #{} needs work ({what}); resuming the session (review round {} of {})",
+                    status.number, watch.rounds, cfg.review_rounds_max
+                ),
+                data: serde_json::json!({ "reason": request.reason, "detail": request.detail, "round": watch.rounds }),
+            });
+        }
+        watch.relaunch = Some(request);
+    }
+    watch.parked = task.state == TaskState::NeedsAttention;
+    task.review = Some(watch);
+    effects
+}
+
+/// Hand the task to a human: `needs_attention` with `reason`.
+fn park(task: &mut Task, reason: String) {
+    task.state = TaskState::NeedsAttention;
+    task.last_error = Some(reason);
+    task.not_before = None;
+}
+
+fn log(level: EventLevel, kind: &str, message: String) -> Effect {
+    Effect::Log { level, kind: kind.to_string(), message, data: serde_json::json!({}) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::TaskSource;
+    use crate::github::{PrCheck, PrThread};
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-10-06T12:00:00Z").unwrap().with_timezone(&Utc)
+    }
+
+    fn status(state: &str, mergeable: &str) -> PrStatus {
+        PrStatus {
+            number: 7,
+            state: state.into(),
+            mergeable: mergeable.into(),
+            merge_state_status: "CLEAN".into(),
+            auto_merge: true,
+            labels: Vec::new(),
+            head_oid: Some("0123456789".into()),
+            checks: vec![PrCheck { name: "test".into(), conclusion: "SUCCESS".into(), required: true }],
+            threads: Vec::new(),
+        }
+    }
+
+    fn task() -> Task {
+        let mut t = Task::new("PR-1", "Ship it", TaskSource::Manual);
+        t.state = TaskState::InReview;
+        t.attempts = 2;
+        t.pr_url = Some("https://github.com/o/r/pull/7".into());
+        t.review = Some(ReviewWatch::armed(now() - Duration::hours(1), None));
+        t
+    }
+
+    fn kinds(effects: &[Effect]) -> Vec<String> {
+        effects
+            .iter()
+            .map(|e| match e {
+                Effect::Log { kind, .. } => kind.clone(),
+                Effect::LinearComment { .. } => "linear_comment".into(),
+                Effect::DeleteBranch => "delete_branch".into(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merged_completes_and_deletes_the_branch_without_moving_linear() {
+        let mut t = task();
+        let fx = on_pr_status(&mut t, &status("MERGED", "UNKNOWN"), &SchedulerConfig::default(), now());
+        assert_eq!(t.state, TaskState::Completed);
+        assert_eq!(kinds(&fx), vec!["review.status", "review.merged", "delete_branch"]);
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Linear { .. })));
+    }
+
+    #[test]
+    fn closed_without_merge_needs_attention() {
+        let mut t = task();
+        on_pr_status(&mut t, &status("CLOSED", "UNKNOWN"), &SchedulerConfig::default(), now());
+        assert_eq!(t.state, TaskState::NeedsAttention);
+        assert_eq!(t.last_error.as_deref(), Some(CLOSED_UNMERGED));
+        assert!(t.parked_in_review(), "resume watches the PR again");
+    }
+
+    #[test]
+    fn conflict_failed_checks_and_new_threads_relaunch_in_that_order() {
+        let cfg = SchedulerConfig::default();
+        let mut t = task();
+        let mut st = status("OPEN", "CONFLICTING");
+        st.checks[0].conclusion = "FAILURE".into();
+        let fx = on_pr_status(&mut t, &st, &cfg, now());
+        assert_eq!(t.state, TaskState::Queued);
+        assert_eq!(kinds(&fx), vec!["review.status", "review.relaunch"]);
+        let review = t.review.clone().unwrap();
+        assert_eq!((review.rounds, review.attempt_base), (1, 2));
+        let relaunch = review.relaunch.unwrap();
+        assert_eq!((relaunch.reason.as_str(), relaunch.pr_number), ("conflict", 7));
+        assert_eq!(
+            review_prompt(&cfg.review_prompt, t.review_relaunch().unwrap(), "u"),
+            "/ship-pr 7 --reason conflict",
+            "no trailing space without a detail"
+        );
+
+        let mut t = task();
+        st.mergeable = "MERGEABLE".into();
+        st.checks.push(PrCheck { name: "lint".into(), conclusion: "FAILURE".into(), required: false });
+        on_pr_status(&mut t, &st, &cfg, now());
+        let relaunch = t.review_relaunch().unwrap().clone();
+        assert_eq!((relaunch.reason.as_str(), relaunch.detail.as_str()), ("ci_failed", "test"));
+        assert_eq!(review_prompt(&cfg.review_prompt, &relaunch, "u"), "/ship-pr 7 --reason ci_failed test");
+
+        let mut t = task();
+        let armed = t.review.as_ref().unwrap().armed_at;
+        let mut st = status("OPEN", "MERGEABLE");
+        st.threads = vec![
+            PrThread { resolved: false, last_comment_at: Some(armed - Duration::minutes(5)) },
+            PrThread { resolved: false, last_comment_at: Some(armed + Duration::minutes(5)) },
+        ];
+        on_pr_status(&mut t, &st, &cfg, now());
+        assert_eq!(
+            t.review_relaunch().map(|r| (r.reason.as_str(), r.detail.as_str())),
+            Some(("review", "1 unresolved thread(s)"))
+        );
+    }
+
+    #[test]
+    fn rounds_are_capped() {
+        let cfg = SchedulerConfig { review_rounds_max: 2, ..SchedulerConfig::default() };
+        let mut t = task();
+        t.review.as_mut().unwrap().rounds = 2;
+        let fx = on_pr_status(&mut t, &status("OPEN", "CONFLICTING"), &cfg, now());
+        assert_eq!(t.state, TaskState::NeedsAttention);
+        assert_eq!(kinds(&fx), vec!["review.status", "review.rounds_exhausted", "linear_comment"]);
+        assert!(t.review_relaunch().is_some(), "`task retry` runs the pending round");
+        assert!(t.parked_in_review(), "`task resume` only watches the PR again");
+        t.review.as_mut().unwrap().rearm(now());
+        assert!(t.review_relaunch().is_none() && !t.review.as_ref().unwrap().parked);
+    }
+
+    #[test]
+    fn unchanged_pr_waits_then_goes_stale_unless_held() {
+        let cfg = SchedulerConfig::default();
+        let mut t = task();
+        let st = status("OPEN", "MERGEABLE");
+        let fx = on_pr_status(&mut t, &st, &cfg, now());
+        assert_eq!(t.state, TaskState::InReview);
+        assert_eq!(kinds(&fx), vec!["review.status"]);
+        // Same status later: no event, still waiting.
+        assert!(on_pr_status(&mut t, &st, &cfg, now() + Duration::hours(2)).is_empty());
+        let fx = on_pr_status(&mut t, &st, &cfg, now() + Duration::hours(24));
+        assert_eq!(t.state, TaskState::NeedsAttention);
+        assert_eq!(kinds(&fx), vec!["review.stale", "linear_comment"]);
+
+        let mut t = task();
+        let mut held = st.clone();
+        held.merge_state_status = "BLOCKED".into();
+        held.labels = vec!["Merge/Hold".into()];
+        let fx = on_pr_status(&mut t, &held, &cfg, now());
+        assert_eq!(kinds(&fx), vec!["review.status", "review.hold"]);
+        assert!(t.review.as_ref().unwrap().waiting_manual_merge);
+        assert!(on_pr_status(&mut t, &held, &cfg, now() + Duration::hours(48)).is_empty(), "a held PR is never stale");
+        assert_eq!(t.state, TaskState::InReview);
+    }
+
+    #[test]
+    fn other_states_are_ignored() {
+        let mut t = task();
+        t.state = TaskState::Running;
+        assert!(on_pr_status(&mut t, &status("MERGED", "UNKNOWN"), &SchedulerConfig::default(), now()).is_empty());
+        assert_eq!(t.state, TaskState::Running);
+    }
+}

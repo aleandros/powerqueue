@@ -78,11 +78,25 @@ pub fn cleanup_plan(cfg: &CleanupConfig, succeeded: bool, has_remote: bool, unpu
 /// Never deletes unpushed work: if `push_branch` fails or there is no
 /// remote, the worktree is kept and an event explains why.
 ///
+/// `for_review` releases a task handed off `in_review`: like a success, but
+/// the local branch is always kept (a review round recreates the worktree
+/// from it) and the tmux window is always closed (the session is resumed
+/// later, never left running).
+///
 /// Mutates `task` (`worktree_path`, `last_error`) but does not persist it;
 /// the caller saves the task. Individual git/tmux failures are logged as
 /// `cleanup.*` events and do not abort the remaining steps; only a store
 /// failure is returned as an error.
-pub fn cleanup_task(cfg: &Config, store: &Store, repo: &Repo, tmux: &Tmux, task: &mut Task, succeeded: bool) -> Result<()> {
+pub fn cleanup_task(
+    cfg: &Config,
+    store: &Store,
+    repo: &Repo,
+    tmux: &Tmux,
+    task: &mut Task,
+    succeeded: bool,
+    for_review: bool,
+) -> Result<()> {
+    let succeeded = succeeded || for_review;
     let log = |level: EventLevel, kind: &str, message: &str, data: serde_json::Value| -> Result<()> {
         store.log_event(Some(task.id), None, level, kind, message, data)?;
         Ok(())
@@ -193,6 +207,10 @@ pub fn cleanup_task(cfg: &Config, store: &Store, repo: &Repo, tmux: &Tmux, task:
         };
 
         let mut plan = cleanup_plan(&cfg.cleanup, succeeded, has_remote, unpushed, pushed_ok);
+        if for_review {
+            plan.delete_branch = false;
+            plan.close_window = true;
+        }
         if !commands_ok && plan.remove_worktree {
             plan.remove_worktree = false;
             plan.delete_branch = false;
@@ -241,9 +259,19 @@ pub fn cleanup_task(cfg: &Config, store: &Store, repo: &Repo, tmux: &Tmux, task:
         log(
             EventLevel::Info,
             "cleanup.done",
-            &format!("cleanup finished ({})", if succeeded { "succeeded" } else { "did not succeed" }),
+            &format!(
+                "cleanup finished ({})",
+                if for_review {
+                    "in review; branch kept"
+                } else if succeeded {
+                    "succeeded"
+                } else {
+                    "did not succeed"
+                }
+            ),
             serde_json::json!({
                 "succeeded": succeeded,
+                "for_review": for_review,
                 "pushed": pushed_ok,
                 "worktree_removed": removed,
                 "branch_deleted": branch_deleted,
@@ -256,7 +284,7 @@ pub fn cleanup_task(cfg: &Config, store: &Store, repo: &Repo, tmux: &Tmux, task:
         if worktree.is_some() {
             task.worktree_path = None;
         }
-        let window_closed = if cfg.cleanup.close_tmux_window { close_window(store, tmux, task) } else { false };
+        let window_closed = if cfg.cleanup.close_tmux_window || for_review { close_window(store, tmux, task) } else { false };
         log(
             EventLevel::Info,
             "cleanup.done",

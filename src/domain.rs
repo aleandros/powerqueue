@@ -447,6 +447,11 @@ pub enum TaskState {
     Blocked,
     /// Claude needs a human (asked a question, blocked by permissions, or reported a blocker).
     NeedsAttention,
+    /// The agent opened a pull request and armed its merge (`task complete
+    /// --pr`). No session runs and no slot is held: the daemon watches the
+    /// PR ([`Task::pr_url`]) and resumes the same session only when
+    /// something needs work (conflict, failed check, new review threads).
+    InReview,
     /// Finished successfully; resources released.
     Completed,
     /// Gave up after `max_attempts` or an unrecoverable error.
@@ -456,7 +461,7 @@ pub enum TaskState {
 }
 
 impl TaskState {
-    pub const ALL: [TaskState; 12] = [
+    pub const ALL: [TaskState; 13] = [
         TaskState::Queued,
         TaskState::Starting,
         TaskState::Running,
@@ -466,6 +471,7 @@ impl TaskState {
         TaskState::Paused,
         TaskState::Blocked,
         TaskState::NeedsAttention,
+        TaskState::InReview,
         TaskState::Completed,
         TaskState::Failed,
         TaskState::Cancelled,
@@ -482,6 +488,7 @@ impl TaskState {
             TaskState::Paused => "paused",
             TaskState::Blocked => "blocked",
             TaskState::NeedsAttention => "needs_attention",
+            TaskState::InReview => "in_review",
             TaskState::Completed => "completed",
             TaskState::Failed => "failed",
             TaskState::Cancelled => "cancelled",
@@ -491,6 +498,13 @@ impl TaskState {
     /// True once the task will never run again.
     pub fn is_terminal(&self) -> bool {
         matches!(self, TaskState::Completed | TaskState::Failed | TaskState::Cancelled)
+    }
+
+    /// True once the agent's work is handed off: finished for good, or parked
+    /// in review. A session still alive in either state is released, and late
+    /// hooks from it never revive the task.
+    pub fn is_handed_off(&self) -> bool {
+        self.is_terminal() || *self == TaskState::InReview
     }
 
     /// True while a tmux window / Claude process is expected to exist.
@@ -511,13 +525,18 @@ impl TaskState {
         match self {
             Queued => matches!(next, Starting | Paused | Cancelled | Throttled | Blocked),
             Starting => matches!(next, Running | Crashed | Failed | Cancelled | Queued),
-            Running => matches!(next, Idle | Crashed | Throttled | NeedsAttention | Completed | Failed | Cancelled | Paused),
-            Idle => matches!(next, Running | Crashed | NeedsAttention | Completed | Failed | Cancelled | Paused),
+            Running => {
+                matches!(next, Idle | Crashed | Throttled | NeedsAttention | InReview | Completed | Failed | Cancelled | Paused)
+            }
+            Idle => matches!(next, Running | Crashed | NeedsAttention | InReview | Completed | Failed | Cancelled | Paused),
             Crashed => matches!(next, Starting | Queued | Failed | Cancelled | Paused | Throttled),
             Throttled => matches!(next, Queued | Starting | Running | Cancelled | Paused | Blocked),
-            Paused => matches!(next, Queued | Cancelled),
+            Paused => matches!(next, Queued | InReview | Cancelled),
             Blocked => matches!(next, Queued | Paused | Cancelled | Completed),
-            NeedsAttention => matches!(next, Queued | Running | Idle | Completed | Failed | Cancelled | Paused | Crashed),
+            NeedsAttention => {
+                matches!(next, Queued | Running | Idle | InReview | Completed | Failed | Cancelled | Paused | Crashed)
+            }
+            InReview => matches!(next, Queued | NeedsAttention | Completed | Cancelled | Paused),
             Completed | Failed | Cancelled => matches!(next, Queued),
         }
     }
@@ -600,6 +619,12 @@ pub struct Task {
     pub updated_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// Pull request the agent handed the task off with (`task complete --pr`).
+    #[serde(default)]
+    pub pr_url: Option<String>,
+    /// PR watcher bookkeeping while the task is (or was) in review.
+    #[serde(default)]
+    pub review: Option<ReviewWatch>,
 }
 
 impl Task {
@@ -638,7 +663,22 @@ impl Task {
             updated_at: now,
             started_at: None,
             completed_at: None,
+            pr_url: None,
+            review: None,
         }
+    }
+
+    /// True for a task the PR watcher parked (stale PR, closed PR, rounds
+    /// used up) or a review paused while waiting: it has a PR and resuming
+    /// it means watching the PR again rather than starting (a paused review
+    /// round with a pending relaunch still runs that round).
+    pub fn parked_in_review(&self) -> bool {
+        self.pr_url.is_some() && self.review.as_ref().is_some_and(|r| r.parked || r.relaunch.is_none())
+    }
+
+    /// The pending review relaunch, if the watcher asked for one.
+    pub fn review_relaunch(&self) -> Option<&ReviewRelaunch> {
+        self.review.as_ref().and_then(|r| r.relaunch.as_ref())
     }
 
     pub fn linear_identifier(&self) -> Option<&str> {
@@ -693,6 +733,87 @@ impl Task {
             self.pending_blockers().into_iter().map(|b| b.key.as_str()).collect()
         }
     }
+}
+
+/// What the PR watcher remembers about a task in review (stored as JSON in
+/// `tasks.review`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReviewWatch {
+    /// When the merge was (last) armed: `task complete --pr`. Review threads
+    /// newer than this are new work; staleness counts from here at the latest.
+    pub armed_at: DateTime<Utc>,
+    /// Relaunches so far (counted against `scheduler.review_rounds_max`).
+    #[serde(default)]
+    pub rounds: u32,
+    /// When the watcher last asked GitHub.
+    #[serde(default)]
+    pub last_polled_at: Option<DateTime<Utc>>,
+    /// When what GitHub reports last changed (see [`ReviewWatch::fingerprint`]).
+    pub last_change_at: DateTime<Utc>,
+    /// Summary of the last observed PR status; a different value is a change.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    /// The PR is blocked and carries the hold label: a human merges it.
+    #[serde(default)]
+    pub waiting_manual_merge: bool,
+    /// Attempts used before the current review round; crashes of a round's
+    /// session count from here, so a relaunch never eats into `max_attempts`.
+    #[serde(default)]
+    pub attempt_base: u32,
+    /// Worktree path of the session that armed the merge; the relaunch
+    /// recreates the worktree there so the agent resumes in the same cwd.
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    /// A relaunch the watcher decided on and the scheduler has not finished yet.
+    #[serde(default)]
+    pub relaunch: Option<ReviewRelaunch>,
+    /// The watcher handed the task to a human (`needs_attention`: PR closed,
+    /// stale, review rounds used up).
+    #[serde(default)]
+    pub parked: bool,
+}
+
+impl ReviewWatch {
+    /// A fresh watch armed at `now`, keeping the rounds of `previous`.
+    pub fn armed(now: DateTime<Utc>, previous: Option<&ReviewWatch>) -> Self {
+        Self {
+            armed_at: now,
+            rounds: previous.map_or(0, |p| p.rounds),
+            last_polled_at: None,
+            last_change_at: now,
+            fingerprint: None,
+            waiting_manual_merge: false,
+            attempt_base: previous.map_or(0, |p| p.attempt_base),
+            worktree_path: None,
+            relaunch: None,
+            parked: false,
+        }
+    }
+
+    /// Watch again from `now` (`task resume`): the staleness clock restarts,
+    /// the next tick polls at once, and the task is no longer parked. A
+    /// relaunch pending from used-up rounds is dropped (`task retry` runs it).
+    pub fn rearm(&mut self, now: DateTime<Utc>) {
+        self.last_change_at = now;
+        self.last_polled_at = None;
+        self.fingerprint = None;
+        self.parked = false;
+        self.relaunch = None;
+    }
+}
+
+/// Why the watcher resumes a session in review, rendered into the review prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRelaunch {
+    /// PR number (`/ship-pr <n>`).
+    pub pr_number: u64,
+    /// `conflict`, `ci_failed` or `review`.
+    pub reason: String,
+    /// Free text after the reason: failed check names, thread count.
+    #[serde(default)]
+    pub detail: String,
+    /// When the watcher asked for it.
+    pub requested_at: DateTime<Utc>,
 }
 
 /// Another Linear issue a task depends on (a blocker or a sub-issue), as

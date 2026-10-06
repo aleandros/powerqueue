@@ -374,6 +374,25 @@ impl Launcher {
         resume_id: Option<&str>,
         previous_error: Option<&str>,
     ) -> Result<LaunchPlan> {
+        self.prepare_with_prompt(cfg, task, session_id, model, attempt, resume, resume_id, previous_error, None)
+    }
+
+    /// [`Launcher::prepare_with_resume_id`] where `prompt_override`, when
+    /// set, replaces the rendered task prompt verbatim (a review round tells
+    /// the resumed session only what changed on its pull request).
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_with_prompt(
+        &self,
+        cfg: &Config,
+        task: &Task,
+        session_id: uuid::Uuid,
+        model: &ModelTier,
+        attempt: u32,
+        resume: bool,
+        resume_id: Option<&str>,
+        previous_error: Option<&str>,
+        prompt_override: Option<&str>,
+    ) -> Result<LaunchPlan> {
         let worktree = worktree_of(task)?;
         let provider = model.provider();
         let agent = agent_for(provider);
@@ -384,7 +403,10 @@ impl Launcher {
         let env_path = task_dir.join("env");
         let script_path = task_dir.join("launch.sh");
 
-        let prompt = render_prompt(task, cfg, &PromptContext { provider, model: Some(model), attempt, previous_error });
+        let prompt = match prompt_override {
+            Some(text) => RenderedPrompt { text: format!("{}\n", text.trim_end()), template: None, warnings: Vec::new() },
+            None => render_prompt(task, cfg, &PromptContext { provider, model: Some(model), attempt, previous_error }),
+        };
         for w in &prompt.warnings {
             tracing::warn!(task = %task.key, session = %session_id, "{w}");
         }

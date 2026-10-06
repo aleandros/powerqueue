@@ -146,7 +146,8 @@ pub fn handle_status_line(store: Option<&Store>, stdin: &mut dyn Read, now: chro
 /// still processes the stored hook row for cleanup and Linear updates.
 fn apply_markers(store: &Store, task_id: TaskId, message: &str) -> Result<()> {
     let Some(mut task) = store.get_task(task_id)? else { return Ok(()) };
-    if task.state.is_terminal() {
+    // In review (`task complete --pr`): the done marker only ends the session.
+    if task.state.is_handed_off() {
         return Ok(());
     }
     if let Some(summary) = text_after(message, DONE_MARKER) {
@@ -277,6 +278,21 @@ mod tests {
         let payload = serde_json::json!({ "last_assistant_message": format!("{DONE_MARKER} late") });
         handle(&store, id, None, HookEvent::Stop, &mut Cursor::new(payload.to_string())).unwrap();
         assert_eq!(store.get_task(id).unwrap().unwrap().state, TaskState::Cancelled, "terminal tasks are not revived");
+    }
+
+    #[test]
+    fn done_marker_after_handing_off_to_review_keeps_the_task_in_review() {
+        let (store, id) = store_with_task();
+        let mut task = store.get_task(id).unwrap().unwrap();
+        task.state = TaskState::InReview;
+        task.pr_url = Some("https://github.com/o/r/pull/7".into());
+        store.update_task(&task).unwrap();
+        let payload = serde_json::json!({ "last_assistant_message": format!("Merge armed.\n{DONE_MARKER} shipped") });
+        handle(&store, id, None, HookEvent::Stop, &mut Cursor::new(payload.to_string())).unwrap();
+        let task = store.get_task(id).unwrap().unwrap();
+        assert_eq!(task.state, TaskState::InReview);
+        assert!(task.completed_at.is_none());
+        assert_eq!(store.drain_hook_events().unwrap().len(), 1, "the daemon releases the session from the row");
     }
 
     #[test]

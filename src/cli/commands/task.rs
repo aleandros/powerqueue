@@ -14,7 +14,8 @@ use owo_colors::{OwoColorize, Stream, Style};
 use crate::cli::output::{self, human_bytes, human_f64, model_with_provider};
 use crate::cli::{Context, TaskCommand, TaskRef};
 use crate::config::Config;
-use crate::domain::{DaemonCommand, Event, EventLevel, ModelTier, Session, Task, TaskState};
+use crate::domain::{DaemonCommand, Event, EventLevel, ModelTier, ReviewWatch, Session, Task, TaskState};
+use crate::github::PrRef;
 use crate::store::Store;
 use crate::tmux::Tmux;
 
@@ -47,6 +48,45 @@ pub fn complete_task(store: &Store, task: &mut Task, summary: Option<&str>) -> R
         "task.completed_by_command",
         "marked completed via `powerqueue task complete`",
         serde_json::json!({ "summary": task.summary }),
+    )?;
+    Ok(())
+}
+
+/// Hand a task off for review (`task complete --pr <url>`): it moves to
+/// `in_review` with the PR recorded, so the daemon releases its session,
+/// slot and worktree (keeping the branch) and watches the PR. Calling it
+/// again while in review re-arms the watch (e.g. after a review round).
+/// Fails for a URL that is not a GitHub pull request or a task that is not
+/// running (queued, finished, ...).
+pub fn hand_off_for_review(store: &Store, task: &mut Task, summary: Option<&str>, pr_url: &str) -> Result<()> {
+    let pr: PrRef = pr_url.parse().map_err(|e: String| anyhow!(e))?;
+    if task.state != TaskState::InReview && !task.state.can_transition_to(TaskState::InReview) {
+        bail!("cannot hand {} off for review while it is {} (only a running task opens a PR)", task.key, task.state);
+    }
+    let now = Utc::now();
+    let mut watch = ReviewWatch::armed(now, task.review.as_ref());
+    watch.worktree_path = task.worktree_path.clone().or_else(|| task.review.as_ref().and_then(|r| r.worktree_path.clone()));
+    let from = task.state;
+    task.state = TaskState::InReview;
+    task.pr_url = Some(pr_url.trim().to_string());
+    task.review = Some(watch);
+    task.not_before = None;
+    task.last_error = None;
+    if let Some(s) = summary.map(str::trim).filter(|s| !s.is_empty()) {
+        task.summary = Some(s.to_string());
+    }
+    store.update_task(task)?;
+    let rounds = task.review.as_ref().map_or(0, |r| r.rounds);
+    store.log_event(
+        Some(task.id),
+        None,
+        EventLevel::Info,
+        "task.in_review",
+        &format!(
+            "handed off for review: {pr} (merge armed{})",
+            if rounds > 0 { format!(", after {rounds} review round(s)") } else { String::new() }
+        ),
+        serde_json::json!({ "pr": task.pr_url, "from": from, "rounds": rounds, "summary": task.summary }),
     )?;
     Ok(())
 }
@@ -88,7 +128,14 @@ pub fn offline_target(cmd: &DaemonCommand) -> Option<TaskState> {
 /// Apply a control command directly (used when no daemon is running).
 /// Returns `Ok(false)` when the transition is not allowed from the current state.
 pub fn apply_offline(store: &Store, task: &mut Task, cmd: &DaemonCommand) -> Result<bool> {
-    let Some(target) = offline_target(cmd) else { return Ok(false) };
+    let Some(mut target) = offline_target(cmd) else { return Ok(false) };
+    if matches!(cmd, DaemonCommand::Resume { .. }) && task.parked_in_review() {
+        target = TaskState::InReview;
+        if let Some(watch) = task.review.as_mut() {
+            watch.rearm(Utc::now());
+        }
+        task.last_error = None;
+    }
     if task.state == target {
         return Ok(true);
     }
@@ -197,6 +244,8 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let task = find_task(&store, &task_ref.task)?;
     let sessions = store.list_sessions_for_task(task.id)?;
     let events = store.events_for_task(task.id, 50)?;
+    let pr_events = if task.pr_url.is_some() { pr_timeline(&store.events_for_task(task.id, 2000)?) } else { Vec::new() };
+    let rounds_max = ctx.config_or_default()?.scheduler.review_rounds_max;
     let usage = store.usage_for_task(task.id)?;
     let mut session_rows = Vec::with_capacity(sessions.len());
     for s in &sessions {
@@ -220,6 +269,7 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
                 "samples": stats.map(|x| x.2),
             })).collect::<Vec<_>>(),
             "events": events,
+            "pr_timeline": pr_events,
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(0);
@@ -295,6 +345,26 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     }
     kv("branch", task.branch.clone().unwrap_or_else(|| "-".into()));
     kv("worktree", task.worktree_path.clone().unwrap_or_else(|| "-".into()));
+    if let Some(url) = &task.pr_url {
+        kv("pull request", url.clone());
+        if let Some(watch) = &task.review {
+            let mut status = vec![format!("review round {}/{rounds_max}", watch.rounds)];
+            if watch.waiting_manual_merge {
+                status.push("waiting for a manual merge".to_string());
+            }
+            if let Some(r) = &watch.relaunch {
+                status.push(format!(
+                    "relaunch pending: {}{}",
+                    r.reason,
+                    if r.detail.is_empty() { String::new() } else { format!(" {}", r.detail) }
+                ));
+            }
+            if let Some(at) = watch.last_polled_at {
+                status.push(format!("last checked {}", at.with_timezone(&chrono::Local).format("%m-%d %H:%M")));
+            }
+            kv("review", status.join("; "));
+        }
+    }
     let attempts = match task.max_attempts {
         Some(max) => format!("{}/{}", task.attempts, max),
         None => task.attempts.to_string(),
@@ -370,6 +440,13 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
         println!("{table}");
     }
 
+    if !pr_events.is_empty() {
+        println!("\n{}", "pull request".if_supports_color(Stream::Stdout, |t| t.bold()));
+        for e in &pr_events {
+            println!("{}", format_event(e, color));
+        }
+    }
+
     if !events.is_empty() {
         println!("\n{}", "timeline".if_supports_color(Stream::Stdout, |t| t.bold()));
         for e in &events {
@@ -377,6 +454,22 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+/// The pull request's story: hand-offs, what the watcher saw and did,
+/// review-round launches, the final branch deletion.
+pub fn pr_timeline(events: &[Event]) -> Vec<Event> {
+    events
+        .iter()
+        .filter(|e| {
+            e.kind == "task.in_review"
+                || e.kind.starts_with("review.")
+                || e.kind == "session.released"
+                || e.kind == "cleanup.branch_deleted"
+                || (e.kind == "session.launched" && !e.data["review"].is_null())
+        })
+        .cloned()
+        .collect()
 }
 
 /// `HH:MM:SS LEVEL kind message` with the level coloured.
@@ -621,12 +714,22 @@ pub fn run(ctx: &mut Context, cmd: TaskCommand) -> Result<i32> {
         TaskCommand::Show(t) => show(ctx, &t),
         TaskCommand::Explain(t) => explain(ctx, &t),
         TaskCommand::Prompt(t) => prompt(ctx, &t),
-        TaskCommand::Complete { task, summary } => {
+        TaskCommand::Complete { task, summary, pr } => {
             let store = ctx.store()?.clone();
             let mut t = find_task(&store, &task.task)?;
-            complete_task(&store, &mut t, summary.as_deref())?;
+            if let Some(url) = pr.as_deref() {
+                hand_off_for_review(&store, &mut t, summary.as_deref(), url)?;
+            } else {
+                complete_task(&store, &mut t, summary.as_deref())?;
+            }
             if ctx.json {
                 println!("{}", serde_json::to_string_pretty(&t)?);
+            } else if let Some(url) = pr.as_deref() {
+                println!(
+                    "{} {} is in review ({url}); the daemon releases its slot and worktree and watches the PR",
+                    "in review".if_supports_color(Stream::Stdout, |t| t.style(Style::new().blue().bold())),
+                    t.key.if_supports_color(Stream::Stdout, |t| t.bold())
+                );
             } else {
                 println!(
                     "{} {} marked completed; the daemon will clean up its worktree and update Linear",
@@ -769,6 +872,43 @@ mod tests {
         block_task(&store, &mut r, Some("need creds")).unwrap();
         assert_eq!(store.get_task(r.id).unwrap().unwrap().state, TaskState::NeedsAttention);
         assert_eq!(store.events_for_task(r.id, 10).unwrap()[0].kind, "task.blocked_by_command");
+    }
+
+    #[test]
+    fn complete_with_pr_hands_off_for_review_and_resume_watches_again() {
+        let store = Store::open_in_memory().unwrap();
+        let mut r = stored(&store, "R", TaskState::Running);
+        r.worktree_path = Some("/wt/r".into());
+        let url = "https://github.com/o/r/pull/7";
+        assert!(hand_off_for_review(&store, &mut r, None, "https://example.com/x").is_err(), "not a PR URL");
+        hand_off_for_review(&store, &mut r, Some("armed"), url).unwrap();
+        let back = store.get_task(r.id).unwrap().unwrap();
+        assert_eq!(back.state, TaskState::InReview);
+        assert_eq!(back.pr_url.as_deref(), Some(url));
+        assert_eq!(back.summary.as_deref(), Some("armed"));
+        let watch = back.review.clone().unwrap();
+        assert_eq!((watch.rounds, watch.worktree_path.as_deref()), (0, Some("/wt/r")));
+        assert_eq!(store.events_for_task(r.id, 10).unwrap().last().unwrap().kind, "task.in_review");
+        let timeline = pr_timeline(&store.events_for_task(r.id, 10).unwrap());
+        assert_eq!(timeline.len(), 1);
+
+        // Re-arming after a review round keeps the round count.
+        let mut again = back.clone();
+        again.state = TaskState::Running;
+        again.review.as_mut().unwrap().rounds = 2;
+        hand_off_for_review(&store, &mut again, None, url).unwrap();
+        assert_eq!(again.review.as_ref().map(|w| (w.rounds, w.relaunch.is_none())), Some((2, true)));
+
+        // Parked by the watcher (stale): an offline resume goes back to watching.
+        again.state = TaskState::NeedsAttention;
+        again.last_error = Some("stale".into());
+        store.update_task(&again).unwrap();
+        let resume = DaemonCommand::Resume { task_id: again.id };
+        assert!(apply_offline(&store, &mut again, &resume).unwrap());
+        assert_eq!(store.get_task(again.id).unwrap().unwrap().state, TaskState::InReview);
+
+        let mut q = stored(&store, "Q", TaskState::Queued);
+        assert!(hand_off_for_review(&store, &mut q, None, url).is_err(), "a queued task has no PR to hand off");
     }
 
     #[test]

@@ -122,6 +122,14 @@ impl Snapshot {
         self.ledgers.as_ref().map(|l| l.ordered(&self.provider_order)).unwrap_or_default()
     }
 
+    /// Tasks handed off `in_review` (no slot held), and how many of them wait
+    /// for a human to merge (hold label).
+    pub fn in_review(&self) -> (usize, usize) {
+        let review: Vec<&Task> = self.tasks.iter().filter(|t| t.state == TaskState::InReview).collect();
+        let manual = review.iter().filter(|t| t.review.as_ref().is_some_and(|r| r.waiting_manual_merge)).count();
+        (review.len(), manual)
+    }
+
     /// Number of tasks currently holding a slot.
     pub fn slots_used(&self) -> usize {
         self.tasks.iter().filter(|t| t.state.has_live_session()).count()
