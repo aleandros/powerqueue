@@ -107,18 +107,31 @@ pub fn on_hook_outcome(
             if transcript_path.is_some() {
                 session.transcript_path = transcript_path.clone();
             }
-            if session.state.is_live() && !task.state.is_terminal() && task.state != TaskState::Paused {
+            // A SessionStart drained after the daemon already saw this
+            // session die (crash right after launch) must not revive the
+            // task: nothing probes a dead session, so it would sit in
+            // `running` forever instead of being relaunched. A resumed
+            // attempt reuses the row as `launching`, which is live.
+            let live = session.state.is_live();
+            if live && !task.state.is_terminal() && task.state != TaskState::Paused {
                 session.state = SessionState::Running;
             }
-            if matches!(task.state, TaskState::Starting | TaskState::Idle | TaskState::NeedsAttention | TaskState::Crashed) {
+            if live
+                && matches!(task.state, TaskState::Starting | TaskState::Idle | TaskState::NeedsAttention | TaskState::Crashed)
+            {
                 task.state = TaskState::Running;
                 task.last_error = None;
             }
+            let message = if live {
+                format!("agent session started ({source})")
+            } else {
+                format!("agent session started ({source}) after it was marked {}; task left {}", session.state, task.state)
+            };
             effects.push(Effect::log(
                 EventLevel::Info,
                 "session.started",
-                format!("agent session started ({source})"),
-                serde_json::json!({ "source": source, "transcript_path": transcript_path, "attempt": session.attempt }),
+                message,
+                serde_json::json!({ "source": source, "transcript_path": transcript_path, "attempt": session.attempt, "late": !live }),
             ));
         }
         HookOutcome::Completed { summary } => {
@@ -730,6 +743,30 @@ mod tests {
                 Effect::RateLimitProvider { provider, .. } => format!("ratelimit({provider})"),
             })
             .collect()
+    }
+
+    #[test]
+    fn late_start_hook_never_revives_a_crashed_session() {
+        // The pane died and the probe marked the attempt crashed before the
+        // SessionStart hook was drained.
+        let mut t = task(TaskState::Crashed, 1);
+        t.not_before = Some(now() + Duration::seconds(1));
+        let mut s = session(SessionState::Crashed, 1);
+        let out = HookOutcome::Started { transcript_path: Some("/tmp/x.jsonl".into()), source: "startup".into() };
+        let fx = on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), period_end());
+        assert_eq!(t.state, TaskState::Crashed, "stays crashed so the daemon relaunches it");
+        assert_eq!(s.state, SessionState::Crashed);
+        assert_eq!(s.transcript_path.as_deref(), Some("/tmp/x.jsonl"), "the transcript is still worth knowing");
+        assert!(
+            matches!(&fx[..], [Effect::Log { kind, message, .. }] if kind == "session.started" && message.contains("after it was marked crashed")),
+            "{fx:?}"
+        );
+
+        // The resumed attempt reuses the row as `launching`: its start does count.
+        s.state = SessionState::Launching;
+        t.state = TaskState::Starting;
+        on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), period_end());
+        assert_eq!((t.state, s.state), (TaskState::Running, SessionState::Running));
     }
 
     #[test]

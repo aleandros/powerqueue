@@ -2224,6 +2224,9 @@ mod tests {
         let mut cfg = Config::default();
         cfg.priority.live_reload = false;
         cfg.linear.endpoint = format!("{}/graphql", server.uri());
+        // Never touch the developer's tmux server or a real repository.
+        cfg.tmux.socket_name = Some(format!("powerqueue-test-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
+        cfg.repo.path = dir.join("repo").display().to_string();
         Daemon::new(cfg, paths, store.clone(), secrets).unwrap()
     }
 
@@ -2339,10 +2342,12 @@ mod tests {
         sync_now(&mut restarted, t2).await;
         let p = store.get_task_by_key("DEP-P").unwrap().unwrap();
         assert_eq!(p.state, TaskState::Completed);
+        let events = store.events_for_task(p.id, 50).unwrap();
         assert!(
-            store.events_for_task(p.id, 50).unwrap().iter().any(|e| e.kind.starts_with("cleanup.")),
-            "cleanup ran for the container"
+            events.iter().any(|e| e.kind == "cleanup.done" && e.message.contains("no worktree on disk")),
+            "cleanup ran for the container: {events:?}"
         );
+        assert_eq!(p.worktree_path, None, "the stale worktree path is cleared");
     }
 
     #[test]

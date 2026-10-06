@@ -193,12 +193,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn probe_runs_the_binary() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let write = |name: &str, body: &str| {
             let path = dir.path().join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_support::write_executable(&path, body);
             path.display().to_string()
         };
         let ok = write(

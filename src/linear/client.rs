@@ -757,7 +757,7 @@ impl LinearClient {
     }
 
     /// Sub-issues and `blocked by` issues of the issues with these UUIDs,
-    /// keyed by UUID. Queries [`DEPENDENCY_BATCH`] issues at a time and
+    /// keyed by UUID. Queries 10 issues at a time and
     /// follows every truncated connection to its last page, so the lists
     /// are complete. Issues Linear does not return are absent from the map.
     pub async fn fetch_dependencies(&self, ids: &[String]) -> Result<std::collections::HashMap<String, IssueDependencies>> {

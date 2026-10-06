@@ -187,13 +187,15 @@ push_branch = false
         }
     }
 
-    /// Poll `task show --json` until `ready` holds or 15 s pass; returns the last snapshot.
+    /// Poll `task show --json` until `ready` holds or 30 s pass (generous for
+    /// loaded CI runners; a passing check returns at once); returns the last
+    /// snapshot.
     fn wait_for_show(&self, key: &str, ready: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
         let start = Instant::now();
         loop {
             let show = self.run_ok(&["--json", "task", "show", key]);
             let v: serde_json::Value = serde_json::from_str(&show).expect("task show json");
-            if ready(&v) || start.elapsed() > Duration::from_secs(15) {
+            if ready(&v) || start.elapsed() > Duration::from_secs(30) {
                 return v;
             }
             std::thread::sleep(Duration::from_millis(500));
@@ -225,6 +227,18 @@ impl Drop for Env {
 
 fn has_event(show: &serde_json::Value, kind: &str) -> bool {
     show["events"].as_array().map(|evs| evs.iter().any(|e| e["kind"] == kind)).unwrap_or(false)
+}
+
+/// A task can be completed by either signal, whichever the daemon sees
+/// first: the agent's `powerqueue task complete` (`task.completed_by_command`)
+/// or the done marker / Stop hook (`task.completed`).
+fn completed_event(kinds: &[impl AsRef<str>]) -> bool {
+    kinds.iter().any(|k| matches!(k.as_ref(), "task.completed" | "task.completed_by_command"))
+}
+
+/// Output tokens recorded so far.
+fn output_tokens(show: &serde_json::Value) -> u64 {
+    show["usage"]["output_tokens"].as_u64().unwrap_or(0)
 }
 
 fn git(repo: &Path, args: &[&str]) {
@@ -273,16 +287,18 @@ fn task_runs_to_completion_with_usage_and_cleanup() {
     assert_eq!(st, "completed", "daemon log:\n{}", env.daemon_log());
 
     // `task complete` flips the state from inside the session; the daemon sweeps
-    // the transcript (and runs cleanup) on its following ticks, so poll briefly.
-    let v = env.wait_for_show(&key, |v| v["usage"]["output_tokens"].as_u64().unwrap_or(0) > 0 && has_event(v, "cleanup.done"));
+    // the transcript (and runs cleanup) on its following ticks, possibly one
+    // turn at a time, so wait for the final totals rather than the first ones.
+    let v = env.wait_for_show(&key, |v| output_tokens(v) >= 1400 && has_event(v, "cleanup.done"));
     assert_eq!(v["task"]["summary"].as_str(), Some("fake-claude finished"));
     assert_eq!(v["task"]["attempts"].as_u64(), Some(1));
     let usage = &v["usage"];
     assert!(usage["output_tokens"].as_u64().unwrap_or(0) >= 1400, "usage from transcript was recorded: {usage}");
     let kinds: Vec<&str> = v["events"].as_array().unwrap().iter().filter_map(|e| e["kind"].as_str()).collect();
-    for expected in ["task.starting", "worktree.ready", "session.launched", "session.started", "task.completed", "cleanup.done"] {
+    for expected in ["task.starting", "worktree.ready", "session.launched", "session.started", "cleanup.done"] {
         assert!(kinds.contains(&expected), "missing event {expected} in {kinds:?}");
     }
+    assert!(completed_event(&kinds), "no completion event in {kinds:?}");
     // The branch exists in the repo and holds the fake commit; the worktree is kept because nothing was pushed.
     let repo = env.root.path().join("repo");
     let branches = Command::new("git").args(["branch", "--list", &format!("pq/{key}")]).current_dir(&repo).output().unwrap();
@@ -354,7 +370,8 @@ fn task_runs_on_codex_when_selected() {
     }
     let st = env.wait_for_state(&key, "completed", Duration::from_secs(60));
     assert_eq!(st, "completed", "daemon log:\n{}", env.daemon_log());
-    let v = env.wait_for_show(&key, |v| v["usage"]["output_tokens"].as_u64().unwrap_or(0) > 0 && has_event(v, "cleanup.done"));
+    // The notify payload (a Stop hook) can be drained after cleanup; wait for it too.
+    let v = env.wait_for_show(&key, |v| output_tokens(v) >= 1400 && has_event(v, "cleanup.done") && has_event(v, "hook.stop"));
     let session = &v["sessions"][0]["session"];
     assert_eq!(session["model"].as_str(), Some("gpt-6-astra"), "{session}");
     assert!(session["agent_session_id"].as_str().is_some_and(|s| !s.is_empty()), "thread id discovered: {session}");
@@ -365,12 +382,12 @@ fn task_runs_on_codex_when_selected() {
     assert_eq!(usage["cache_read_input_tokens"].as_u64(), Some(12032 + 15000), "{usage}");
     assert_eq!(usage["input_tokens"].as_u64(), Some(18699 - 12032 + 20000 - 15000), "{usage}");
     let kinds = event_kinds(&v);
-    for expected in ["task.starting", "session.launched", "session.discovered", "task.completed", "cleanup.done"] {
+    for expected in ["task.starting", "session.launched", "session.discovered", "cleanup.done"] {
         assert!(kinds.iter().any(|k| k == expected), "missing event {expected} in {kinds:?}");
     }
+    assert!(completed_event(&kinds), "no completion event in {kinds:?}");
     // The notify payload reached `powerqueue hook --provider codex` as a Stop.
-    let log = env.run_ok(&["--json", "task", "show", &key]);
-    assert!(log.contains("hook.stop"), "{log}");
+    assert!(kinds.iter().any(|k| k == "hook.stop"), "{kinds:?}");
 }
 
 #[test]

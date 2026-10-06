@@ -41,6 +41,9 @@ pub mod tmux;
 pub mod tune;
 pub mod worktree;
 
+#[cfg(all(test, unix))]
+pub(crate) mod test_support;
+
 /// Crate version, injected by Cargo.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Name used for keychain service, tmux session, directories and log targets.
