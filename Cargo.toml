@@ -1,6 +1,6 @@
 [package]
 name = "powerqueue"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.88"
 description = "Get the most out of your Claude subscription: an autonomous work queue that turns Linear tickets into Claude Code sessions on a cheap VPS or your laptop, with budget pacing, crash recovery and usage learning"

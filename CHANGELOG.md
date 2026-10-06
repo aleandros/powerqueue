@@ -7,14 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-05
+
 ### Fixed
 
 - Clear the dashboard and restored shell screen on exit, including `q`, Ctrl+C
   and tmux panes with alternate-screen disabled, without purging scrollback.
 - Clear stale `needs_attention` and its reason after prompt submission; permission
   requests also clear on tool completion or newer assistant output. Preserve
-  explicit blockers and paused/finished tasks and
-  ignore historical transcript replay as a recovery signal.
+  explicit blockers and paused/finished tasks, and ignore historical transcript
+  replay as a recovery signal.
 - Preserve Claude hook ordering so delayed permission notifications do not
   overwrite subsequent activity; register `PostToolUse` / `PostToolUseFailure`.
 - Do not classify courtesy "let me know" closings or requests quoted earlier
@@ -304,7 +306,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/aleandros/powerqueue/releases/tag/v0.4.2
+[0.4.1]: https://github.com/aleandros/powerqueue/releases/tag/v0.4.1
 [0.4.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.4.0
 [0.3.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.3.0
 [0.2.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.2.0
