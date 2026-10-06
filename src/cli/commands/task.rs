@@ -115,6 +115,24 @@ pub fn block_task(store: &Store, task: &mut Task, reason: Option<&str>) -> Resul
     Ok(())
 }
 
+/// When `task block` runs inside the task's own agent session
+/// (`POWERQUEUE_TASK_ID` / `POWERQUEUE_SESSION_ID` from the launcher), note
+/// it in the task's relay state so the daemon relays the session's final
+/// message to Linear as the agent's question. A human running `task block`
+/// records nothing. Returns whether it was recorded.
+pub fn record_agent_block(store: &Store, task: &Task, env_task: Option<&str>, env_session: Option<&str>) -> Result<bool> {
+    use crate::scheduler::relay::{RelayState, relay_key};
+    if env_task.map(str::trim) != Some(task.id.to_string().as_str()) {
+        return Ok(false);
+    }
+    let Some(session) = env_session.and_then(|s| s.trim().parse::<uuid::Uuid>().ok()) else { return Ok(false) };
+    let key = relay_key(task.id);
+    let mut state = store.kv_get::<RelayState>(&key)?.unwrap_or_default();
+    state.agent_blocked = Some(session);
+    store.kv_set(&key, &state).with_context(|| format!("record the agent's block of {}", task.key))?;
+    Ok(true)
+}
+
 /// The state a control command moves a task to when applied offline.
 pub fn offline_target(cmd: &DaemonCommand) -> Option<TaskState> {
     match cmd {
@@ -748,6 +766,8 @@ pub fn run(ctx: &mut Context, cmd: TaskCommand) -> Result<i32> {
             let store = ctx.store()?.clone();
             let mut t = find_task(&store, &task.task)?;
             block_task(&store, &mut t, reason.as_deref())?;
+            let env = |k: &str| std::env::var(k).ok();
+            record_agent_block(&store, &t, env("POWERQUEUE_TASK_ID").as_deref(), env("POWERQUEUE_SESSION_ID").as_deref())?;
             if ctx.json {
                 println!("{}", serde_json::to_string_pretty(&t)?);
             } else {
@@ -932,6 +952,22 @@ mod tests {
 
         let mut q = stored(&store, "Q", TaskState::Queued);
         assert!(hand_off_for_review(&store, &mut q, None, url).is_err(), "a queued task has no PR to hand off");
+    }
+
+    #[test]
+    fn only_the_tasks_own_session_records_an_agent_block() {
+        use crate::scheduler::relay::{RelayState, relay_key};
+        let store = Store::open_in_memory().unwrap();
+        let t = stored(&store, "ENG-9", TaskState::NeedsAttention);
+        let sid = uuid::Uuid::new_v4();
+        let id = t.id.to_string();
+        assert!(!record_agent_block(&store, &t, None, Some(&sid.to_string())).unwrap(), "a human's shell");
+        assert!(!record_agent_block(&store, &t, Some("another-task"), Some(&sid.to_string())).unwrap());
+        assert!(!record_agent_block(&store, &t, Some(&id), Some("garbage")).unwrap());
+        assert!(store.kv_get::<RelayState>(&relay_key(t.id)).unwrap().is_none());
+        assert!(record_agent_block(&store, &t, Some(&id), Some(&sid.to_string())).unwrap());
+        let state: RelayState = store.kv_get(&relay_key(t.id)).unwrap().unwrap();
+        assert_eq!(state.agent_blocked, Some(sid));
     }
 
     #[test]

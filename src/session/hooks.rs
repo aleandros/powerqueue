@@ -12,7 +12,13 @@ pub enum HookOutcome {
     /// `Stop` with the done marker in the last message.
     Completed { summary: String },
     /// `Stop` with the blocked marker (or a question) in the last message.
-    Blocked { reason: String },
+    /// `message` is that whole final message (relayed to Linear as the
+    /// agent's question).
+    Blocked {
+        reason: String,
+        #[serde(default)]
+        message: String,
+    },
     /// `Stop` without a marker: Claude is waiting for input.
     TurnEnded { last_message: String },
     /// `StopFailure` with `rate_limit` / `overloaded`.
@@ -65,9 +71,9 @@ pub fn interpret_hook(event: HookEvent, payload: &serde_json::Value) -> HookOutc
             if message.contains(DONE_MARKER) {
                 HookOutcome::Completed { summary: text_around_marker(&message, DONE_MARKER) }
             } else if message.contains(BLOCKED_MARKER) {
-                HookOutcome::Blocked { reason: text_around_marker(&message, BLOCKED_MARKER) }
+                HookOutcome::Blocked { reason: text_around_marker(&message, BLOCKED_MARKER), message }
             } else if looks_like_question(&message) {
-                HookOutcome::Blocked { reason: last_line(&message).to_string() }
+                HookOutcome::Blocked { reason: last_line(&message).to_string(), message }
             } else {
                 HookOutcome::TurnEnded { last_message: message }
             }
@@ -167,18 +173,24 @@ mod tests {
 
     #[test]
     fn stop_with_blocked_marker() {
-        let out = stop("I cannot proceed without the staging credentials.\n\n[[POWERQUEUE:BLOCKED]]");
-        assert_eq!(out, HookOutcome::Blocked { reason: "I cannot proceed without the staging credentials.".into() });
+        let msg = "I cannot proceed without the staging credentials.\n\n[[POWERQUEUE:BLOCKED]]";
+        assert_eq!(
+            stop(msg),
+            HookOutcome::Blocked { reason: "I cannot proceed without the staging credentials.".into(), message: msg.into() }
+        );
         let out = stop("[[POWERQUEUE:BLOCKED]] need the API key");
-        assert_eq!(out, HookOutcome::Blocked { reason: "need the API key".into() });
+        assert!(matches!(out, HookOutcome::Blocked { ref reason, .. } if reason == "need the API key"), "{out:?}");
     }
 
     #[test]
     fn stop_with_question_is_blocked() {
-        let out = stop("I found two ways to fix this.\n\nWhich approach do you prefer?");
-        assert_eq!(out, HookOutcome::Blocked { reason: "Which approach do you prefer?".into() });
+        let msg = "I found two ways to fix this.\n\nWhich approach do you prefer?";
+        assert_eq!(stop(msg), HookOutcome::Blocked { reason: "Which approach do you prefer?".into(), message: msg.into() });
         let out = stop("Should I also update the docs? I'll wait.");
-        assert_eq!(out, HookOutcome::Blocked { reason: "Should I also update the docs? I'll wait.".into() });
+        assert!(
+            matches!(out, HookOutcome::Blocked { ref reason, .. } if reason == "Should I also update the docs? I'll wait."),
+            "{out:?}"
+        );
         let out = stop("Done with part one. Let me know if you want more.");
         assert!(matches!(out, HookOutcome::TurnEnded { .. }));
         let out = stop("Do you want me to proceed with the migration?**");

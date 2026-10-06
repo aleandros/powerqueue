@@ -112,8 +112,11 @@ pub struct LinearConfig {
     /// when your own Claude skills or CI own the status; comments still
     /// follow `post_comments`.
     pub manage_states: bool,
-    /// Post progress comments on the issue.
-    pub post_comments: bool,
+    /// Which comments to post on the issue: `true` (everything, the
+    /// default), `"questions"` (only agent questions, parent auto-close and
+    /// PR merge/hold notices) or `false` (none). Anything but `false` also
+    /// relays human replies on the issue back to the session.
+    pub post_comments: PostComments,
     pub poll_interval_secs: u64,
     /// Cap on issues fetched per poll.
     pub max_issues: u32,
@@ -137,10 +140,76 @@ impl Default for LinearConfig {
             blocked_state: None,
             done_state_parent: Some("Done".to_string()),
             manage_states: true,
-            post_comments: true,
+            post_comments: PostComments::All,
             poll_interval_secs: 60,
             max_issues: 100,
             endpoint: "https://api.linear.app/graphql".to_string(),
+        }
+    }
+}
+
+/// `linear.post_comments`: `true`, `"questions"` or `false` (see
+/// [`LinearConfig::post_comments`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PostComments {
+    /// Progress comments (started, completed, blocked, ...) plus everything below.
+    #[default]
+    All,
+    /// Only agent questions, parent auto-close and PR merge/hold notices.
+    Questions,
+    /// No comments at all; replies are not relayed either.
+    Off,
+}
+
+impl PostComments {
+    /// Accepted string spellings (for messages); booleans are accepted too.
+    pub const NAMES: [&'static str; 3] = ["true", "questions", "false"];
+
+    /// Post routine progress comments (started, completed, failed, ...).
+    pub fn progress(self) -> bool {
+        self == Self::All
+    }
+
+    /// Post questions and notices, and relay human replies to the session.
+    pub fn questions(self) -> bool {
+        self != Self::Off
+    }
+
+    /// Parse a string value (case-insensitive). `None` for an unknown word.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "all" | "yes" | "on" => Self::All,
+            "questions" | "question" => Self::Questions,
+            "false" | "none" | "no" | "off" => Self::Off,
+            _ => return None,
+        })
+    }
+}
+
+impl Serialize for PostComments {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::All => serializer.serialize_bool(true),
+            Self::Questions => serializer.serialize_str("questions"),
+            Self::Off => serializer.serialize_bool(false),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PostComments {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bool(bool),
+            Text(String),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Bool(true) => Ok(Self::All),
+            Raw::Bool(false) => Ok(Self::Off),
+            Raw::Text(s) => Self::parse(&s).ok_or_else(|| {
+                serde::de::Error::custom(format!("unknown post_comments value `{s}` (expected {})", Self::NAMES.join(", ")))
+            }),
         }
     }
 }
@@ -1539,6 +1608,27 @@ mod tests {
         assert!(text.contains("[budget.providers.codex.models.\"gpt-6.1-sol\"]"), "{text}");
         let back = Config::from_toml(&text).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn post_comments_accepts_booleans_and_questions() {
+        let parse = |v: &str| Config::from_toml(&format!("[linear]\npost_comments = {v}\n")).map(|c| c.linear.post_comments);
+        assert_eq!(Config::default().linear.post_comments, PostComments::All);
+        assert_eq!(parse("true").unwrap(), PostComments::All);
+        assert_eq!(parse("false").unwrap(), PostComments::Off);
+        assert_eq!(parse("\"questions\"").unwrap(), PostComments::Questions);
+        assert_eq!(parse("\"Questions\"").unwrap(), PostComments::Questions);
+        let err = format!("{:#}", parse("\"some\"").unwrap_err());
+        assert!(err.contains("unknown post_comments value `some`"), "{err}");
+        assert!(PostComments::Questions.questions() && !PostComments::Questions.progress());
+        assert!(!PostComments::Off.questions() && PostComments::All.progress());
+        // Written back as the same spelling.
+        let mut cfg = Config::default();
+        cfg.repo.path = "/tmp/repo".into();
+        cfg.linear.post_comments = PostComments::Questions;
+        let text = cfg.to_toml().unwrap();
+        assert!(text.contains("post_comments = \"questions\""), "{text}");
+        assert_eq!(Config::from_toml(&text).unwrap(), cfg);
     }
 
     #[test]

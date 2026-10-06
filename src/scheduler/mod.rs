@@ -9,10 +9,12 @@
 //! 6. detect stale/idle sessions (nudge once, then `needs_attention`);
 //! 7. finish completed tasks: cleanup worktree, update Linear; release the
 //!    sessions of tasks handed off `in_review`;
-//! 8. watch the pull requests of `in_review` tasks ([`review`]): merged ⇒
+//! 8. relay agent questions and human replies through Linear comments
+//!    ([`relay`]);
+//! 9. watch the pull requests of `in_review` tasks ([`review`]): merged ⇒
 //!    completed, conflict / failed check / new review ⇒ relaunch;
-//! 9. while slots are free: pick the best schedulable task, ask the budget
-//!    policy for a model, launch it.
+//! 10. while slots are free: pick the best schedulable task, ask the budget
+//!     policy for a model, launch it.
 //!
 //! State transitions are logged as events so `task show` reconstructs the story.
 //! The decisions themselves live in [`transitions`] as pure functions; the
@@ -20,6 +22,7 @@
 
 pub mod daemon;
 pub mod lifecycle;
+pub mod relay;
 pub mod review;
 pub mod transitions;
 

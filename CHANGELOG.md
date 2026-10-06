@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Question relay through Linear comments. When an agent asks something
+  (`task block`, the blocked marker, or a final message that reads like a
+  question) the daemon posts `🤖 Pregunta del agente` with the last
+  paragraph of its final message and a hidden `<!-- powerqueue:question -->`
+  marker on the issue, once while the question is open (only for a
+  `task block` the agent ran from its own session). On the Linear poll
+  cadence it reads new comments: a reply to an open question is typed into
+  the live session and the task goes back to `running` (and the issue back
+  to `linear.in_progress_state` if it was moved to `blocked_state`), or, when the session
+  is gone (`in_review`, parked), the task is re-queued and the next launch
+  resumes the session with the reply as its prompt; comments on a
+  `running` / `idle` task are typed in as hints. powerqueue's own comments
+  carry `<!-- powerqueue -->` and their ids are remembered (kv
+  `relay.<task id>`), so they are never relayed. New events
+  `relay.question_posted`, `relay.answer_sent`, `relay.answer_queued`,
+  `relay.hint_sent`, `relay.error`; `doctor` reports the relay under
+  "question relay".
+- `linear.post_comments` accepts `"questions"` besides `true` / `false`:
+  only agent questions, parent auto-close comments and PR watcher notices
+  (merge hold, stale PR, review rounds used up); no progress comments.
+  `false` also turns the relay off.
 - New task branches start from `origin/<default_branch>` right after
   `repo.fetch_before_start`'s fetch instead of the local default branch, so a
   blocker merged on GitHub is in the next task's branch even when the VPS's
@@ -76,6 +97,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `review.relaunch`, `review.merged`, `review.closed`, `review.hold`,
   `review.stale`, `review.rounds_exhausted`, `review.error`,
   `cleanup.branch_deleted`.
+
+### Changed
+
+- A blocked agent no longer gets the generic "powerqueue needs a human"
+  comment; the new question comment replaces it.
 
 ## [0.5.0] - 2026-10-06
 

@@ -866,14 +866,63 @@ impl LinearClient {
 
     /// Post a Markdown comment on an issue.
     pub async fn comment(&self, issue_id: &str, body: &str) -> Result<()> {
-        let mutation = "mutation($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success } }";
+        self.post_comment(issue_id, body).await.map(|_| ())
+    }
+
+    /// Post a Markdown comment on an issue and return the created comment
+    /// (`None` when Linear confirms without returning it). Fails when
+    /// Linear does not confirm the comment.
+    pub async fn post_comment(&self, issue_id: &str, body: &str) -> Result<Option<IssueComment>> {
+        let mutation = "mutation($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id body createdAt user { displayName name } } } }";
         let data = self.graphql(mutation, serde_json::json!({ "issueId": issue_id, "body": body })).await?;
         if data.pointer("/commentCreate/success").and_then(|v| v.as_bool()) != Some(true) {
             bail!("Linear did not confirm the comment on issue {issue_id}");
         }
         debug!(target: "powerqueue::linear", issue = %issue_id, bytes = body.len(), "comment posted");
-        Ok(())
+        Ok(data.pointer("/commentCreate/comment").and_then(parse_comment))
     }
+
+    /// Comments on an issue created after `since`, oldest first (at most
+    /// 50). An issue that no longer exists has none.
+    pub async fn comments_since(&self, issue_id: &str, since: DateTime<Utc>) -> Result<Vec<IssueComment>> {
+        let query = "query($id: String!, $since: DateTimeOrDuration!) { issue(id: $id) { comments(first: 50, filter: { createdAt: { gt: $since } }) { nodes { id body createdAt user { displayName name } } } } }";
+        let since = since.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let data = match self.graphql(query, serde_json::json!({ "id": issue_id, "since": since })).await {
+            Ok(d) => d,
+            Err(e) if is_not_found(&e) => return Ok(Vec::new()),
+            Err(e) => return Err(e).with_context(|| format!("fetch comments of {issue_id}")),
+        };
+        let mut comments: Vec<IssueComment> = data
+            .pointer("/issue/comments/nodes")
+            .and_then(|n| n.as_array())
+            .map(|nodes| nodes.iter().filter_map(parse_comment).collect())
+            .unwrap_or_default();
+        comments.sort_by_key(|c| c.created_at);
+        Ok(comments)
+    }
+}
+
+/// A comment on a Linear issue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueComment {
+    pub id: String,
+    pub body: String,
+    pub created_at: DateTime<Utc>,
+    /// Display name of the author, if Linear reports a user.
+    pub author: Option<String>,
+}
+
+/// Parse a Linear `Comment` node; `None` without an id or a valid `createdAt`.
+fn parse_comment(node: &serde_json::Value) -> Option<IssueComment> {
+    let id = node.get("id")?.as_str()?.to_string();
+    let created_at = node.get("createdAt")?.as_str()?.parse::<DateTime<Utc>>().ok()?;
+    let body = node.get("body").and_then(|b| b.as_str()).unwrap_or_default().to_string();
+    let author = node
+        .get("user")
+        .and_then(|u| u.get("displayName").or_else(|| u.get("name")))
+        .and_then(|n| n.as_str())
+        .map(str::to_string);
+    Some(IssueComment { id, body, created_at, author })
 }
 
 /// True if any attachment in `nodes` (Linear `Attachment` objects with
