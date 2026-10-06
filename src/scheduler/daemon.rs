@@ -1241,7 +1241,7 @@ impl Daemon {
                 && sc.stale_session_secs > 0
                 && silent > Duration::seconds(sc.stale_session_secs as i64);
             let timeout = sc.max_session_secs > 0 && now - session.started_at > Duration::seconds(sc.max_session_secs as i64);
-            let dying = !probe.is_alive() && !(task.state.is_terminal() || task.state == TaskState::Paused);
+            let dying = !(probe.is_alive() || task.state.is_terminal() || task.state == TaskState::Paused);
             let pane_tail = if dying || stale || timeout {
                 session.pane_id.as_deref().and_then(|p| self.rt.tmux.capture_pane(p, CRASH_TAIL_LINES).ok())
             } else {
@@ -1436,8 +1436,9 @@ impl Daemon {
     }
 
     /// The rules' preference list for a task, most wanted first: the
-    /// per-task override line (`KEY: model = ...`) else the `## Models`
-    /// entry for its criticality. Empty when the rules say nothing.
+    /// per-task override line (`KEY: model = ...`), else the first matching
+    /// `## Models` `if` row, else the `## Models` entry for its criticality.
+    /// Empty when the rules say nothing.
     fn preferred_models(&self, task: &Task, now: DateTime<Utc>) -> Vec<ModelTier> {
         let evaluated = self.rt.rules.evaluate(task, now, None, 0.0, 0.0).models;
         if evaluated.is_empty() { self.rt.rules.model_for(task.criticality).to_vec() } else { evaluated }

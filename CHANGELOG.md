@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `## Models` in `PRIORITY.md` accepts conditional rows, `- if <conditions>:
+  <model> [| <model>...]`, using the criticality-section condition grammar
+  (`label: model/fable`, `label ~ regex`, `and`). The first matching row wins
+  over the criticality row (an `## Overrides` model list still wins over it).
+  `priority check` lists the rows, `priority explain` shows which line chose
+  the model (`model: fable (if label: model/fable)` / `model: opus (high
+  row)`), and `priority simulate` tags conditional picks.
+
+### Changed
+
+- Linear child labels are now stored qualified with their group
+  (`model/fable`), so they are distinguishable from a loose `fable` label.
+  Existing tasks pick up the new form on the next Linear poll. A qualified
+  `label: model/fable` matches only the child label; an unqualified
+  `label: fable` (in rules and in `linear.required_labels` /
+  `excluded_labels`) still matches both, so existing configurations keep
+  working. `label ~ regex` sees the qualified form.
+
 ## [0.4.3] - 2026-10-05
 
 ### Fixed

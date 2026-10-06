@@ -15,7 +15,7 @@ use crate::cli::output::{criticality_colored, model_colored, model_list_colored,
 use crate::cli::{CheckArgs, Context, PriorityCommand, SimulateArgs, TaskRef};
 use crate::config::Config;
 use crate::domain::{Criticality, ModelTier, Task, TaskState};
-use crate::priority::{Evaluation, PriorityRules, RuleError};
+use crate::priority::{Evaluation, PriorityRules, RuleError, fmt_conditions};
 use crate::scheduler::pick_next;
 use crate::store::Store;
 
@@ -117,7 +117,7 @@ fn check(ctx: &mut Context, args: &CheckArgs) -> Result<i32> {
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "ok": true, "path": path, "rules": rules.rule_count(), "scoring": rules.scoring.len(),
-                "overrides": rules.overrides.len(), "warnings": rules.warnings,
+                "overrides": rules.overrides.len(), "model_rules": rules.model_rules, "warnings": rules.warnings,
             }))?
         );
         return Ok(0);
@@ -136,8 +136,23 @@ fn check(ctx: &mut Context, args: &CheckArgs) -> Result<i32> {
     Ok(0)
 }
 
-/// The `## Models` preference lists, one line per criticality that has one.
+/// `fable (if label: model/fable)`: a model list followed by the line that chose it.
+fn with_model_source(models: String, source: Option<&str>) -> String {
+    match source {
+        Some(src) => {
+            let note = format!("({src})");
+            format!("{models} {}", note.if_supports_color(Stream::Stdout, |t| t.dimmed()))
+        }
+        None => models,
+    }
+}
+
+/// The `## Models` preference lists: conditional `if` rows in file order
+/// (first match wins), then one line per criticality that has one.
 fn print_model_lists(rules: &PriorityRules) {
+    for r in &rules.model_rules {
+        println!("  models line {}: if {} → {}", r.line, fmt_conditions(&r.conditions), model_list_colored(&r.models));
+    }
     for c in crate::domain::Criticality::ALL {
         let models = rules.model_for(c);
         if !models.is_empty() {
@@ -211,7 +226,7 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     println!("  rules:       {}", path.display());
     println!("  criticality: {}", criticality_colored(eval.criticality));
     println!("  score:       {:.1}", eval.score);
-    println!("  model:       {}", model_list_colored(&eval.models));
+    println!("  model:       {}", with_model_source(model_list_colored(&eval.models), eval.model_source.as_deref()));
     if eval.skip {
         println!("  skip:        {}", "yes (override)".if_supports_color(Stream::Stdout, |t| t.red()));
     }
@@ -248,6 +263,9 @@ pub struct SimRow {
     pub score: f64,
     pub skip: bool,
     pub preferred_models: Vec<ModelTier>,
+    /// Which `PRIORITY.md` line chose `preferred_models` (see
+    /// [`crate::priority::Evaluation::model_source`]).
+    pub model_source: Option<String>,
     /// What the budget policy would run (None = throttled or `--no-budget`).
     pub model: Option<ModelTier>,
     /// Why the policy chose (or refused) a model; empty with `--no-budget`.
@@ -401,6 +419,11 @@ pub fn simulate_with(
         let (task, eval, stored) = (&simulated_tasks[*idx], &evaluated[*idx], &tasks[*idx]);
         let schedulable = task.state.is_schedulable() && task.not_before.is_none_or(|nb| nb <= now);
         let preferred = if eval.models.is_empty() { rules.model_for(eval.criticality).to_vec() } else { eval.models.clone() };
+        let model_source = if eval.models.is_empty() && !preferred.is_empty() {
+            Some(format!("{} row", eval.criticality))
+        } else {
+            eval.model_source.clone()
+        };
         let (model, policy_reason) = match policy_input.as_mut() {
             Some(input) if schedulable => {
                 let decision = Policy::new(&cfg.budget, &input.ledgers, &input.limits).decide(
@@ -445,6 +468,7 @@ pub fn simulate_with(
             score: eval.score,
             skip: eval.skip,
             preferred_models: preferred,
+            model_source,
             model,
             policy: policy_reason,
             would_start_now,
@@ -579,7 +603,12 @@ pub fn render_simulation(sim: &Simulation, args: &SimulateArgs) -> String {
         } else {
             crate::cli::output::state_colored(r.state)
         };
-        let mut row = vec![rank, was, r.key.clone(), state, crit, score, model_list_colored(&r.preferred_models)];
+        // Only conditional rows are worth the width; the criticality row is implied.
+        let preferred = match r.model_source.as_deref() {
+            Some(src) if src.starts_with("if ") => with_model_source(model_list_colored(&r.preferred_models), Some(src)),
+            _ => model_list_colored(&r.preferred_models),
+        };
+        let mut row = vec![rank, was, r.key.clone(), state, crit, score, preferred];
         if !args.no_budget {
             let policy = match (&r.model, r.schedulable) {
                 (Some(m), _) => model_colored(Some(m)),

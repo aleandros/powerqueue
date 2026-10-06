@@ -27,6 +27,7 @@
 //! - ENG-201: model = opus
 //!
 //! ## Models
+//! - if label: model/fable: fable
 //! - critical: fable
 //! - high: opus
 //! - normal: sonnet
@@ -41,7 +42,7 @@
 pub mod rules;
 pub mod watcher;
 
-pub use rules::{Condition, Evaluation, JevSection, PriorityRules, Rule, RuleError, ScoringRule};
+pub use rules::{Condition, Evaluation, JevSection, ModelRule, PriorityRules, Rule, RuleError, ScoringRule, fmt_conditions};
 pub use watcher::RulesWatcher;
 
 /// The default `PRIORITY.md` written by `powerqueue init`.

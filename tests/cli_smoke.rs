@@ -152,6 +152,42 @@ fn add_then_status_and_show() {
 }
 
 #[test]
+fn conditional_model_rows_are_reported_by_priority_commands() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    write_minimal_config(home.path(), repo.path());
+    std::fs::write(
+        home.path().join("config").join("PRIORITY.md"),
+        "## High\n- source: manual\n\n## Models\n- if label: model/fable: fable\n- high: opus\n",
+    )
+    .unwrap();
+    pq(home.path()).args(["add", "Grouped", "--key", "G-1", "--label", "model/fable"]).assert().success();
+    pq(home.path()).args(["add", "Loose", "--key", "G-2", "--label", "fable"]).assert().success();
+
+    pq(home.path()).args(["task", "show", "G-1"]).assert().success().stdout(predicate::str::contains("model/fable"));
+    pq(home.path())
+        .args(["priority", "explain", "G-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("model:       fable (if label: model/fable)"));
+    pq(home.path())
+        .args(["priority", "explain", "G-2"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("model:       opus (high row)"));
+    pq(home.path())
+        .args(["priority", "check"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("models line 5: if label: model/fable → fable"));
+    pq(home.path())
+        .args(["priority", "simulate", "--no-budget"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fable (if label: model/fable)"));
+}
+
+#[test]
 fn offline_control_commands_apply_directly() {
     let home = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();

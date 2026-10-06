@@ -23,7 +23,7 @@ other headings) is ignored, so you can keep notes in the file.
 | `## Default` | criticality for tasks no rule matches (default `normal`) |
 | `## Scoring` | point adjustments |
 | `## Overrides` | per-ticket pins |
-| `## Models` | preferred models per criticality (`fable \| gpt-6.1-sol`) |
+| `## Models` | preferred models per criticality (`fable \| gpt-6.1-sol`), plus conditional `if <conditions>: <models>` rows |
 | `## Jev` | Jev question and rubric |
 
 Rules are bullet lines (`- ...` or `* ...`). Blank lines and non-bullet lines
@@ -58,11 +58,26 @@ Join conditions with ` and `. All conditions in a rule must hold. There is no
 Quotes around values are optional; use them when a value contains spaces or
 regex metacharacters.
 
+### Grouped labels (`parent/name`)
+
+Linear labels can live in a group (a parent label): the `fable` label inside
+the `model` group is a different label from a loose `fable` label.
+powerqueue stores a child label qualified with its group, `model/fable`, and
+a loose label as plain `fable` (`task show` lists them that way). Labels on
+existing tasks are re-synced on the next Linear poll.
+
+- `label: model/fable` matches only the child label in the `model` group.
+- `label: fable` (no `/`) matches a loose `fable` label **and** any child
+  label called `fable`, so rules (and `linear.required_labels` /
+  `excluded_labels`) written before labels were qualified keep working.
+- `label ~ regex` runs against the stored form: `label ~ ^model/` matches any
+  label in the `model` group.
+
 ## Fields
 
 | Field | Type | Values |
 |-------|------|--------|
-| `label` | list of strings | any Linear label, or labels given with `add --label` |
+| `label` | list of strings | any Linear label, or labels given with `add --label`; a child label in a Linear label group is stored as `parent/name` (see below) |
 | `priority` | enum / number | `urgent`, `high`, `normal` (`medium`), `low`, `none`, or Linear's 0–4 (0 = none, 1 = urgent) |
 | `estimate` | number | Linear estimate points |
 | `project` | string | Linear project name |
@@ -165,7 +180,22 @@ rather than ignored.
 - low: sonnet
 ```
 
+```markdown
+## Models
+- if label: model/fable: fable
+- if label ~ ^model/ and priority: urgent: opus | gpt-6.1-sol
+- critical: fable
+```
+
 Maps a criticality to a list of preferred models, most wanted first.
+A bullet starting with `if` is a **conditional row**: `if <conditions>:
+<model> [| <model>...]`. Conditions use the same grammar as the criticality
+sections (`label: model/fable`, `label ~ regex`, `and`, ...); the model list
+follows the last `:`. Conditional rows are tried in file order and the first
+one whose conditions all hold wins over the criticality row (an `##
+Overrides` model list still wins over both). They do not change the task's
+criticality or score.
+
 Alternatives are separated by `|` (whitespace around them does not matter;
 `critical = fable | gpt-6.1-sol` also works). Each name is parsed with the
 same rules as `task model`: Claude's aliases (`fable`, `opus`, `sonnet`,
@@ -181,8 +211,11 @@ Missing levels leave the choice to the budget policy: `normal` falls back to
 take the most capable eligible model. As with override models, this is a
 preference: the policy tries each alternative in order (each through its own
 provider's downgrade chain) and, when none is eligible, the first eligible
-model in `budget.provider_order`. `priority check` prints the lists;
-`priority explain` and `task explain` show which one applied.
+model in `budget.provider_order`. `priority check` prints the lists
+(conditional rows first, with their line numbers); `priority explain` shows
+which one applied, e.g. `model: fable (if label: model/fable)` or `model:
+opus (high row)`, and `priority simulate` tags models chosen by a
+conditional row the same way.
 
 ## Jev
 
@@ -222,8 +255,8 @@ For one task, at every re-score:
    `+` Jev normalised score × `priority.jev.weight` (when enabled)
    `+` hours waiting × `priority.age_boost_per_hour`, capped at 200 points.
 4. **Model**: the CLI (`task model`, `add --model`) wins, then the
-   `## Overrides` model list, then the `## Models` list for the criticality,
-   else none. The list is handed to the budget policy as the preferences
+   `## Overrides` model list, then the first matching `## Models` `if` row,
+   then the `## Models` list for the criticality, else none. The list is handed to the budget policy as the preferences
    (`Evaluation.models`; `Evaluation.model` is its first entry): each entry
    is tried in order, downgraded within its own provider when it is out of
    budget, never upgraded above it; when nothing on the list fits the
@@ -244,6 +277,7 @@ dashboard. The exact strings (`src/priority/rules.rs::evaluate`):
 | Jev | `jev 0.48 × 300 = +144` |
 | age | `age +4.0 (2.0h)` |
 | model from overrides | `model opus from ## Overrides` |
+| model from a Models `if` row | `model fable from ## Models line 30 (if label: model/fable)` |
 | model from Models | `model fable \| gpt-6.1-sol from ## Models` |
 
 Ties in score are broken by criticality, then by age (older first)

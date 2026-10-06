@@ -352,3 +352,26 @@ async fn fetch_issues_sends_cycle_and_project_filters_and_parses_cycles() {
     let body: Value = requests.last().unwrap().body_json().unwrap();
     assert_eq!(body["variables"]["filter"], json!({}));
 }
+
+#[tokio::test]
+async fn child_labels_come_back_qualified_with_their_group() {
+    let server = server().await;
+    let mut grouped = issue("u1", "ENG-1", &["bug"]);
+    grouped["labels"]["nodes"].as_array_mut().unwrap().push(json!({ "name": "fable", "parent": { "name": "model" } }));
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "issues": {
+                "nodes": [grouped, issue("u2", "ENG-2", &["fable"])],
+                "pageInfo": { "hasNextPage": false, "endCursor": null }
+            } }
+        })))
+        .mount(&server)
+        .await;
+    let issues = client(&server).fetch_issues(&IssueFilter::default()).await.unwrap();
+    assert_eq!(issues[0].labels, vec!["bug".to_string(), "model/fable".to_string()]);
+    assert_eq!(issues[1].labels, vec!["fable".to_string()]);
+
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = requests[0].body_json().unwrap();
+    assert!(body["query"].as_str().unwrap().contains("labels { nodes { name parent { name } } }"));
+}

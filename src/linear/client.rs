@@ -50,6 +50,8 @@ pub struct LinearIssue {
     /// 0 = none, 1 = urgent, 2 = high, 3 = normal, 4 = low.
     pub priority: u8,
     pub estimate: Option<f64>,
+    /// Label names; child labels are qualified as `parent/name`
+    /// (see [`crate::domain::qualified_label`]).
     pub labels: Vec<String>,
     pub state_name: String,
     pub state_type: String,
@@ -64,9 +66,10 @@ pub struct LinearIssue {
 }
 
 impl LinearIssue {
-    /// True if the issue carries `label` (case-insensitive).
+    /// True if the issue carries `label` (case-insensitive; see
+    /// [`crate::domain::label_matches`] for how `parent/name` is handled).
     pub fn has_label(&self, label: &str) -> bool {
-        self.labels.iter().any(|l| l.eq_ignore_ascii_case(label.trim()))
+        self.labels.iter().any(|l| crate::domain::label_matches(l, label))
     }
 
     /// The cycle status word stored on tasks (`active`, `next`, `past`,
@@ -220,7 +223,7 @@ impl IssueFilter {
 
 /// Fields requested for every issue query; shared by list and single lookups.
 const ISSUE_FIELDS: &str = "id identifier title description url priority estimate \
-     labels { nodes { name } } state { name type } team { key } \
+     labels { nodes { name parent { name } } } state { name type } team { key } \
      project { name } assignee { id } \
      cycle { number name isActive isNext isPast isFuture } createdAt updatedAt";
 
@@ -248,7 +251,7 @@ struct RawIssue {
     #[serde(default)]
     estimate: Option<f64>,
     #[serde(default)]
-    labels: Option<Nodes<Named>>,
+    labels: Option<Nodes<RawLabel>>,
     #[serde(default)]
     state: Option<RawState>,
     #[serde(default)]
@@ -300,6 +303,14 @@ struct Named {
     name: String,
 }
 
+/// A label with its group, if it is a child label.
+#[derive(Debug, Deserialize)]
+struct RawLabel {
+    name: String,
+    #[serde(default)]
+    parent: Option<Named>,
+}
+
 #[derive(Debug, Deserialize)]
 struct Keyed {
     key: String,
@@ -342,7 +353,15 @@ impl From<RawIssue> for LinearIssue {
             url: raw.url,
             priority: raw.priority.map(|p| p.clamp(0.0, 4.0) as u8).unwrap_or(0),
             estimate: raw.estimate,
-            labels: raw.labels.map(|l| l.nodes.into_iter().map(|n| n.name).collect()).unwrap_or_default(),
+            labels: raw
+                .labels
+                .map(|l| {
+                    l.nodes
+                        .into_iter()
+                        .map(|n| crate::domain::qualified_label(&n.name, n.parent.as_ref().map(|p| p.name.as_str())))
+                        .collect()
+                })
+                .unwrap_or_default(),
             state_name,
             state_type,
             team_key: raw.team.map(|t| t.key).unwrap_or_default(),
@@ -761,6 +780,33 @@ mod tests {
         assert_eq!(issue.labels, vec!["bug".to_string()]);
         assert_eq!(issue.team_key, "ENG");
         assert!(issue.project.is_none());
+    }
+
+    #[test]
+    fn child_labels_are_qualified_with_their_parent() {
+        let raw: RawIssue = serde_json::from_value(serde_json::json!({
+            "id": "abc", "identifier": "ENG-9", "title": "T", "url": "https://x",
+            "labels": { "nodes": [
+                {"name": "fable", "parent": {"name": "model"}},
+                {"name": "fable", "parent": null},
+                {"name": "bug"}
+            ] },
+            "createdAt": "2026-01-01T00:00:00.000Z", "updatedAt": "2026-01-02T00:00:00.000Z"
+        }))
+        .unwrap();
+        let issue = LinearIssue::from(raw);
+        assert_eq!(issue.labels, vec!["model/fable".to_string(), "fable".to_string(), "bug".to_string()]);
+        assert!(ISSUE_FIELDS.contains("labels { nodes { name parent { name } } }"));
+    }
+
+    #[test]
+    fn label_filter_understands_qualified_labels() {
+        let f = IssueFilter { excluded_labels: vec!["skip".into()], ..Default::default() };
+        assert!(!f.labels_allow(&issue(&["flags/skip"])), "unqualified filter still sees the child label");
+        let f = IssueFilter { required_labels: vec!["model/fable".into()], ..Default::default() };
+        assert!(f.labels_allow(&issue(&["Model/Fable"])));
+        assert!(!f.labels_allow(&issue(&["fable"])), "qualified filter ignores a loose label");
+        assert!(!f.labels_allow(&issue(&["other/fable"])));
     }
 
     #[test]
