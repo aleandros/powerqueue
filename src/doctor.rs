@@ -1077,7 +1077,11 @@ fn check_reviews(cfg: &Config, store: &Store) -> CheckResult {
         Ok(t) => t,
         Err(e) => return CheckResult::fail(STATE, "reviews", format!("{e:#}"), "check the database"),
     };
-    let errors = store.count_events_of_kind("review.error", Utc::now() - Duration::hours(24)).unwrap_or(0);
+    let since = Utc::now() - Duration::hours(24);
+    // `review.lookup_failed`: `gh pr list` failed when a task completed
+    // without `--pr`, so an open PR may have gone unwatched.
+    let errors = store.count_events_of_kind("review.error", since).unwrap_or(0)
+        + store.count_events_of_kind("review.lookup_failed", since).unwrap_or(0);
     review_status(&tasks, errors, cfg.scheduler.review_rounds_max)
 }
 

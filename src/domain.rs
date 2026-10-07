@@ -981,6 +981,23 @@ pub struct Session {
     /// passed as `--session-id`. Discovered after launch, used for resume.
     #[serde(default)]
     pub agent_session_id: Option<String>,
+    /// Since when the task has been waiting on a human (`needs_attention`);
+    /// `None` while the agent is not waiting. Set and cleared by the probe.
+    #[serde(default)]
+    pub waiting_since: Option<DateTime<Utc>>,
+    /// Seconds this session spent waiting on a human in earlier waits.
+    /// `max_session_secs` counts only the time the agent was working.
+    #[serde(default)]
+    pub waited_secs: i64,
+}
+
+impl Session {
+    /// Wall time the agent has been working: the session's age minus the
+    /// time it spent waiting on a human (past waits and the current one).
+    pub fn working_time(&self, now: DateTime<Utc>) -> chrono::Duration {
+        let current_wait = self.waiting_since.map(|since| now - since).unwrap_or_else(chrono::Duration::zero);
+        now - self.started_at - chrono::Duration::seconds(self.waited_secs) - current_wait
+    }
 }
 
 /// Token usage attributed to one session and model, summed over the session.

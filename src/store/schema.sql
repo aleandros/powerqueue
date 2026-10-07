@@ -58,7 +58,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     ended_at         TEXT,
     last_activity_at TEXT NOT NULL,
     error            TEXT,
-    agent_session_id TEXT                      -- the CLI's own id (Codex thread, agy conversation); NULL for Claude
+    agent_session_id TEXT,                     -- the CLI's own id (Codex thread, agy conversation); NULL for Claude
+    waiting_since    TEXT,                     -- start of the current wait on a human (v6)
+    waited_secs      INTEGER NOT NULL DEFAULT 0 -- earlier waits on a human, excluded from max_session_secs (v6)
 );
 CREATE INDEX IF NOT EXISTS sessions_task_idx ON sessions(task_id);
 CREATE INDEX IF NOT EXISTS sessions_state_idx ON sessions(state);

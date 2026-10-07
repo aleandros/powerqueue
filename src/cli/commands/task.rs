@@ -147,6 +147,24 @@ pub fn offline_target(cmd: &DaemonCommand) -> Option<TaskState> {
 /// Returns `Ok(false)` when the transition is not allowed from the current state.
 pub fn apply_offline(store: &Store, task: &mut Task, cmd: &DaemonCommand) -> Result<bool> {
     let Some(mut target) = offline_target(cmd) else { return Ok(false) };
+    if matches!(cmd, DaemonCommand::Retry { .. }) && task.state == TaskState::InReview {
+        // A review round resuming the released session, as the daemon does.
+        let Some(crate::scheduler::transitions::Effect::Log { level, kind, message, data }) =
+            crate::scheduler::review::request_round(task, Utc::now())
+        else {
+            return Ok(false);
+        };
+        store.update_task(task)?;
+        store.log_event(
+            Some(task.id),
+            None,
+            level,
+            &kind,
+            &format!("{message} (applied by the CLI, no daemon running)"),
+            data,
+        )?;
+        return Ok(true);
+    }
     if matches!(cmd, DaemonCommand::Resume { .. }) && task.parked_in_review() {
         target = TaskState::InReview;
         if let Some(watch) = task.review.as_mut() {

@@ -503,6 +503,34 @@ impl Daemon {
             }
             DaemonCommand::Retry { task_id } => {
                 let mut task = self.require_task(*task_id)?;
+                if task.state == TaskState::InReview {
+                    // The session was released for review: resume it for a
+                    // review round on the same branch and worktree path.
+                    match review::request_round(&mut task, now) {
+                        Some(effect) => {
+                            self.store.update_task(&task)?;
+                            self.apply_effects(&mut task, None, vec![effect]).await;
+                            self.store.update_task(&task)?;
+                            self.log(
+                                Some(task.id),
+                                None,
+                                EventLevel::Info,
+                                "task.retried",
+                                "re-queued by user for a review round",
+                                serde_json::json!({}),
+                            );
+                        }
+                        None => self.log(
+                            Some(task.id),
+                            None,
+                            EventLevel::Warn,
+                            "task.retry_ignored",
+                            "retry ignored: the task is in review but its PR number is unknown",
+                            serde_json::json!({ "pr": task.pr_url }),
+                        ),
+                    }
+                    return Ok(());
+                }
                 if task.state.is_terminal() {
                     task.attempts = 0;
                     task.last_error = None;
@@ -513,6 +541,14 @@ impl Daemon {
                     task.state,
                     TaskState::Crashed | TaskState::Throttled | TaskState::Paused | TaskState::NeedsAttention
                 ) {
+                    self.log(
+                        Some(task.id),
+                        None,
+                        EventLevel::Info,
+                        "task.retry_ignored",
+                        &format!("retry ignored: the task is {}", task.state),
+                        serde_json::json!({ "state": task.state }),
+                    );
                     return Ok(());
                 }
                 // A retry is a fresh attempt: a session that is still alive
@@ -1604,7 +1640,23 @@ impl Daemon {
         let period_end = self.provider_period_end(session.model.provider(), now);
         let outcome = interpret_hook(ev.event, &ev.payload);
         tracing::debug!(task = %task.key, session = %session.id, event = ev.event.as_str(), ?outcome, "hook outcome");
-        let effects = transitions::on_hook_outcome(&mut task, &mut session, &outcome, &self.cfg, now, period_end);
+        let mut effects = transitions::on_hook_outcome(&mut task, &mut session, &outcome, &self.cfg, now, period_end);
+        if task.state == TaskState::Completed && self.adopt_open_pr(&mut task, now) {
+            // The agent finished without `--pr` but its branch has an open
+            // PR: release the session for review instead of completing.
+            effects = vec![
+                Effect::Log {
+                    level: EventLevel::Info,
+                    kind: "session.released".into(),
+                    message: format!(
+                        "task is in review ({}); releasing its slot and worktree",
+                        task.pr_url.as_deref().unwrap_or("no PR")
+                    ),
+                    data: serde_json::json!({ "pr": task.pr_url }),
+                },
+                Effect::ReleaseForReview,
+            ];
+        }
         if task.state == TaskState::Running && session.state == SessionState::Running {
             self.rt.nudged.remove(&session.id);
         }
@@ -1968,7 +2020,7 @@ impl Daemon {
             let stale = matches!(task.state, TaskState::Running | TaskState::Starting)
                 && sc.stale_session_secs > 0
                 && silent > Duration::seconds(sc.stale_session_secs as i64);
-            let timeout = sc.max_session_secs > 0 && now - session.started_at > Duration::seconds(sc.max_session_secs as i64);
+            let timeout = transitions::session_timed_out(&task, &session, sc, now);
             let dying = !(probe.is_alive() || task.state.is_handed_off() || task.state == TaskState::Paused);
             let pane_tail = if dying || stale || timeout {
                 session.pane_id.as_deref().and_then(|p| self.rt.tmux.capture_pane(p, CRASH_TAIL_LINES).ok())
@@ -1987,8 +2039,13 @@ impl Daemon {
                 };
             }
             let ctx = ProbeContext { now, nudged: self.rt.nudged.contains(&session.id), pane_tail, provider_cooldown_until };
+            let wait_before = (session.waiting_since, session.waited_secs);
             let effects = transitions::on_probe(&mut task, &mut session, &probe, &self.cfg.scheduler, &ctx);
             if effects.is_empty() {
+                // A wait on a human started or ended: keep the bookkeeping.
+                if (session.waiting_since, session.waited_secs) != wait_before {
+                    self.store.update_session(&session)?;
+                }
                 continue;
             }
             self.store.update_session(&session)?;
@@ -2002,6 +2059,51 @@ impl Daemon {
         Ok(())
     }
 
+    /// A task the agent completed without `task complete --pr` whose branch
+    /// has an open PR goes `in_review` with that PR instead, so the watcher
+    /// follows it to the merge (AVS-1652). Returns whether it did; a failed
+    /// `gh` call is logged and leaves the task completed.
+    fn adopt_open_pr(&mut self, task: &mut Task, now: DateTime<Utc>) -> bool {
+        if task.state != TaskState::Completed || task.pr_url.is_some() || self.cfg.scheduler.pr_poll_secs == 0 {
+            return false;
+        }
+        let Some(branch) = task.branch.clone() else { return false };
+        let dir = task.worktree_path.clone().map(PathBuf::from).filter(|p| p.is_dir()).unwrap_or_else(|| self.cfg.repo_path());
+        let gh = Gh::new(&self.cfg.scheduler.gh_binary);
+        let url = match gh.open_pr_for_branch(&dir, &branch) {
+            Ok(Some(url)) => url,
+            Ok(None) => return false,
+            Err(e) => {
+                self.log(
+                    Some(task.id),
+                    None,
+                    EventLevel::Warn,
+                    "review.lookup_failed",
+                    &format!("cannot tell whether {branch} has an open PR; completing the task: {e:#}"),
+                    serde_json::json!({ "branch": branch }),
+                );
+                return false;
+            }
+        };
+        let mut watch = ReviewWatch::armed(now, task.review.as_ref());
+        watch.worktree_path = task.worktree_path.clone().or_else(|| task.review.as_ref().and_then(|r| r.worktree_path.clone()));
+        task.state = TaskState::InReview;
+        task.completed_at = None;
+        task.pr_url = Some(url.clone());
+        task.review = Some(watch);
+        task.not_before = None;
+        task.last_error = None;
+        self.log(
+            Some(task.id),
+            None,
+            EventLevel::Info,
+            "task.in_review",
+            &format!("completed without a PR link, but {branch} has open PR {url}; handed off for review (merge armed)"),
+            serde_json::json!({ "pr": url, "from": TaskState::Completed, "adopted": true }),
+        );
+        true
+    }
+
     /// Tasks finished outside the hook path (`powerqueue task complete`,
     /// cancelled by Linear sync, ...) still have a live session: release it.
     /// A task handed off `in_review` gives up its window, slot and worktree
@@ -2009,6 +2111,9 @@ impl Daemon {
     async fn finalize_terminal(&mut self, now: DateTime<Utc>) -> Result<()> {
         for mut session in self.store.list_live_sessions()? {
             let Some(mut task) = self.store.get_task(session.task_id)? else { continue };
+            if task.state == TaskState::Completed && self.adopt_open_pr(&mut task, now) {
+                self.store.update_task(&task)?;
+            }
             if task.state == TaskState::InReview {
                 session.state = SessionState::Exited;
                 session.ended_at = Some(now);
@@ -2485,6 +2590,14 @@ impl Daemon {
                     format!("powerqueue resumed the session for PR #{}: {}{detail}. Prompt: `{prompt}`", r.pr_number, r.reason);
                 self.comment_linear(&task, comment, CommentKind::Progress).await;
             }
+            // A resumed attempt (crash, timeout) leaves the issue where it
+            // is: the first start already moved it to In Progress, and since
+            // then a PR may have moved it to In Review (AVS-1618). Only the
+            // move to `linear.blocked_state` is undone.
+            _ if resume && self.cfg.linear.blocked_state.as_deref().is_none_or(|s| s.trim().is_empty()) => {
+                let comment = format!("powerqueue resumed attempt {attempt} on branch `{branch}` with model {model}.");
+                self.comment_linear(&task, comment, CommentKind::Progress).await;
+            }
             _ => {
                 let comment = format!("powerqueue started attempt {attempt} on branch `{branch}` with model {model}.");
                 self.update_linear(&task, LinearTarget::InProgress, Some(comment)).await;
@@ -2765,6 +2878,8 @@ mod tests {
             last_activity_at: at,
             error: None,
             agent_session_id: None,
+            waiting_since: None,
+            waited_secs: 0,
         };
         store.insert_session(&session).unwrap();
         let mut transcript = std::fs::File::create(&path).unwrap();
@@ -3206,6 +3321,8 @@ mod tests {
             last_activity_at: Utc::now(),
             error: None,
             agent_session_id: agent.map(str::to_string),
+            waiting_since: None,
+            waited_secs: 0,
         };
         let claude = crashed(ModelTier::opus(), None);
         assert_eq!(resume_plan(Some(&claude), &ModelTier::sonnet(), true, false), (claude.id, true, None));
@@ -3354,6 +3471,8 @@ mod tests {
             last_activity_at: started,
             error: None,
             agent_session_id: None,
+            waiting_since: None,
+            waited_secs: 0,
         };
         store.insert_session(&session).unwrap();
         (daemon, store, task, session, mock, server)

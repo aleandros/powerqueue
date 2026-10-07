@@ -129,7 +129,12 @@ pub fn on_hook_outcome(
             if live && !task.state.is_handed_off() && task.state != TaskState::Paused {
                 session.state = SessionState::Running;
             }
+            // Compacting the context is the agent's own housekeeping, not an
+            // answer: a task waiting on a human keeps waiting (otherwise the
+            // stale timer kills it and the relaunch asks the question again).
+            let still_waiting = task.state == TaskState::NeedsAttention && source == "compact";
             if live
+                && !still_waiting
                 && matches!(task.state, TaskState::Starting | TaskState::Idle | TaskState::NeedsAttention | TaskState::Crashed)
             {
                 task.state = TaskState::Running;
@@ -345,6 +350,30 @@ pub fn on_hook_outcome(
     effects
 }
 
+/// Track how long the session waits on a human: a wait starts when the
+/// task is first seen in `needs_attention` and its length is added to
+/// `waited_secs` when it leaves that state. No I/O or failure is possible.
+pub fn note_waiting(task: &Task, session: &mut Session, now: DateTime<Utc>) {
+    match (task.state == TaskState::NeedsAttention, session.waiting_since) {
+        (true, None) => session.waiting_since = Some(now),
+        (false, Some(since)) => {
+            session.waited_secs += (now - since).num_seconds().max(0);
+            session.waiting_since = None;
+        }
+        _ => {}
+    }
+}
+
+/// True when the attempt exceeded `max_session_secs` of *working* time.
+/// A task waiting on a human never times out, and time spent waiting does
+/// not count (see [`Session::working_time`]).
+pub fn session_timed_out(task: &Task, session: &Session, cfg: &SchedulerConfig, now: DateTime<Utc>) -> bool {
+    cfg.max_session_secs > 0
+        && !task.state.is_handed_off()
+        && task.state != TaskState::NeedsAttention
+        && session.working_time(now) > Duration::seconds(cfg.max_session_secs as i64)
+}
+
 /// Resume idle tasks and clear permission attention after agent progress.
 /// Explicit blockers still require a reply: finishing `task block` or writing
 /// its explanation is not a resolution. No I/O or failure is possible.
@@ -445,12 +474,12 @@ pub fn on_probe(
         return effects;
     }
 
+    note_waiting(task, session, now);
     let since_activity = now - session.last_activity_at;
     let running = matches!(task.state, TaskState::Running | TaskState::Starting);
     let stale = running && cfg.stale_session_secs > 0 && since_activity > Duration::seconds(cfg.stale_session_secs as i64);
-    let age = now - session.started_at;
-    let timed_out =
-        cfg.max_session_secs > 0 && !task.state.is_handed_off() && age > Duration::seconds(cfg.max_session_secs as i64);
+    let worked = session.working_time(now);
+    let timed_out = session_timed_out(task, session, cfg, now);
 
     // An agent waiting in-session for its usage limit to reset is not hung:
     // while its provider is on cooldown, park the task as throttled instead
@@ -494,12 +523,21 @@ pub fn on_probe(
         return effects;
     }
     if timed_out {
-        let reason = format!("attempt ran for {}s (max_session_secs = {})", age.num_seconds(), cfg.max_session_secs);
+        let reason = format!(
+            "agent worked for {}s in this attempt (max_session_secs = {}; {}s waiting on a human not counted)",
+            worked.num_seconds(),
+            cfg.max_session_secs,
+            session.waited_secs
+        );
         effects.push(Effect::log(
             EventLevel::Warn,
             "session.timeout",
             reason.clone(),
-            serde_json::json!({ "age_secs": age.num_seconds() }),
+            serde_json::json!({
+                "age_secs": (now - session.started_at).num_seconds(),
+                "worked_secs": worked.num_seconds(),
+                "waited_secs": session.waited_secs,
+            }),
         ));
         effects.push(Effect::KillWindow);
         effects.extend(on_crash(task, Some(session), &reason, None, cfg, now, ctx.pane_tail.as_deref()));
@@ -780,6 +818,8 @@ mod tests {
             last_activity_at: now() - Duration::minutes(1),
             error: None,
             agent_session_id: None,
+            waiting_since: None,
+            waited_secs: 0,
         }
     }
 
@@ -1334,6 +1374,60 @@ mod tests {
         let ctx = ProbeContext { now: now(), ..Default::default() };
         let fx = on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx);
         assert_eq!(kinds(&fx), vec!["session.timeout", "kill", "session.crashed"]);
+    }
+
+    #[test]
+    fn waiting_on_a_human_never_times_out_and_does_not_count() {
+        // AVS-1618 / AVS-1749: the agent asked a question, the human took
+        // hours to answer, and max_session_secs killed the waiting session.
+        let mut t = task(TaskState::NeedsAttention, 1);
+        let mut s = session(SessionState::Idle, 1);
+        s.started_at = now() - Duration::hours(5);
+        s.last_activity_at = now() - Duration::hours(5);
+        let asked = now() - Duration::hours(4) - Duration::minutes(50);
+        let ctx = ProbeContext { now: asked, ..Default::default() };
+        on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx);
+        assert_eq!(s.waiting_since, Some(asked));
+
+        let ctx = ProbeContext { now: now(), ..Default::default() };
+        let fx = on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx);
+        assert!(fx.is_empty(), "a task waiting on a human is not timed out: {fx:?}");
+        assert_eq!(t.state, TaskState::NeedsAttention);
+
+        // The human answers: the agent worked 10 minutes, not 5 hours.
+        t.state = TaskState::Running;
+        s.state = SessionState::Running;
+        s.last_activity_at = now();
+        let fx = on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx);
+        assert!(fx.is_empty(), "the wait does not count towards max_session_secs: {fx:?}");
+        assert_eq!(s.waiting_since, None);
+        assert_eq!(s.waited_secs, (Duration::hours(4) + Duration::minutes(50)).num_seconds());
+        assert_eq!(s.working_time(now()), Duration::minutes(10));
+
+        // Working time still runs out eventually.
+        let later = now() + Duration::hours(4);
+        s.last_activity_at = later;
+        let ctx = ProbeContext { now: later, ..Default::default() };
+        let fx = on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx);
+        assert_eq!(kinds(&fx), vec!["session.timeout", "kill", "session.crashed"]);
+    }
+
+    #[test]
+    fn compaction_does_not_clear_a_pending_question() {
+        // AVS-1618: a compaction while the question was open moved the task
+        // back to running; 30 minutes later the stale timer killed it.
+        let mut t = task(TaskState::NeedsAttention, 1);
+        t.last_error = Some("which option?".into());
+        let mut s = session(SessionState::Idle, 1);
+        let out = HookOutcome::Started { transcript_path: None, source: "compact".into() };
+        on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), period_end());
+        assert_eq!(t.state, TaskState::NeedsAttention);
+        assert_eq!(t.last_error.as_deref(), Some("which option?"));
+
+        let later = now() + Duration::hours(1);
+        let ctx = ProbeContext { now: later, ..Default::default() };
+        let fx = on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx);
+        assert!(!kinds(&fx).iter().any(|k| k == "session.stale"), "{fx:?}");
     }
 
     #[test]
