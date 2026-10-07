@@ -37,10 +37,34 @@ Fixes:
   `powerqueue doctor --fix` removes the stale `daemon.lock` and `daemon.pid`
   (or delete them by hand).
 - You want two instances: give each its own `POWERQUEUE_HOME`.
+- The service keeps restarting because a daemon started by hand holds the
+  lock: `powerqueue stop`, then `powerqueue service start`.
 
 **Symptom**: `cannot read .../config.toml (run powerqueue init first)`.
 
 Run `powerqueue init`, or point `--home`/`POWERQUEUE_HOME` at the right place.
+Under a service, that variable comes from the unit: re-run
+`powerqueue service install --force` from a shell where it is set.
+
+**Symptom**: `powerqueue service status` says `running: no`, or the service
+restarts every 10 seconds.
+
+```sh
+powerqueue service status      # problems: binary moved, tools missing from PATH, daemon outside the service
+powerqueue service logs -n 50  # journalctl --user -u powerqueue.service / launchd.err.log: the startup error
+```
+
+- `it runs <path>, which does not exist`: the binary moved (a different
+  install method, or a `target/` build that was cleaned). Re-run
+  `powerqueue service install --force` from the binary you want to keep.
+- `its PATH cannot find claude, ...`: the unit's `PATH` is a copy of the
+  installing shell's. Re-run `install --force` from a shell where
+  `which claude` works, or pass `--env PATH=...`.
+- `systemctl --user` fails with `Failed to connect to bus` (over SSH, under
+  `sudo`/`su`): log in as the user directly so `XDG_RUNTIME_DIR` is set, or
+  `export XDG_RUNTIME_DIR=/run/user/$(id -u)`.
+- The service stops when you log out: `powerqueue service install --linger`
+  (or `loginctl enable-linger $USER`).
 
 ## No tasks are picked up
 
@@ -131,7 +155,8 @@ Fixes:
   `session.crashed` event). Common causes: not logged in
   (`claude auth status`), an invalid `claude.extra_args`, a `claude.binary`
   that is not on the daemon's `PATH` (launchd and systemd have a minimal
-  `PATH`; set it in the unit).
+  `PATH`; `powerqueue service install` copies your shell's, and
+  `service status` lists the tools it cannot find).
 - **Permission prompts**: in `permission_mode = "default"` a prompt blocks the
   session until a human answers. Use `acceptEdits` (default) or
   `bypassPermissions` for unattended runs, or add `claude.allowed_tools`.
@@ -219,6 +244,11 @@ powerqueue attach ENG-123 --print      # the exact tmux command (socket, window 
 
 - `tmux.socket_name` must match: the daemon and your shell must use the same
   `-L` socket. Unset it unless you need isolation.
+- Every session vanished when the daemon's systemd service stopped or
+  restarted: the unit lacks `KillMode=process`, so systemd killed the tmux
+  server the daemon had started in its cgroup. `powerqueue service install
+  --force` regenerates the unit; `service status` shows `sessions: survive a
+  stop/restart of the service` afterwards.
 - The server was killed (`tmux kill-server`, reboot). Running sessions are
   gone; the daemon marks them `crashed` on the next probe and relaunches
   with `--resume`, so context survives.
@@ -312,10 +342,14 @@ echo "$POWERQUEUE_SECRETS"
 Precedence is environment (`LINEAR_API_KEY`, `JEV_API_KEY`) → keychain → file.
 
 - The key was stored in the keychain but the daemon runs under launchd/systemd
-  without keychain access. Either grant access when prompted, set the
-  environment variable in the unit, or use the file backend for the daemon:
-  `POWERQUEUE_SECRETS=file powerqueue secrets set linear` and start the
-  daemon with the same variable.
+  without keychain access. Either grant access when prompted or use the file
+  backend for the daemon: `POWERQUEUE_SECRETS=file powerqueue secrets set linear`,
+  then `POWERQUEUE_SECRETS=file powerqueue service install --force` (the
+  variable is copied into the unit). Avoid putting the key itself in the unit
+  (`--env`): the file is world-readable.
+- The key is only exported in your shell (`LINEAR_API_KEY=...`): a service does
+  not see it. `service install` warns about this; store it with
+  `powerqueue secrets set linear`.
 - Linux without Secret Service (headless): the file backend
   (`<config>/secrets.toml`, mode 0600) is chosen automatically; `doctor`
   says so.

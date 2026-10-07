@@ -11,7 +11,8 @@
 //!   per provider: model shares, period anchor known (config / observed / default),
 //!   `powerqueue tune` drafts waiting to be applied or left behind by a failed run
 //! * secrets: keychain backend, Linear key works (`viewer`), Jev key (if enabled)
-//! * state: database integrity, daemon heartbeat, orphaned worktrees / tmux windows,
+//! * state: database integrity, daemon heartbeat, the systemd/launchd service (installed,
+//!   running, keeps tmux sessions on stop, binary and PATH still right), orphaned worktrees / tmux windows,
 //!   tasks stuck in `starting`/`running` with no live session
 //! * algorithm: estimator accuracy, crash rate, idle rate, throttling frequency,
 //!   per provider: probe freshness, top-model under/over-reservation, window
@@ -876,6 +877,47 @@ fn check_daemon(store: &Store) -> CheckResult {
     }
 }
 
+/// The user service from `powerqueue service install`: running, and its unit
+/// still points at a binary and a PATH that work. Skipped when there is no
+/// service manager or no unit.
+fn check_service(cfg: &Config) -> CheckResult {
+    use crate::service::{InstalledUnit, Manager, query, required_tools, unit_problems};
+    const NAME: &str = "service";
+    let Ok(manager) = Manager::detect() else {
+        return CheckResult::skipped(STATE, NAME, "no systemd or launchd");
+    };
+    let unit = match InstalledUnit::load(manager) {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            return CheckResult::skipped(STATE, NAME, "not installed")
+                .hint("`powerqueue service install` keeps the daemon running and restarts it after a crash");
+        }
+        Err(e) => return CheckResult::warn(STATE, NAME, format!("{e:#}"), "check the file permissions"),
+    };
+    let exe = std::env::current_exe().ok();
+    let problems = unit_problems(&unit, exe.as_deref(), &required_tools(cfg));
+    if let Some(first) = problems.first() {
+        let details: Vec<&str> = problems.iter().map(|p| p.detail.as_str()).collect();
+        return CheckResult::warn(STATE, NAME, format!("{manager}: {}", details.join("; ")), first.hint.clone());
+    }
+    match query(manager) {
+        Ok(s) if s.running => {
+            let mut r = CheckResult::ok(STATE, NAME, format!("{manager}: running ({})", s.detail));
+            if s.linger == Some(false) {
+                r = r.hint("it stops when you log out; `powerqueue service install --linger` keeps it up on a server");
+            }
+            r
+        }
+        Ok(s) => CheckResult::warn(
+            STATE,
+            NAME,
+            format!("{manager}: installed but not running ({})", s.detail),
+            "`powerqueue service start`; `powerqueue service logs` shows why it stopped",
+        ),
+        Err(e) => CheckResult::warn(STATE, NAME, format!("{manager}: {e:#}"), "check that the user service manager is reachable"),
+    }
+}
+
 /// `powerqueue pause` in effect: nothing launches until `resume`.
 fn check_scheduling_pause(store: &Store) -> CheckResult {
     match crate::domain::SchedulingPause::load(store) {
@@ -1692,6 +1734,7 @@ pub async fn run_all(
 
     results.push(check_db(store));
     results.push(check_daemon(store));
+    results.push(check_service(cfg));
     results.push(check_scheduling_pause(store));
     results.push(check_stuck_tasks(cfg, store, fix));
     results.push(check_dependencies(cfg, store));

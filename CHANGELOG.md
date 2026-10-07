@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-07
+
+The daemon can now run as a user service: `powerqueue service install`
+writes a systemd user unit (Linux) or a launchd agent (macOS) for the binary
+you run it from, with your shell's `PATH`, then enables and starts it.
+
+If you run powerqueue under the systemd unit the README used to suggest,
+regenerate it with `powerqueue service install --force`. That unit lacked
+`KillMode=process`, so every stop or restart of the service also killed the
+tmux server and every running Claude session.
+
+### Added
+
+- `powerqueue service install|uninstall|start|stop|restart|status|logs` runs
+  the daemon as a user service: a systemd user unit on Linux, a launchd agent
+  on macOS. `install` writes the file for this binary with your shell's `PATH`
+  (deduplicated, with per-shell version-manager directories such as fnm's
+  replaced by the stable directories they point to) and the powerqueue/XDG/tmux/locale
+  variables that are set, then enables and starts it. It shows a diff and
+  needs `--force` to replace a different file, and does not start next to a
+  daemon running in a terminal. `--linger` keeps the service running after
+  logout, and `--print` / `--manager` preview the file without installing.
+  The service restarts after a crash but not after `powerqueue stop`.
+- `doctor` has a `service` check: whether the service is installed and
+  running, whether its binary still exists and is this one, whether its
+  `PATH` finds git, tmux, gh and the agent CLIs, and whether a stop would
+  kill the tmux sessions.
+
+### Fixed
+
+- The systemd unit the README suggested killed every tmux session (and the
+  Claude sessions in it) whenever the service stopped or restarted, because
+  the daemon starts the tmux server inside the unit's cgroup. Generated units
+  set `KillMode=process`, launchd agents set `AbandonProcessGroup`, and
+  `service stop|restart|uninstall` refuse to act on a unit without it until
+  it is regenerated (or `--force`).
+
+### Changed
+
+- `update` tells you to run `powerqueue service restart` when the daemon runs
+  as a service.
+
 ## [0.7.0] - 2026-10-06
 
 Budget pacing now trusts the provider's own usage readings and learns the
@@ -541,7 +583,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.8.0
 [0.7.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.7.0
 [0.6.1]: https://github.com/aleandros/powerqueue/releases/tag/v0.6.1
 [0.6.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.6.0
