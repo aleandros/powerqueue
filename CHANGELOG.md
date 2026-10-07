@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-10-07
+
+Fixes for tasks that wait on a human, tasks in review and PR hand-offs.
+The database schema goes to v6 (`sessions.waiting_since`,
+`sessions.waited_secs`); the migration runs on the first start.
+
+### Fixed
+
+- A session waiting on a human (`needs_attention`: a question, a permission
+  prompt) was killed by `max_session_secs` and relaunched, and the relaunch
+  asked the same question again. A waiting task no longer times out, and
+  `max_session_secs` counts only the agent's working time (the
+  `session.timeout` event reports worked and waited seconds).
+- A context compaction (`SessionStart` with source `compact`) while a
+  question was open moved the task back to `running`, so the stale timer
+  killed it after `stale_session_secs`. The question now stays open.
+- `task retry` of an `in_review` task was silently ignored. It now resumes
+  the session for a review round right away (reason `requested`, not capped
+  by `review_rounds_max`); the CLI does the same when no daemon runs. Any
+  other ignored retry logs `task.retry_ignored`.
+- A session that completed without `task complete --pr` while its branch
+  had an open PR left the task `completed` and the PR unwatched. The daemon
+  now asks `gh pr list --head <branch>` and hands the task off for review
+  with that PR; a failed lookup logs `review.lookup_failed` (counted by
+  `doctor`'s reviews check) and completes the task as before.
+- A resumed attempt (crash, timeout) moved the Linear issue back to
+  `linear.in_progress_state`, undoing the In Review a PR had set. Only the
+  first start moves it now (and a relaunch still undoes
+  `linear.blocked_state` when one is configured).
+
 ## [0.8.0] - 2026-10-07
 
 The daemon can now run as a user service: `powerqueue service install`
@@ -584,6 +614,7 @@ it: older versions reject them and fail to load the whole file.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
 [Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.8.0...HEAD
+[0.8.1]: https://github.com/aleandros/powerqueue/releases/tag/v0.8.1
 [0.8.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.8.0
 [0.7.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.7.0
 [0.6.1]: https://github.com/aleandros/powerqueue/releases/tag/v0.6.1
