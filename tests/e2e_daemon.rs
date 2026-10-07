@@ -541,6 +541,28 @@ fn gh_pr(number: u64, state: &str, mergeable: &str) -> String {
 }
 
 #[test]
+fn completion_without_a_pr_link_adopts_the_branch_open_pr() {
+    // AVS-1652: the agent printed the done marker without `--pr`; its
+    // branch had an open PR, and the task vanished as `completed`.
+    let gh = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-gh.sh");
+    let extra = format!("pr_poll_secs = 1\ngh_binary = \"{}\"", gh.display());
+    let Some(mut env) = Env::new("adopt", &extra) else { return };
+    let state = env.root.path().join("fakestate");
+    std::fs::create_dir_all(&state).unwrap();
+    env.vars.push(("FAKE_GH_DIR".into(), state.display().to_string()));
+    std::fs::write(state.join("pr-list.json"), r#"[{"url":"https://github.com/o/r/pull/9"}]"#).unwrap();
+    std::fs::write(state.join("pr-9.json"), gh_pr(9, "OPEN", "MERGEABLE")).unwrap();
+    let a = add_task(&env, "Ship without link", &[]);
+    env.start_daemon();
+
+    let v = env.wait_for_show(&a, |v| v["task"]["state"] == "in_review" && has_event(v, "session.released"));
+    assert_eq!(v["task"]["state"].as_str(), Some("in_review"), "{}", env.daemon_log());
+    assert_eq!(v["task"]["pr_url"].as_str(), Some("https://github.com/o/r/pull/9"));
+    let calls = std::fs::read_to_string(state.join("gh-calls.log")).unwrap_or_default();
+    assert!(calls.contains("pr list head=pq/"), "{calls}");
+}
+
+#[test]
 fn review_hand_off_frees_the_slot_and_a_conflict_resumes_the_same_session() {
     let gh = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-gh.sh");
     let extra = format!("max_concurrent = 1\npr_poll_secs = 1\ngh_binary = \"{}\"", gh.display());

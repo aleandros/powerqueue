@@ -27,7 +27,9 @@ const SCHEMA: &str = include_str!("schema.sql");
 ///   dependencies; see [`crate::domain::LinkedIssue`]).
 /// * v5: `tasks.pr_url` and `tasks.review` (the PR watcher; see
 ///   [`crate::domain::ReviewWatch`]).
-pub const SCHEMA_VERSION: i64 = 5;
+/// * v6: `sessions.waiting_since` and `sessions.waited_secs` (time spent
+///   waiting on a human does not count towards `max_session_secs`).
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// kv key of the Claude calibration before schema v2.
 const LEGACY_CALIBRATION_KEY: &str = "budget.calibration";
@@ -208,6 +210,22 @@ impl Store {
             }
             if !added.is_empty() {
                 tracing::info!(from = version, to = SCHEMA_VERSION, columns_added = ?added, "migrated database schema to v5");
+            }
+        }
+        if version < 6 {
+            let cols = columns_of("sessions")?;
+            let mut added = Vec::new();
+            for (name, sql) in [
+                ("waiting_since", "ALTER TABLE sessions ADD COLUMN waiting_since TEXT"),
+                ("waited_secs", "ALTER TABLE sessions ADD COLUMN waited_secs INTEGER NOT NULL DEFAULT 0"),
+            ] {
+                if !cols.iter().any(|c| c == name) {
+                    conn.execute(sql, []).with_context(|| format!("add sessions.{name}"))?;
+                    added.push(name);
+                }
+            }
+            if !added.is_empty() {
+                tracing::info!(from = version, to = SCHEMA_VERSION, columns_added = ?added, "migrated database schema to v6");
             }
         }
         if version < SCHEMA_VERSION {
@@ -488,8 +506,8 @@ impl Store {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO sessions (id, task_id, attempt, model, state, tmux_session, tmux_window, pane_id, pid, transcript_path,
-                exit_code, started_at, ended_at, last_activity_at, error, agent_session_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                exit_code, started_at, ended_at, last_activity_at, error, agent_session_id, waiting_since, waited_secs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 s.id.to_string(),
                 s.task_id.to_string(),
@@ -507,6 +525,8 @@ impl Store {
                 ts(&s.last_activity_at),
                 s.error,
                 s.agent_session_id,
+                s.waiting_since.as_ref().map(ts),
+                s.waited_secs,
             ],
         )?;
         Ok(())
@@ -517,7 +537,7 @@ impl Store {
         let n = conn.execute(
             "UPDATE sessions SET task_id=?2, attempt=?3, model=?4, state=?5, tmux_session=?6, tmux_window=?7, pane_id=?8, pid=?9,
                 transcript_path=?10, exit_code=?11, started_at=?12, ended_at=?13, last_activity_at=?14, error=?15,
-                agent_session_id=?16 WHERE id=?1",
+                agent_session_id=?16, waiting_since=?17, waited_secs=?18 WHERE id=?1",
             params![
                 s.id.to_string(),
                 s.task_id.to_string(),
@@ -535,6 +555,8 @@ impl Store {
                 ts(&s.last_activity_at),
                 s.error,
                 s.agent_session_id,
+                s.waiting_since.as_ref().map(ts),
+                s.waited_secs,
             ],
         )?;
         if n == 0 {
@@ -580,12 +602,14 @@ impl Store {
             last_activity_at: parse_ts(&last_activity_at).map_err(conv)?,
             error: row.get("error")?,
             agent_session_id: row.get("agent_session_id")?,
+            waiting_since: opt_ts(row.get("waiting_since")?).map_err(conv)?,
+            waited_secs: row.get("waited_secs")?,
         })
     }
 
     const SESSION_COLS: &'static str =
         "id, task_id, attempt, model, state, tmux_session, tmux_window, pane_id, pid, transcript_path,
-        exit_code, started_at, ended_at, last_activity_at, error, agent_session_id";
+        exit_code, started_at, ended_at, last_activity_at, error, agent_session_id, waiting_since, waited_secs";
 
     pub fn get_session(&self, id: uuid::Uuid) -> Result<Option<Session>> {
         let conn = self.lock();
@@ -1363,6 +1387,8 @@ mod tests {
             last_activity_at: now,
             error: None,
             agent_session_id: None,
+            waiting_since: None,
+            waited_secs: 0,
         };
         store.insert_session(&s).unwrap();
         assert_eq!(store.list_live_sessions().unwrap().len(), 1);

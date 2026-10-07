@@ -245,7 +245,7 @@ Global flags work on every command.
 | `task cancel <task>` | cancel and release resources |
 | `task pause <task>` | do not schedule; a running session stops after its turn |
 | `task resume <task>` | resume a paused or needs-attention task; one the PR watcher parked goes back to `in_review` |
-| `task retry <task>` | re-queue a failed, cancelled or completed task (also crashed, throttled, paused, needs-attention); one parked with its review rounds used up runs one more round |
+| `task retry <task>` | re-queue a failed, cancelled or completed task (also crashed, throttled, paused, needs-attention); one parked with its review rounds used up runs one more round; one `in_review` resumes its session for a review round now; in any other state the daemon ignores it (`task.retry_ignored`, debug) |
 | `task explain <task>` | current score and model decision, with reasons; for Linear tasks also what it waits on (pending `blocked by` issues, open sub-issues of a parent) |
 | `task model <task> <model\|auto>` | force (or clear) the model for the next attempt (`fable`, `opus`, `sonnet`, `haiku`, or another provider's model such as `gpt-6.1-sol`, `gemini-3-pro`, `codex:<name>`); the policy may still downgrade it within the same provider when the model is out of budget |
 | `task prompt <task>` | print the prompt the next attempt would receive (renders `prompt.template` with attempt = attempts + 1, the task's last error and its forced/last model); nothing is launched. `--json` prints `{"task", "template", "prompt", "warnings"}` |
@@ -387,7 +387,19 @@ with your own Markdown (see [`[prompt]`](#prompt)); `powerqueue task prompt
   puts the tier on cooldown and the task in `throttled`.
 - **Review**: a session that opens a pull request and arms its merge runs
   `powerqueue task complete <id> --pr <url>` instead (then the done marker).
-  The task becomes `in_review` and the session ends; see below.
+  The task becomes `in_review` and the session ends; see below. A session
+  that completes without `--pr` while its branch has an open PR
+  (`gh pr list --head pq/<slug>`) is handed off for review with that PR too
+  (also at the end of a review round).
+- **Waiting**: while a task is `needs_attention` (a question, a permission
+  prompt), paused or throttled with its session alive, neither
+  `stale_session_secs` nor `max_session_secs` ends the session, and a
+  context compaction does not clear a question. `max_session_secs` counts
+  only the time the agent worked.
+- A later attempt (crash, timeout) leaves the Linear issue's state alone (it
+  may be In Review by now); only attempt 1 moves it to
+  `linear.in_progress_state`. With `linear.blocked_state` set, every attempt
+  moves it, to undo a block.
 
 ### Review (pull requests)
 
@@ -423,7 +435,10 @@ in Linear's review state; only a comment says why the session was resumed.
 Relaunches count against `scheduler.review_rounds_max` (5), not
 `max_attempts`: each round gets its own `max_attempts` for crashes. Past the
 cap the task goes to `needs_attention`; `task retry` runs one more round,
-`task resume` just watches the PR again. If the previous session cannot be
+`task resume` just watches the PR again. `task retry` of a task that is
+`in_review` resumes its session for a review round right away (reason
+`requested`, detail `by user`; it does not count against
+`review_rounds_max`), e.g. to talk to the agent about the PR. If the previous session cannot be
 resumed (other provider, no transcript) a fresh session gets the full task
 prompt with the review prompt as its first step.
 
@@ -673,13 +688,13 @@ without it the session has no way to tell powerqueue it is done.
 | `idle_timeout_secs` | `600` | silent after a turn without a marker: nudge once, then `needs_attention` |
 | `stale_session_secs` | `1800` | no transcript growth or hook events while running = hung |
 | `restart_backoff_secs` | `[30, 120, 600]` | backoff after a crash, per attempt (last value repeats) |
-| `max_session_secs` | `14400` | wall-clock cap per attempt; `0` disables |
+| `max_session_secs` | `14400` | cap on the agent's working time per attempt (time spent `needs_attention`, paused or throttled does not count); `0` disables |
 | `resource_sample_secs` | `30` | CPU/RSS sampling interval |
 | `pr_poll_secs` | `120` | how often the PR of each `in_review` task is checked with `gh`; `0` turns the watcher off |
 | `review_rounds_max` | `5` | relaunches of one task for its PR (conflict, failed check, review) before `needs_attention`; separate from `max_attempts` |
 | `review_stale_hours` | `24` | a PR unchanged this long gets a Linear comment and the task goes to `needs_attention`; `0` disables |
 | `merge_hold_label` | `"merge/hold"` | PR label meaning "a human merges this": while the PR carries it, the watcher waits and never reports it stale |
-| `review_prompt` | `"/ship-pr {pr} --reason {reason} {detail}"` | prompt of a resumed review session; placeholders `{pr}`, `{url}`, `{reason}` (`conflict`, `ci_failed`, `review`), `{detail}` |
+| `review_prompt` | `"/ship-pr {pr} --reason {reason} {detail}"` | prompt of a resumed review session; placeholders `{pr}`, `{url}`, `{reason}` (`conflict`, `ci_failed`, `review`, `requested` for `task retry`), `{detail}` |
 | `gh_binary` | `"gh"` | GitHub CLI the watcher runs |
 
 ### `[claude]`

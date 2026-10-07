@@ -144,6 +144,8 @@ stateDiagram-v2
     paused --> queued: task resume / skip line removed
     needs_attention --> running: task resume (session alive)
     completed --> queued: task retry
+    completed --> in_review: completed without --pr, branch has an open PR
+    in_review --> queued: task retry (review round)
     failed --> queued: task retry
     cancelled --> queued: task retry
     queued --> cancelled

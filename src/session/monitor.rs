@@ -133,6 +133,8 @@ mod tests {
             last_activity_at: now,
             error: None,
             agent_session_id: None,
+            waiting_since: None,
+            waited_secs: 0,
         }
     }
 

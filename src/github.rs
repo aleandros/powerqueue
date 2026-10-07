@@ -279,11 +279,53 @@ impl Gh {
         }
         parse_pr_status(&stdout).with_context(|| format!("read the status of {pr}"))
     }
+
+    /// URL of an open pull request whose head is `branch`, in the GitHub
+    /// repository of the git checkout at `repo_dir` (`gh pr list --head`).
+    /// `Ok(None)` when there is none. Fails when `gh` is missing, not
+    /// authenticated or cannot tell the repository; the error carries stderr.
+    pub fn open_pr_for_branch(&self, repo_dir: &std::path::Path, branch: &str) -> Result<Option<String>> {
+        let out = Command::new(&self.binary)
+            .args(["pr", "list", "--head", branch, "--state", "open", "--json", "url", "--limit", "1"])
+            .current_dir(repo_dir)
+            .stdin(Stdio::null())
+            .env("GH_PROMPT_DISABLED", "1")
+            .output()
+            .with_context(|| format!("cannot run `{} pr list --head {branch}` (is the GitHub CLI installed?)", self.binary))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "`{} pr list --head {branch}` failed in {} ({}): {}",
+                self.binary,
+                repo_dir.display(),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        parse_pr_list(&String::from_utf8_lossy(&out.stdout))
+    }
+}
+
+/// First PR URL in the JSON `gh pr list --json url` printed; `None` for an
+/// empty list. Fails on output that is not that JSON.
+pub fn parse_pr_list(text: &str) -> Result<Option<String>> {
+    let v: serde_json::Value = serde_json::from_str(text).context("gh pr list printed something that is not JSON")?;
+    let list = v.as_array().ok_or_else(|| anyhow!("gh pr list did not print a JSON array"))?;
+    Ok(list.iter().filter_map(|pr| pr["url"].as_str()).map(str::to_string).find(|u| !u.trim().is_empty()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pr_list_yields_the_first_url() {
+        assert_eq!(
+            parse_pr_list(r#"[{"url":"https://github.com/o/r/pull/1079"}]"#).unwrap().as_deref(),
+            Some("https://github.com/o/r/pull/1079")
+        );
+        assert_eq!(parse_pr_list("[]").unwrap(), None);
+        assert!(parse_pr_list("nope").is_err());
+    }
 
     fn sample(state: &str, mergeable: &str) -> serde_json::Value {
         serde_json::json!({ "data": { "repository": { "pullRequest": {
