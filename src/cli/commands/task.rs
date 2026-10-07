@@ -14,7 +14,7 @@ use owo_colors::{OwoColorize, Stream, Style};
 use crate::cli::output::{self, human_bytes, human_f64, model_with_provider};
 use crate::cli::{Context, TaskCommand, TaskRef};
 use crate::config::Config;
-use crate::domain::{BRANCH_CREATED_EVENT, DaemonCommand, Event, EventLevel, ModelTier, ReviewWatch, Session, Task, TaskState};
+use crate::domain::{BRANCH_CREATED_EVENT, DaemonCommand, Event, EventLevel, ModelTier, Session, Task, TaskState};
 use crate::github::PrRef;
 use crate::store::Store;
 use crate::tmux::Tmux;
@@ -63,15 +63,8 @@ pub fn hand_off_for_review(store: &Store, task: &mut Task, summary: Option<&str>
     if task.state != TaskState::InReview && !task.state.can_transition_to(TaskState::InReview) {
         bail!("cannot hand {} off for review while it is {} (only a running task opens a PR)", task.key, task.state);
     }
-    let now = Utc::now();
-    let mut watch = ReviewWatch::armed(now, task.review.as_ref());
-    watch.worktree_path = task.worktree_path.clone().or_else(|| task.review.as_ref().and_then(|r| r.worktree_path.clone()));
     let from = task.state;
-    task.state = TaskState::InReview;
-    task.pr_url = Some(pr_url.trim().to_string());
-    task.review = Some(watch);
-    task.not_before = None;
-    task.last_error = None;
+    task.hand_off_for_review(pr_url, Utc::now());
     if let Some(s) = summary.map(str::trim).filter(|s| !s.is_empty()) {
         task.summary = Some(s.to_string());
     }

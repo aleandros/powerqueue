@@ -735,6 +735,23 @@ impl Task {
     }
 }
 
+impl Task {
+    /// Move the task to `in_review` with `pr_url`: a fresh PR watch is armed
+    /// at `now` (keeping the rounds of the previous one) and remembers the
+    /// worktree path so a review round resumes in the same cwd. Pure; the
+    /// caller persists the task and logs the hand-off.
+    pub fn hand_off_for_review(&mut self, pr_url: &str, now: DateTime<Utc>) {
+        let mut watch = ReviewWatch::armed(now, self.review.as_ref());
+        watch.worktree_path = self.worktree_path.clone().or_else(|| self.review.as_ref().and_then(|r| r.worktree_path.clone()));
+        self.state = TaskState::InReview;
+        self.pr_url = Some(pr_url.trim().to_string());
+        self.review = Some(watch);
+        self.not_before = None;
+        self.last_error = None;
+        self.completed_at = None;
+    }
+}
+
 /// What the PR watcher remembers about a task in review (stored as JSON in
 /// `tasks.review`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -807,7 +824,7 @@ impl ReviewWatch {
 pub struct ReviewRelaunch {
     /// PR number (`/ship-pr <n>`).
     pub pr_number: u64,
-    /// `conflict`, `ci_failed` or `review`.
+    /// `conflict`, `ci_failed` or `review`; `requested` for `task retry`.
     pub reason: String,
     /// Free text after the reason: failed check names, thread count.
     #[serde(default)]
@@ -981,19 +998,20 @@ pub struct Session {
     /// passed as `--session-id`. Discovered after launch, used for resume.
     #[serde(default)]
     pub agent_session_id: Option<String>,
-    /// Since when the task has been waiting on a human (`needs_attention`);
-    /// `None` while the agent is not waiting. Set and cleared by the probe.
+    /// Since when the agent has not been working: its task waits on a human
+    /// (`needs_attention`), is paused, or is throttled waiting for a usage
+    /// limit to reset. `None` while it works. Set and cleared by the probe.
     #[serde(default)]
     pub waiting_since: Option<DateTime<Utc>>,
-    /// Seconds this session spent waiting on a human in earlier waits.
-    /// `max_session_secs` counts only the time the agent was working.
+    /// Seconds this session spent not working in earlier waits (see
+    /// `waiting_since`). `max_session_secs` counts only working time.
     #[serde(default)]
     pub waited_secs: i64,
 }
 
 impl Session {
     /// Wall time the agent has been working: the session's age minus the
-    /// time it spent waiting on a human (past waits and the current one).
+    /// time it spent waiting (past waits and the current one).
     pub fn working_time(&self, now: DateTime<Utc>) -> chrono::Duration {
         let current_wait = self.waiting_since.map(|since| now - since).unwrap_or_else(chrono::Duration::zero);
         now - self.started_at - chrono::Duration::seconds(self.waited_secs) - current_wait

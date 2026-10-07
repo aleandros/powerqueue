@@ -17,25 +17,31 @@ The database schema goes to v6 (`sessions.waiting_since`,
 
 - A session waiting on a human (`needs_attention`: a question, a permission
   prompt) was killed by `max_session_secs` and relaunched, and the relaunch
-  asked the same question again. A waiting task no longer times out, and
+  asked the same question again. A waiting task (`needs_attention`, paused,
+  throttled with its session alive) no longer times out, and
   `max_session_secs` counts only the agent's working time (the
-  `session.timeout` event reports worked and waited seconds).
+  `session.timeout` event reports worked and waited seconds). A wait that
+  ends without a hook (`task resume`) counts as activity, so the stale
+  timer does not fire right after it.
 - A context compaction (`SessionStart` with source `compact`) while a
   question was open moved the task back to `running`, so the stale timer
   killed it after `stale_session_secs`. The question now stays open.
 - `task retry` of an `in_review` task was silently ignored. It now resumes
-  the session for a review round right away (reason `requested`, not capped
-  by `review_rounds_max`); the CLI does the same when no daemon runs. Any
-  other ignored retry logs `task.retry_ignored`.
+  the session for a review round right away (reason `requested`, detail
+  `by user`; it does not count against `review_rounds_max`); the CLI does
+  the same when no daemon runs. Any other ignored retry logs
+  `task.retry_ignored` at debug level.
 - A session that completed without `task complete --pr` while its branch
   had an open PR left the task `completed` and the PR unwatched. The daemon
-  now asks `gh pr list --head <branch>` and hands the task off for review
-  with that PR; a failed lookup logs `review.lookup_failed` (counted by
-  `doctor`'s reviews check) and completes the task as before.
-- A resumed attempt (crash, timeout) moved the Linear issue back to
-  `linear.in_progress_state`, undoing the In Review a PR had set. Only the
-  first start moves it now (and a relaunch still undoes
-  `linear.blocked_state` when one is configured).
+  now asks `gh pr list --head <branch>` once, when the session ends, and
+  hands the task off for review with that PR (also when a review round ends
+  with only the done marker); a failed lookup (no `gh`, not a GitHub repo)
+  logs `review.lookup_failed` at debug level and completes the task as
+  before.
+- A later attempt (crash, timeout) moved the Linear issue back to
+  `linear.in_progress_state`, undoing the In Review a PR had set. Only
+  attempt 1 moves it now; with `linear.blocked_state` configured every
+  attempt still moves it, so a block is undone.
 
 ## [0.8.0] - 2026-10-07
 

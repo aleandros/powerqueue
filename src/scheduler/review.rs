@@ -215,7 +215,7 @@ pub fn on_pr_status(task: &mut Task, status: &PrStatus, cfg: &SchedulerConfig, n
 
 /// `powerqueue task retry` of a task in review: resume the session for a
 /// review round now, whatever the PR says (the user wants the agent back on
-/// it). User rounds are counted but not capped by `review_rounds_max`.
+/// it). User rounds do not count against `review_rounds_max`.
 /// Returns the event to log, or `None` (task untouched) when the task is not
 /// in review or its PR number cannot be read from `pr_url`.
 pub fn request_round(task: &mut Task, now: DateTime<Utc>) -> Option<Effect> {
@@ -224,7 +224,6 @@ pub fn request_round(task: &mut Task, now: DateTime<Utc>) -> Option<Effect> {
     }
     let pr_number = task.pr_url.as_deref().and_then(pr_number_of)?;
     let mut watch = task.review.clone().unwrap_or_else(|| ReviewWatch::armed(now, None));
-    watch.rounds += 1;
     watch.attempt_base = task.attempts;
     watch.waiting_manual_merge = false;
     watch.parked = false;
@@ -232,19 +231,19 @@ pub fn request_round(task: &mut Task, now: DateTime<Utc>) -> Option<Effect> {
     task.state = TaskState::Queued;
     task.not_before = None;
     task.last_error = None;
-    let round = watch.rounds;
     task.review = Some(watch);
     Some(Effect::Log {
         level: EventLevel::Info,
         kind: "review.relaunch".into(),
-        message: format!("PR #{pr_number}: review round {round} requested by user; resuming the session"),
-        data: serde_json::json!({ "reason": "requested", "detail": "by user", "round": round }),
+        message: format!("PR #{pr_number}: review round requested by user; resuming the session"),
+        data: serde_json::json!({ "reason": "requested", "detail": "by user" }),
     })
 }
 
-/// PR number at the end of a GitHub PR URL (`.../pull/1084`).
-fn pr_number_of(url: &str) -> Option<u64> {
-    url.trim_end_matches('/').rsplit('/').next()?.parse().ok()
+/// PR number of a GitHub PR URL, as `task complete --pr` accepts it
+/// (`.../pull/1084`, `.../pull/1084/files`, ...); `None` when it is not one.
+pub fn pr_number_of(url: &str) -> Option<u64> {
+    url.parse::<crate::github::PrRef>().ok().map(|pr| pr.number)
 }
 
 /// Hand the task to a human: `needs_attention` with `reason`.
@@ -411,9 +410,10 @@ mod tests {
         assert_eq!(kinds(&[fx]), vec!["review.relaunch"]);
         assert_eq!(t.state, TaskState::Queued);
         let watch = t.review.as_ref().unwrap();
-        assert_eq!((watch.rounds, watch.attempt_base, watch.waiting_manual_merge), (6, 2, false));
+        assert_eq!((watch.rounds, watch.attempt_base, watch.waiting_manual_merge), (5, 2, false), "user rounds are not counted");
         let relaunch = t.review_relaunch().unwrap();
         assert_eq!((relaunch.pr_number, relaunch.reason.as_str()), (1084, "requested"));
+        assert_eq!(pr_number_of("https://github.com/o/r/pull/12/files"), Some(12));
 
         let mut t = task();
         t.state = TaskState::Running;

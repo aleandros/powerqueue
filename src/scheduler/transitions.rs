@@ -350,28 +350,51 @@ pub fn on_hook_outcome(
     effects
 }
 
-/// Track how long the session waits on a human: a wait starts when the
-/// task is first seen in `needs_attention` and its length is added to
-/// `waited_secs` when it leaves that state. No I/O or failure is possible.
+/// States in which a live session is not working: waiting on a human,
+/// paused by one, or waiting for a usage limit to reset.
+fn is_waiting(state: TaskState) -> bool {
+    matches!(state, TaskState::NeedsAttention | TaskState::Paused | TaskState::Throttled)
+}
+
+/// Track how long the session is not working (`needs_attention`, paused,
+/// throttled): a wait starts when the task is first seen waiting and its
+/// length is added to `waited_secs` when it stops. The end of a wait counts as activity, so a
+/// wait that ends without a hook (`task resume`) is not taken for a hang.
+/// No I/O or failure is possible.
 pub fn note_waiting(task: &Task, session: &mut Session, now: DateTime<Utc>) {
-    match (task.state == TaskState::NeedsAttention, session.waiting_since) {
+    match (is_waiting(task.state), session.waiting_since) {
         (true, None) => session.waiting_since = Some(now),
         (false, Some(since)) => {
             session.waited_secs += (now - since).num_seconds().max(0);
             session.waiting_since = None;
+            session.last_activity_at = session.last_activity_at.max(now);
         }
         _ => {}
     }
 }
 
 /// True when the attempt exceeded `max_session_secs` of *working* time.
-/// A task waiting on a human never times out, and time spent waiting does
-/// not count (see [`Session::working_time`]).
+/// A waiting task (`needs_attention`, paused, throttled) never times out, and time spent
+/// waiting does not count (see [`Session::working_time`]).
 pub fn session_timed_out(task: &Task, session: &Session, cfg: &SchedulerConfig, now: DateTime<Utc>) -> bool {
     cfg.max_session_secs > 0
         && !task.state.is_handed_off()
-        && task.state != TaskState::NeedsAttention
+        && !is_waiting(task.state)
         && session.working_time(now) > Duration::seconds(cfg.max_session_secs as i64)
+}
+
+/// Effects that release a live session of a task that went `in_review`
+/// outside the hook path: its window, slot and worktree (branch kept).
+pub fn release_for_review(task: &Task) -> Vec<Effect> {
+    vec![
+        Effect::log(
+            EventLevel::Info,
+            "session.released",
+            format!("task is in review ({}); releasing its slot and worktree", task.pr_url.as_deref().unwrap_or("no PR")),
+            serde_json::json!({ "pr": task.pr_url }),
+        ),
+        Effect::ReleaseForReview,
+    ]
 }
 
 /// Resume idle tasks and clear permission attention after agent progress.
@@ -524,7 +547,7 @@ pub fn on_probe(
     }
     if timed_out {
         let reason = format!(
-            "agent worked for {}s in this attempt (max_session_secs = {}; {}s waiting on a human not counted)",
+            "agent worked for {}s in this attempt (max_session_secs = {}; {}s spent waiting not counted)",
             worked.num_seconds(),
             cfg.max_session_secs,
             session.waited_secs
@@ -1410,6 +1433,37 @@ mod tests {
         let ctx = ProbeContext { now: later, ..Default::default() };
         let fx = on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx);
         assert_eq!(kinds(&fx), vec!["session.timeout", "kill", "session.crashed"]);
+    }
+
+    #[test]
+    fn paused_sessions_do_not_time_out() {
+        let mut t = task(TaskState::Paused, 1);
+        let mut s = session(SessionState::Idle, 1);
+        s.started_at = now() - Duration::hours(5);
+        let ctx = ProbeContext { now: now(), ..Default::default() };
+        let fx = on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx);
+        assert!(fx.is_empty(), "{fx:?}");
+        assert_eq!(s.waiting_since, Some(now()));
+    }
+
+    #[test]
+    fn a_wait_ended_without_a_hook_is_not_taken_for_a_hang() {
+        // `task resume` of a needs_attention task: no hook refreshes the
+        // activity clock, so the stale check must not see hours of silence.
+        let mut t = task(TaskState::NeedsAttention, 1);
+        let mut s = session(SessionState::Idle, 1);
+        s.last_activity_at = now() - Duration::hours(3);
+        let asked = now() - Duration::hours(3);
+        let ctx = ProbeContext { now: asked, ..Default::default() };
+        on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx);
+
+        t.state = TaskState::Running;
+        s.state = SessionState::Running;
+        let ctx = ProbeContext { now: now(), ..Default::default() };
+        let fx = on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx);
+        assert!(fx.is_empty(), "{fx:?}");
+        assert_eq!(s.last_activity_at, now());
+        assert_eq!(s.waited_secs, Duration::hours(3).num_seconds());
     }
 
     #[test]

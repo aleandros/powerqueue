@@ -373,7 +373,8 @@ pub struct SchedulerConfig {
     pub stale_session_secs: u64,
     /// Backoff after crash, per attempt (last value repeats).
     pub restart_backoff_secs: Vec<u64>,
-    /// Hard cap on wall-clock per attempt; 0 disables.
+    /// Cap on the agent's working time per attempt: time the task waits
+    /// (`needs_attention`, paused, throttled) does not count; 0 disables.
     pub max_session_secs: u64,
     /// How often to sample CPU/RSS of sessions.
     pub resource_sample_secs: u64,
@@ -390,7 +391,8 @@ pub struct SchedulerConfig {
     /// the watcher waits (no stale report).
     pub merge_hold_label: String,
     /// Prompt of a resumed review session. Placeholders: `{pr}` (number),
-    /// `{url}`, `{reason}` (`conflict`, `ci_failed`, `review`), `{detail}`.
+    /// `{url}`, `{reason}` (`conflict`, `ci_failed`, `review`, or
+    /// `requested` for `task retry`, detail `by user`), `{detail}`.
     pub review_prompt: String,
     /// GitHub CLI used by the PR watcher.
     pub gh_binary: String,

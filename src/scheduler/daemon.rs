@@ -503,35 +503,22 @@ impl Daemon {
             }
             DaemonCommand::Retry { task_id } => {
                 let mut task = self.require_task(*task_id)?;
-                if task.state == TaskState::InReview {
-                    // The session was released for review: resume it for a
-                    // review round on the same branch and worktree path.
-                    match review::request_round(&mut task, now) {
-                        Some(effect) => {
-                            self.store.update_task(&task)?;
-                            self.apply_effects(&mut task, None, vec![effect]).await;
-                            self.store.update_task(&task)?;
-                            self.log(
-                                Some(task.id),
-                                None,
-                                EventLevel::Info,
-                                "task.retried",
-                                "re-queued by user for a review round",
-                                serde_json::json!({}),
-                            );
-                        }
-                        None => self.log(
+                // In review: resume the released session for a review round
+                // on the same branch and worktree path.
+                let review_round = task.state == TaskState::InReview;
+                if review_round {
+                    if task.pr_url.as_deref().and_then(review::pr_number_of).is_none() {
+                        self.log(
                             Some(task.id),
                             None,
                             EventLevel::Warn,
                             "task.retry_ignored",
                             "retry ignored: the task is in review but its PR number is unknown",
                             serde_json::json!({ "pr": task.pr_url }),
-                        ),
+                        );
+                        return Ok(());
                     }
-                    return Ok(());
-                }
-                if task.state.is_terminal() {
+                } else if task.state.is_terminal() {
                     task.attempts = 0;
                     task.last_error = None;
                     task.summary = None;
@@ -541,10 +528,12 @@ impl Daemon {
                     task.state,
                     TaskState::Crashed | TaskState::Throttled | TaskState::Paused | TaskState::NeedsAttention
                 ) {
+                    // Debug: the CLI also applies a retry itself when no
+                    // daemon runs, and the daemon drains it later.
                     self.log(
                         Some(task.id),
                         None,
-                        EventLevel::Info,
+                        EventLevel::Debug,
                         "task.retry_ignored",
                         &format!("retry ignored: the task is {}", task.state),
                         serde_json::json!({ "state": task.state }),
@@ -571,6 +560,13 @@ impl Daemon {
                         "live session ended by retry",
                         serde_json::json!({ "attempt": session.attempt }),
                     );
+                }
+                if review_round {
+                    if let Some(Effect::Log { level, kind, message, data }) = review::request_round(&mut task, now) {
+                        self.store.update_task(&task)?;
+                        self.log(Some(task.id), None, level, &kind, &message, data);
+                    }
+                    return Ok(());
                 }
                 task.state = TaskState::Queued;
                 task.not_before = None;
@@ -1640,22 +1636,18 @@ impl Daemon {
         let period_end = self.provider_period_end(session.model.provider(), now);
         let outcome = interpret_hook(ev.event, &ev.payload);
         tracing::debug!(task = %task.key, session = %session.id, event = ev.event.as_str(), ?outcome, "hook outcome");
+        let session_was_live = session.state.is_live();
         let mut effects = transitions::on_hook_outcome(&mut task, &mut session, &outcome, &self.cfg, now, period_end);
-        if task.state == TaskState::Completed && self.adopt_open_pr(&mut task, now) {
+        // Only the hook that ends the session of a completed task: later
+        // ones (duplicate Stop, SessionEnd) come after its cleanup ran.
+        if session_was_live
+            && !session.state.is_live()
+            && task.state == TaskState::Completed
+            && self.adopt_open_pr(&mut task, now)
+        {
             // The agent finished without `--pr` but its branch has an open
             // PR: release the session for review instead of completing.
-            effects = vec![
-                Effect::Log {
-                    level: EventLevel::Info,
-                    kind: "session.released".into(),
-                    message: format!(
-                        "task is in review ({}); releasing its slot and worktree",
-                        task.pr_url.as_deref().unwrap_or("no PR")
-                    ),
-                    data: serde_json::json!({ "pr": task.pr_url }),
-                },
-                Effect::ReleaseForReview,
-            ];
+            effects = transitions::release_for_review(&task);
         }
         if task.state == TaskState::Running && session.state == SessionState::Running {
             self.rt.nudged.remove(&session.id);
@@ -2061,10 +2053,12 @@ impl Daemon {
 
     /// A task the agent completed without `task complete --pr` whose branch
     /// has an open PR goes `in_review` with that PR instead, so the watcher
-    /// follows it to the merge (AVS-1652). Returns whether it did; a failed
-    /// `gh` call is logged and leaves the task completed.
+    /// follows it to the merge (AVS-1652; also a review round that ends with
+    /// only the done marker). Returns whether it did; a failed `gh` call
+    /// (not installed, not a GitHub repo) is logged at debug level and
+    /// leaves the task completed.
     fn adopt_open_pr(&mut self, task: &mut Task, now: DateTime<Utc>) -> bool {
-        if task.state != TaskState::Completed || task.pr_url.is_some() || self.cfg.scheduler.pr_poll_secs == 0 {
+        if task.state != TaskState::Completed || self.cfg.scheduler.pr_poll_secs == 0 {
             return false;
         }
         let Some(branch) = task.branch.clone() else { return false };
@@ -2077,7 +2071,7 @@ impl Daemon {
                 self.log(
                     Some(task.id),
                     None,
-                    EventLevel::Warn,
+                    EventLevel::Debug,
                     "review.lookup_failed",
                     &format!("cannot tell whether {branch} has an open PR; completing the task: {e:#}"),
                     serde_json::json!({ "branch": branch }),
@@ -2085,14 +2079,7 @@ impl Daemon {
                 return false;
             }
         };
-        let mut watch = ReviewWatch::armed(now, task.review.as_ref());
-        watch.worktree_path = task.worktree_path.clone().or_else(|| task.review.as_ref().and_then(|r| r.worktree_path.clone()));
-        task.state = TaskState::InReview;
-        task.completed_at = None;
-        task.pr_url = Some(url.clone());
-        task.review = Some(watch);
-        task.not_before = None;
-        task.last_error = None;
+        task.hand_off_for_review(&url, now);
         self.log(
             Some(task.id),
             None,
@@ -2118,18 +2105,7 @@ impl Daemon {
                 session.state = SessionState::Exited;
                 session.ended_at = Some(now);
                 self.store.update_session(&session)?;
-                let effects = vec![
-                    Effect::Log {
-                        level: EventLevel::Info,
-                        kind: "session.released".into(),
-                        message: format!(
-                            "task is in review ({}); releasing its slot and worktree",
-                            task.pr_url.as_deref().unwrap_or("no PR")
-                        ),
-                        data: serde_json::json!({ "pr": task.pr_url }),
-                    },
-                    Effect::ReleaseForReview,
-                ];
+                let effects = transitions::release_for_review(&task);
                 self.apply_effects(&mut task, Some(&session), effects).await;
                 self.store.update_task(&task)?;
                 continue;
@@ -2590,11 +2566,13 @@ impl Daemon {
                     format!("powerqueue resumed the session for PR #{}: {}{detail}. Prompt: `{prompt}`", r.pr_number, r.reason);
                 self.comment_linear(&task, comment, CommentKind::Progress).await;
             }
-            // A resumed attempt (crash, timeout) leaves the issue where it
-            // is: the first start already moved it to In Progress, and since
-            // then a PR may have moved it to In Review (AVS-1618). Only the
-            // move to `linear.blocked_state` is undone.
-            _ if resume && self.cfg.linear.blocked_state.as_deref().is_none_or(|s| s.trim().is_empty()) => {
+            // A later attempt (crash, timeout) leaves the issue where it is:
+            // the first start already moved it to In Progress, and since then
+            // a PR may have moved it to In Review (AVS-1618). A retry of a
+            // finished task starts over at attempt 1. With a
+            // `linear.blocked_state` configured every attempt moves the
+            // issue, so a block is undone.
+            _ if attempt > 1 && self.cfg.linear.blocked_state.as_deref().is_none_or(|s| s.trim().is_empty()) => {
                 let comment = format!("powerqueue resumed attempt {attempt} on branch `{branch}` with model {model}.");
                 self.comment_linear(&task, comment, CommentKind::Progress).await;
             }
