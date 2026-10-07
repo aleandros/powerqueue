@@ -31,6 +31,7 @@ src/
   budget/            period clock, ledger (one per provider: Ledgers), probe.rs (observed usage + UsageProbe), cost estimator, model policy
   worktree.rs        git worktree ops (shell out to git)
   tmux.rs            tmux ops (shell out to tmux)
+  service.rs         `powerqueue service`: systemd user unit / launchd agent rendering, parsing, systemctl/launchctl ops
   session/           agent.rs (AgentCli trait, agent_for, shared helpers), claude.rs, codex.rs, gemini.rs (one per CLI), launcher (prompt, launch.sh), transcript tailing, probes
   scheduler/         daemon loop (daemon.rs), pure transitions (transitions.rs), pick_next + cleanup (lifecycle.rs), PR watcher decisions (review.rs)
   hook.rs            `powerqueue hook` (called by Claude Code hooks)
@@ -76,7 +77,7 @@ Module ownership is coarse so agents can work on branches without conflicts:
 | area | files |
 |------|-------|
 | linear + priority + jev | `src/linear/**`, `src/priority/**`, `src/jev.rs`, `src/cli/commands/{linear,priority}.rs` |
-| runtime | `src/tmux.rs`, `src/worktree.rs`, `src/session/**` (incl. `session/{agent,claude,codex,gemini}.rs`, the provider trait and its CLIs), `src/cli/commands/attach.rs` |
+| runtime | `src/tmux.rs`, `src/worktree.rs`, `src/service.rs`, `src/session/**` (incl. `session/{agent,claude,codex,gemini}.rs`, the provider trait and its CLIs), `src/cli/commands/{attach,service}.rs` |
 | budget + scheduler | `src/budget/**` (incl. `budget/probe.rs`, observed usage), `src/scheduler/**`, `src/github.rs`, `src/hook.rs`, `src/cli/commands/{run,budget,hook}.rs` |
 | ux | `src/dashboard/**`, `src/doctor.rs`, `src/tune.rs`, `src/cli/commands/{init,status,add,task,logs,config,secrets,doctor,tune}.rs` |
 

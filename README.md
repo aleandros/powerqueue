@@ -82,7 +82,8 @@ curl -fsSL https://raw.githubusercontent.com/aleandros/powerqueue/main/install.s
 **Update**: `powerqueue update` downloads the latest release for your
 platform, verifies its SHA-256, checks that the new binary runs, and swaps it
 in atomically, so a running daemon keeps working until you restart it
-(`powerqueue stop`, then `powerqueue run`). `powerqueue update --check` only
+(`powerqueue service restart` when it runs as a service, otherwise
+`powerqueue stop`, then `powerqueue run`). `powerqueue update --check` only
 tells you whether a newer release exists (exit code 10 when it does, handy in
 cron). Re-running the install script works too. Pin a version with
 `powerqueue update --version v0.4.0` (or `POWERQUEUE_VERSION=v0.4.0` for the
@@ -135,47 +136,58 @@ cd ~/code/your-repo && powerqueue init --team ENG --permission-mode auto
 
 Pick the `auto` permission mode (or `bypassPermissions`) during `init` so
 sessions never wait for a human; on a laptop where you are around,
-`acceptEdits` is the safer choice. Then keep the daemon alive with systemd
-(below) and check on it from anywhere with `ssh box -t powerqueue dashboard`
+`acceptEdits` is the safer choice. Then keep the daemon alive with
+`powerqueue service install --linger` (below) and check on it from anywhere with `ssh box -t powerqueue dashboard`
 or `powerqueue attach ENG-123`.
 
-Run the daemon somewhere that survives your terminal. In a tmux window:
+Run the daemon somewhere that survives your terminal. The easiest way is a
+user service: a systemd user unit on Linux, a launchd agent on macOS.
+
+```sh
+powerqueue service install            # write the unit, enable it (starts at login), start it
+powerqueue service install --linger   # Linux server: also keep it running after logout and start it at boot
+powerqueue service status             # installed? running? unit still right?
+powerqueue service logs -f            # the service manager's output (journalctl / launchd log files)
+powerqueue service restart            # e.g. after `powerqueue update`
+powerqueue service uninstall          # stop, disable, remove the file
+```
+
+`install` writes `~/.config/systemd/user/powerqueue.service` or
+`~/Library/LaunchAgents/dev.powerqueue.plist`. The file runs this binary
+(`<path> run`) with the `PATH` of the shell you install from, so the daemon
+finds `git`, `tmux`, `gh` and the agent CLIs just as your shell does. Per-shell
+version-manager directories such as fnm's `fnm_multishells/<pid>/bin` are
+replaced by the stable directories they point to. The file also passes along
+`POWERQUEUE_HOME`, `POWERQUEUE_SECRETS`, `XDG_{CONFIG,DATA,STATE}_HOME`,
+`TMUX_TMPDIR`, `LANG` and `LC_ALL` when they are set; add more with
+`--env KEY=VALUE`. API keys are never written to the file, so keep them in the
+keychain or `secrets.toml` (`powerqueue secrets set linear`). `install` warns
+when a key only exists in your shell's environment, when a tool is missing
+from that `PATH`, and when the binary is a cargo build output that a rebuild
+would replace.
+
+The daemon restarts 10 s after a crash but stays stopped after
+`powerqueue stop` or `service stop`. Stopping or restarting the service never
+touches tmux, so running sessions carry on and the next daemon picks them up.
+Under systemd this needs `KillMode=process`: the daemon starts the tmux server
+inside the unit's cgroup, so the default kill mode would take every Claude
+session down with it. launchd gets `AbandonProcessGroup` for the same reason.
+`service status` and `doctor` flag a unit without it, and `stop`, `restart`
+and `uninstall` refuse to run one until you regenerate it with
+`service install --force` (or pass `--force`).
+
+Re-run `powerqueue service install` after moving the binary or changing your
+`PATH`. When the file would change it shows a diff and asks for `--force`,
+then restarts a running service with the new file. `--print` shows the file
+without installing anything (`--manager launchd|systemd` previews the other
+platform), and `--no-start` enables it without starting it now. `install`
+does not start a second daemon while one is already running in a terminal: it
+tells you to `powerqueue stop` it, then `powerqueue service start`.
+
+Without a service manager, use a tmux window:
 
 ```sh
 tmux new-session -d -s pq-daemon 'powerqueue run'
-```
-
-Or with launchd (macOS, `~/Library/LaunchAgents/dev.powerqueue.plist`):
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>dev.powerqueue</string>
-  <key>ProgramArguments</key><array>
-    <string>/usr/local/bin/powerqueue</string><string>run</string>
-  </array>
-  <key>EnvironmentVariables</key><dict>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-</dict></plist>
-```
-
-Or with systemd (Linux, `~/.config/systemd/user/powerqueue.service`):
-
-```ini
-[Unit]
-Description=powerqueue daemon
-
-[Service]
-ExecStart=%h/.cargo/bin/powerqueue run
-Restart=on-failure
-Environment=PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
-
-[Install]
-WantedBy=default.target
 ```
 
 Then watch and interact:
@@ -196,7 +208,7 @@ Global flags work on every command.
 | `-v`, `-vv` | debug / trace logging on stderr |
 | `-q`, `--quiet` | only print errors |
 | `--home DIR` | base directory for config/data/state (env `POWERQUEUE_HOME`) |
-| `--json` | machine-readable output where supported (status, add, task, priority, tune, budget, linear, doctor, update, config, `logs --events`) |
+| `--json` | machine-readable output where supported (status, add, task, priority, tune, budget, linear, doctor, update, service, config, `logs --events`) |
 | `--no-color` | disable colours (env `NO_COLOR`) |
 
 ### Setup and daemon
@@ -212,7 +224,12 @@ Global flags work on every command.
 | `dashboard [--once] [--ascii]` (`ui`, `top`) | live TUI: task table, one budget block per enabled provider (period, window, cooldown, a gauge per model), a header with the compact per-provider summary (`cl 34/12%  cx 17/–` = period/window spent) and `next <model>` (what the policy would run now); needs an interactive terminal (exit 2 otherwise). `--once` prints one frame as text and exits (works in pipes; with `--json` prints the snapshot); `--ascii` uses `*`/`>`/`#` and `+-\|` borders (automatic when the locale is not UTF-8) |
 | `status [-a]` (`ls`) | one-shot table; `-a` includes completed/failed/cancelled |
 | `doctor [--fix] [--offline]` | diagnostics and tuning advice, per enabled provider (binary and version, logged in, model shares, period anchor source, probe freshness, top-model pacing, window pressure, the learned usage rate vs the configured budget, whether the top model's share can hold one typical task, a daemon-wide pause); `--fix` applies safe repairs |
-| `update [--check] [--version TAG] [-y] [--force]` | replace this binary with a [GitHub release](https://github.com/aleandros/powerqueue/releases): downloads `powerqueue-<target>.tar.gz` and its `.sha256`, verifies the checksum, writes the new file next to the current one, runs it with `--version`, then renames it over the old one (atomic; a running daemon keeps the old version until `stop` / `run`); asks before replacing unless `-y` / `--yes` or stdin is not a terminal; `--check` only reports (exit 0 up to date, 10 newer release available); `--version v0.4.0` installs a specific tag; `--force` reinstalls the same version; `--json` prints `{"current","latest","updated","path",...}`; `GITHUB_TOKEN` is used for the API when set; `POWERQUEUE_UPDATE_API` / `POWERQUEUE_UPDATE_TARGET` override the API base and target triple (mirrors, tests) |
+| `update [--check] [--version TAG] [-y] [--force]` | replace this binary with a [GitHub release](https://github.com/aleandros/powerqueue/releases): downloads `powerqueue-<target>.tar.gz` and its `.sha256`, verifies the checksum, writes the new file next to the current one, runs it with `--version`, then renames it over the old one (atomic; a running daemon keeps the old version until `service restart`, or `stop` / `run`); asks before replacing unless `-y` / `--yes` or stdin is not a terminal; `--check` only reports (exit 0 up to date, 10 newer release available); `--version v0.4.0` installs a specific tag; `--force` reinstalls the same version; `--json` prints `{"current","latest","updated","path",...}`; `GITHUB_TOKEN` is used for the API when set; `POWERQUEUE_UPDATE_API` / `POWERQUEUE_UPDATE_TARGET` override the API base and target triple (mirrors, tests) |
+| `service install [--print] [--manager systemd\|launchd] [--no-start] [-f] [--linger] [--env KEY=VALUE]...` | run the daemon as a user service: writes the systemd user unit (`~/.config/systemd/user/powerqueue.service`) or launchd agent (`~/Library/LaunchAgents/dev.powerqueue.plist`) for `<this binary> run` with the current `PATH` (and `POWERQUEUE_HOME`, `POWERQUEUE_SECRETS`, `XDG_*_HOME`, `TMUX_TMPDIR`, `LANG`, `LC_ALL` when set), enables it and starts it. Restarts after crashes, not after `stop`, and leaves tmux sessions running when it stops (`KillMode=process` / `AbandonProcessGroup`). `--print` only prints the file (`--manager` picks the platform); `--no-start` enables without starting; `-f` / `--force` replaces a different existing file (shown as a diff otherwise) and restarts a running service with it; `--linger` runs `loginctl enable-linger` so the service outlives your login (Linux); `--env` adds variables (stored in plain text, so no API keys); needs `init` first; `--json` reports what was done |
+| `service uninstall [-f]` | stop and disable the service and remove its file; tmux sessions keep running |
+| `service start` / `stop [-f]` / `restart [-f]` | control the service (`systemctl --user` / `launchctl`). `stop` and `restart` refuse a unit that would kill the tmux sessions until it is regenerated, or with `-f` |
+| `service status` | unit path (generated or hand-written), binary, enabled, running (pid), linger (Linux), whether sessions survive a stop, and problems: a missing or different binary, tools its `PATH` cannot find, a daemon running outside the service; exits 0 when the service is running and 3 otherwise; `--json` |
+| `service logs [-f] [-n N]` | the service manager's output: `journalctl --user -u powerqueue.service`, or the launchd files `<state>/logs/launchd.{out,err}.log`; the daemon's own log is `logs` |
 | `logs [-f] [-n N] [-t TASK] [-l LEVEL] [--events]` | read the daemon log (default 200 lines); `--events` shows the DB timeline instead; `-f` follows either |
 | `completions <shell>` | shell completions (bash, elvish, fish, powershell, zsh) |
 
@@ -1066,8 +1083,10 @@ isolated instances run.
 | config, `PRIORITY.md`, `secrets.toml` | `~/.config/powerqueue/` |
 | database, worktrees | `~/.local/share/powerqueue/{powerqueue.db,worktrees/}` |
 | logs, per-task dirs, lock/pid | `~/.local/state/powerqueue/{logs/,tasks/,daemon.lock,daemon.pid}` |
+| service unit | `~/.config/systemd/user/powerqueue.service` (Linux), `~/Library/LaunchAgents/dev.powerqueue.plist` (macOS) |
 
 - `powerqueue logs -f` tails `logs/powerqueue.log.<date>` (JSON lines by default); `--task ENG-123` filters; `--events` replays the DB timeline.
+- `powerqueue service logs` shows what systemd/launchd captured, which is where a daemon that fails at startup leaves its error; `service status` says whether the unit still fits this binary.
 - `powerqueue task show ENG-123` prints the task's timeline, sessions and usage.
 - `powerqueue task output ENG-123` shows the last screen of the pane; `attach` opens it.
 - `powerqueue dashboard --once` prints the dashboard frame as plain text (`--json` for the raw snapshot, with `ledgers.by_provider.<p>`, `cooldowns` and `next_model`); paste it when the live dashboard looks wrong.

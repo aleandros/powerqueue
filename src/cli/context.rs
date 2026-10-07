@@ -14,6 +14,8 @@ use crate::store::Store;
 /// commands like `init` and `completions` work before anything exists.
 pub struct Context {
     pub paths: Paths,
+    /// `--home` / `POWERQUEUE_HOME`, when given.
+    pub home: Option<PathBuf>,
     pub verbosity: Verbosity,
     pub json: bool,
     pub color: bool,
@@ -25,11 +27,11 @@ pub struct Context {
 
 impl Context {
     pub fn new(home: Option<PathBuf>, verbosity: Verbosity, json: bool, color: bool) -> Self {
-        let paths = match home {
-            Some(h) => Paths::rooted(&h),
+        let paths = match &home {
+            Some(h) => Paths::rooted(h),
             None => Paths::resolve(),
         };
-        Self { paths, verbosity, json, color, config: None, store: None, secrets: None, _log_guard: None }
+        Self { paths, home, verbosity, json, color, config: None, store: None, secrets: None, _log_guard: None }
     }
 
     /// Initialise file + stderr logging. `stderr=false` for TUI commands.

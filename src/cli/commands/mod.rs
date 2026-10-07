@@ -15,6 +15,7 @@ pub mod priority;
 pub mod reset;
 pub mod run;
 pub mod secrets;
+pub mod service;
 pub mod status;
 pub mod task;
 pub mod tune;
@@ -65,6 +66,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 Command::Linear(cmd) => linear::run(&mut ctx, cmd),
                 Command::Doctor(args) => doctor::run(&mut ctx, args),
                 Command::Update(args) => update::run(&mut ctx, args),
+                Command::Service(cmd) => service::run(&mut ctx, cmd),
                 Command::Logs(args) => logs::run(&mut ctx, args),
                 Command::Config(cmd) => config::run(&mut ctx, cmd),
                 Command::Secrets(cmd) => secrets::run(&mut ctx, cmd),

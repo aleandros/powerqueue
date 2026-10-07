@@ -15,6 +15,7 @@
 //! powerqueue linear <teams|states|test|sync>
 //! powerqueue doctor [--fix]       diagnostics + tuning advice
 //! powerqueue update [--check]     self-update from GitHub releases (--check exits 10 when a newer release exists)
+//! powerqueue service <install|uninstall|start|stop|restart|status|logs>   run the daemon under systemd (Linux) / launchd (macOS)
 //! powerqueue logs [-f] [--task]   read the daemon log
 //! powerqueue config <show|get|set|unset|path|edit|validate>
 //! powerqueue secrets <set|unset|list>
@@ -101,6 +102,9 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Update this binary to the latest GitHub release (or `--check` for a newer one).
     Update(UpdateArgs),
+    /// Run the daemon as a user service: systemd on Linux, launchd on macOS.
+    #[command(subcommand)]
+    Service(ServiceCommand),
     /// Read the daemon log.
     Logs(LogsArgs),
     /// Configuration file helpers.
@@ -395,6 +399,66 @@ pub struct DoctorArgs {
     /// Skip network checks.
     #[arg(long)]
     pub offline: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceCommand {
+    /// Write the systemd unit / launchd agent for `powerqueue run` with this binary and
+    /// your current PATH, enable it (starts at login) and start it.
+    Install(ServiceInstallArgs),
+    /// Stop the service, disable it and remove its file (sessions keep running in tmux).
+    Uninstall(ServiceStopArgs),
+    /// Start the service.
+    Start,
+    /// Stop the daemon; it is not restarted until `service start` or the next login.
+    Stop(ServiceStopArgs),
+    /// Restart the daemon (e.g. after `powerqueue update`).
+    Restart(ServiceStopArgs),
+    /// Installed? enabled? running? Does the unit still match this binary, and can its
+    /// PATH find git, tmux and the agent CLIs?
+    Status,
+    /// The service manager's output: `journalctl --user -u powerqueue` or the launchd log files.
+    Logs(ServiceLogsArgs),
+}
+
+#[derive(Debug, Args, Default)]
+pub struct ServiceInstallArgs {
+    /// Print the generated file and change nothing.
+    #[arg(long)]
+    pub print: bool,
+    /// Write and enable the service but do not start it now.
+    #[arg(long)]
+    pub no_start: bool,
+    /// Replace an existing unit that differs from the generated one.
+    #[arg(short, long)]
+    pub force: bool,
+    /// Keep the service running after you log out and start it at boot
+    /// (`loginctl enable-linger`; Linux only).
+    #[arg(long)]
+    pub linger: bool,
+    /// Extra environment for the daemon (repeatable). Stored in plain text: do not pass API keys.
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
+    /// Generate for this service manager instead of the detected one.
+    #[arg(long, value_enum, requires = "print")]
+    pub manager: Option<crate::service::Manager>,
+}
+
+#[derive(Debug, Args, Default)]
+pub struct ServiceStopArgs {
+    /// Go ahead even though the installed unit would kill the tmux sessions with the daemon.
+    #[arg(short, long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args, Default)]
+pub struct ServiceLogsArgs {
+    /// Follow (like `tail -f`).
+    #[arg(short, long)]
+    pub follow: bool,
+    /// Number of lines to show.
+    #[arg(short = 'n', long, default_value_t = 100)]
+    pub lines: usize,
 }
 
 #[derive(Debug, Args, Default)]

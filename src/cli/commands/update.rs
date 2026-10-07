@@ -435,6 +435,11 @@ fn daemon_running(ctx: &mut Context) -> Option<bool> {
     store.daemon_alive(chrono::Duration::seconds(3 * tick_secs)).ok()
 }
 
+/// A systemd/launchd service from `powerqueue service install` exists.
+fn service_installed() -> bool {
+    crate::service::Manager::detect().ok().and_then(|m| crate::service::InstalledUnit::load(m).ok().flatten()).is_some()
+}
+
 fn bold(s: &str) -> String {
     s.if_supports_color(Stream::Stdout, |t| t.bold()).to_string()
 }
@@ -557,7 +562,13 @@ pub fn run(ctx: &mut Context, args: UpdateArgs) -> Result<i32> {
     } else {
         println!("{done} powerqueue {current} -> {} at {}", bold(&latest.to_string()), path.display());
         if daemon == Some(true) {
-            println!("the daemon is running and keeps the old version until restarted: `powerqueue stop`, then `powerqueue run`");
+            if service_installed() {
+                println!("the daemon is running and keeps the old version until restarted: `powerqueue service restart`");
+            } else {
+                println!(
+                    "the daemon is running and keeps the old version until restarted: `powerqueue stop`, then `powerqueue run`"
+                );
+            }
         }
     }
     Ok(0)

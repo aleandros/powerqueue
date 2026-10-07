@@ -36,6 +36,7 @@ pub mod paths;
 pub mod priority;
 pub mod scheduler;
 pub mod secrets;
+pub mod service;
 pub mod session;
 pub mod store;
 pub mod tmux;
