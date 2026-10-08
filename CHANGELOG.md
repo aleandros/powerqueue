@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-08
+
+The queue's policy can live in the repository: `.powerqueue.toml` now carries
+`[linear]`, `[github]`, `[scheduler]` and the rules file, and the daemon can
+read it from the default branch instead of the working tree.
+
+### Added
+
+- `.powerqueue.toml` accepts `[linear]` (everything but `endpoint`),
+  `[github]` (everything but `endpoint`), `[scheduler]` (everything but
+  `gh_binary`) and `priority_file` (the rules file, relative to the repo
+  root). Precedence is repo over global, key by key; lists replace. Secrets,
+  `[budget]` and host settings stay global.
+- `repo.overrides_from = "default-branch"` reads `.powerqueue.toml` and a
+  relative `priority_file` as committed on `origin/<default_branch>` (the
+  local branch without a remote), so a `git checkout` in the main checkout
+  cannot change what the daemon runs; `repo.fetch_interval_secs` (300) makes
+  the daemon fetch while idle so a merged change arrives on its own. The
+  default stays `"working-tree"`.
+- The daemon reloads its configuration when `.powerqueue.toml` changes
+  (working tree: mtime and size; branch: blob ids), without `config set` or a
+  restart: events `daemon.reloaded` (with the keys taken and the commit) and
+  `daemon.reload_failed` (the previous configuration is kept). Committed
+  rules reload the same way; `rules.loaded` names the commit.
+- `config show` marks every key that came from the repository
+  (`# .powerqueue.toml`) and names the file and branch; `--json` adds
+  `repo_overrides`. `config validate` validates the merged configuration and
+  reports what the repo sets. `config path` lists `repo_config`.
+- `doctor`: the `.powerqueue.toml` check reports the source and the keys set
+  and fails when the branch cannot be read; a new `overrides source` check
+  warns when the main checkout is not on the default branch (working-tree
+  mode), when `default-branch` mode has no remote branch to read, or when the
+  daemon never fetches. The `PRIORITY.md` check reads the committed copy when
+  that is what the daemon reads.
+- `priority show|check|explain|simulate` read the committed rules when the
+  daemon does and say so; `priority edit` reminds you to commit and push;
+  `tune` refuses to rewrite a rules file the repository owns.
+
 ### Changed
 
 - Shorten the README to an overview and quick start with a Mermaid workflow;
@@ -692,7 +730,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.11.0
 [0.10.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.10.0
 [0.9.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.9.0
 [0.8.1]: https://github.com/aleandros/powerqueue/releases/tag/v0.8.1

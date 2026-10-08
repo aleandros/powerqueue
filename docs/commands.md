@@ -67,8 +67,8 @@ state machine allows it. `complete` and `block` always write directly.
 | Command | What it does |
 |---------|--------------|
 | `priority show` | print the parsed rules (model preference lists joined with ` \| `) |
-| `priority check [--file PATH]` | validate `PRIORITY.md` (or a draft), report problems with line numbers and print the `## Models` lists (conditional `if` rows included) |
-| `priority edit` | open `PRIORITY.md` in `$EDITOR` |
+| `priority check [--file PATH]` | validate `PRIORITY.md` (or a draft), report problems with line numbers and print the `## Models` lists (conditional `if` rows included); without `--file` it reads the rules the daemon reads, the committed copy included when the repo's `.powerqueue.toml` names a `priority_file` and `repo.overrides_from = "default-branch"` |
+| `priority edit` | open `PRIORITY.md` in `$EDITOR` (the working-tree copy when the repo owns the rules, with a reminder to commit and push) |
 | `priority explain <task>` | show how the rules score one task |
 | `priority simulate [--file PATH] [--config PATH] [-a] [--linear] [--reasons] [--no-budget] [-n N]` | dry-run: re-score every open task with the live rules (or a draft `--file`), rank them the way the scheduler would, and show what the budget policy would run for each (`▶` = would start now); nothing is written. `--config` tries a draft `config.toml` (budget, concurrency) too, `--linear` also ranks queued issues not yet in the queue, `-a` includes finished tasks, `--reasons` prints every rule that fired |
 | `priority path` | print the path of the rules file |
@@ -104,13 +104,13 @@ state machine allows it. `complete` and `block` always write directly.
 
 | Command | What it does |
 |---------|--------------|
-| `config show` | effective configuration as TOML |
-| `config path` | config/data/state paths |
+| `config show` | effective configuration as TOML, with every key the repo's `.powerqueue.toml` set marked `# .powerqueue.toml` and a header naming the file and the branch it was read from (`working tree` or `origin/main`, see `repo.overrides_from`); `--json` adds `repo_overrides` (`file`, `source`, `rev`, `keys`) |
+| `config path` | config/data/state paths, the rules file and the repo's `.powerqueue.toml` |
 | `config get <key>` | one value by dotted key (`claude.permission_mode`, `budget.providers.claude.models.fable.share`, `linear.team_keys`) as TOML; `--json` for JSON |
 | `config set <key> <value>` | change one key; `<value>` is TOML (`3`, `true`, `["ENG","OPS"]`) or a bare string (`auto`); the result is validated before anything is written, comments in `config.toml` survive, and a running daemon is asked to reload (new sessions use the new value) |
 | `config unset <key>` | remove a key so its default applies again |
 | `config edit` | open `config.toml` in `$EDITOR` |
-| `config validate [--file PATH]` | validate `config.toml` (or a draft) and the repo's `.powerqueue.toml` |
+| `config validate [--file PATH]` | validate `config.toml` (or a draft) with the repo's `.powerqueue.toml` applied, so a bad value the repo sets is reported too; says which keys the repo sets and from which branch |
 | `secrets set <linear\|github\|jev> [value]` | store a key (prompts if omitted) |
 | `secrets unset <name>` | remove a key |
 | `secrets list` | which keys are configured and where they come from |

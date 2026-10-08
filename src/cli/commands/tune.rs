@@ -45,6 +45,14 @@ fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
     let instruction = read_instruction(args.instruction.as_deref())?;
     let cfg = ctx.config()?.clone();
     let paths = ctx.paths.clone();
+    if args.scope.includes_priority() && cfg.overrides.sets("priority.file") {
+        bail!(
+            "the rules file is set by the repository ({} in {}); edit it in the repository (or run with `--scope config`) \
+             instead of letting tune write into the checkout",
+            cfg.priority_file(&paths).display(),
+            cfg.overrides.file.as_deref().map(|f| f.display().to_string()).unwrap_or_else(|| REPO_CONFIG_FILE.to_string())
+        );
+    }
 
     let model = match &args.model {
         Some(m) => m.clone(),
@@ -73,11 +81,8 @@ fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
     // Live files.
     let live_priority = cfg.priority_file(&paths);
     let live_config = paths.config_file();
-    let priority_text = match std::fs::read_to_string(&live_priority) {
-        Ok(t) => Some(t),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e).with_context(|| format!("read {}", live_priority.display())),
-    };
+    // What the daemon reads (the committed copy when the repo owns the rules).
+    let priority_text = cfg.read_rules_text(&paths)?;
     let config_text = std::fs::read_to_string(&live_config).with_context(|| format!("read {}", live_config.display()))?;
     let rules = match &priority_text {
         Some(text) => match PriorityRules::parse(text) {
@@ -97,10 +102,7 @@ fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
     let tasks = ctx.store()?.list_open_tasks()?;
     let ledgers = Ledgers::load(ctx.store()?, &cfg.budget, chrono::Utc::now())?;
     let context_md = context_markdown(&cfg, &live_priority, priority_text.is_some(), &live_sim, &sim_args, &tasks, &ledgers);
-    let repo_overrides = {
-        let file = cfg.repo_path().join(REPO_CONFIG_FILE);
-        std::fs::read_to_string(&file).ok()
-    };
+    let repo_overrides = cfg.read_repo_overrides(&cfg.repo_path()).ok().and_then(|l| l.text);
 
     // Draft directory + prompt.
     let id = new_draft_id(chrono::Utc::now());

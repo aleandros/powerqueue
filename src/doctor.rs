@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::budget::{Estimator, Ledger, Ledgers, load_observations, load_observed, load_probe_status, tier_weight};
 use crate::cli::output::human_f64;
-use crate::config::{Config, REPO_CONFIG_FILE, RepoOverrides};
+use crate::config::{Config, OverridesSource, REPO_CONFIG_FILE, RepoOverrides};
 use crate::domain::{EventLevel, ModelTier, Provider, SessionState, Task, TaskState};
 use crate::jev::JevClient;
 use crate::linear::client::LinearClient;
@@ -454,22 +454,31 @@ fn check_worktree_root(cfg: &Config, paths: &Paths) -> CheckResult {
 }
 
 fn check_priority_file(cfg: &Config, paths: &Paths) -> CheckResult {
-    let file = cfg.priority_file(paths);
-    let text = match std::fs::read_to_string(&file) {
-        Ok(t) => t,
-        Err(_) => {
+    let source = cfg.rules_source(paths);
+    let text = match source.read() {
+        Ok(Some(t)) => t,
+        Ok(None) => {
             return CheckResult::warn(
                 CONF,
                 "PRIORITY.md",
-                format!("{} not found; every task gets the default criticality", file.display()),
-                "run `powerqueue init` or create the file from the template (`powerqueue priority edit`)",
+                format!("{source} not found; every task gets the default criticality"),
+                match source.rev() {
+                    Some(rev) => format!("commit the file on {rev} (the daemon reads the rules from that branch)"),
+                    None => "run `powerqueue init` or create the file from the template (`powerqueue priority edit`)".to_string(),
+                },
+            );
+        }
+        Err(e) => {
+            return CheckResult::fail(
+                CONF,
+                "PRIORITY.md",
+                format!("cannot read {source}: {e:#}"),
+                "fix the file permissions, or the git state of the main checkout",
             );
         }
     };
     match PriorityRules::parse(&text) {
-        Ok(rules) if rules.warnings.is_empty() => {
-            CheckResult::ok(CONF, "PRIORITY.md", format!("{} parses cleanly", file.display()))
-        }
+        Ok(rules) if rules.warnings.is_empty() => CheckResult::ok(CONF, "PRIORITY.md", format!("{source} parses cleanly")),
         Ok(rules) => CheckResult::warn(
             CONF,
             "PRIORITY.md",
@@ -528,17 +537,151 @@ fn check_prompt_template(cfg: &Config) -> CheckResult {
     }
 }
 
+/// `.powerqueue.toml`: readable from wherever `repo.overrides_from` points,
+/// parses, and which keys it sets. `cfg` already has it applied when the
+/// load succeeded; the file is read again here so a problem is reported
+/// rather than hidden behind a failed `powerqueue doctor`.
 fn check_repo_overrides(cfg: &Config) -> CheckResult {
-    let file = cfg.repo_path().join(REPO_CONFIG_FILE);
-    if !file.exists() {
-        return CheckResult::ok(CONF, ".powerqueue.toml", "no repository overrides");
+    let repo = cfg.repo_path();
+    let file = repo.join(REPO_CONFIG_FILE);
+    if !repo.exists() {
+        return CheckResult::ok(CONF, ".powerqueue.toml", "no repository overrides (repository missing)");
     }
-    match std::fs::read_to_string(&file)
-        .map_err(|e| e.to_string())
-        .and_then(|t| toml::from_str::<RepoOverrides>(&t).map_err(|e| e.message().to_string()))
-    {
-        Ok(_) => CheckResult::ok(CONF, ".powerqueue.toml", format!("{} parses", file.display())),
-        Err(e) => CheckResult::fail(CONF, ".powerqueue.toml", format!("{}: {e}", file.display()), "fix the override file"),
+    let loaded = match cfg.read_repo_overrides(&repo) {
+        Ok(l) if l.text.is_some() => l,
+        Ok(l) => {
+            return CheckResult::ok(
+                CONF,
+                ".powerqueue.toml",
+                format!(
+                    "no repository overrides ({} not present in the {})",
+                    file.display(),
+                    match &l.rev {
+                        Some(rev) => format!("default branch, {rev}"),
+                        None => "working tree".to_string(),
+                    }
+                ),
+            );
+        }
+        Err(e) => {
+            return CheckResult::fail(
+                CONF,
+                ".powerqueue.toml",
+                format!("{e:#}"),
+                match cfg.repo.overrides_from {
+                    OverridesSource::WorkingTree => "fix the override file".to_string(),
+                    OverridesSource::DefaultBranch => {
+                        "make sure the main checkout has the default branch (fetch it), or set repo.overrides_from = \"working-tree\""
+                            .to_string()
+                    }
+                },
+            );
+        }
+    };
+    match toml::from_str::<RepoOverrides>(loaded.text.as_deref().unwrap_or_default()) {
+        Ok(_) => {
+            let mut merged = cfg.clone();
+            // A re-apply on a copy tells which keys the file sets without
+            // trusting that `cfg` was loaded from the same text.
+            let keys = match merged.apply_repo_overrides(&repo) {
+                Ok(_) => merged.overrides.keys,
+                Err(_) => cfg.overrides.keys.clone(),
+            };
+            CheckResult::ok(
+                CONF,
+                ".powerqueue.toml",
+                if keys.is_empty() {
+                    format!("{} parses (sets no keys)", loaded.describe())
+                } else {
+                    format!("{} sets {}", loaded.describe(), keys.join(", "))
+                },
+            )
+        }
+        Err(e) => CheckResult::fail(
+            CONF,
+            ".powerqueue.toml",
+            format!("{}: {}", loaded.describe(), e.message()),
+            "fix the override file (unknown keys are rejected; see docs/configuration.md for what a repo may set)",
+        ),
+    }
+}
+
+/// Where the repository overrides come from, and whether that matches what
+/// the user expects: with `working-tree` the main checkout must be on the
+/// default branch or the daemon runs a branch's `.powerqueue.toml`; with
+/// `default-branch` the daemon must fetch now and then or an upstream
+/// change never arrives.
+fn check_overrides_source(cfg: &Config) -> CheckResult {
+    let repo = Repo::new(cfg.repo_path());
+    if !repo.is_repo() {
+        return CheckResult::ok(CONF, "overrides source", format!("repo.overrides_from = {}", cfg.repo.overrides_from));
+    }
+    match cfg.repo.overrides_from {
+        OverridesSource::WorkingTree => {
+            let default = match cfg.repo.default_branch.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+                Some(b) => Some(b.to_string()),
+                None => repo.default_branch().ok(),
+            };
+            let current = repo.current_branch().ok().flatten();
+            match (default, current) {
+                (Some(d), Some(c)) if d == c => CheckResult::ok(
+                    CONF,
+                    "overrides source",
+                    format!("working tree of the main checkout (on {c}); a `git checkout` there changes what the daemon runs"),
+                ),
+                (Some(d), Some(c)) => CheckResult::warn(
+                    CONF,
+                    "overrides source",
+                    format!("the main checkout is on `{c}`, not `{d}`: .powerqueue.toml and a repo rules file are read from that working tree"),
+                    format!("check out `{d}` there, or set repo.overrides_from = \"default-branch\" to read origin/{d} regardless"),
+                ),
+                (Some(d), None) => CheckResult::warn(
+                    CONF,
+                    "overrides source",
+                    "the main checkout has a detached HEAD: .powerqueue.toml and a repo rules file are read from that working tree".to_string(),
+                    format!("check out `{d}` there, or set repo.overrides_from = \"default-branch\""),
+                ),
+                (None, _) => CheckResult::ok(CONF, "overrides source", "working tree of the main checkout".to_string()),
+            }
+        }
+        OverridesSource::DefaultBranch => match cfg.overrides_rev(&repo) {
+            Ok(rev) if rev.starts_with("origin/") => {
+                if cfg.repo.fetch_interval_secs == 0 && !cfg.repo.fetch_before_start {
+                    CheckResult::warn(
+                        CONF,
+                        "overrides source",
+                        format!(
+                            "{rev}, but the daemon never fetches (repo.fetch_interval_secs = 0, repo.fetch_before_start = false)"
+                        ),
+                        "set repo.fetch_interval_secs (300 is the default) so a change merged upstream reaches the daemon",
+                    )
+                } else {
+                    CheckResult::ok(
+                        CONF,
+                        "overrides source",
+                        format!(
+                            "{rev} (fetched every {}s{})",
+                            cfg.repo.fetch_interval_secs,
+                            if cfg.repo.fetch_before_start { " and before each task" } else { "" }
+                        ),
+                    )
+                }
+            }
+            Ok(rev) => CheckResult::warn(
+                CONF,
+                "overrides source",
+                format!(
+                    "local branch `{rev}` (no origin/{rev} in the main checkout); upstream changes arrive only when that branch moves"
+                ),
+                "add an `origin` remote and fetch it, or keep the local branch up to date",
+            ),
+            Err(e) => CheckResult::fail(
+                CONF,
+                "overrides source",
+                format!("repo.overrides_from = \"default-branch\" but the branch cannot be resolved: {e:#}"),
+                "set repo.default_branch, fetch origin, or set repo.overrides_from = \"working-tree\"",
+            ),
+        },
     }
 }
 
@@ -1857,6 +2000,7 @@ pub async fn run_all(
     results.push(check_worktree_root(cfg, paths));
     results.push(check_priority_file(cfg, paths));
     results.push(check_repo_overrides(cfg));
+    results.push(check_overrides_source(cfg));
     results.push(check_prompt_template(cfg));
     results.push(check_tune_drafts(paths));
     results.extend(check_provider_models(cfg));

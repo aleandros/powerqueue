@@ -52,6 +52,8 @@ anything else uses the explicit `codex:<name>` form.
 | `fetch_before_start` | `true` | `git fetch` before creating a worktree; new branches then start from `origin/<default_branch>` |
 | `fast_forward_base` | `true` | after that fetch, before creating a branch, fast-forward the local default branch to `origin/<default_branch>` when it is safe (no local commits, no rebase/bisect, clean checkout; hooks off) |
 | `setup` | `[]` | commands run (`sh -c`) in a fresh worktree before Claude starts, with `POWERQUEUE_TASK_ID`, `POWERQUEUE_TASK_KEY`, `POWERQUEUE_TASK_SLUG`, `POWERQUEUE_TASK_DIR`, `POWERQUEUE_BRANCH`, `POWERQUEUE_WORKTREE`, `POWERQUEUE_DATA_DIR` and `POWERQUEUE_STATE_DIR` in the environment |
+| `overrides_from` | `"working-tree"` | where the repository's [`.powerqueue.toml`](#per-repository-overrides-powerqueuetoml) (and a relative `priority_file` named in it) is read from: the main checkout's working tree, or `"default-branch"` for the file as committed on `origin/<default_branch>` (the local branch when there is no remote), so a `git checkout` in the main checkout cannot change what the daemon runs |
+| `fetch_interval_secs` | `300` | with `overrides_from = "default-branch"`, how often the daemon runs `git fetch` so a change merged upstream reaches it while the queue is idle; `0` = only the fetch before a task starts |
 
 ## `[github]`
 
@@ -517,9 +519,17 @@ full recipe, an example image
 ## Per-repository overrides: `.powerqueue.toml`
 
 A `.powerqueue.toml` in the repository root overrides a subset of the global
-config for that repo. Lists replace; `instructions` and
-`claude.append_system_prompt` are appended to the global value;
-`prompt_template` (relative to the repo root) replaces `prompt.template`.
+config for that repo, so the queue's policy can be versioned and reviewed with
+the code. Precedence is repo over global, key by key: scalars and lists
+replace the global value (lists are not merged), `instructions` and
+`claude.append_system_prompt` are appended to the global value,
+`prompt_template` and `priority_file` (relative to the repo root) replace
+`prompt.template` and `priority.file`. Secrets, `[budget]`, `[repo]` (except
+`setup`, `default_branch` and `branch_template`), `[tmux]`, `[logging]`,
+`[tune]`, `linear.endpoint`, `github.endpoint` and `scheduler.gh_binary` stay
+global: they describe the host, not the project. Unknown keys are rejected,
+and the daemon then keeps its previous configuration (event
+`daemon.reload_failed`; `config validate` and `doctor` show the problem).
 
 ```toml
 setup = ["npm ci"]
@@ -527,6 +537,21 @@ default_branch = "develop"
 branch_template = "agent/{key}"
 instructions = "Run `npm test` before you finish. Never touch migrations."
 prompt_template = "docs/agent-prompt.md"   # see [prompt] above
+priority_file = "docs/PRIORITY.md"         # the rules file, versioned with the code
+
+[linear]                     # everything in [linear] but endpoint
+queued_states = ["Todo"]
+excluded_labels = ["agent/skip"]
+assignee = "me"
+post_comments = "questions"
+done_state = ""              # "" clears a state the global config set
+
+[github]                     # everything in [github] but endpoint
+required_labels = ["powerqueue"]
+
+[scheduler]                  # everything in [scheduler] but gh_binary
+max_concurrent = 2
+review_rounds_max = 5
 
 [cleanup]
 remove_worktree = false     # also: push_branch, delete_branch, keep_failed, run, close_tmux_window
@@ -540,3 +565,38 @@ approval = "on-request"     # also: reasoning_effort, extra_args
 [gemini]
 mode = "accept-edits"       # also: effort, extra_args
 ```
+
+`config show` marks every key that came from the file (`# .powerqueue.toml`)
+and names the file and the branch it was read from; `config validate` validates
+the merged result, so a bad value set by the repo is reported; `doctor` has a
+`.powerqueue.toml` check (readable, parses, which keys) and an `overrides
+source` check (see below). `--json` output of `config show` and `config
+validate` carries the same attribution under `repo_overrides`.
+
+**Which copy of the file?** By default the daemon reads the file in the main
+checkout's working tree (`repo.overrides_from = "working-tree"`), so whatever
+is checked out there is what runs, and `doctor` warns when that checkout is
+not on the default branch. Set `repo.overrides_from = "default-branch"` to
+read `.powerqueue.toml` as committed on `origin/<default_branch>` instead
+(the local default branch when the repository has no `origin`): a `git
+checkout` in the main checkout changes nothing, and a change merged upstream
+applies on its own after the next `git fetch`, which the daemon runs before
+each task and every `repo.fetch_interval_secs` (300 by default). A relative
+`priority_file` is then read from the same commit, so `PRIORITY.md` can live
+in the repository too; `priority show`, `priority check`, `priority explain`,
+`priority simulate` and `doctor` read that same committed copy and say so
+(`docs/PRIORITY.md (origin/main)`), `priority edit` edits the working-tree
+copy and reminds you to commit and push it, and `tune` refuses to rewrite a
+rules file the repository owns (use `--scope config`, or edit the file in the
+repository). What is read from the commit is only `.powerqueue.toml` and
+`priority_file`: `prompt_template` is still read from the main checkout's
+working tree, and `setup` / `cleanup.run` commands run inside the task's
+worktree (which starts from the same `origin/<default_branch>`).
+
+**Reloads.** The daemon fingerprints the file every 10 seconds (mtime and size
+in the working tree; blob ids on the branch) and reloads its configuration
+when it changed (event `daemon.reloaded`, with the keys taken), or only the
+rules when nothing but the committed rules changed. As with `config set`,
+new sessions use the new values; running sessions keep theirs. A working-tree
+`PRIORITY.md` (global or `priority_file`) is watched as before
+(`priority.live_reload`).

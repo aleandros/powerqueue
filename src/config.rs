@@ -26,6 +26,9 @@ pub const REPO_CONFIG_FILE: &str = ".powerqueue.toml";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    /// What `.powerqueue.toml` contributed (not a TOML key).
+    #[serde(skip)]
+    pub overrides: AppliedOverrides,
     pub repo: RepoConfig,
     pub linear: LinearConfig,
     pub github: GitHubConfig,
@@ -63,6 +66,17 @@ pub struct RepoConfig {
     /// Commands run inside a fresh worktree before Claude starts (e.g. `npm ci`).
     /// Each entry is run with `sh -c`.
     pub setup: Vec<String>,
+    /// Where the repository's `.powerqueue.toml` (and a relative
+    /// `priority_file` named in it) are read from: the main checkout's
+    /// working tree (`working-tree`, the default) or the default branch as
+    /// committed (`default-branch`: `origin/<default_branch>` when the remote
+    /// branch exists, else the local one), so a `git checkout` in the main
+    /// checkout cannot change what the daemon runs.
+    pub overrides_from: OverridesSource,
+    /// With `overrides_from = "default-branch"`, how often the daemon runs
+    /// `git fetch` so a change merged upstream reaches it while the queue is
+    /// idle; 0 = only the fetch before a task starts.
+    pub fetch_interval_secs: u64,
 }
 
 impl Default for RepoConfig {
@@ -75,7 +89,73 @@ impl Default for RepoConfig {
             fetch_before_start: true,
             fast_forward_base: true,
             setup: Vec::new(),
+            overrides_from: OverridesSource::WorkingTree,
+            fetch_interval_secs: 300,
         }
+    }
+}
+
+/// Where `.powerqueue.toml` is read from (`repo.overrides_from`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OverridesSource {
+    /// The file in the main checkout's working tree, whatever is checked out.
+    #[default]
+    WorkingTree,
+    /// The file as committed on the default branch (`origin/<branch>` after
+    /// a fetch, else the local branch); the working tree is ignored.
+    DefaultBranch,
+}
+
+impl OverridesSource {
+    /// Accepted spellings (for messages).
+    pub const NAMES: [&'static str; 2] = ["working-tree", "default-branch"];
+
+    /// Canonical spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkingTree => "working-tree",
+            Self::DefaultBranch => "default-branch",
+        }
+    }
+}
+
+impl std::fmt::Display for OverridesSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What a loaded [`Config`] took from the repository's `.powerqueue.toml`,
+/// for `config show`, `config validate` and `doctor` to attribute keys.
+/// Not part of the TOML; filled by [`Config::apply_repo_overrides`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AppliedOverrides {
+    /// The override file (as a path in the main checkout), when one was applied.
+    pub file: Option<PathBuf>,
+    /// The commit the file was read from (`origin/main`), or `None` for the
+    /// working tree.
+    pub rev: Option<String>,
+    /// Dotted keys the file set, in the order they were applied
+    /// (`linear.excluded_labels`, `scheduler.max_concurrent`, `priority.file`, ...).
+    pub keys: Vec<String>,
+    /// `priority_file` as written in the file when it is relative to the
+    /// repository root (the rules then come from the same place as the file).
+    pub priority_file_in_repo: Option<String>,
+}
+
+impl AppliedOverrides {
+    /// `working tree` or the commit the overrides came from, for messages.
+    pub fn origin(&self) -> String {
+        match &self.rev {
+            Some(rev) => rev.clone(),
+            None => "working tree".to_string(),
+        }
+    }
+
+    /// True when `key` (or a key under it, e.g. `linear`) came from the repo.
+    pub fn sets(&self, key: &str) -> bool {
+        self.keys.iter().any(|k| k == key || k.starts_with(&format!("{key}.")))
     }
 }
 
@@ -1242,6 +1322,78 @@ pub struct RepoOverrides {
     /// Prompt template for this repo (overrides `[prompt] template`); a
     /// relative path is resolved against the repository root.
     pub prompt_template: Option<String>,
+    /// The rules file for this repo (replaces `priority.file`); a relative
+    /// path is resolved against the repository root and, with
+    /// `repo.overrides_from = "default-branch"`, read from the same commit
+    /// as this file.
+    pub priority_file: Option<String>,
+    /// `[linear]` keys the repo owns (everything but `endpoint`).
+    pub linear: Option<LinearOverrides>,
+    /// `[github]` keys the repo owns (everything but `endpoint`).
+    pub github: Option<GitHubOverrides>,
+    /// `[scheduler]` keys the repo owns (everything but `gh_binary`).
+    pub scheduler: Option<SchedulerOverrides>,
+}
+
+/// `[linear]` subset a repository may override: the intake and lifecycle
+/// policy, never the endpoint (a host concern) or the API key (a secret).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct LinearOverrides {
+    pub enabled: Option<bool>,
+    pub team_keys: Option<Vec<String>>,
+    pub assignee: Option<String>,
+    pub queued_states: Option<Vec<String>>,
+    pub required_labels: Option<Vec<String>>,
+    pub excluded_labels: Option<Vec<String>>,
+    pub cycle: Option<String>,
+    pub projects: Option<Vec<String>>,
+    pub in_progress_state: Option<String>,
+    pub done_state: Option<String>,
+    pub blocked_state: Option<String>,
+    pub done_state_parent: Option<String>,
+    pub manage_states: Option<bool>,
+    pub post_comments: Option<PostComments>,
+    pub poll_interval_secs: Option<u64>,
+    pub max_issues: Option<u32>,
+}
+
+/// `[github]` subset a repository may override (everything but `endpoint`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct GitHubOverrides {
+    pub enabled: Option<bool>,
+    pub repository: Option<String>,
+    pub required_labels: Option<Vec<String>>,
+    pub excluded_labels: Option<Vec<String>>,
+    pub assignee: Option<String>,
+    pub in_progress_label: Option<String>,
+    pub done_label: Option<String>,
+    pub blocked_label: Option<String>,
+    pub post_comments: Option<bool>,
+    pub close_on_complete: Option<bool>,
+    pub poll_interval_secs: Option<u64>,
+    pub max_issues: Option<u32>,
+}
+
+/// `[scheduler]` subset a repository may override (everything but
+/// `gh_binary`, which names a program on the host).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct SchedulerOverrides {
+    pub max_concurrent: Option<u32>,
+    pub max_attempts: Option<u32>,
+    pub tick_secs: Option<u64>,
+    pub idle_timeout_secs: Option<u64>,
+    pub stale_session_secs: Option<u64>,
+    pub restart_backoff_secs: Option<Vec<u64>>,
+    pub max_session_secs: Option<u64>,
+    pub resource_sample_secs: Option<u64>,
+    pub pr_poll_secs: Option<u64>,
+    pub review_rounds_max: Option<u32>,
+    pub review_stale_hours: Option<u64>,
+    pub merge_hold_label: Option<String>,
+    pub review_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -1281,6 +1433,84 @@ pub struct GeminiOverrides {
     pub mode: Option<String>,
     pub effort: Option<String>,
     pub extra_args: Option<Vec<String>>,
+}
+
+/// A `.powerqueue.toml` as read by [`Config::read_repo_overrides`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedOverrides {
+    /// The file's path in the main checkout (for messages, even when the
+    /// text came from a commit).
+    pub file: PathBuf,
+    /// The commit the text was read from, or `None` for the working tree.
+    pub rev: Option<String>,
+    /// The file's text; `None` when there is no such file there.
+    pub text: Option<String>,
+}
+
+impl LoadedOverrides {
+    /// `/repo/.powerqueue.toml` or `/repo/.powerqueue.toml (origin/main)`.
+    pub fn describe(&self) -> String {
+        match &self.rev {
+            Some(rev) => format!("{} ({rev})", self.file.display()),
+            None => self.file.display().to_string(),
+        }
+    }
+}
+
+/// Where the priority rules come from (see [`Config::rules_source`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RulesSource {
+    /// A file on disk (watched for live reload).
+    File(PathBuf),
+    /// `path` as committed on `rev` in `repo` (polled through git).
+    Committed { repo: PathBuf, rev: String, path: String },
+}
+
+impl RulesSource {
+    /// Read the rules text: `Ok(None)` when the file does not exist (on disk
+    /// or in the commit), an error when git fails or the file is unreadable.
+    pub fn read(&self) -> Result<Option<String>> {
+        match self {
+            Self::File(path) => match std::fs::read_to_string(path) {
+                Ok(t) => Ok(Some(t)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
+            },
+            Self::Committed { repo, rev, path } => crate::worktree::Repo::new(repo)
+                .show_file(rev, path)
+                .with_context(|| format!("cannot read {path} from {rev} in {}", repo.display())),
+        }
+    }
+
+    /// The path as the user knows it: on disk, or inside the checkout.
+    pub fn path(&self) -> PathBuf {
+        match self {
+            Self::File(p) => p.clone(),
+            Self::Committed { repo, path, .. } => repo.join(path),
+        }
+    }
+
+    /// The commit the rules are read from, if any.
+    pub fn rev(&self) -> Option<&str> {
+        match self {
+            Self::File(_) => None,
+            Self::Committed { rev, .. } => Some(rev),
+        }
+    }
+
+    /// `/x/PRIORITY.md` or `/repo/docs/PRIORITY.md (origin/main)`.
+    pub fn describe(&self) -> String {
+        match self.rev() {
+            Some(rev) => format!("{} ({rev})", self.path().display()),
+            None => self.path().display().to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for RulesSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.describe())
+    }
 }
 
 impl Config {
@@ -1363,104 +1593,196 @@ impl Config {
         Ok(())
     }
 
-    /// Apply a repository's `.powerqueue.toml`, if present.
-    pub fn apply_repo_overrides(&mut self, repo_path: &Path) -> Result<Option<PathBuf>> {
+    /// The raw `.powerqueue.toml` of the repository per `repo.overrides_from`:
+    /// the working-tree file, or the file as committed on the default branch
+    /// (`origin/<branch>` after a fetch, else the local branch). The result's
+    /// `text` is `None` when there is no such file; an error when the branch
+    /// cannot be read (the working tree is never used as a fallback, by
+    /// design). Call it on the *global* config: `.powerqueue.toml` may set
+    /// `default_branch` itself, and that must not change where it is read from.
+    pub fn read_repo_overrides(&self, repo_path: &Path) -> Result<LoadedOverrides> {
         let file = repo_path.join(REPO_CONFIG_FILE);
-        if !file.exists() {
-            return Ok(None);
+        match self.repo.overrides_from {
+            OverridesSource::WorkingTree => {
+                let text = match std::fs::read_to_string(&file) {
+                    Ok(t) => Some(t),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(e).with_context(|| format!("cannot read {}", file.display())),
+                };
+                Ok(LoadedOverrides { file, rev: None, text })
+            }
+            OverridesSource::DefaultBranch => {
+                let repo = crate::worktree::Repo::new(repo_path);
+                let rev = self.overrides_rev(&repo).with_context(|| {
+                    format!(
+                        "cannot determine the branch to read {REPO_CONFIG_FILE} from (repo.overrides_from = \"default-branch\")"
+                    )
+                })?;
+                let text = repo.show_file(&rev, REPO_CONFIG_FILE).with_context(|| {
+                    format!("cannot read {REPO_CONFIG_FILE} from {rev} (repo.overrides_from = \"default-branch\")")
+                })?;
+                Ok(LoadedOverrides { file, rev: Some(rev), text })
+            }
         }
-        let text = std::fs::read_to_string(&file)?;
-        let mut ov: RepoOverrides = toml::from_str(&text).with_context(|| format!("invalid {}", file.display()))?;
-        if let Some(t) = ov.prompt_template.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-            let path = expand_tilde(t);
-            let resolved = if path.is_absolute() { path } else { repo_path.join(path) };
-            ov.prompt_template = Some(resolved.to_string_lossy().to_string());
-        }
-        self.merge_overrides(ov);
-        Ok(Some(file))
     }
 
+    /// The commit `repo.overrides_from = "default-branch"` reads from:
+    /// `origin/<default_branch>` when that remote branch exists locally,
+    /// else the local default branch. Fails when git cannot run or no
+    /// default branch can be determined.
+    pub fn overrides_rev(&self, repo: &crate::worktree::Repo) -> Result<String> {
+        let branch = match self.repo.default_branch.as_deref().map(str::trim) {
+            Some(b) if !b.is_empty() => b.to_string(),
+            _ => repo.default_branch()?,
+        };
+        Ok(if repo.remote_branch_exists(&branch)? { format!("origin/{branch}") } else { branch })
+    }
+
+    /// Apply a repository's `.powerqueue.toml`, if present, from wherever
+    /// `repo.overrides_from` says (see [`Config::read_repo_overrides`]).
+    /// Records what was taken in [`Config::overrides`]. Returns the file's
+    /// path in the checkout when something was applied. Fails when the file
+    /// cannot be read or parsed.
+    pub fn apply_repo_overrides(&mut self, repo_path: &Path) -> Result<Option<PathBuf>> {
+        let loaded = self.read_repo_overrides(repo_path)?;
+        let Some(text) = &loaded.text else {
+            // Remember the commit anyway: the daemon watches it for the file.
+            self.overrides = AppliedOverrides { rev: loaded.rev, ..AppliedOverrides::default() };
+            return Ok(None);
+        };
+        let mut ov: RepoOverrides = toml::from_str(text).with_context(|| format!("invalid {}", loaded.describe()))?;
+        let resolve = |raw: &str| {
+            let path = expand_tilde(raw);
+            if path.is_absolute() { path } else { repo_path.join(path) }
+        };
+        if let Some(t) = ov.prompt_template.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            ov.prompt_template = Some(resolve(t).to_string_lossy().to_string());
+        }
+        let mut priority_file_in_repo = None;
+        if let Some(t) = ov.priority_file.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            let raw = expand_tilde(t);
+            if !raw.is_absolute() {
+                priority_file_in_repo = Some(t.trim_start_matches("./").to_string());
+            }
+            ov.priority_file = Some(resolve(t).to_string_lossy().to_string());
+        }
+        self.overrides =
+            AppliedOverrides { file: Some(loaded.file.clone()), rev: loaded.rev, keys: Vec::new(), priority_file_in_repo };
+        self.merge_overrides(ov);
+        Ok(Some(loaded.file))
+    }
+
+    /// Fold `ov` into this config: scalars replace, lists replace,
+    /// `instructions` / `claude.append_system_prompt` append. Every key
+    /// taken is appended to `overrides.keys` (dotted, as in `config get`).
     pub fn merge_overrides(&mut self, ov: RepoOverrides) {
-        if let Some(setup) = ov.setup {
-            self.repo.setup = setup;
+        let keys = &mut self.overrides.keys;
+        macro_rules! take {
+            ($target:expr, $value:expr, $key:literal) => {
+                if let Some(v) = $value {
+                    $target = v;
+                    keys.push($key.to_string());
+                }
+            };
         }
-        if ov.default_branch.is_some() {
-            self.repo.default_branch = ov.default_branch;
-        }
-        if let Some(t) = ov.branch_template {
-            self.repo.branch_template = t;
-        }
+        take!(self.repo.setup, ov.setup, "repo.setup");
+        take!(self.repo.default_branch, ov.default_branch.map(Some), "repo.default_branch");
+        take!(self.repo.branch_template, ov.branch_template, "repo.branch_template");
         if let Some(c) = ov.cleanup {
-            if let Some(v) = c.remove_worktree {
-                self.cleanup.remove_worktree = v;
-            }
-            if let Some(v) = c.push_branch {
-                self.cleanup.push_branch = v;
-            }
-            if let Some(v) = c.delete_branch {
-                self.cleanup.delete_branch = v;
-            }
-            if let Some(v) = c.keep_failed {
-                self.cleanup.keep_failed = v;
-            }
-            if let Some(v) = c.run {
-                self.cleanup.run = v;
-            }
-            if let Some(v) = c.close_tmux_window {
-                self.cleanup.close_tmux_window = v;
-            }
+            take!(self.cleanup.remove_worktree, c.remove_worktree, "cleanup.remove_worktree");
+            take!(self.cleanup.push_branch, c.push_branch, "cleanup.push_branch");
+            take!(self.cleanup.delete_branch, c.delete_branch, "cleanup.delete_branch");
+            take!(self.cleanup.keep_failed, c.keep_failed, "cleanup.keep_failed");
+            take!(self.cleanup.run, c.run, "cleanup.run");
+            take!(self.cleanup.close_tmux_window, c.close_tmux_window, "cleanup.close_tmux_window");
         }
         if let Some(c) = ov.claude {
-            if let Some(v) = c.permission_mode {
-                self.claude.permission_mode = v;
-            }
-            if c.effort.is_some() {
-                self.claude.effort = c.effort;
-            }
-            if let Some(v) = c.extra_args {
-                self.claude.extra_args = v;
-            }
-            if let Some(v) = c.allowed_tools {
-                self.claude.allowed_tools = v;
-            }
+            take!(self.claude.permission_mode, c.permission_mode, "claude.permission_mode");
+            take!(self.claude.effort, c.effort.map(Some), "claude.effort");
+            take!(self.claude.extra_args, c.extra_args, "claude.extra_args");
+            take!(self.claude.allowed_tools, c.allowed_tools, "claude.allowed_tools");
             if let Some(v) = c.append_system_prompt {
                 self.claude.append_system_prompt = Some(match &self.claude.append_system_prompt {
                     Some(existing) => format!("{existing}\n\n{v}"),
                     None => v,
                 });
+                keys.push("claude.append_system_prompt".to_string());
             }
         }
         if let Some(c) = ov.codex {
-            if let Some(v) = c.approval {
-                self.codex.approval = v;
-            }
-            if c.reasoning_effort.is_some() {
-                self.codex.reasoning_effort = c.reasoning_effort;
-            }
-            if let Some(v) = c.extra_args {
-                self.codex.extra_args = v;
-            }
+            take!(self.codex.approval, c.approval, "codex.approval");
+            take!(self.codex.reasoning_effort, c.reasoning_effort.map(Some), "codex.reasoning_effort");
+            take!(self.codex.extra_args, c.extra_args, "codex.extra_args");
         }
         if let Some(g) = ov.gemini {
-            if let Some(v) = g.mode {
-                self.gemini.mode = v;
-            }
-            if g.effort.is_some() {
-                self.gemini.effort = g.effort;
-            }
-            if let Some(v) = g.extra_args {
-                self.gemini.extra_args = v;
-            }
+            take!(self.gemini.mode, g.mode, "gemini.mode");
+            take!(self.gemini.effort, g.effort.map(Some), "gemini.effort");
+            take!(self.gemini.extra_args, g.extra_args, "gemini.extra_args");
         }
         if let Some(instr) = ov.instructions {
             self.claude.append_system_prompt = Some(match &self.claude.append_system_prompt {
                 Some(existing) => format!("{existing}\n\n{instr}"),
                 None => instr,
             });
+            keys.push("instructions".to_string());
         }
         if let Some(t) = ov.prompt_template.filter(|t| !t.trim().is_empty()) {
             self.prompt.template = Some(t);
+            keys.push("prompt.template".to_string());
         }
+        if let Some(t) = ov.priority_file.filter(|t| !t.trim().is_empty()) {
+            self.priority.file = Some(t);
+            keys.push("priority.file".to_string());
+        }
+        if let Some(l) = ov.linear {
+            take!(self.linear.enabled, l.enabled, "linear.enabled");
+            take!(self.linear.team_keys, l.team_keys, "linear.team_keys");
+            take!(self.linear.assignee, l.assignee.map(Some), "linear.assignee");
+            take!(self.linear.queued_states, l.queued_states, "linear.queued_states");
+            take!(self.linear.required_labels, l.required_labels, "linear.required_labels");
+            take!(self.linear.excluded_labels, l.excluded_labels, "linear.excluded_labels");
+            take!(self.linear.cycle, l.cycle, "linear.cycle");
+            take!(self.linear.projects, l.projects, "linear.projects");
+            take!(self.linear.in_progress_state, l.in_progress_state.map(Some), "linear.in_progress_state");
+            take!(self.linear.done_state, l.done_state.map(Some), "linear.done_state");
+            take!(self.linear.blocked_state, l.blocked_state.map(Some), "linear.blocked_state");
+            take!(self.linear.done_state_parent, l.done_state_parent.map(Some), "linear.done_state_parent");
+            take!(self.linear.manage_states, l.manage_states, "linear.manage_states");
+            take!(self.linear.post_comments, l.post_comments, "linear.post_comments");
+            take!(self.linear.poll_interval_secs, l.poll_interval_secs, "linear.poll_interval_secs");
+            take!(self.linear.max_issues, l.max_issues, "linear.max_issues");
+        }
+        if let Some(g) = ov.github {
+            take!(self.github.enabled, g.enabled, "github.enabled");
+            take!(self.github.repository, g.repository, "github.repository");
+            take!(self.github.required_labels, g.required_labels, "github.required_labels");
+            take!(self.github.excluded_labels, g.excluded_labels, "github.excluded_labels");
+            take!(self.github.assignee, g.assignee.map(Some), "github.assignee");
+            take!(self.github.in_progress_label, g.in_progress_label.map(Some), "github.in_progress_label");
+            take!(self.github.done_label, g.done_label.map(Some), "github.done_label");
+            take!(self.github.blocked_label, g.blocked_label.map(Some), "github.blocked_label");
+            take!(self.github.post_comments, g.post_comments, "github.post_comments");
+            take!(self.github.close_on_complete, g.close_on_complete, "github.close_on_complete");
+            take!(self.github.poll_interval_secs, g.poll_interval_secs, "github.poll_interval_secs");
+            take!(self.github.max_issues, g.max_issues, "github.max_issues");
+        }
+        if let Some(s) = ov.scheduler {
+            take!(self.scheduler.max_concurrent, s.max_concurrent, "scheduler.max_concurrent");
+            take!(self.scheduler.max_attempts, s.max_attempts, "scheduler.max_attempts");
+            take!(self.scheduler.tick_secs, s.tick_secs, "scheduler.tick_secs");
+            take!(self.scheduler.idle_timeout_secs, s.idle_timeout_secs, "scheduler.idle_timeout_secs");
+            take!(self.scheduler.stale_session_secs, s.stale_session_secs, "scheduler.stale_session_secs");
+            take!(self.scheduler.restart_backoff_secs, s.restart_backoff_secs, "scheduler.restart_backoff_secs");
+            take!(self.scheduler.max_session_secs, s.max_session_secs, "scheduler.max_session_secs");
+            take!(self.scheduler.resource_sample_secs, s.resource_sample_secs, "scheduler.resource_sample_secs");
+            take!(self.scheduler.pr_poll_secs, s.pr_poll_secs, "scheduler.pr_poll_secs");
+            take!(self.scheduler.review_rounds_max, s.review_rounds_max, "scheduler.review_rounds_max");
+            take!(self.scheduler.review_stale_hours, s.review_stale_hours, "scheduler.review_stale_hours");
+            take!(self.scheduler.merge_hold_label, s.merge_hold_label, "scheduler.merge_hold_label");
+            take!(self.scheduler.review_prompt, s.review_prompt, "scheduler.review_prompt");
+        }
+        // The repo may blank a lifecycle state the global config set.
+        self.normalise();
     }
 
     /// Absolute repository path.
@@ -1480,11 +1802,32 @@ impl Config {
         }
     }
 
+    /// The rules file as a path: `priority.file` (or the repo's
+    /// `priority_file`, resolved against the checkout), else
+    /// `<config_dir>/PRIORITY.md`. With overrides read from a commit the
+    /// daemon reads the rules from that commit instead; see
+    /// [`Config::rules_source`].
     pub fn priority_file(&self, paths: &Paths) -> PathBuf {
         match &self.priority.file {
             Some(p) => expand_tilde(p),
             None => paths.priority_file(),
         }
+    }
+
+    /// Where the priority rules are read from: the file, or the committed
+    /// copy when `.powerqueue.toml` came from a commit and named a relative
+    /// `priority_file`.
+    pub fn rules_source(&self, paths: &Paths) -> RulesSource {
+        match (&self.overrides.rev, &self.overrides.priority_file_in_repo) {
+            (Some(rev), Some(path)) => RulesSource::Committed { repo: self.repo_path(), rev: rev.clone(), path: path.clone() },
+            _ => RulesSource::File(self.priority_file(paths)),
+        }
+    }
+
+    /// The rules text from [`Config::rules_source`]: `Ok(None)` when there
+    /// is no rules file, an error when it exists but cannot be read.
+    pub fn read_rules_text(&self, paths: &Paths) -> Result<Option<String>> {
+        self.rules_source(paths).read()
     }
 
     /// The launch settings of one provider in a provider-neutral shape.
@@ -2132,5 +2475,217 @@ mod tests {
         assert!(text.contains("[prompt]"), "{text}");
         assert!(!text.contains("base_dir"), "{text}");
         assert!(Config::from_toml("[prompt]\nbogus = 1\n").is_err());
+    }
+    #[test]
+    fn repo_overrides_cover_linear_github_scheduler_and_priority_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join(REPO_CONFIG_FILE),
+            r#"priority_file = "docs/agent/PRIORITY.md"
+
+[linear]
+excluded_labels = ["agent/skip"]
+assignee = "me"
+post_comments = "questions"
+done_state = ""
+cycle = "active"
+
+[github]
+enabled = true
+repository = "acme/app"
+
+[scheduler]
+max_concurrent = 3
+restart_backoff_secs = [5, 10]
+"#,
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cfg.repo.path = repo.display().to_string();
+        cfg.linear.done_state = Some("Done".into());
+        let applied = cfg.apply_repo_overrides(&repo).unwrap();
+        assert_eq!(applied, Some(repo.join(REPO_CONFIG_FILE)));
+        assert_eq!(cfg.linear.excluded_labels, vec!["agent/skip".to_string()]);
+        assert_eq!(cfg.linear.assignee.as_deref(), Some("me"));
+        assert_eq!(cfg.linear.post_comments, PostComments::Questions);
+        assert_eq!(cfg.linear.done_state, None, "a blank state from the repo clears the global one");
+        assert_eq!(cfg.linear.cycle, "active");
+        assert_eq!(cfg.linear.queued_states, vec!["Todo".to_string()], "untouched keys keep the global value");
+        assert!(cfg.github.enabled);
+        assert_eq!(cfg.github.repository, "acme/app");
+        assert_eq!(cfg.scheduler.max_concurrent, 3);
+        assert_eq!(cfg.scheduler.restart_backoff_secs, vec![5, 10]);
+        assert_eq!(cfg.scheduler.max_attempts, 3);
+        assert_eq!(cfg.priority_file(&paths), repo.join("docs/agent/PRIORITY.md"));
+        assert_eq!(cfg.overrides.priority_file_in_repo.as_deref(), Some("docs/agent/PRIORITY.md"));
+        assert_eq!(cfg.overrides.rev, None);
+        assert_eq!(cfg.overrides.origin(), "working tree");
+        assert_eq!(
+            cfg.overrides.keys,
+            vec![
+                "priority.file",
+                "linear.assignee",
+                "linear.excluded_labels",
+                "linear.cycle",
+                "linear.done_state",
+                "linear.post_comments",
+                "github.enabled",
+                "github.repository",
+                "scheduler.max_concurrent",
+                "scheduler.restart_backoff_secs",
+            ]
+        );
+        assert!(cfg.overrides.sets("linear"));
+        assert!(cfg.overrides.sets("scheduler.max_concurrent"));
+        assert!(!cfg.overrides.sets("scheduler.max_attempts"));
+        assert!(!cfg.overrides.sets("linear.endpoint"));
+        // In the working tree the rules are a plain file.
+        assert_eq!(cfg.rules_source(&paths), RulesSource::File(repo.join("docs/agent/PRIORITY.md")));
+        assert_eq!(cfg.read_rules_text(&paths).unwrap(), None);
+        std::fs::create_dir_all(repo.join("docs/agent")).unwrap();
+        std::fs::write(repo.join("docs/agent/PRIORITY.md"), "## Low\n- label: chore\n").unwrap();
+        assert_eq!(cfg.read_rules_text(&paths).unwrap().as_deref(), Some("## Low\n- label: chore\n"));
+
+        // Host concerns stay global.
+        for bad in ["[linear]\nendpoint = 'http://x'\n", "[scheduler]\ngh_binary = 'gh'\n", "[budget]\nsafety_margin = 0.1\n"] {
+            assert!(toml::from_str::<RepoOverrides>(bad).is_err(), "{bad} must be rejected");
+        }
+        // An absolute priority_file is never read from a commit.
+        let abs = dir.path().join("elsewhere/PRIORITY.md");
+        std::fs::write(repo.join(REPO_CONFIG_FILE), format!("priority_file = '{}'\n", abs.display())).unwrap();
+        let mut cfg = Config::default();
+        cfg.repo.path = repo.display().to_string();
+        cfg.apply_repo_overrides(&repo).unwrap();
+        assert_eq!(cfg.priority_file(&paths), abs);
+        assert_eq!(cfg.overrides.priority_file_in_repo, None);
+        assert_eq!(cfg.overrides.keys, vec!["priority.file".to_string()]);
+        // No file at all: nothing recorded.
+        std::fs::remove_file(repo.join(REPO_CONFIG_FILE)).unwrap();
+        let mut cfg = Config::default();
+        cfg.repo.path = repo.display().to_string();
+        assert_eq!(cfg.apply_repo_overrides(&repo).unwrap(), None);
+        assert_eq!(cfg.overrides, AppliedOverrides::default());
+    }
+
+    #[test]
+    fn overrides_rev_is_the_global_default_branch_even_when_the_repo_overrides_it() {
+        if which::which("git").is_err() {
+            eprintln!("git not available; skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "default_branch = \"develop\"\n[scheduler]\nmax_concurrent = 3\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "main"]);
+        git(&repo, &["checkout", "-q", "-b", "develop"]);
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "[scheduler]\nmax_concurrent = 8\n").unwrap();
+        git(&repo, &["commit", "-qam", "develop"]);
+        git(&repo, &["checkout", "-q", "main"]);
+        let mut cfg = Config::default();
+        cfg.repo.path = repo.display().to_string();
+        cfg.repo.overrides_from = OverridesSource::DefaultBranch;
+        cfg.apply_repo_overrides(&repo).unwrap();
+        assert_eq!(cfg.scheduler.max_concurrent, 3, "read from main, the global default branch");
+        assert_eq!(cfg.repo.default_branch.as_deref(), Some("develop"), "the override applies to new worktrees");
+        assert_eq!(cfg.overrides.rev.as_deref(), Some("main"), "and the recorded commit is the one that was read");
+        // Without the file, the commit is still recorded.
+        git(&repo, &["rm", "-q", REPO_CONFIG_FILE]);
+        git(&repo, &["commit", "-qm", "drop"]);
+        let mut cfg = Config::default();
+        cfg.repo.path = repo.display().to_string();
+        cfg.repo.overrides_from = OverridesSource::DefaultBranch;
+        assert_eq!(cfg.apply_repo_overrides(&repo).unwrap(), None);
+        assert_eq!(cfg.overrides.rev.as_deref(), Some("main"));
+        assert!(cfg.overrides.keys.is_empty());
+    }
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn overrides_from_default_branch_read_the_committed_file_not_the_working_tree() {
+        if which::which("git").is_err() {
+            eprintln!("git not available; skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("docs")).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        let mut cfg = Config::default();
+        cfg.repo.path = repo.display().to_string();
+        cfg.repo.overrides_from = OverridesSource::DefaultBranch;
+
+        // No commit yet: the branch cannot be read, and that is an error, not a fallback.
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "[scheduler]\nmax_concurrent = 7\n").unwrap();
+        let err = cfg.clone().apply_repo_overrides(&repo).unwrap_err().to_string();
+        assert!(err.contains("default-branch"), "{err}");
+
+        // Committed on main: the working tree copy (7) is ignored.
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "priority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 3\n")
+            .unwrap();
+        std::fs::write(repo.join("docs/PRIORITY.md"), "## High\n- source: manual\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "config"]);
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "[scheduler]\nmax_concurrent = 7\n").unwrap();
+        std::fs::write(repo.join("docs/PRIORITY.md"), "## Low\n- source: manual\n").unwrap();
+        let mut local = cfg.clone();
+        local.apply_repo_overrides(&repo).unwrap();
+        assert_eq!(local.scheduler.max_concurrent, 3);
+        assert_eq!(local.overrides.rev.as_deref(), Some("main"), "no origin: the local branch");
+        assert_eq!(local.overrides.keys, vec!["priority.file".to_string(), "scheduler.max_concurrent".to_string()]);
+        assert_eq!(
+            local.rules_source(&paths),
+            RulesSource::Committed { repo: repo.clone(), rev: "main".into(), path: "docs/PRIORITY.md".into() }
+        );
+        assert_eq!(local.read_rules_text(&paths).unwrap().as_deref(), Some("## High\n- source: manual\n"));
+        assert_eq!(local.priority_file(&paths), repo.join("docs/PRIORITY.md"));
+
+        // With origin/main ahead of the local branch, origin/main wins.
+        let bare = dir.path().join("origin.git");
+        git(dir.path(), &["init", "-q", "--bare", "-b", "main", &bare.to_string_lossy()]);
+        git(&repo, &["remote", "add", "origin", &bare.to_string_lossy()]);
+        git(&repo, &["push", "-q", "origin", "main"]);
+        let other = dir.path().join("other");
+        git(dir.path(), &["clone", "-q", &bare.to_string_lossy(), &other.to_string_lossy()]);
+        std::fs::write(other.join(REPO_CONFIG_FILE), "[scheduler]\nmax_concurrent = 5\n").unwrap();
+        git(&other, &["add", "."]);
+        git(&other, &["commit", "-qm", "bump"]);
+        git(&other, &["push", "-q", "origin", "main"]);
+        git(&repo, &["fetch", "-q", "origin"]);
+        let mut remote = cfg.clone();
+        remote.apply_repo_overrides(&repo).unwrap();
+        assert_eq!(remote.scheduler.max_concurrent, 5);
+        assert_eq!(remote.overrides.rev.as_deref(), Some("origin/main"));
+        assert_eq!(remote.overrides.priority_file_in_repo, None, "the new commit dropped priority_file");
+        assert_eq!(remote.rules_source(&paths), RulesSource::File(paths.priority_file()));
+        // A checkout of another branch in the main checkout changes nothing.
+        git(&repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "[scheduler]\nmax_concurrent = 9\n").unwrap();
+        git(&repo, &["commit", "-qam", "feature"]);
+        let mut again = cfg.clone();
+        again.apply_repo_overrides(&repo).unwrap();
+        assert_eq!(again.scheduler.max_concurrent, 5);
+        // A branch without the file: no overrides at all.
+        let mut explicit = cfg.clone();
+        explicit.repo.default_branch = Some("feature".into());
+        git(&repo, &["rm", "-q", REPO_CONFIG_FILE]);
+        git(&repo, &["commit", "-qm", "drop"]);
+        assert_eq!(explicit.apply_repo_overrides(&repo).unwrap(), None);
+        assert_eq!(explicit.scheduler.max_concurrent, SchedulerConfig::default().max_concurrent);
     }
 }

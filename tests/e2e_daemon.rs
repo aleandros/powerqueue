@@ -615,6 +615,63 @@ fn new_task_branch_starts_from_fetched_origin() {
 }
 
 #[test]
+fn committed_overrides_reach_the_daemon_after_a_fetch() {
+    let Some(mut env) = Env::with_opts(
+        Opts {
+            mode: "complete",
+            extra_repo: "overrides_from = \"default-branch\"\nfetch_interval_secs = 1".to_string(),
+            ..Opts::default()
+        },
+        |_| String::new(),
+    ) else {
+        return;
+    };
+    let repo = env.root.path().join("repo");
+    std::fs::create_dir_all(repo.join("docs")).unwrap();
+    std::fs::write(repo.join(".powerqueue.toml"), "priority_file = \"docs/PRIORITY.md\"\n").unwrap();
+    std::fs::write(repo.join("docs/PRIORITY.md"), "## Low\n- source: manual\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "config"]);
+    let bare = env.root.path().join("origin.git");
+    git(env.root.path(), &["init", "-q", "--bare", "-b", "main", &bare.to_string_lossy()]);
+    git(&repo, &["remote", "add", "origin", &bare.to_string_lossy()]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+
+    let key = add_task(&env, "Scored by the committed rules", &[]);
+    env.run_ok(&["pause", "--reason", "test"]);
+    env.start_daemon();
+    let v = env.wait_for_show(&key, |v| v["task"]["criticality"] == "low");
+    assert_eq!(v["task"]["criticality"], "low", "show: {v}\nlog:\n{}", env.daemon_log());
+
+    // Merged upstream only: the main checkout's working tree still says low.
+    let other = env.root.path().join("other");
+    git(env.root.path(), &["clone", "-q", &bare.to_string_lossy(), &other.to_string_lossy()]);
+    std::fs::write(other.join("docs/PRIORITY.md"), "## Critical\n- source: manual\n").unwrap();
+    std::fs::write(other.join(".powerqueue.toml"), "priority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 7\n")
+        .unwrap();
+    git(&other, &["add", "."]);
+    git(&other, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "critical"]);
+    git(&other, &["push", "-q", "origin", "main"]);
+    let v = env.wait_for_show(&key, |v| v["task"]["criticality"] == "critical");
+    assert_eq!(v["task"]["criticality"], "critical", "show: {v}\nlog:\n{}", env.daemon_log());
+    assert_eq!(std::fs::read_to_string(repo.join("docs/PRIORITY.md")).unwrap(), "## Low\n- source: manual\n");
+    let events = env.run_ok(&["--json", "logs", "--events", "-n", "200"]);
+    let events: serde_json::Value = serde_json::from_str(&events).unwrap();
+    let reloaded = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "daemon.reloaded")
+        .unwrap_or_else(|| panic!("no daemon.reloaded event: {events}"));
+    assert_eq!(reloaded["data"]["rev"], "origin/main");
+    assert_eq!(reloaded["data"]["keys"][1], "scheduler.max_concurrent");
+    let show = env.run_ok(&["--json", "config", "show"]);
+    let show: serde_json::Value = serde_json::from_str(&show).unwrap();
+    assert_eq!(show["scheduler"]["max_concurrent"], 7);
+    assert_eq!(show["repo_overrides"]["rev"], "origin/main");
+}
+
+#[test]
 fn crashed_session_is_resumed_and_completes() {
     let Some(mut env) = Env::new("crash-once", "") else { return };
     let key = add_task(&env, "Crashy", &["--label", "customer"]);

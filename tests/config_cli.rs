@@ -213,3 +213,90 @@ fn init_with_provider_flag_enables_codex() {
         .code(2)
         .stderr(predicate::str::contains("codex"));
 }
+
+fn git(cwd: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("git runs");
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn repo_overrides_are_attributed_validated_and_read_from_the_default_branch() {
+    let Some(repo) = git_repo() else {
+        eprintln!("git not available; skipping");
+        return;
+    };
+    let home = tempfile::tempdir().unwrap();
+    pq(home.path()).args(["init", "--non-interactive", "--no-linear", "--repo"]).arg(repo.path()).assert().success();
+    std::fs::create_dir_all(repo.path().join("docs")).unwrap();
+    std::fs::write(
+        repo.path().join(".powerqueue.toml"),
+        "priority_file = \"docs/PRIORITY.md\"\n[linear]\nexcluded_labels = [\"agent/skip\"]\n[scheduler]\nmax_concurrent = 3\n",
+    )
+    .unwrap();
+    std::fs::write(repo.path().join("docs/PRIORITY.md"), "## High\n- source: manual\n").unwrap();
+
+    // show: header names the keys, lines are marked, JSON carries the attribution.
+    pq(home.path())
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(working tree): priority.file, linear.excluded_labels, scheduler.max_concurrent"))
+        .stdout(predicate::str::contains("max_concurrent = 3  # .powerqueue.toml\n"))
+        .stdout(predicate::str::contains("max_attempts = 3\n"));
+    let out = pq(home.path()).args(["--json", "config", "show"]).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["repo_overrides"]["source"], "working-tree");
+    assert_eq!(v["repo_overrides"]["rev"], serde_json::Value::Null);
+    assert_eq!(v["repo_overrides"]["keys"][2], "scheduler.max_concurrent");
+    assert_eq!(v["scheduler"]["max_concurrent"], 3);
+    pq(home.path())
+        .args(["config", "validate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(working tree) is valid and sets priority.file, linear.excluded_labels"));
+    pq(home.path()).args(["priority", "path"]).assert().success().stdout(predicate::str::contains("docs/PRIORITY.md"));
+    pq(home.path()).args(["priority", "check"]).assert().success().stdout(predicate::str::contains("1 rule(s)"));
+
+    // A bad value set by the repo fails validation.
+    std::fs::write(repo.path().join(".powerqueue.toml"), "[scheduler]\nmax_concurrent = 0\n").unwrap();
+    pq(home.path())
+        .args(["config", "validate"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("scheduler.max_concurrent must be >= 1"));
+
+    // default-branch: the committed file counts, the working tree does not.
+    std::fs::write(
+        repo.path().join(".powerqueue.toml"),
+        "priority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 3\n",
+    )
+    .unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "config"]);
+    std::fs::write(repo.path().join(".powerqueue.toml"), "[scheduler]\nmax_concurrent = 8\n").unwrap();
+    std::fs::write(repo.path().join("docs/PRIORITY.md"), "## Low\n- source: manual\n## Low\n- label: x\n").unwrap();
+    pq(home.path()).args(["config", "set", "repo.overrides_from", "default-branch"]).assert().success();
+    pq(home.path())
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(main): priority.file, scheduler.max_concurrent"))
+        .stdout(predicate::str::contains("max_concurrent = 3  # .powerqueue.toml\n"));
+    pq(home.path())
+        .args(["priority", "check"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("docs/PRIORITY.md (main): 1 rule(s)"));
+    pq(home.path()).args(["priority", "show"]).assert().success().stdout(predicate::str::contains("(main)"));
+    pq(home.path()).args(["config", "validate"]).assert().success().stdout(predicate::str::contains("(main) is valid"));
+    pq(home.path())
+        .args(["tune", "--dry-run", "make chores low"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("set by the repository"));
+}
