@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The scheduler is a functional core with an imperative shell: every task
+  and session state change is a pure function returning `Effect`s
+  (`scheduler::{transitions,commands,launch,review}`), and the daemon only
+  loads rows, persists what changed and carries the effects out. The
+  budget core (`Ledger::build`, `resolve_clock`, the observation history
+  rules) takes plain rows; store access lives in `budget::io`. `budget
+  plan` and `priority simulate` share the daemon's reservation and
+  preferred-model helpers. No behaviour change; events logged from a
+  cancel or retry now carry the session they ended.
+
 ### Fixed
 
 - A `.powerqueue.toml` that cannot be read from the default branch no longer
