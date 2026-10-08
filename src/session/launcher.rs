@@ -204,7 +204,9 @@ pub fn prompt_variables(task: &Task, cfg: &Config, ctx: &PromptContext<'_>) -> B
          {commit_rule}\
          - Do not push unless asked; powerqueue pushes on completion.\n"
     );
-    let powerqueue = ctx.powerqueue.map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "powerqueue".to_string());
+    // Shell-quoted: the prompt's commands are typed into a shell, and the
+    // state directory may contain spaces.
+    let powerqueue = ctx.powerqueue.map(|p| shell_quote(&p.to_string_lossy())).unwrap_or_else(|| "powerqueue".to_string());
     let completion_protocol = format!(
         "## Completion protocol\n\n\
          When the task is fully done, run `{powerqueue} task complete {id} --summary \"...\"` and then print `{DONE_MARKER}` as the last line of your final message.\n\
@@ -421,6 +423,12 @@ impl Launcher {
         if let Some((shim_bin, inbox)) = &shim {
             write_executable(shim_bin, &crate::session::inbox::shim_script(&task.key, inbox))?;
             std::fs::create_dir_all(inbox).with_context(|| format!("cannot create {}", inbox.display()))?;
+            // Whatever the previous session wrote after it was finalised must
+            // not act on this launch.
+            let stale = crate::session::inbox::purge(inbox)?;
+            if stale > 0 {
+                tracing::warn!(task = %task.key, session = %session_id, stale, "discarded inbox messages left by the previous session");
+            }
         }
         let powerqueue_bin: &Path = shim.as_ref().map(|(s, _)| s.as_path()).unwrap_or(&self.self_bin);
 
@@ -599,7 +607,8 @@ impl Launcher {
             argv.extend(["--fallback-model".to_string(), c.fallback_models.join(",")]);
         }
         let mut allowed: Vec<String> = c.allowed_tools.clone();
-        let shim = c.shim.then(|| ctx.self_bin.to_string_lossy().to_string());
+        // Quoted like the prompt writes it, so the rule matches the command.
+        let shim = c.shim.then(|| shell_quote(&ctx.self_bin.to_string_lossy()));
         for always in always_allowed_tools(shim.as_deref()) {
             if !allowed.contains(&always) {
                 allowed.push(always);
@@ -888,6 +897,40 @@ mod tests {
         assert!(err.contains("claude.binary") && err.contains("unbalanced"), "{err}");
         assert_eq!(always_allowed_tools(None), vec!["Bash(powerqueue task *)".to_string()]);
         assert_eq!(always_allowed_tools(Some(" ")), vec!["Bash(powerqueue task *)".to_string()]);
+    }
+
+    #[test]
+    fn prepare_with_shim_purges_stale_messages_and_quotes_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // A state directory with a space: the prompt and the tool rule must quote the shim.
+        let root = dir.path().join("pq home");
+        let launcher =
+            Launcher { paths: Paths::rooted(&root), tmux: Tmux::new("tmux", None), self_bin: PathBuf::from("/bin/pq") };
+        let mut cfg = config();
+        cfg.claude.shim = true;
+        let mut t = task();
+        t.worktree_path = Some(dir.path().join("wt").to_string_lossy().to_string());
+        let plan = launcher.prepare(&cfg, &t, uuid::Uuid::new_v4(), &ModelTier::sonnet(), 1, false, None).unwrap();
+        let shim = crate::session::inbox::shim_path(&plan.task_dir);
+        let quoted = shell_quote(&shim.to_string_lossy());
+        assert!(quoted.starts_with('\''), "{quoted}");
+        let prompt = std::fs::read_to_string(&plan.prompt_path).unwrap();
+        assert!(prompt.contains(&format!("run `{quoted} task complete {} --summary", t.id)), "{prompt}");
+        let script = std::fs::read_to_string(&plan.script_path).unwrap();
+        assert!(script.contains(&format!("Bash({quoted} task *)")), "{script}");
+
+        // A message the finished session left behind is discarded by the next launch.
+        let inbox = crate::session::inbox::inbox_dir(&plan.task_dir);
+        let late = crate::session::inbox::InboxHeader::Hook {
+            provider: Provider::Claude,
+            task: t.id.to_string(),
+            session: None,
+            event: "Stop".into(),
+        };
+        crate::session::inbox::write_message(&inbox, &late, "{}").unwrap();
+        assert_eq!(crate::session::inbox::drain(&inbox).unwrap().len(), 1);
+        launcher.prepare(&cfg, &t, uuid::Uuid::new_v4(), &ModelTier::sonnet(), 2, true, Some("crashed")).unwrap();
+        assert!(crate::session::inbox::drain(&inbox).unwrap().is_empty(), "stale message purged");
     }
 
     #[test]

@@ -145,14 +145,69 @@ pub fn render_message(header: &InboxHeader, body: &str) -> String {
     s
 }
 
+/// The mkdir lock writers take while bumping the `.seq` counter.
+const LOCK_DIR: &str = ".lock";
+
+/// Bump and return the inbox's sequence counter under the same mkdir lock
+/// the shim uses; a lock older than ~2 s is taken over (its holder died).
+fn next_sequence(inbox: &Path) -> Result<u64> {
+    let lock = inbox.join(LOCK_DIR);
+    let mut tries = 0u32;
+    while let Err(e) = std::fs::create_dir(&lock) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(e).with_context(|| format!("cannot lock {}", inbox.display()));
+        }
+        tries += 1;
+        if tries > 100 {
+            let _ = std::fs::remove_dir(&lock);
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    let seq_file = inbox.join(SEQ_FILE);
+    let result = (|| {
+        let n: u64 = std::fs::read_to_string(&seq_file).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0) + 1;
+        let tmp = inbox.join(format!("{SEQ_FILE}.{}", std::process::id()));
+        std::fs::write(&tmp, format!("{n}\n")).with_context(|| format!("cannot write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &seq_file).with_context(|| format!("cannot write {}", seq_file.display()))?;
+        Ok(n)
+    })();
+    let _ = std::fs::remove_dir(&lock);
+    result
+}
+
+/// Remove every message (and temporary file) left in `inbox` by a previous
+/// session of the task, so nothing a finished session wrote late can act on
+/// the next launch (a Stop hook that arrived after `task complete` would
+/// otherwise complete a retried task before it starts). Returns how many
+/// files were removed; a missing inbox is fine.
+pub fn purge(inbox: &Path) -> Result<usize> {
+    let entries = match std::fs::read_dir(inbox) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e).with_context(|| format!("cannot read {}", inbox.display())),
+    };
+    let mut removed = 0;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if path.extension().and_then(|e| e.to_str()) == Some(MESSAGE_EXT) || name.ends_with(".tmp") {
+            std::fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 /// Write `header` + `body` as a new message in `inbox` (created if needed),
 /// atomically, numbered from the inbox's `.seq` counter like the shim does.
 /// Returns the file written.
 pub fn write_message(inbox: &Path, header: &InboxHeader, body: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(inbox).with_context(|| format!("cannot create {}", inbox.display()))?;
-    let seq_file = inbox.join(SEQ_FILE);
-    let n: u64 = std::fs::read_to_string(&seq_file).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0) + 1;
-    std::fs::write(&seq_file, format!("{n}\n")).with_context(|| format!("cannot write {}", seq_file.display()))?;
+    let n = next_sequence(inbox)?;
     let name = format!("{n:08}-{}-{}-{}.{MESSAGE_EXT}", chrono::Utc::now().timestamp(), std::process::id(), header.kind());
     let tmp = inbox.join(format!(".{name}.tmp"));
     let path = inbox.join(name);
@@ -258,10 +313,22 @@ session_json() {{
 # pipeline, `die` only ends this function's subshell.
 emit() {{
   mkdir -p "$inbox" || die "cannot create $inbox"
+  # Writers overlap (the status line runs alongside hooks): the counter is
+  # read and bumped under a mkdir lock, and a lock left by a dead writer
+  # is broken after ~2 s.
+  i=0
+  until mkdir "$inbox/.lock" 2>/dev/null; do
+    i=$((i + 1))
+    if [ "$i" -gt 100 ]; then rm -rf "$inbox/.lock"; else sleep 0.02 2>/dev/null || sleep 1; fi
+  done
   n=$(cat "$inbox/.seq" 2>/dev/null || echo 0)
   case "$n" in ''|*[!0-9]*) n=0 ;; esac
   n=$((n + 1))
-  echo "$n" > "$inbox/.seq" || die "cannot write to $inbox"
+  if ! echo "$n" > "$inbox/.seq.$$" || ! mv "$inbox/.seq.$$" "$inbox/.seq"; then
+    rmdir "$inbox/.lock" 2>/dev/null
+    die "cannot write to $inbox"
+  fi
+  rmdir "$inbox/.lock" 2>/dev/null
   name="$(printf '%08d' "$n")-$(date +%s)-$$-$2"
   tmp="$inbox/.$name.tmp"
   {{ printf '%s\n' "$1"; cat; }} > "$tmp" && mv "$tmp" "$inbox/$name.msg" || die "cannot write to $inbox"
@@ -561,5 +628,27 @@ mod tests {
         assert!(b.file_name().unwrap().to_string_lossy().starts_with("00000002-"), "{}", b.display());
         let bodies: Vec<String> = drain(&inbox).unwrap().into_iter().map(|(_, m)| m.unwrap().body).collect();
         assert_eq!(bodies, ["first", "second"]);
+        // A lock left behind by a dead writer is taken over.
+        std::fs::create_dir(inbox.join(LOCK_DIR)).unwrap();
+        let c = write_message(&inbox, &InboxHeader::Block { task: "t".into(), session: None }, "third").unwrap();
+        assert!(c.file_name().unwrap().to_string_lossy().starts_with("00000003-"));
+        assert!(!inbox.join(LOCK_DIR).exists(), "the lock is released");
+    }
+
+    #[test]
+    fn purge_removes_messages_but_keeps_the_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = inbox_dir(dir.path());
+        assert_eq!(purge(&inbox).unwrap(), 0, "a missing inbox is fine");
+        write_message(&inbox, &InboxHeader::Complete { task: "t".into(), pr: None, session: None }, "late").unwrap();
+        std::fs::write(inbox.join(".00000002-1-1-hook.msg.tmp"), "partial").unwrap();
+        std::fs::create_dir_all(inbox.join(REJECTED_RELATIVE)).unwrap();
+        std::fs::write(inbox.join(REJECTED_RELATIVE).join("x.msg"), "kept").unwrap();
+        assert_eq!(purge(&inbox).unwrap(), 2);
+        assert!(drain(&inbox).unwrap().is_empty());
+        assert!(inbox.join(SEQ_FILE).exists(), "numbering continues after a purge");
+        assert!(inbox.join(REJECTED_RELATIVE).join("x.msg").exists(), "rejected files stay for inspection");
+        let next = write_message(&inbox, &InboxHeader::Block { task: "t".into(), session: None }, "new").unwrap();
+        assert!(next.file_name().unwrap().to_string_lossy().starts_with("00000002-"));
     }
 }

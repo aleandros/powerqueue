@@ -359,9 +359,14 @@ fn shim_routes_hooks_and_completion_through_the_inbox() {
     assert!(settings.contains(&format!("{} hook --task", shim.display())), "{settings}");
 }
 
+/// The container tests run one at a time: each names its container after
+/// the task slug, and every test environment hands out the same first key.
+static CONTAINER_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Name of the image the container tests use; built from the fixtures when
 /// `POWERQUEUE_E2E_DOCKER` is set and `docker` works, else `None` (skip).
-fn docker_image() -> Option<String> {
+/// The returned guard serialises the container tests.
+fn docker_image() -> Option<(String, std::sync::MutexGuard<'static, ()>)> {
     if std::env::var_os("POWERQUEUE_E2E_DOCKER").is_none() {
         eprintln!("skipping container test: set POWERQUEUE_E2E_DOCKER=1 to run it");
         return None;
@@ -388,7 +393,8 @@ fn docker_image() -> Option<String> {
     .unwrap();
     let out = Command::new("docker").args(["build", "-q", "-t", &image]).arg(ctx.path()).output().unwrap();
     assert!(out.status.success(), "docker build failed: {}", String::from_utf8_lossy(&out.stderr));
-    Some(image)
+    let guard = CONTAINER_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    Some((image, guard))
 }
 
 /// `repo.setup` / `cleanup.run` lines that start and remove a per-task
@@ -399,6 +405,7 @@ fn container_setup_and_cleanup(image: &str) -> (String, String) {
         "setup = ['''root=$(dirname \"$(dirname \"$POWERQUEUE_STATE_DIR\")\"); \
          docker rm -f pq-$POWERQUEUE_TASK_SLUG >/dev/null 2>&1; \
          docker run -d --name pq-$POWERQUEUE_TASK_SLUG -v \"$root:$root\" \
+         --user \"$(id -u):$(id -g)\" -e HOME=\"$root\" \
          -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
          {image} sleep infinity >/dev/null''']"
     );
@@ -428,7 +435,7 @@ impl Drop for ContainerGuard {
 /// the container.
 #[test]
 fn container_claude_session_completes_through_docker_exec() {
-    let Some(image) = docker_image() else { return };
+    let Some((image, _serial)) = docker_image() else { return };
     let (setup, cleanup) = container_setup_and_cleanup(&image);
     let opts = Opts {
         mode: "complete",
@@ -479,7 +486,7 @@ fn container_claude_session_completes_through_docker_exec() {
 /// the rollout is discovered in the mounted `CODEX_HOME`.
 #[test]
 fn container_codex_session_completes_through_docker_exec() {
-    let Some(image) = docker_image() else { return };
+    let Some((image, _serial)) = docker_image() else { return };
     let (setup, cleanup) = container_setup_and_cleanup(&image);
     let opts = Opts { mode: "complete", extra_repo: setup, extra_cleanup: cleanup, ..Opts::default() };
     let Some(mut env) = Env::with_opts(opts, |root| {

@@ -57,9 +57,17 @@ writes.
    ```sh
    AGENT_HOME=~/.local/share/powerqueue/agent-home
    mkdir -p $AGENT_HOME/claude $AGENT_HOME/codex
-   docker run -it --rm -v $AGENT_HOME:$AGENT_HOME -e CLAUDE_CONFIG_DIR=$AGENT_HOME/claude powerqueue-agent claude auth login
-   docker run -it --rm -v $AGENT_HOME:$AGENT_HOME -e CODEX_HOME=$AGENT_HOME/codex powerqueue-agent codex login
+   docker run -it --rm --user "$(id -u):$(id -g)" -e HOME=$AGENT_HOME -v $AGENT_HOME:$AGENT_HOME \
+     -e CLAUDE_CONFIG_DIR=$AGENT_HOME/claude powerqueue-agent claude auth login
+   docker run -it --rm --user "$(id -u):$(id -g)" -e HOME=$AGENT_HOME -v $AGENT_HOME:$AGENT_HOME \
+     -e CODEX_HOME=$AGENT_HOME/codex powerqueue-agent codex login
    ```
+
+   Run the containers as your own user (`--user`, as the helper does): on
+   rootful Docker on Linux the agent would otherwise leave root-owned
+   sources and git objects on the bind mounts that the daemon cannot clean
+   up. `HOME` is set to the mounted agent home so the CLIs can write their
+   state.
 
 3. Copy [docs/examples/agent-container.sh](examples/agent-container.sh) into
    your repository (e.g. `tools/agent-container.sh`). It starts a container
@@ -126,7 +134,8 @@ recreates the worktree and runs `setup` (and so `up`) again.
   would stop the agent's turn); when it cannot write, it says so on stderr
   and exits 0.
 - The inbox is `<task dir>/inbox/`: one `<seq>-<epoch>-<pid>-<kind>.msg` per
-  call (the sequence number comes from the inbox's `.seq` counter, so the
+  call (the sequence number comes from the inbox's `.seq` counter, bumped
+  under a `mkdir` lock since the status line runs alongside hooks, so the
   daemon applies messages in the order they were written), a JSON header
   line (`{"kind":"complete","task":"…","pr":null,"session":"…"}`) followed by
   the body (the summary, the reason, or the hook's JSON payload). Files are
@@ -153,7 +162,10 @@ task when any provider has `shim = true`:
   `doctor` reports how many are parked;
 - when the session probe finds a pane dead, it drains that task's inbox
   first, so a `task complete` the session wrote right before exiting is
-  applied instead of the exit being read as a crash.
+  applied instead of the exit being read as a crash;
+- a launch discards whatever the previous session left in the inbox after
+  it was finalised (a late Stop hook must not complete a retried task
+  before it starts).
 
 Everything else is unchanged: tmux liveness, `--resume` after a crash (the
 relaunch runs the same `docker exec` against the same container, so keep the

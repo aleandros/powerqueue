@@ -44,7 +44,11 @@ case "$cmd" in
     docker rm -f "$name" >/dev/null 2>&1 || true
     # The worktree is mounted on its own: `repo.worktree_root` may live
     # outside the data directory.
+    # Run as the host user so files the agent creates on the bind mounts
+    # (sources, git objects) stay owned by you and cleanup can remove them;
+    # HOME is the mounted agent home so the CLIs can write their state.
     docker run -d --name "$name" \
+      --user "$(id -u):$(id -g)" -e HOME="$AGENT_HOME" \
       -v "$POWERQUEUE_WORKTREE:$POWERQUEUE_WORKTREE" \
       -v "$POWERQUEUE_DATA_DIR:$POWERQUEUE_DATA_DIR" \
       -v "$POWERQUEUE_STATE_DIR:$POWERQUEUE_STATE_DIR" \
