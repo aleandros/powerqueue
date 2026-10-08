@@ -149,7 +149,8 @@ pub fn render_message(header: &InboxHeader, body: &str) -> String {
 const LOCK_DIR: &str = ".lock";
 
 /// Bump and return the inbox's sequence counter under the same mkdir lock
-/// the shim uses; a lock older than ~2 s is taken over (its holder died).
+/// the shim uses; a lock older than ~2 s is taken over (its holder died),
+/// and a lock that cannot be made at all fails after ~3 s.
 fn next_sequence(inbox: &Path) -> Result<u64> {
     let lock = inbox.join(LOCK_DIR);
     let mut tries = 0u32;
@@ -158,11 +159,14 @@ fn next_sequence(inbox: &Path) -> Result<u64> {
             return Err(e).with_context(|| format!("cannot lock {}", inbox.display()));
         }
         tries += 1;
-        if tries > 100 {
+        if tries == 100 {
             let _ = std::fs::remove_dir(&lock);
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
         }
+        if tries >= 150 {
+            anyhow::bail!("cannot lock {}: {} is held by another writer", inbox.display(), lock.display());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let seq_file = inbox.join(SEQ_FILE);
     let result = (|| {
@@ -314,12 +318,15 @@ session_json() {{
 emit() {{
   mkdir -p "$inbox" || die "cannot create $inbox"
   # Writers overlap (the status line runs alongside hooks): the counter is
-  # read and bumped under a mkdir lock, and a lock left by a dead writer
-  # is broken after ~2 s.
+  # read and bumped under a mkdir lock. A lock left by a dead writer is
+  # broken after ~2 s; an inbox where the lock cannot be made at all
+  # (unwritable) fails after ~3 s instead of hanging.
   i=0
   until mkdir "$inbox/.lock" 2>/dev/null; do
     i=$((i + 1))
-    if [ "$i" -gt 100 ]; then rm -rf "$inbox/.lock"; else sleep 0.02 2>/dev/null || sleep 1; fi
+    if [ "$i" -eq 100 ]; then rm -rf "$inbox/.lock"; continue; fi
+    [ "$i" -lt 150 ] || die "cannot lock $inbox"
+    sleep 0.02 2>/dev/null || sleep 1
   done
   n=$(cat "$inbox/.seq" 2>/dev/null || echo 0)
   case "$n" in ''|*[!0-9]*) n=0 ;; esac
@@ -616,6 +623,35 @@ mod tests {
             run(&shim, &["hook", "--task", "abc-1", "--event", "Stop"], Some("{}"), &[("POWERQUEUE_INBOX", &bad)]);
         assert_eq!(code, 0);
         assert!(err.contains("not delivered"), "{err}");
+    }
+
+    /// An inbox that exists but cannot be written (so the lock cannot be
+    /// made) fails within seconds instead of hanging.
+    #[cfg(unix)]
+    #[test]
+    fn shim_gives_up_on_an_unwritable_inbox() {
+        use std::os::unix::fs::PermissionsExt;
+        if which::which("sh").is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let shim = write_shim(dir.path());
+        let sealed = dir.path().join("sealed");
+        std::fs::create_dir_all(&sealed).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::create_dir(sealed.join("probe")).is_ok() {
+            eprintln!("skipping: running as a user that ignores directory permissions");
+            return;
+        }
+        let started = std::time::Instant::now();
+        let (code, out, err) =
+            run(&shim, &["task", "complete", "abc-1"], None, &[("POWERQUEUE_INBOX", &sealed.to_string_lossy())]);
+        assert_eq!(code, 2, "{out}{err}");
+        assert!(err.contains("cannot lock"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "bounded wait");
+        let rust = next_sequence(&sealed).unwrap_err().to_string();
+        assert!(rust.contains("cannot lock"), "{rust}");
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]

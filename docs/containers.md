@@ -163,9 +163,12 @@ task when any provider has `shim = true`:
 - when the session probe finds a pane dead, it drains that task's inbox
   first, so a `task complete` the session wrote right before exiting is
   applied instead of the exit being read as a crash;
-- a launch discards whatever the previous session left in the inbox after
-  it was finalised (a late Stop hook must not complete a retried task
-  before it starts).
+- a message from a session that already ended (its `session` id, or the
+  task's latest session when the shim had none) is ignored and logged as
+  `inbox.stale`: a Stop that arrived after `task complete` and was only
+  drained once the task was re-queued must not complete the next attempt
+  before it starts. A launch also discards whatever the previous session
+  left in the inbox.
 
 Everything else is unchanged: tmux liveness, `--resume` after a crash (the
 relaunch runs the same `docker exec` against the same container, so keep the

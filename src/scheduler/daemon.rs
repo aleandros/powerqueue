@@ -1872,6 +1872,25 @@ impl Daemon {
             bail!("the message names {} but sat in the inbox of {}", target.key, task.key);
         }
         let session = msg.header.session();
+        // A message from a session that already ended (a Stop that arrived
+        // after `task complete`, drained only once the task was re-queued)
+        // must not act on the next attempt.
+        let live = match session {
+            Some(sid) => self.store.get_session(sid)?.map(|s| s.state.is_live()),
+            None => self.store.latest_session(task.id)?.map(|s| s.state.is_live()),
+        };
+        if live == Some(false) {
+            tracing::debug!(task = %task.key, kind = msg.header.kind(), ?session, "ignoring an inbox message from an ended session");
+            self.log(
+                Some(task.id),
+                session,
+                EventLevel::Debug,
+                "inbox.stale",
+                &format!("{} message from a session that already ended; ignored", msg.header.kind()),
+                serde_json::json!({ "kind": msg.header.kind() }),
+            );
+            return Ok(());
+        }
         let body = msg.body.trim();
         match &msg.header {
             InboxHeader::Hook { provider, event, .. } => {
