@@ -1443,7 +1443,8 @@ pub struct LoadedOverrides {
     pub file: PathBuf,
     /// The commit the text was read from, or `None` for the working tree.
     pub rev: Option<String>,
-    pub text: String,
+    /// The file's text; `None` when there is no such file there.
+    pub text: Option<String>,
 }
 
 impl LoadedOverrides {
@@ -1594,18 +1595,21 @@ impl Config {
 
     /// The raw `.powerqueue.toml` of the repository per `repo.overrides_from`:
     /// the working-tree file, or the file as committed on the default branch
-    /// (`origin/<branch>` after a fetch, else the local branch). `Ok(None)`
-    /// when there is no such file; an error when the branch cannot be read
-    /// (the working tree is never used as a fallback, by design).
-    pub fn read_repo_overrides(&self, repo_path: &Path) -> Result<Option<LoadedOverrides>> {
+    /// (`origin/<branch>` after a fetch, else the local branch). The result's
+    /// `text` is `None` when there is no such file; an error when the branch
+    /// cannot be read (the working tree is never used as a fallback, by
+    /// design). Call it on the *global* config: `.powerqueue.toml` may set
+    /// `default_branch` itself, and that must not change where it is read from.
+    pub fn read_repo_overrides(&self, repo_path: &Path) -> Result<LoadedOverrides> {
         let file = repo_path.join(REPO_CONFIG_FILE);
         match self.repo.overrides_from {
             OverridesSource::WorkingTree => {
-                if !file.exists() {
-                    return Ok(None);
-                }
-                let text = std::fs::read_to_string(&file).with_context(|| format!("cannot read {}", file.display()))?;
-                Ok(Some(LoadedOverrides { file, rev: None, text }))
+                let text = match std::fs::read_to_string(&file) {
+                    Ok(t) => Some(t),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(e).with_context(|| format!("cannot read {}", file.display())),
+                };
+                Ok(LoadedOverrides { file, rev: None, text })
             }
             OverridesSource::DefaultBranch => {
                 let repo = crate::worktree::Repo::new(repo_path);
@@ -1617,7 +1621,7 @@ impl Config {
                 let text = repo.show_file(&rev, REPO_CONFIG_FILE).with_context(|| {
                     format!("cannot read {REPO_CONFIG_FILE} from {rev} (repo.overrides_from = \"default-branch\")")
                 })?;
-                Ok(text.map(|text| LoadedOverrides { file, rev: Some(rev), text }))
+                Ok(LoadedOverrides { file, rev: Some(rev), text })
             }
         }
     }
@@ -1640,10 +1644,13 @@ impl Config {
     /// path in the checkout when something was applied. Fails when the file
     /// cannot be read or parsed.
     pub fn apply_repo_overrides(&mut self, repo_path: &Path) -> Result<Option<PathBuf>> {
-        let Some(loaded) = self.read_repo_overrides(repo_path)? else {
+        let loaded = self.read_repo_overrides(repo_path)?;
+        let Some(text) = &loaded.text else {
+            // Remember the commit anyway: the daemon watches it for the file.
+            self.overrides = AppliedOverrides { rev: loaded.rev, ..AppliedOverrides::default() };
             return Ok(None);
         };
-        let mut ov: RepoOverrides = toml::from_str(&loaded.text).with_context(|| format!("invalid {}", loaded.describe()))?;
+        let mut ov: RepoOverrides = toml::from_str(text).with_context(|| format!("invalid {}", loaded.describe()))?;
         let resolve = |raw: &str| {
             let path = expand_tilde(raw);
             if path.is_absolute() { path } else { repo_path.join(path) }
@@ -2561,6 +2568,41 @@ restart_backoff_secs = [5, 10]
         cfg.repo.path = repo.display().to_string();
         assert_eq!(cfg.apply_repo_overrides(&repo).unwrap(), None);
         assert_eq!(cfg.overrides, AppliedOverrides::default());
+    }
+
+    #[test]
+    fn overrides_rev_is_the_global_default_branch_even_when_the_repo_overrides_it() {
+        if which::which("git").is_err() {
+            eprintln!("git not available; skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "default_branch = \"develop\"\n[scheduler]\nmax_concurrent = 3\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "main"]);
+        git(&repo, &["checkout", "-q", "-b", "develop"]);
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "[scheduler]\nmax_concurrent = 8\n").unwrap();
+        git(&repo, &["commit", "-qam", "develop"]);
+        git(&repo, &["checkout", "-q", "main"]);
+        let mut cfg = Config::default();
+        cfg.repo.path = repo.display().to_string();
+        cfg.repo.overrides_from = OverridesSource::DefaultBranch;
+        cfg.apply_repo_overrides(&repo).unwrap();
+        assert_eq!(cfg.scheduler.max_concurrent, 3, "read from main, the global default branch");
+        assert_eq!(cfg.repo.default_branch.as_deref(), Some("develop"), "the override applies to new worktrees");
+        assert_eq!(cfg.overrides.rev.as_deref(), Some("main"), "and the recorded commit is the one that was read");
+        // Without the file, the commit is still recorded.
+        git(&repo, &["rm", "-q", REPO_CONFIG_FILE]);
+        git(&repo, &["commit", "-qm", "drop"]);
+        let mut cfg = Config::default();
+        cfg.repo.path = repo.display().to_string();
+        cfg.repo.overrides_from = OverridesSource::DefaultBranch;
+        assert_eq!(cfg.apply_repo_overrides(&repo).unwrap(), None);
+        assert_eq!(cfg.overrides.rev.as_deref(), Some("main"));
+        assert!(cfg.overrides.keys.is_empty());
     }
 
     fn git(cwd: &Path, args: &[&str]) {

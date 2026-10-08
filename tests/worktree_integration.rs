@@ -362,6 +362,12 @@ fn show_file_blob_ids_and_current_branch() {
     let after = repo.blob_ids("main", &["README.md"]).unwrap();
     assert_ne!(before["README.md"], after["README.md"]);
     assert!(repo.blob_ids("nope", &["README.md"]).is_err());
+    // Non-ASCII paths come back verbatim (git would quote them otherwise).
+    std::fs::create_dir_all(repo.path.join("docs")).unwrap();
+    commit_file(&repo.path, "docs/règles.md", "accents");
+    let ids = repo.blob_ids("main", &["docs/règles.md"]).unwrap();
+    assert!(ids.contains_key("docs/règles.md"), "{ids:?}");
+    assert_eq!(repo.show_file("main", "docs/règles.md").unwrap().as_deref(), Some("docs/règles.md\n"));
 
     git(&repo.path, &["checkout", "-q", "--detach"]);
     assert_eq!(repo.current_branch().unwrap(), None);

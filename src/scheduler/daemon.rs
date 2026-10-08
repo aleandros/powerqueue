@@ -879,6 +879,12 @@ impl Daemon {
         if !self.cfg.repo_path().exists() {
             return Ok(());
         }
+        // The baseline is what the configuration was loaded from, taken
+        // *before* the first fetch: a change merged while the daemon was
+        // down must count as a change, not as the starting point.
+        if self.rt.overrides_fingerprint.is_none() {
+            self.rt.overrides_fingerprint = Some(self.overrides_fingerprint());
+        }
         let from_branch = self.cfg.repo.overrides_from == OverridesSource::DefaultBranch;
         if from_branch && self.cfg.repo.fetch_interval_secs > 0 && !self.offline {
             let interval = Duration::seconds(self.cfg.repo.fetch_interval_secs.min(i64::MAX as u64) as i64);
@@ -940,7 +946,14 @@ impl Daemon {
             }
             OverridesSource::DefaultBranch => {
                 let rules_path = self.cfg.overrides.priority_file_in_repo.clone();
-                let ids = self.cfg.overrides_rev(&self.rt.repo).and_then(|rev| {
+                // The commit the loader read (recorded even when the file was
+                // absent): the merged config's `default_branch` may be the
+                // repo's own override and must not move the watch.
+                let rev = match &self.cfg.overrides.rev {
+                    Some(rev) => Ok(rev.clone()),
+                    None => self.cfg.overrides_rev(&self.rt.repo),
+                };
+                let ids = rev.and_then(|rev| {
                     let mut paths = vec![REPO_CONFIG_FILE];
                     if let Some(p) = &rules_path {
                         paths.push(p);
@@ -4293,30 +4306,49 @@ mod tests {
         std::fs::write(repo.join("docs/PRIORITY.md"), "## High\n- source: manual\n").unwrap();
         git_in(&repo, &["add", "."]);
         git_in(&repo, &["commit", "-qm", "config"]);
+        // A bare origin and a second clone: "upstream" is what lands there.
+        let bare = dir.path().join("origin.git");
+        git_in(dir.path(), &["init", "-q", "--bare", "-b", "main", &bare.to_string_lossy()]);
+        git_in(&repo, &["remote", "add", "origin", &bare.to_string_lossy()]);
+        git_in(&repo, &["push", "-q", "origin", "main"]);
+        let other = dir.path().join("other");
+        git_in(dir.path(), &["clone", "-q", &bare.to_string_lossy(), &other.to_string_lossy()]);
+        let upstream = |files: &[(&str, &str)], msg: &str| {
+            for (name, text) in files {
+                std::fs::write(other.join(name), text).unwrap();
+            }
+            git_in(&other, &["add", "."]);
+            git_in(&other, &["commit", "-qm", msg]);
+            git_in(&other, &["push", "-q", "origin", "main"]);
+        };
 
         let mut cfg = Config::default();
         cfg.repo.path = repo.display().to_string();
         cfg.repo.overrides_from = OverridesSource::DefaultBranch;
-        cfg.repo.fetch_interval_secs = 0;
+        cfg.repo.fetch_interval_secs = 1;
         cfg.save(&paths).unwrap();
         cfg.apply_repo_overrides(&repo).unwrap();
         assert_eq!(cfg.scheduler.max_concurrent, 3);
+        assert_eq!(cfg.overrides.rev.as_deref(), Some("origin/main"));
         let store = Store::open_in_memory().unwrap();
         let secrets = Secrets::with_backend(Box::new(FileBackend::new(paths.secrets_file())));
         let mut daemon = Daemon::new(cfg, paths, store.clone(), secrets).unwrap();
-        daemon.offline = true;
         let since = Utc::now() - Duration::minutes(1);
         let mut now = Utc::now();
 
+        // Merged upstream while the daemon was down: the first check's fetch
+        // brings it, and it counts as a change from what was loaded.
+        upstream(&[(REPO_CONFIG_FILE, "priority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 4\n")], "while down");
         daemon.refresh_overrides(now).unwrap();
+        assert_eq!(daemon.cfg.scheduler.max_concurrent, 4, "the first check compares against what was loaded");
+        assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 1);
         daemon.refresh_rules(now).await.unwrap();
         assert!(daemon.rt.rules_loaded);
         assert_eq!(daemon.rt.rules.rule_count(), 1);
         assert!(daemon.rt.watcher.is_none(), "committed rules are polled, not watched");
 
-        // Only the rules change on the branch: the rules reload, the config does not.
-        std::fs::write(repo.join("docs/PRIORITY.md"), "## High\n- source: manual\n## Low\n- label: chore\n").unwrap();
-        git_in(&repo, &["commit", "-qam", "rules"]);
+        // Only the rules change upstream: the rules reload, the config does not.
+        upstream(&[("docs/PRIORITY.md", "## High\n- source: manual\n## Low\n- label: chore\n")], "rules");
         daemon.refresh_overrides(now).unwrap();
         assert!(daemon.rt.rules_loaded, "throttled: nothing is checked within OVERRIDES_CHECK_SECS");
         now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
@@ -4324,24 +4356,21 @@ mod tests {
         assert!(!daemon.rt.rules_loaded);
         daemon.refresh_rules(now).await.unwrap();
         assert_eq!(daemon.rt.rules.rule_count(), 2);
-        assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 0);
+        assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 1, "rules only: no config reload");
 
-        // The config changes on the branch: full reload with the keys named.
-        std::fs::write(repo.join(REPO_CONFIG_FILE), "priority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 5\n")
-            .unwrap();
-        git_in(&repo, &["commit", "-qam", "concurrency"]);
+        // The config changes upstream: full reload with the keys named.
+        upstream(&[(REPO_CONFIG_FILE, "priority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 5\n")], "concurrency");
         now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
         daemon.refresh_overrides(now).unwrap();
         assert_eq!(daemon.cfg.scheduler.max_concurrent, 5);
-        assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 1);
+        assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 2);
         let events = store.recent_events(5).unwrap();
         let reloaded = events.iter().find(|e| e.kind == "daemon.reloaded").unwrap();
-        assert_eq!(reloaded.data["rev"], "main");
+        assert_eq!(reloaded.data["rev"], "origin/main");
         assert_eq!(reloaded.data["keys"], serde_json::json!(["priority.file", "scheduler.max_concurrent"]));
 
         // A broken file keeps the previous configuration, reported once.
-        std::fs::write(repo.join(REPO_CONFIG_FILE), "[scheduler]\nmax_concurrent = 0\n").unwrap();
-        git_in(&repo, &["commit", "-qam", "broken"]);
+        upstream(&[(REPO_CONFIG_FILE, "[scheduler]\nmax_concurrent = 0\n")], "broken");
         now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
         daemon.refresh_overrides(now).unwrap();
         now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
@@ -4349,15 +4378,40 @@ mod tests {
         assert_eq!(daemon.cfg.scheduler.max_concurrent, 5);
         assert_eq!(store.count_events_of_kind("daemon.reload_failed", since).unwrap(), 1);
 
-        // The working tree never matters: a checkout of another branch with
-        // other values is invisible.
+        // The main checkout never matters: a local branch with other values,
+        // checked out there, is invisible.
         git_in(&repo, &["checkout", "-q", "-b", "feature"]);
         std::fs::write(repo.join(REPO_CONFIG_FILE), "[scheduler]\nmax_concurrent = 9\n").unwrap();
         git_in(&repo, &["commit", "-qam", "feature"]);
         now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
         daemon.refresh_overrides(now).unwrap();
         assert_eq!(daemon.cfg.scheduler.max_concurrent, 5);
-        assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 1);
+        assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 2);
+
+        // The repo's own `default_branch` does not move the watch: the
+        // fingerprint follows the commit the loader read (origin/main).
+        upstream(
+            &[(
+                REPO_CONFIG_FILE,
+                "default_branch = \"feature\"\npriority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 6\n",
+            )],
+            "override default branch",
+        );
+        now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
+        daemon.refresh_overrides(now).unwrap();
+        assert_eq!(daemon.cfg.scheduler.max_concurrent, 6);
+        assert_eq!(daemon.cfg.repo.default_branch.as_deref(), Some("feature"));
+        assert_eq!(daemon.cfg.overrides.rev.as_deref(), Some("origin/main"));
+        upstream(
+            &[(
+                REPO_CONFIG_FILE,
+                "default_branch = \"feature\"\npriority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 7\n",
+            )],
+            "still on main",
+        );
+        now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
+        daemon.refresh_overrides(now).unwrap();
+        assert_eq!(daemon.cfg.scheduler.max_concurrent, 7, "a change on origin/main is still seen");
     }
 
     #[tokio::test]

@@ -256,24 +256,53 @@ pub fn overrides_summary(cfg: &Config) -> String {
 
 /// Mark every `key = value` line of a pretty-printed config that came from
 /// `.powerqueue.toml` with a trailing comment. Table headers (`[linear]`)
-/// set the prefix; only the first line of a multi-line value is marked.
+/// set the prefix. A multi-line value (an array, or a `"""` / `\'\'\'`
+/// string) gets the comment on the line *before* the key instead, where it
+/// cannot land inside the value, and the lines inside a multi-line string
+/// are never mistaken for keys.
 pub fn annotate_overrides(toml: &str, keys: &[String]) -> String {
+    const MARK: &str = "# .powerqueue.toml";
     let mut table = String::new();
+    // The delimiter that closes the multi-line string we are inside, if any.
+    let mut in_string: Option<&str> = None;
     let mut out = String::with_capacity(toml.len() + keys.len() * 24);
     for line in toml.lines() {
+        if let Some(delim) = in_string {
+            if line.contains(delim) {
+                in_string = None;
+            }
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
         let trimmed = line.trim();
         if let Some(name) = trimmed.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
             table = name.trim_matches('[').trim_matches(']').to_string();
             out.push_str(line);
-        } else if let Some((key, _)) = trimmed.split_once('=')
+        } else if let Some((key, value)) = trimmed.split_once('=')
             && !trimmed.starts_with('#')
             && key.trim().chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '"')
         {
             let key = key.trim().trim_matches('"');
             let full = if table.is_empty() { key.to_string() } else { format!("{table}.{key}") };
-            out.push_str(line);
-            if keys.iter().any(|k| k == &full) {
-                out.push_str("  # .powerqueue.toml");
+            let value = value.trim();
+            if let Some(delim) = ["\"\"\"", "\'\'\'"].into_iter().find(|d| value.starts_with(d))
+                && !value[delim.len()..].contains(delim)
+            {
+                in_string = Some(delim);
+            }
+            let multi_line = in_string.is_some() || (value.starts_with('[') && !value.contains(']'));
+            let marked = keys.iter().any(|k| k == &full);
+            if marked && multi_line {
+                out.push_str(MARK);
+                out.push('\n');
+                out.push_str(line);
+            } else {
+                out.push_str(line);
+                if marked {
+                    out.push_str("  ");
+                    out.push_str(MARK);
+                }
             }
         } else {
             out.push_str(line);
@@ -606,15 +635,32 @@ mod tests {
     }
 
     #[test]
-    fn annotate_marks_only_repo_keys() {
+    fn annotate_marks_only_repo_keys_and_never_inside_values() {
         let toml = "[repo]\npath = \"/r\"\nsetup = [\n    \"make\",\n]\n\n[linear]\nexcluded_labels = [\"x\"]\ncycle = \"any\"\n";
         let keys = vec!["repo.setup".to_string(), "linear.cycle".to_string()];
         let out = annotate_overrides(toml, &keys);
-        assert!(out.contains("setup = [  # .powerqueue.toml\n"), "{out}");
+        assert!(out.contains("# .powerqueue.toml\nsetup = [\n"), "{out}");
         assert!(out.contains("cycle = \"any\"  # .powerqueue.toml\n"), "{out}");
         assert!(out.contains("path = \"/r\"\n"), "{out}");
         assert!(out.contains("excluded_labels = [\"x\"]\n"), "{out}");
         assert_eq!(annotate_overrides(toml, &[]), toml);
+
+        // A multi-line string: the mark goes before the key, lines inside the
+        // string (even `x = y` lookalikes) are left alone, and the annotated
+        // text still parses to the same config.
+        let mut cfg = Config::default();
+        cfg.claude.append_system_prompt = Some("Line one\nmode = fake\nLine three".into());
+        cfg.claude.permission_mode = "plan".into();
+        let text = cfg.to_toml().unwrap();
+        assert!(text.contains("\"\"\""), "pretty TOML uses a multi-line string: {text}");
+        let keys = vec!["claude.append_system_prompt".to_string(), "claude.permission_mode".to_string()];
+        let out = annotate_overrides(&text, &keys);
+        assert!(out.contains("# .powerqueue.toml\nappend_system_prompt = \"\"\""), "{out}");
+        assert!(out.contains("permission_mode = \"plan\"  # .powerqueue.toml\n"), "{out}");
+        assert!(out.contains("mode = fake\n"), "{out}");
+        let back = Config::from_toml(&out).unwrap();
+        assert_eq!(back.claude.append_system_prompt, cfg.claude.append_system_prompt);
+        assert_eq!(back.claude.permission_mode, "plan");
     }
 
     #[test]

@@ -303,8 +303,16 @@ fn queued_decisions(
     now: DateTime<Utc>,
 ) -> Result<Vec<QueuedDecision>> {
     use crate::scheduler::pick_next;
-    let path = cfg.priority_file(paths);
-    let rules = if path.exists() { PriorityRules::load(&path)? } else { PriorityRules::default() };
+    let source = cfg.rules_source(paths);
+    let rules = match source.read()? {
+        Some(text) => PriorityRules::parse(&text).map_err(|errors| {
+            anyhow::anyhow!(
+                "{source} has errors:\n  - {}",
+                errors.iter().map(|e| format!("line {}: {}", e.line, e.message)).collect::<Vec<_>>().join("\n  - ")
+            )
+        })?,
+        None => PriorityRules::default(),
+    };
     let tasks: Vec<Task> = store.list_open_tasks()?.into_iter().filter(|t| t.state.is_schedulable()).collect();
     let mut ledgers = ledgers.clone();
     let mut out = Vec::new();

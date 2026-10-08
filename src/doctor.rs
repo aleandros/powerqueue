@@ -548,17 +548,17 @@ fn check_repo_overrides(cfg: &Config) -> CheckResult {
         return CheckResult::ok(CONF, ".powerqueue.toml", "no repository overrides (repository missing)");
     }
     let loaded = match cfg.read_repo_overrides(&repo) {
-        Ok(Some(l)) => l,
-        Ok(None) => {
+        Ok(l) if l.text.is_some() => l,
+        Ok(l) => {
             return CheckResult::ok(
                 CONF,
                 ".powerqueue.toml",
                 format!(
                     "no repository overrides ({} not present in the {})",
                     file.display(),
-                    match cfg.repo.overrides_from {
-                        OverridesSource::WorkingTree => "working tree".to_string(),
-                        OverridesSource::DefaultBranch => "default branch".to_string(),
+                    match &l.rev {
+                        Some(rev) => format!("default branch, {rev}"),
+                        None => "working tree".to_string(),
                     }
                 ),
             );
@@ -578,7 +578,7 @@ fn check_repo_overrides(cfg: &Config) -> CheckResult {
             );
         }
     };
-    match toml::from_str::<RepoOverrides>(&loaded.text) {
+    match toml::from_str::<RepoOverrides>(loaded.text.as_deref().unwrap_or_default()) {
         Ok(_) => {
             let mut merged = cfg.clone();
             // A re-apply on a copy tells which keys the file sets without

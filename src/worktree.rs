@@ -204,13 +204,15 @@ impl Repo {
         if self.try_rev_sha(rev)?.is_none() {
             bail!("`{rev}` does not resolve to a commit in {}", self.path.display());
         }
-        let mut args = vec!["ls-tree", rev, "--"];
+        // `-z`: NUL-terminated records with the path verbatim (otherwise git
+        // quotes and escapes non-ASCII names per `core.quotePath`).
+        let mut args = vec!["ls-tree", "-z", rev, "--"];
         args.extend(paths);
         let out = self.git(None, &args)?;
         Ok(out
-            .lines()
-            .filter_map(|line| {
-                let (meta, path) = line.split_once('\t')?;
+            .split('\0')
+            .filter_map(|record| {
+                let (meta, path) = record.split_once('\t')?;
                 let sha = meta.split_whitespace().nth(2)?;
                 Some((path.to_string(), sha.to_string()))
             })
