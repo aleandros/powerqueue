@@ -32,6 +32,50 @@ use super::transitions::Effect;
 /// `last_error` of a task whose PR was closed without merging.
 pub const CLOSED_UNMERGED: &str = "the pull request was closed without merging";
 
+/// `last_error` prefix of a PR watcher failure (gh missing, no access, ...).
+pub const WATCHER_ERROR_PREFIX: &str = "PR watcher:";
+
+/// An `in_review` task whose `pr_url` is not a usable pull request: nothing
+/// can be watched, so a human must look at it.
+pub fn on_unusable_pr(task: &mut Task, error: &str) -> Vec<Effect> {
+    let url = task.pr_url.clone().unwrap_or_default();
+    task.state = TaskState::NeedsAttention;
+    task.last_error = Some(format!("in review without a usable pull request: {error}"));
+    vec![Effect::Log {
+        level: EventLevel::Warn,
+        kind: "review.error".into(),
+        message: error.to_string(),
+        data: serde_json::json!({ "pr": url }),
+    }]
+}
+
+/// The PR could not be read (`gh` missing, no access, ...): the task is not
+/// changed, the failure is noted in `last_error` (logged as `review.error`
+/// only when the message changed) and the poll is retried at the next
+/// interval.
+pub fn on_watch_error(task: &mut Task, pr: &str, error: &str, now: DateTime<Utc>) -> Vec<Effect> {
+    let message = format!("{WATCHER_ERROR_PREFIX} cannot read {pr}: {error}");
+    let changed = task.last_error.as_deref() != Some(message.as_str());
+    task.review.get_or_insert_with(|| ReviewWatch::armed(now, None)).last_polled_at = Some(now);
+    task.last_error = Some(message.clone());
+    if !changed {
+        return Vec::new();
+    }
+    vec![Effect::Log {
+        level: EventLevel::Warn,
+        kind: "review.error".into(),
+        message,
+        data: serde_json::json!({ "pr": task.pr_url }),
+    }]
+}
+
+/// The PR can be read again: a watcher error noted earlier is cleared.
+pub fn on_watch_recovered(task: &mut Task) {
+    if task.last_error.as_deref().is_some_and(|e| e.starts_with(WATCHER_ERROR_PREFIX)) {
+        task.last_error = None;
+    }
+}
+
 /// One-line summary of what GitHub reported; a change of this value is a
 /// change of the PR (staleness restarts).
 pub fn fingerprint(status: &PrStatus, armed_at: DateTime<Utc>) -> String {
@@ -471,5 +515,42 @@ mod tests {
         t.state = TaskState::Running;
         assert!(on_pr_status(&mut t, &status("MERGED", "UNKNOWN"), &SchedulerConfig::default(), now()).is_empty());
         assert_eq!(t.state, TaskState::Running);
+    }
+
+    #[test]
+    fn an_unusable_pr_parks_the_task_for_a_human() {
+        let mut t = task();
+        t.pr_url = Some("not a url".into());
+        let effects = on_unusable_pr(&mut t, "invalid pull request URL");
+        assert_eq!(t.state, TaskState::NeedsAttention);
+        assert_eq!(t.last_error.as_deref(), Some("in review without a usable pull request: invalid pull request URL"));
+        assert!(matches!(&effects[..], [Effect::Log { kind, data, .. }] if kind == "review.error" && data["pr"] == "not a url"));
+    }
+
+    #[test]
+    fn a_watch_error_is_noted_once_and_cleared_on_recovery() {
+        let mut t = task();
+        let effects = on_watch_error(&mut t, "o/r#7", "gh: command not found", now());
+        assert_eq!(kinds(&effects), ["review.error"]);
+        assert_eq!(t.state, TaskState::InReview, "the task is not changed");
+        assert_eq!(t.last_error.as_deref(), Some("PR watcher: cannot read o/r#7: gh: command not found"));
+        assert_eq!(t.review.as_ref().and_then(|w| w.last_polled_at), Some(now()), "retried at the next interval");
+        assert!(
+            on_watch_error(&mut t, "o/r#7", "gh: command not found", now() + Duration::minutes(1)).is_empty(),
+            "same message: silent"
+        );
+        assert_eq!(kinds(&on_watch_error(&mut t, "o/r#7", "403", now())), ["review.error"], "a new message is logged");
+
+        on_watch_recovered(&mut t);
+        assert_eq!(t.last_error, None);
+        t.last_error = Some(CLOSED_UNMERGED.into());
+        on_watch_recovered(&mut t);
+        assert_eq!(t.last_error.as_deref(), Some(CLOSED_UNMERGED), "only watcher errors are cleared");
+
+        // A task without a watch gets one so the poll interval applies.
+        let mut t = task();
+        t.review = None;
+        on_watch_error(&mut t, "o/r#7", "x", now());
+        assert!(t.review.is_some());
     }
 }

@@ -20,8 +20,8 @@ use crate::budget::{
 };
 use crate::config::{Config, OverridesSource, REPO_CONFIG_FILE, RulesSource};
 use crate::domain::{
-    BRANCH_CREATED_EVENT, DaemonCommand, EventLevel, ModelTier, Provider, ReviewWatch, SCHEDULING_PAUSE_KEY, SchedulingPause,
-    Session, SessionState, Task, TaskId, TaskSource, TaskState, is_closed_state_type,
+    BRANCH_CREATED_EVENT, DaemonCommand, EventLevel, ModelTier, Provider, SCHEDULING_PAUSE_KEY, SchedulingPause, Session,
+    SessionState, Task, TaskId, TaskSource, TaskState, is_closed_state_type,
 };
 use crate::github::{Gh, GitHubClient, PrRef, apply_plan, plan_sync};
 use crate::jev::{JevClient, JevQuestion, content_hash};
@@ -40,13 +40,12 @@ use crate::store::{JevCached, PendingHookEvent, Store};
 use crate::tmux::Tmux;
 use crate::worktree::{BasePreference, FastForward, Repo, branch_name, run_commands};
 
+use super::commands;
 use super::lifecycle::{cleanup_task, pick_next, worktree_dir};
 use super::relay::{self, PostedQuestion, RelayState, relay_key};
 use super::review;
+pub use super::transitions::SKIP_REASON;
 use super::transitions::{self, CRASH_TAIL_LINES, Effect, LinearTarget, ProbeContext};
-
-/// `last_error` marker for tasks paused by a PRIORITY.md `skip` override.
-pub const SKIP_REASON: &str = "skipped by PRIORITY.md";
 /// Longest pause between Linear polls after repeated failures.
 const LINEAR_MAX_BACKOFF: Duration = Duration::minutes(10);
 /// How often `.powerqueue.toml` (and committed rules) are fingerprinted for
@@ -506,163 +505,43 @@ impl Daemon {
         match cmd {
             DaemonCommand::Pause { task_id } => {
                 let mut task = self.require_task(*task_id)?;
-                if task.state.is_terminal() || task.state == TaskState::Paused {
-                    return Ok(());
-                }
-                task.state = TaskState::Paused;
-                task.not_before = None;
-                self.store.update_task(&task)?;
-                let msg = if self.store.latest_session(task.id)?.is_some_and(|s| s.state.is_live()) {
-                    "paused; the current session finishes its turn and will not be relaunched"
-                } else {
-                    "paused"
-                };
-                self.log(Some(task.id), None, EventLevel::Info, "task.paused", msg, serde_json::json!({}));
+                let live = self.store.latest_session(task.id)?.is_some_and(|s| s.state.is_live());
+                let before = task.clone();
+                let effects = commands::on_pause(&mut task, live);
+                self.commit(&before, &mut task, None, effects).await?;
             }
             DaemonCommand::Resume { task_id } => {
                 let mut task = self.require_task(*task_id)?;
-                if !matches!(task.state, TaskState::Paused | TaskState::NeedsAttention) {
-                    return Ok(());
-                }
                 let live = self.store.latest_session(task.id)?.filter(|s| s.state.is_live());
-                task.not_before = None;
-                if task.last_error.as_deref() == Some(SKIP_REASON) {
-                    task.last_error = None;
-                }
-                task.state = if live.is_some() {
-                    TaskState::Running
-                } else if task.parked_in_review() {
-                    // Back to watching the PR, with a fresh staleness clock.
-                    rearm_watch(&mut task, now);
-                    TaskState::InReview
-                } else {
-                    TaskState::Queued
-                };
-                self.store.update_task(&task)?;
-                self.log(
-                    Some(task.id),
-                    live.map(|s| s.id),
-                    EventLevel::Info,
-                    "task.resumed",
-                    &format!("resumed → {}", task.state),
-                    serde_json::json!({}),
-                );
+                let before = task.clone();
+                let effects = commands::on_resume(&mut task, live.is_some(), now);
+                self.commit(&before, &mut task, live.as_ref(), effects).await?;
             }
             DaemonCommand::Cancel { task_id } => {
                 let mut task = self.require_task(*task_id)?;
-                if task.state.is_terminal() {
-                    return Ok(());
+                let mut session = self.store.latest_session(task.id)?.filter(|s| s.state.is_live());
+                let before = task.clone();
+                let effects = commands::on_cancel(&mut task, session.as_mut(), now);
+                if let Some(session) = &session {
+                    self.store.update_session(session)?;
                 }
-                if let Some(mut session) = self.store.latest_session(task.id)?.filter(|s| s.state.is_live()) {
-                    if let Err(e) = self.rt.tmux.kill_window(&session.tmux_window) {
-                        tracing::debug!(task = %task.key, error = %format!("{e:#}"), "kill window on cancel");
-                    }
-                    session.state = SessionState::Killed;
-                    session.ended_at = Some(now);
-                    self.store.update_session(&session)?;
-                    self.forget_session(session.id);
-                }
-                task.state = TaskState::Cancelled;
-                task.completed_at = Some(now);
-                task.not_before = None;
-                self.store.update_task(&task)?;
-                self.log(Some(task.id), None, EventLevel::Info, "task.cancelled", "cancelled by user", serde_json::json!({}));
-                self.apply_effects(&mut task, None, vec![Effect::Cleanup { succeeded: false }]).await;
-                self.store.update_task(&task)?;
+                self.commit(&before, &mut task, session.as_ref(), effects).await?;
             }
             DaemonCommand::Retry { task_id } => {
                 let mut task = self.require_task(*task_id)?;
-                // In review: resume the released session for a review round
-                // on the same branch and worktree path.
-                let review_round = task.state == TaskState::InReview;
-                if review_round {
-                    if task.pr_url.as_deref().and_then(review::pr_number_of).is_none() {
-                        self.log(
-                            Some(task.id),
-                            None,
-                            EventLevel::Warn,
-                            "task.retry_ignored",
-                            "retry ignored: the task is in review but its PR number is unknown",
-                            serde_json::json!({ "pr": task.pr_url }),
-                        );
-                        return Ok(());
-                    }
-                } else if task.state.is_terminal() {
-                    task.attempts = 0;
-                    task.last_error = None;
-                    task.summary = None;
-                    task.completed_at = None;
-                    task.started_at = None;
-                } else if !matches!(
-                    task.state,
-                    TaskState::Crashed | TaskState::Throttled | TaskState::Paused | TaskState::NeedsAttention
-                ) {
-                    // Debug: the CLI also applies a retry itself when no
-                    // daemon runs, and the daemon drains it later.
-                    self.log(
-                        Some(task.id),
-                        None,
-                        EventLevel::Debug,
-                        "task.retry_ignored",
-                        &format!("retry ignored: the task is {}", task.state),
-                        serde_json::json!({ "state": task.state }),
-                    );
-                    return Ok(());
+                let mut session = self.store.latest_session(task.id)?.filter(|s| s.state.is_live());
+                let before = (task.clone(), session.clone());
+                let effects = commands::on_retry(&mut task, session.as_mut(), now);
+                if let Some(session) = session.as_ref().filter(|s| Some(*s) != before.1.as_ref()) {
+                    self.store.update_session(session)?;
                 }
-                // A retry is a fresh attempt: a session that is still alive
-                // (e.g. the agent reported a blocker and is waiting) is ended
-                // first, otherwise it would keep the slot and the task could
-                // never relaunch.
-                if let Some(mut session) = self.store.latest_session(task.id)?.filter(|s| s.state.is_live()) {
-                    if let Err(e) = self.rt.tmux.kill_window(&session.tmux_window) {
-                        tracing::debug!(task = %task.key, error = %format!("{e:#}"), "kill window on retry");
-                    }
-                    session.state = SessionState::Killed;
-                    session.ended_at = Some(now);
-                    self.store.update_session(&session)?;
-                    self.forget_session(session.id);
-                    self.log(
-                        Some(task.id),
-                        Some(session.id),
-                        EventLevel::Info,
-                        "session.ended",
-                        "live session ended by retry",
-                        serde_json::json!({ "attempt": session.attempt }),
-                    );
-                }
-                if review_round {
-                    if let Some(Effect::Log { level, kind, message, data }) = review::request_round(&mut task, now) {
-                        self.store.update_task(&task)?;
-                        self.log(Some(task.id), None, level, &kind, &message, data);
-                    }
-                    return Ok(());
-                }
-                task.state = TaskState::Queued;
-                task.not_before = None;
-                self.store.update_task(&task)?;
-                // A retry starts over: a relayed answer is not replayed.
-                self.update_relay(&task, |state| {
-                    state.pending_answer = None;
-                    state.pending_session = None;
-                });
-                self.log(Some(task.id), None, EventLevel::Info, "task.retried", "re-queued by user", serde_json::json!({}));
+                self.commit(&before.0, &mut task, session.as_ref(), effects).await?;
             }
             DaemonCommand::SetModel { task_id, model } => {
                 let mut task = self.require_task(*task_id)?;
-                task.model_override = model.clone();
-                self.store.update_task(&task)?;
-                let msg = match model {
-                    Some(m) => format!("model forced to {m} for the next attempt"),
-                    None => "model override cleared".to_string(),
-                };
-                self.log(
-                    Some(task.id),
-                    None,
-                    EventLevel::Info,
-                    "task.model_override",
-                    &msg,
-                    serde_json::json!({ "model": model }),
-                );
+                let before = task.clone();
+                let effects = commands::on_set_model(&mut task, model.clone());
+                self.commit(&before, &mut task, None, effects).await?;
             }
             DaemonCommand::SyncNow => self.rt.force_sync = true,
             DaemonCommand::Reload => {
@@ -705,6 +584,37 @@ impl Daemon {
             }
         }
         Ok(())
+    }
+
+    /// Persist what a pure transition changed on `task` (compared with
+    /// `before`), carry out its effects, and persist again when an effect
+    /// (cleanup, branch deletion) changed the task further.
+    async fn commit(&mut self, before: &Task, task: &mut Task, session: Option<&Session>, effects: Vec<Effect>) -> Result<()> {
+        if *task != *before {
+            self.store.update_task(task)?;
+        }
+        if effects.is_empty() {
+            return Ok(());
+        }
+        let saved = task.clone();
+        self.apply_effects(task, session, effects).await;
+        if *task != saved {
+            self.store.update_task(task)?;
+        }
+        Ok(())
+    }
+
+    /// Log the events of a transition that requests nothing else (any other
+    /// effect is a programming error and is reported at warn level).
+    fn log_only(&self, task: &Task, session: Option<&Session>, effects: Vec<Effect>) {
+        for effect in effects {
+            match effect {
+                Effect::Log { level, kind, message, data } => {
+                    self.log(Some(task.id), session.map(|s| s.id), level, &kind, &message, data)
+                }
+                other => tracing::warn!(task = %task.key, effect = ?other, "effect ignored in a log-only phase"),
+            }
+        }
     }
 
     fn require_task(&self, id: TaskId) -> Result<Task> {
@@ -771,59 +681,10 @@ impl Daemon {
             let jev_norm = self.jev_norm_for(&task, now).await;
             let eval =
                 self.rt.rules.evaluate(&task, now, jev_norm, self.cfg.priority.jev.weight, self.cfg.priority.age_boost_per_hour);
-            let mut changed = false;
-            if task.criticality != eval.criticality {
-                task.criticality = eval.criticality;
-                changed = true;
-            }
-            if (task.score - eval.score).abs() > 0.5 {
-                task.score = eval.score;
-                changed = true;
-            }
-            // A new label or `## Models` row can change the preferred models
-            // without moving criticality or score; keep the stored trail honest.
-            let model_line = |reasons: &[String]| reasons.iter().find(|r| r.starts_with("model ")).cloned();
-            let (old_model, new_model) = (model_line(&task.score_reasons), model_line(&eval.reasons));
-            if old_model != new_model {
-                changed = true;
-                self.log(
-                    Some(task.id),
-                    None,
-                    EventLevel::Info,
-                    "task.models_changed",
-                    new_model.as_deref().unwrap_or("no preferred model from PRIORITY.md"),
-                    serde_json::json!({ "models": eval.models, "source": eval.model_source, "previous": old_model }),
-                );
-            }
-            if changed {
-                task.score_reasons = eval.reasons.clone();
-            }
-            if eval.skip && task.state != TaskState::Paused && !task.state.is_handed_off() {
-                task.state = TaskState::Paused;
-                task.last_error = Some(SKIP_REASON.to_string());
-                task.not_before = None;
-                changed = true;
-                self.log(Some(task.id), None, EventLevel::Info, "task.skipped", SKIP_REASON, serde_json::json!({}));
-            } else if !eval.skip && task.state == TaskState::Paused && task.last_error.as_deref() == Some(SKIP_REASON) {
-                task.state = TaskState::Queued;
-                task.last_error = None;
-                changed = true;
-                self.log(
-                    Some(task.id),
-                    None,
-                    EventLevel::Info,
-                    "task.unskipped",
-                    "no longer skipped by PRIORITY.md",
-                    serde_json::json!({}),
-                );
-            }
-            for effect in transitions::on_dependencies(&mut task) {
-                changed = true;
-                if let Effect::Log { level, kind, message, data } = effect {
-                    self.log(Some(task.id), None, level, &kind, &message, data);
-                }
-            }
-            if changed {
+            let before = task.clone();
+            let effects = transitions::on_evaluation(&mut task, &eval);
+            self.log_only(&task, None, effects);
+            if task != before {
                 self.store.update_task(&task)?;
                 tracing::debug!(task = %task.key, criticality = %task.criticality, score = task.score, "re-scored");
             }
@@ -1398,29 +1259,10 @@ impl Daemon {
                     );
                 }
             }
-            if let Some(mut task) = task.filter(|t| !t.state.is_terminal()) {
-                // Written as computed, like the daemon's other transitions: a
-                // task that ran before it got sub-issues may be paused or
-                // crashed here, which the CLI could not complete directly.
-                let previous = task.state;
-                task.state = TaskState::Completed;
-                task.children = parent.children.clone();
-                task.summary = Some(format!("container closed: all sub-issues done ({})", children.join(", ")));
-                task.completed_at = Some(now);
-                task.not_before = None;
-                self.store.update_task(&task)?;
-                self.log(
-                    Some(task.id),
-                    None,
-                    EventLevel::Info,
-                    "task.completed",
-                    "container completed: every sub-issue is done",
-                    serde_json::json!({ "previous_state": previous.as_str(), "children": children }),
-                );
-                if task.worktree_path.is_some() || task.branch.is_some() {
-                    self.apply_effects(&mut task, None, vec![Effect::Cleanup { succeeded: true }]).await;
-                    self.store.update_task(&task)?;
-                }
+            if let Some(mut task) = task {
+                let before = task.clone();
+                let effects = transitions::on_container_closed(&mut task, &parent.children, now);
+                self.commit(&before, &mut task, None, effects).await?;
             }
         }
         if watched != before {
@@ -1829,54 +1671,23 @@ impl Daemon {
         }
         let mut task = task.clone();
         let mut session = session.clone();
-        task.state = TaskState::Running;
-        task.last_error = None;
-        session.state = SessionState::Running;
-        session.last_activity_at = now;
+        let effects = transitions::on_answer_sent(&mut task, &mut session, text, ids, &self.cfg, now);
         self.store.update_session(&session)?;
         self.store.update_task(&task)?;
         self.rt.nudged.remove(&session.id);
-        self.log(
-            Some(task.id),
-            Some(session.id),
-            EventLevel::Info,
-            "relay.answer_sent",
-            "relayed the Linear reply to the session; task running again",
-            serde_json::json!({ "comments": ids, "text": text }),
-        );
-        // Undo the move to `linear.blocked_state` (a relaunch does the same
-        // when it starts the session).
-        if self.cfg.linear.blocked_state.as_deref().is_some_and(|s| !s.trim().is_empty()) {
-            self.update_issue(&task, LinearTarget::InProgress, None).await;
-        }
+        self.apply_effects(&mut task, Some(&session), effects).await;
         Ok(Delivery::Sent)
     }
 
     /// Re-queue a task whose session is gone so the next launch resumes it
     /// with the pending answer ([`RelayState::pending_answer`]).
     fn requeue_with_answer(&mut self, mut task: Task, ids: &[String], now: DateTime<Utc>) -> Result<()> {
-        let from = task.state;
-        if task.state != TaskState::Queued && !task.state.can_transition_to(TaskState::Queued) {
-            return Ok(());
+        let before = task.clone();
+        let effects = transitions::on_answer_queued(&mut task, ids, now);
+        if task != before {
+            self.store.update_task(&task)?;
         }
-        task.state = TaskState::Queued;
-        task.not_before = None;
-        task.last_error = None;
-        if let Some(watch) = task.review.as_mut() {
-            // The answer wins over a pending review round (`start_task`
-            // folds both into one prompt) and over a parked watch.
-            watch.parked = false;
-            watch.last_change_at = now;
-        }
-        self.store.update_task(&task)?;
-        self.log(
-            Some(task.id),
-            None,
-            EventLevel::Info,
-            "relay.answer_queued",
-            &format!("Linear reply received while {from}; re-queued to resume the session with it"),
-            serde_json::json!({ "comments": ids, "from": from }),
-        );
+        self.log_only(&task, None, effects);
         Ok(())
     }
 
@@ -2349,6 +2160,13 @@ impl Daemon {
                         self.post_question(task, s.id, &text, reason.as_deref(), confirmed).await;
                     }
                 }
+                Effect::ProgressComment { body } => {
+                    self.comment_issue(task, body, CommentKind::Progress).await;
+                }
+                Effect::ForgetAnswer => self.update_relay(task, |state| {
+                    state.pending_answer = None;
+                    state.pending_session = None;
+                }),
                 Effect::DeleteBranch => {
                     let Some(branch) = task.branch.clone() else { continue };
                     if let Some(wt) = task.worktree_path.clone() {
@@ -2482,10 +2300,7 @@ impl Daemon {
                         self.rt.nudged.remove(&session.id);
                     }
                 }
-                session.last_activity_at = session.last_activity_at.max(newest);
-                if session.state == SessionState::Launching {
-                    session.state = SessionState::Running;
-                }
+                transitions::on_transcript_activity(&mut session, newest);
                 self.store.update_session(&session)?;
             }
             tracing::debug!(session = %session.id, inserted, weighted, "recorded transcript usage");
@@ -2586,8 +2401,7 @@ impl Daemon {
     async fn probe_sessions(&mut self, now: DateTime<Utc>) -> Result<()> {
         for mut session in self.store.list_live_sessions()? {
             let Some(mut task) = self.store.get_task(session.task_id)? else {
-                session.state = SessionState::Killed;
-                session.ended_at = Some(now);
+                transitions::orphan_session(&mut session, now);
                 self.store.update_session(&session)?;
                 self.forget_session(session.id);
                 continue;
@@ -2702,49 +2516,11 @@ impl Daemon {
             if task.state == TaskState::Completed && self.adopt_open_pr(&mut task, now) {
                 self.store.update_task(&task)?;
             }
-            if task.state == TaskState::InReview {
-                session.state = SessionState::Exited;
-                session.ended_at = Some(now);
-                self.store.update_session(&session)?;
-                let effects = transitions::release_for_review(&task);
-                self.apply_effects(&mut task, Some(&session), effects).await;
-                self.store.update_task(&task)?;
+            let effects = transitions::release_session(&task, &mut session, now);
+            if effects.is_empty() {
                 continue;
             }
-            if !task.state.is_terminal() {
-                continue;
-            }
-            session.state = SessionState::Exited;
-            session.ended_at = Some(now);
             self.store.update_session(&session)?;
-            let succeeded = task.state == TaskState::Completed;
-            let mut effects = vec![
-                Effect::Log {
-                    level: EventLevel::Info,
-                    kind: "session.finalized".into(),
-                    message: format!("task is {}; releasing its session", task.state),
-                    data: serde_json::json!({}),
-                },
-                Effect::Cleanup { succeeded },
-            ];
-            match task.state {
-                TaskState::Completed => effects.push(Effect::Linear {
-                    target: LinearTarget::Done,
-                    comment: Some(format!(
-                        "powerqueue completed this task on branch `{}`.\n\n{}",
-                        task.branch.as_deref().unwrap_or("?"),
-                        task.summary.as_deref().unwrap_or("No summary was provided.")
-                    )),
-                }),
-                TaskState::Failed => effects.push(Effect::Linear {
-                    target: LinearTarget::Blocked,
-                    comment: Some(format!(
-                        "powerqueue failed this task: {}",
-                        task.last_error.as_deref().unwrap_or("unknown error")
-                    )),
-                }),
-                _ => {}
-            }
             self.apply_effects(&mut task, Some(&session), effects).await;
             self.store.update_task(&task)?;
             self.forget_session(session.id);
@@ -2780,37 +2556,22 @@ impl Daemon {
             let pr = match url.parse::<PrRef>() {
                 Ok(pr) => pr,
                 Err(e) => {
-                    task.state = TaskState::NeedsAttention;
-                    task.last_error = Some(format!("in review without a usable pull request: {e}"));
+                    let effects = review::on_unusable_pr(&mut task, &e);
                     self.store.update_task(&task)?;
-                    self.log(Some(task.id), None, EventLevel::Warn, "review.error", &e, serde_json::json!({ "pr": url }));
+                    self.log_only(&task, None, effects);
                     continue;
                 }
             };
             let status = match gh.pr_status(&pr) {
                 Ok(status) => status,
                 Err(e) => {
-                    let message = format!("{WATCHER_ERROR_PREFIX} cannot read {pr}: {e:#}");
-                    let changed = task.last_error.as_deref() != Some(message.as_str());
-                    task.review.get_or_insert_with(|| ReviewWatch::armed(now, None)).last_polled_at = Some(now);
-                    task.last_error = Some(message.clone());
+                    let effects = review::on_watch_error(&mut task, &pr.to_string(), &format!("{e:#}"), now);
                     self.store.update_task(&task)?;
-                    if changed {
-                        self.log(
-                            Some(task.id),
-                            None,
-                            EventLevel::Warn,
-                            "review.error",
-                            &message,
-                            serde_json::json!({ "pr": url }),
-                        );
-                    }
+                    self.log_only(&task, None, effects);
                     continue;
                 }
             };
-            if task.last_error.as_deref().is_some_and(|e| e.starts_with(WATCHER_ERROR_PREFIX)) {
-                task.last_error = None;
-            }
+            review::on_watch_recovered(&mut task);
             let effects = review::on_pr_status(&mut task, &status, &self.cfg.scheduler, now);
             self.store.update_task(&task)?;
             self.apply_effects(&mut task, None, effects).await;
@@ -3394,17 +3155,6 @@ fn resume_plan(
         }
         _ => (uuid::Uuid::new_v4(), false, None),
     }
-}
-
-/// `last_error` prefix of a PR watcher failure (gh missing, no access, ...).
-const WATCHER_ERROR_PREFIX: &str = "PR watcher:";
-
-/// Watch the PR again from `now` (see [`ReviewWatch::rearm`]).
-fn rearm_watch(task: &mut Task, now: DateTime<Utc>) {
-    if let Some(watch) = task.review.as_mut() {
-        watch.rearm(now);
-    }
-    task.last_error = None;
 }
 
 /// Count a predicted cost against the in-memory ledger of the model's
