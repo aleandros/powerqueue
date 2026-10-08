@@ -1706,9 +1706,9 @@ impl Daemon {
     /// (logged as `inbox.rejected`, reported by `doctor`); a message that
     /// cannot be applied is logged as `inbox.error` and dropped.
     async fn process_inbox(&mut self, now: DateTime<Utc>) -> Result<()> {
-        if !self.cfg.shim_enabled() {
-            return Ok(());
-        }
+        // Not gated on the current `shim` settings: a session launched with
+        // a shim keeps using it after a config reload turned the setting
+        // off, and an inbox directory only exists for such sessions.
         let tasks = self.store.list_tasks()?;
         for task in tasks.iter().filter(|t| !t.state.is_terminal()) {
             self.drain_task_inbox(task, now)?;
@@ -2358,7 +2358,7 @@ impl Daemon {
             // A shim session may have queued `task complete` and exited
             // between the inbox phase and this probe: apply what it left
             // before reading the dead pane as a crash.
-            if !probe.is_alive() && self.cfg.shim_enabled() {
+            if !probe.is_alive() {
                 self.drain_task_inbox(&task, now)?;
                 if let Some(fresh) = self.store.get_task(task.id)? {
                     task = fresh;

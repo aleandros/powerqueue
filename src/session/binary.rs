@@ -16,7 +16,6 @@
 //! probes, `powerqueue tune`); one with placeholders cannot, and those
 //! callers say so instead of guessing.
 
-use std::path::Path;
 use std::sync::LazyLock;
 
 use anyhow::{Result, anyhow, bail};
@@ -191,12 +190,9 @@ pub fn which_program(binary: &str) -> Option<std::path::PathBuf> {
     if program_is_per_task(binary) {
         return None;
     }
-    let program = program_of(binary);
-    if Path::new(&program).components().count() > 1 {
-        let p = Path::new(&program);
-        return p.is_file().then(|| p.to_path_buf());
-    }
-    which::which(program).ok()
+    // `which` checks an explicit path the same way it checks PATH entries:
+    // the file must exist and be executable.
+    which::which(program_of(binary)).ok()
 }
 
 #[cfg(test)]
@@ -266,6 +262,19 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
         assert!(which_program("sh -c x").is_some());
         assert!(which_program("/definitely/not/here/sh").is_none());
+        // An explicit path must be executable, not merely present.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        let template = format!("{} exec {{slug}}", script.display());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(which_program(&template).is_none(), "not executable");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(which_program(&template).as_deref(), Some(script.as_path()));
         // A program that only exists once the placeholders are filled cannot be looked up.
         assert!(program_is_per_task("{repo}/tools/agent-container.sh exec {slug} claude"));
         assert!(!program_is_per_task("docker exec pq-{slug} claude"));
