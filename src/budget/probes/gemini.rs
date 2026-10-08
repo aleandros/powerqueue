@@ -7,7 +7,6 @@
 //! rolling window) and `gemini-weekly` (the period), each carrying
 //! `remaining_fraction` (0–1) and `disabled` (the quota is exhausted).
 
-use std::process::Command;
 use std::time::Duration as StdDuration;
 
 use anyhow::{Result, bail};
@@ -49,7 +48,7 @@ impl UsageProbe for GeminiProbe {
     /// Fails when the binary cannot start, exits non-zero or exceeds the
     /// timeout; `Ok(None)` for output it does not understand.
     fn probe(&self) -> Result<Option<ObservedUsage>> {
-        let out = run_with_timeout(Command::new(&self.binary).args(Self::args()), self.timeout)?;
+        let out = run_with_timeout(crate::session::binary::host_command(&self.binary)?.args(Self::args()), self.timeout)?;
         if !out.status.success() {
             let detail = match first_line(&out.stderr) {
                 s if s.is_empty() => first_line(&out.stdout),

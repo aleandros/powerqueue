@@ -103,6 +103,20 @@ These tests run in the existing Linux/macOS CI suite. They verify the complete
 powerqueue flow against controlled services; live GitHub token permissions and
 real agent behavior need a separate smoke test with a designated test repository.
 
+The same file tests the container transport (`<provider>.shim`, see
+docs/containers.md): `shim_routes_hooks_and_completion_through_the_inbox`
+runs on the host (the fixture finds the generated shim on PATH, hooks and
+`task complete` go through `<task dir>/inbox`), and the two
+`container_*_through_docker_exec` tests build a small Alpine image with the
+fixtures and point `claude.binary` / `codex.binary` at `docker exec … pq-{slug}
+fake-claude|fake-codex` with `setup` / `cleanup.run` starting and removing
+the container. The Docker tests only run with `POWERQUEUE_E2E_DOCKER=1` and a
+working `docker` (the first build needs network access):
+
+```sh
+POWERQUEUE_E2E_DOCKER=1 cargo test --test e2e_daemon container_
+```
+
 ## Pull requests
 
 Before you open one, go through the checklist from AGENTS.md:

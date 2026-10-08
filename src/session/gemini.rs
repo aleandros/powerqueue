@@ -82,7 +82,7 @@ pub fn mode_flags(mode: &str) -> Result<Vec<String>> {
 /// Full `agy` command line (last element: the prompt, after `-i`).
 pub fn agy_command(ctx: &LaunchContext<'_>) -> Result<Vec<String>> {
     let g = &ctx.cfg.gemini;
-    let mut argv = vec![g.binary.clone()];
+    let mut argv = crate::session::binary::launch_argv(&g.binary, ctx).context("gemini.binary")?;
     if let Some(id) = ctx.resume {
         argv.extend(["--conversation".to_string(), id.to_string()]);
     }
@@ -205,7 +205,7 @@ impl AgentCli for GeminiCli {
         let transcript = ctx.resume.map(|id| transcript_path(&agy_home(ctx.cfg), id));
         Ok(AgentLaunch {
             files: vec![(hooks_path, hooks, 0o644)],
-            env: session_env(&ctx.cfg.gemini.env, ctx.task, ctx.session_id),
+            env: session_env(&ctx.cfg.gemini.env, ctx.task, ctx.session_id, ctx.self_bin),
             argv: agy_command(ctx)?,
             transcript_path: transcript,
             poll_transcript_for_completion: true,
@@ -308,8 +308,10 @@ impl AgentCli for GeminiCli {
     /// `agy --version`: the CLI has no login-status command, so a runnable
     /// binary counts as "logged in" and the version is the detail.
     fn auth_status(&self, binary: &str) -> Result<AuthStatus> {
-        let out =
-            std::process::Command::new(binary).arg("--version").output().with_context(|| format!("run `{binary} --version`"))?;
+        let out = crate::session::binary::host_command(binary)?
+            .arg("--version")
+            .output()
+            .with_context(|| format!("run `{binary} --version`"))?;
         Ok(AuthStatus {
             logged_in: out.status.success(),
             detail: format!("{} (login state not verifiable)", first_line(&out.stdout, &out.stderr, "no version output")),

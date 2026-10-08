@@ -147,7 +147,7 @@ pub fn trust_override(worktree: &Path) -> String {
 pub fn codex_command(ctx: &LaunchContext<'_>) -> Result<Vec<String>> {
     let c = &ctx.cfg.codex;
     let wt = ctx.worktree.to_string_lossy().to_string();
-    let mut argv = vec![c.binary.clone()];
+    let mut argv = crate::session::binary::launch_argv(&c.binary, ctx).context("codex.binary")?;
     if let Some(thread) = ctx.resume {
         argv.extend(["resume".to_string(), thread.to_string()]);
     }
@@ -332,7 +332,7 @@ impl AgentCli for CodexCli {
     fn prepare(&self, ctx: &LaunchContext<'_>) -> Result<AgentLaunch> {
         Ok(AgentLaunch {
             files: Vec::new(),
-            env: session_env(&ctx.cfg.codex.env, ctx.task, ctx.session_id),
+            env: session_env(&ctx.cfg.codex.env, ctx.task, ctx.session_id, ctx.self_bin),
             argv: codex_command(ctx)?,
             transcript_path: None,
             poll_transcript_for_completion: false,
@@ -444,7 +444,7 @@ impl AgentCli for CodexCli {
 
     /// `codex login status`: exit 0 means logged in; the first output line is the detail.
     fn auth_status(&self, binary: &str) -> Result<AuthStatus> {
-        let out = std::process::Command::new(binary)
+        let out = crate::session::binary::host_command(binary)?
             .args(["login", "status"])
             .output()
             .with_context(|| format!("run `{binary} login status`"))?;

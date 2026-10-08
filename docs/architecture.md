@@ -26,7 +26,9 @@ github.rs          `gh api graphql` PR status (state, mergeability, checks, thre
   tmux.rs            tmux ops (shell out to tmux)
   session/           agent.rs (AgentCli trait, agent_for, shared helpers) with one
                      implementation per CLI: claude.rs, codex.rs, gemini.rs (experimental);
-                     launcher (prompt, launch.sh), hook interpretation,
+                     binary.rs (`<provider>.binary` command templates with per-task
+                     placeholders), inbox.rs (the container shim + inbox transport for
+                     `<provider>.shim`), launcher (prompt, launch.sh), hook interpretation,
                      transcript tailing, liveness + resource probes
   scheduler/         daemon.rs (Daemon, tick loop, effects), transitions.rs (pure
                      state logic → Effect list), lifecycle.rs (pick_next, cleanup_task)

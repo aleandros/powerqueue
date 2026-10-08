@@ -24,7 +24,6 @@ use anyhow::{Context as _, Result, bail};
 use serde::Serialize;
 
 use crate::config::Config;
-use crate::domain::Provider;
 use crate::paths::Paths;
 
 /// Name of the systemd user unit.
@@ -592,11 +591,13 @@ fn plist_strings(text: &str) -> Vec<String> {
 pub fn required_tools(cfg: &Config) -> Vec<String> {
     let mut tools = vec!["git".to_string(), cfg.tmux.binary.clone()];
     for p in cfg.budget.enabled_providers_in_order() {
-        tools.push(match p {
-            Provider::Claude => cfg.claude.binary.clone(),
-            Provider::Codex => cfg.codex.binary.clone(),
-            Provider::Gemini => cfg.gemini.binary.clone(),
-        });
+        // A command template (`docker exec … claude`) needs its program, not
+        // the whole line; a program that only exists once the placeholders
+        // are filled (`{repo}/tools/run.sh …`) cannot be checked here.
+        let binary = cfg.launch_settings(p).binary;
+        if !crate::session::program_is_per_task(&binary) {
+            tools.push(crate::session::program_of(&binary));
+        }
     }
     if cfg.scheduler.pr_poll_secs > 0 {
         tools.push(cfg.scheduler.gh_binary.clone());

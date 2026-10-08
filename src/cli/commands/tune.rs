@@ -55,9 +55,17 @@ fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
         bail!("`{model}` is not a Claude model; `powerqueue tune` runs on Claude Code");
     }
     let binary = cfg.claude.binary.clone();
-    if which::which(&binary).is_err() {
+    if let Some(t) = crate::session::BinaryTemplate::parse(&binary).ok().filter(|t| t.is_per_task()) {
         bail!(
-            "`{binary}` not found on PATH; install Claude Code (npm install -g @anthropic-ai/claude-code) or set claude.binary"
+            "claude.binary is a per-task command (`{binary}`, placeholders {}) and `powerqueue tune` runs Claude Code on this host; \
+             set claude.binary to a plain command while tuning",
+            t.placeholders().iter().map(|p| format!("{{{p}}}")).collect::<Vec<_>>().join(", ")
+        );
+    }
+    if crate::session::which_program(&binary).is_none() {
+        bail!(
+            "`{}` not found on PATH; install Claude Code (npm install -g @anthropic-ai/claude-code) or set claude.binary",
+            crate::session::program_of(&binary)
         );
     }
     let timeout = Duration::from_secs(args.timeout.unwrap_or(cfg.tune.timeout_secs).max(1));

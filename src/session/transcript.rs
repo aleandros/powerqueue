@@ -65,9 +65,15 @@ pub fn encode_cwd(cwd: &str) -> String {
     cwd.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
 }
 
-/// `~/.claude` honouring `CLAUDE_CONFIG_DIR`.
-pub fn claude_home() -> PathBuf {
-    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+/// Claude Code's config directory as the sessions see it:
+/// `claude.env.CLAUDE_CONFIG_DIR` (what `launch.sh` exports; with
+/// containers, the directory mounted at the same path inside), else the
+/// daemon's own `CLAUDE_CONFIG_DIR`, else `~/.claude`.
+pub fn claude_home(cfg: &crate::config::Config) -> PathBuf {
+    if let Some(dir) = cfg.claude.env.get("CLAUDE_CONFIG_DIR").filter(|d| !d.trim().is_empty()) {
+        return crate::paths::expand_tilde(dir);
+    }
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
         return PathBuf::from(dir);
     }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));

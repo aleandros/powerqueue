@@ -207,9 +207,10 @@ pub fn parse_claude_auth(exit_ok: bool, stdout: &str, stderr: &str) -> ClaudeAut
 }
 
 /// Run `claude auth status` and interpret it. Errors only when the binary
-/// cannot be executed at all.
+/// cannot be executed at all (or `claude.binary` is a per-task command that
+/// cannot run outside a task).
 pub fn claude_auth_status(binary: &str) -> Result<ClaudeAuth> {
-    let out = std::process::Command::new(binary)
+    let out = crate::session::host_command(binary)?
         .args(["auth", "status"])
         .output()
         .with_context(|| format!("run `{binary} auth status`"))?;
@@ -217,7 +218,7 @@ pub fn claude_auth_status(binary: &str) -> Result<ClaudeAuth> {
 }
 
 fn version_of(binary: &str, flag: &str) -> Result<String> {
-    let out = std::process::Command::new(binary).arg(flag).output().with_context(|| format!("run `{binary} {flag}`"))?;
+    let out = crate::session::host_command(binary)?.arg(flag).output().with_context(|| format!("run `{binary} {flag}`"))?;
     if !out.status.success() {
         return Err(anyhow!("`{binary} {flag}` exited with {}: {}", out.status, String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -325,19 +326,44 @@ fn check_terminal() -> CheckResult {
     terminal_status(interactive, term.as_deref(), locale.as_deref())
 }
 
+/// The program of a per-task `binary` template (one with placeholders),
+/// which can only be run for a launch, not from here.
+fn per_task_binary(binary: &str) -> Option<String> {
+    crate::session::BinaryTemplate::parse(binary).ok().filter(|t| t.is_per_task()).map(|t| t.program().to_string())
+}
+
 fn check_claude(cfg: &Config) -> Vec<CheckResult> {
     let binary = &cfg.claude.binary;
-    let found = which::which(binary).ok();
+    let program = crate::session::program_of(binary);
     let mut out = Vec::new();
+    if crate::session::program_is_per_task(binary) {
+        out.push(CheckResult::ok(ENV, "claude", format!("per-task command `{binary}`; its program is resolved at launch")));
+        out.push(CheckResult::skipped(
+            ENV,
+            "claude auth",
+            "claude.binary is a per-task command; check the login where it runs (e.g. inside the container)",
+        ));
+        return out;
+    }
+    let found = crate::session::which_program(binary);
     match found {
         None => {
             out.push(CheckResult::fail(
                 ENV,
                 "claude",
-                format!("`{binary}` not found on PATH"),
+                format!("`{program}` not found on PATH"),
                 "install Claude Code (npm install -g @anthropic-ai/claude-code) or set claude.binary",
             ));
             out.push(CheckResult::skipped(ENV, "claude auth", "claude binary missing"));
+            return out;
+        }
+        Some(path) if per_task_binary(binary).is_some() => {
+            out.push(CheckResult::ok(ENV, "claude", format!("per-task command `{binary}` (`{program}` at {})", path.display())));
+            out.push(CheckResult::skipped(
+                ENV,
+                "claude auth",
+                "claude.binary is a per-task command; check the login where it runs (e.g. inside the container)",
+            ));
             return out;
         }
         Some(path) => match version_of(binary, "--version") {
@@ -674,41 +700,83 @@ fn check_providers(cfg: &Config) -> Vec<CheckResult> {
         let agent = crate::session::agent_for(p);
         let name = p.as_str();
         let auth_name = format!("{p} auth");
-        match which::which(&settings.binary) {
-            Err(_) => {
+        let program = crate::session::program_of(&settings.binary);
+        if crate::session::program_is_per_task(&settings.binary) {
+            out.push(CheckResult::ok(
+                ENV,
+                name,
+                format!("per-task command `{}`; its program is resolved at launch", settings.binary),
+            ));
+            out.push(CheckResult::skipped(
+                ENV,
+                &auth_name,
+                format!("{p}.binary is a per-task command; check the login where it runs (e.g. inside the container)"),
+            ));
+            if !agent.allowed_modes().contains(&settings.mode.as_str()) {
                 out.push(CheckResult::fail(
-                    ENV,
+                    CONF,
                     name,
-                    format!("budget.providers.{p}.enabled is true but `{}` is not on PATH", settings.binary),
-                    format!("{}, or set budget.providers.{p}.enabled = false", install_hint(p)),
+                    format!("{name} mode `{}` is not one of {}", settings.mode, agent.allowed_modes().join("|")),
+                    "fix it in config.toml",
                 ));
-                out.push(CheckResult::skipped(ENV, &auth_name, format!("{name} binary missing")));
             }
-            Ok(path) => {
-                match version_of(&settings.binary, "--version") {
-                    Ok(v) => out.push(CheckResult::ok(ENV, name, format!("{v} ({})", path.display()))),
-                    Err(e) => out.push(CheckResult::warn(ENV, name, format!("{e:#}"), install_hint(p))),
+        } else {
+            match crate::session::which_program(&settings.binary) {
+                None => {
+                    out.push(CheckResult::fail(
+                        ENV,
+                        name,
+                        format!("budget.providers.{p}.enabled is true but `{program}` is not on PATH"),
+                        format!("{}, or set budget.providers.{p}.enabled = false", install_hint(p)),
+                    ));
+                    out.push(CheckResult::skipped(ENV, &auth_name, format!("{name} binary missing")));
                 }
-                match agent.auth_status(&settings.binary) {
-                    Ok(a) if a.logged_in => out.push(CheckResult::ok(ENV, &auth_name, a.detail)),
-                    Ok(a) => out.push(CheckResult::fail(
+                Some(path) if per_task_binary(&settings.binary).is_some() => {
+                    out.push(CheckResult::ok(
+                        ENV,
+                        name,
+                        format!("per-task command `{}` (`{program}` at {})", settings.binary, path.display()),
+                    ));
+                    out.push(CheckResult::skipped(
                         ENV,
                         &auth_name,
-                        format!(
-                            "`{}` is not logged in ({}); its sessions would stop at the login prompt",
-                            settings.binary, a.detail
-                        ),
-                        login_hint(p, &settings.binary),
-                    )),
-                    Err(e) => out.push(CheckResult::fail(ENV, &auth_name, format!("{e:#}"), login_hint(p, &settings.binary))),
-                }
-                if !agent.allowed_modes().contains(&settings.mode.as_str()) {
-                    out.push(CheckResult::fail(
-                        CONF,
-                        name,
-                        format!("{name} mode `{}` is not one of {}", settings.mode, agent.allowed_modes().join("|")),
-                        "fix it in config.toml",
+                        format!("{p}.binary is a per-task command; check the login where it runs (e.g. inside the container)"),
                     ));
+                    if !agent.allowed_modes().contains(&settings.mode.as_str()) {
+                        out.push(CheckResult::fail(
+                            CONF,
+                            name,
+                            format!("{name} mode `{}` is not one of {}", settings.mode, agent.allowed_modes().join("|")),
+                            "fix it in config.toml",
+                        ));
+                    }
+                }
+                Some(path) => {
+                    match version_of(&settings.binary, "--version") {
+                        Ok(v) => out.push(CheckResult::ok(ENV, name, format!("{v} ({})", path.display()))),
+                        Err(e) => out.push(CheckResult::warn(ENV, name, format!("{e:#}"), install_hint(p))),
+                    }
+                    match agent.auth_status(&settings.binary) {
+                        Ok(a) if a.logged_in => out.push(CheckResult::ok(ENV, &auth_name, a.detail)),
+                        Ok(a) => out.push(CheckResult::fail(
+                            ENV,
+                            &auth_name,
+                            format!(
+                                "`{}` is not logged in ({}); its sessions would stop at the login prompt",
+                                settings.binary, a.detail
+                            ),
+                            login_hint(p, &settings.binary),
+                        )),
+                        Err(e) => out.push(CheckResult::fail(ENV, &auth_name, format!("{e:#}"), login_hint(p, &settings.binary))),
+                    }
+                    if !agent.allowed_modes().contains(&settings.mode.as_str()) {
+                        out.push(CheckResult::fail(
+                            CONF,
+                            name,
+                            format!("{name} mode `{}` is not one of {}", settings.mode, agent.allowed_modes().join("|")),
+                            "fix it in config.toml",
+                        ));
+                    }
                 }
             }
         }
@@ -724,12 +792,49 @@ fn check_providers(cfg: &Config) -> Vec<CheckResult> {
     out
 }
 
+/// With `<provider>.shim = true` sessions talk to the daemon through
+/// `<task dir>/inbox`; a message the daemon could not parse is parked in
+/// `inbox/rejected/`. Reports those (the shim and the daemon disagree,
+/// or something else wrote there). `None` when no provider uses the shim
+/// and nothing is parked.
+fn check_session_inbox(cfg: &Config, paths: &Paths) -> Option<CheckResult> {
+    let rejected = crate::session::inbox::rejected_counts(&paths.tasks_dir());
+    if rejected.is_empty() {
+        return cfg.shim_enabled().then(|| {
+            CheckResult::ok(
+                CONF,
+                "session inbox",
+                format!(
+                    "sessions reach the daemon through <task dir>/{} (no rejected messages)",
+                    crate::session::inbox::INBOX_RELATIVE
+                ),
+            )
+        });
+    }
+    let total: usize = rejected.iter().map(|(_, n)| n).sum();
+    let dirs: Vec<String> = rejected.iter().take(5).map(|(d, n)| format!("{d} ({n})")).collect();
+    Some(CheckResult::warn(
+        CONF,
+        "session inbox",
+        format!(
+            "{total} message{} from session shims could not be parsed and sit in {}/<task>/{}/{}: {}",
+            if total == 1 { "" } else { "s" },
+            paths.tasks_dir().display(),
+            crate::session::inbox::INBOX_RELATIVE,
+            crate::session::inbox::REJECTED_RELATIVE,
+            dirs.join(", ")
+        ),
+        "inspect the files (`inbox.rejected` events name them); delete them once understood. A shim older than this \
+         daemon is replaced at the task's next launch",
+    ))
+}
+
 /// Interactive Claude Code blocks on a trust dialog in untrusted folders.
 /// With `claude.trust_workspace` the launcher pre-seeds trust; otherwise the
 /// repository root must already be trusted in `~/.claude.json`.
 fn check_workspace_trust(cfg: &Config, fix: bool) -> CheckResult {
     use crate::session::trust::{claude_json_path, ensure_trusted, is_trusted};
-    let file = claude_json_path();
+    let file = claude_json_path(cfg);
     let repo = cfg.repo_path();
     let root = std::fs::canonicalize(&repo).unwrap_or(repo);
     if is_trusted(&file, &root) {
@@ -1758,6 +1863,9 @@ pub async fn run_all(
     results.extend(check_period_anchors(cfg, store));
     results.extend(check_providers(cfg));
     results.push(check_workspace_trust(cfg, fix));
+    if let Some(r) = check_session_inbox(cfg, paths) {
+        results.push(r);
+    }
 
     results.extend(check_secrets(cfg, secrets, online).await);
     if cfg.github.enabled {

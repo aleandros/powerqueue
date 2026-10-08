@@ -527,7 +527,20 @@ impl SchedulerConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClaudeConfig {
+    /// The command that runs Claude Code: a program, or a command line with
+    /// leading arguments and per-task placeholders (`{key}`, `{slug}`,
+    /// `{task_id}`, `{session_id}`, `{worktree}`, `{task_dir}`, `{repo}`,
+    /// `{attempt}`, `{model}`), e.g. `docker exec -it --env-file
+    /// {task_dir}/env -w {worktree} pq-{slug} claude`. See
+    /// [`crate::session::binary`].
     pub binary: String,
+    /// The session runs where the daemon's `powerqueue` binary cannot (a
+    /// container): write a shell shim to `<task dir>/bin/powerqueue` and
+    /// route the hooks, the status line and `powerqueue task complete|block`
+    /// through the task inbox the daemon drains. The task directory must be
+    /// visible at the same path inside the session. See
+    /// [`crate::session::inbox`].
+    pub shim: bool,
     /// `--permission-mode` value. `acceptEdits` is the safe default (other
     /// tools still prompt); `auto` lets Claude Code's classifier approve
     /// routine commands for unattended runs; `bypassPermissions` never asks.
@@ -554,6 +567,7 @@ impl Default for ClaudeConfig {
     fn default() -> Self {
         Self {
             binary: "claude".to_string(),
+            shim: false,
             permission_mode: "acceptEdits".to_string(),
             effort: None,
             extra_args: Vec::new(),
@@ -580,7 +594,12 @@ pub const GEMINI_MODES: [&str; 3] = ["skip-permissions", "accept-edits", "plan"]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CodexConfig {
+    /// The command that runs Codex: a program or a command line with
+    /// per-task placeholders (same rules as `claude.binary`).
     pub binary: String,
+    /// Route hooks and `powerqueue task complete|block` through the task
+    /// inbox (same meaning as `claude.shim`).
+    pub shim: bool,
     /// `workspace-write` (`-a never -s workspace-write`), `approve-for-me`,
     /// `yolo` (`--dangerously-bypass-approvals-and-sandbox`) or `on-request`.
     pub approval: String,
@@ -599,6 +618,7 @@ impl Default for CodexConfig {
     fn default() -> Self {
         Self {
             binary: "codex".to_string(),
+            shim: false,
             approval: "workspace-write".to_string(),
             reasoning_effort: Some("high".to_string()),
             extra_args: Vec::new(),
@@ -613,7 +633,12 @@ impl Default for CodexConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GeminiConfig {
+    /// The command that runs the CLI: a program or a command line with
+    /// per-task placeholders (same rules as `claude.binary`).
     pub binary: String,
+    /// Route hooks and `powerqueue task complete|block` through the task
+    /// inbox (same meaning as `claude.shim`).
+    pub shim: bool,
     /// `skip-permissions` (`--dangerously-skip-permissions`), `accept-edits` or `plan` (`--mode`).
     pub mode: String,
     /// `--effort` value when set (`low|medium|high`).
@@ -628,6 +653,7 @@ impl Default for GeminiConfig {
     fn default() -> Self {
         Self {
             binary: "agy".to_string(),
+            shim: false,
             mode: "skip-permissions".to_string(),
             effort: Some("high".to_string()),
             extra_args: Vec::new(),
@@ -642,6 +668,7 @@ impl Default for GeminiConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchSettings {
     pub provider: Provider,
+    /// The command template (see [`crate::session::binary`]).
     pub binary: String,
     /// `claude.permission_mode`, `codex.approval` or `gemini.mode`.
     pub mode: String,
@@ -650,6 +677,8 @@ pub struct LaunchSettings {
     pub extra_args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub trust_workspace: bool,
+    /// `<provider>.shim`: sessions reach the daemon through the task inbox.
+    pub shim: bool,
 }
 
 /// Model-usage pacing: shared knobs plus one budget per provider.
@@ -1469,6 +1498,7 @@ impl Config {
                 extra_args: self.claude.extra_args.clone(),
                 env: self.claude.env.clone(),
                 trust_workspace: self.claude.trust_workspace,
+                shim: self.claude.shim,
             },
             Provider::Codex => LaunchSettings {
                 provider,
@@ -1478,6 +1508,7 @@ impl Config {
                 extra_args: self.codex.extra_args.clone(),
                 env: self.codex.env.clone(),
                 trust_workspace: self.codex.trust_workspace,
+                shim: self.codex.shim,
             },
             Provider::Gemini => LaunchSettings {
                 provider,
@@ -1487,8 +1518,40 @@ impl Config {
                 extra_args: self.gemini.extra_args.clone(),
                 env: self.gemini.env.clone(),
                 trust_workspace: false,
+                shim: self.gemini.shim,
             },
         }
+    }
+
+    /// True when any provider routes its sessions through the task inbox
+    /// (`<provider>.shim = true`), so the daemon has inboxes to drain.
+    pub fn shim_enabled(&self) -> bool {
+        self.claude.shim || self.codex.shim || self.gemini.shim
+    }
+
+    /// Problems with the `<provider>.binary` command templates: empty,
+    /// unbalanced quotes, unknown placeholders.
+    fn binary_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        for p in Provider::ALL {
+            let s = self.launch_settings(p);
+            let key = format!("{p}.binary");
+            match crate::session::BinaryTemplate::parse(&s.binary) {
+                Err(e) => problems.push(format!("{key}: {e}")),
+                Ok(t) => {
+                    let unknown = t.unknown_placeholders();
+                    if !unknown.is_empty() {
+                        problems.push(format!(
+                            "{key} uses unknown placeholder{} {} (known: {})",
+                            if unknown.len() > 1 { "s" } else { "" },
+                            unknown.iter().map(|u| format!("{{{u}}}")).collect::<Vec<_>>().join(", "),
+                            crate::session::BINARY_PLACEHOLDERS.iter().map(|u| format!("{{{u}}}")).collect::<Vec<_>>().join(", ")
+                        ));
+                    }
+                }
+            }
+        }
+        problems
     }
 
     /// Deprecation notes: legacy `[budget]` keys that were moved on load.
@@ -1526,6 +1589,7 @@ impl Config {
         if self.scheduler.gh_binary.trim().is_empty() {
             problems.push("scheduler.gh_binary is empty (the PR watcher runs it)".to_string());
         }
+        problems.extend(self.binary_problems());
         for conflict in &self.budget.migration_conflicts {
             problems.push(format!("legacy budget key {conflict}"));
         }

@@ -462,7 +462,21 @@ pub fn on_probe(
             session.exit_code = probe.exit_status;
             return end_review_session(session, "pane gone", now);
         }
-        if task.state.is_terminal() || task.state == TaskState::Paused {
+        if task.state.is_terminal() {
+            // The task finished (`task complete`, a done marker) and the
+            // pane went with it, before the hook phase saw a Stop. The
+            // session stays live so `finalize_terminal` releases it with
+            // cleanup and the source-issue update, as the hook path would.
+            session.exit_code = probe.exit_status;
+            effects.push(Effect::log(
+                EventLevel::Debug,
+                "session.pane_gone",
+                format!("pane gone; task is {}; finalizing", task.state),
+                serde_json::json!({ "exit_status": probe.exit_status, "pane_exists": probe.pane_exists }),
+            ));
+            return effects;
+        }
+        if task.state == TaskState::Paused {
             session.state = SessionState::Exited;
             session.ended_at = Some(now);
             session.exit_code = probe.exit_status;
@@ -1358,15 +1372,30 @@ mod tests {
     }
 
     #[test]
-    fn dead_pane_for_paused_or_finished_task_just_exits() {
-        for state in [TaskState::Paused, TaskState::Completed, TaskState::Cancelled, TaskState::Failed] {
+    fn dead_pane_for_paused_task_just_exits() {
+        let mut t = task(TaskState::Paused, 1);
+        let mut s = session(SessionState::Running, 1);
+        let ctx = ProbeContext { now: now(), ..Default::default() };
+        let fx = on_probe(&mut t, &mut s, &dead(Some(0)), &cfg().scheduler, &ctx);
+        assert_eq!(t.state, TaskState::Paused);
+        assert_eq!(s.state, SessionState::Exited);
+        assert_eq!(kinds(&fx), vec!["session.exited"]);
+    }
+
+    /// A finished task whose pane died before the hook phase saw a Stop
+    /// keeps its session live: `finalize_terminal` releases it with cleanup
+    /// and the source-issue update, which a plain exit would skip.
+    #[test]
+    fn dead_pane_for_finished_task_is_left_to_finalize() {
+        for state in [TaskState::Completed, TaskState::Cancelled, TaskState::Failed] {
             let mut t = task(state, 1);
             let mut s = session(SessionState::Running, 1);
             let ctx = ProbeContext { now: now(), ..Default::default() };
             let fx = on_probe(&mut t, &mut s, &dead(Some(0)), &cfg().scheduler, &ctx);
             assert_eq!(t.state, state);
-            assert_eq!(s.state, SessionState::Exited);
-            assert_eq!(kinds(&fx), vec!["session.exited"]);
+            assert!(s.state.is_live(), "{state}: left for finalize_terminal");
+            assert_eq!(s.exit_code, Some(0));
+            assert_eq!(kinds(&fx), vec!["session.pane_gone"]);
         }
     }
 

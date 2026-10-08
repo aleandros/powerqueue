@@ -595,7 +595,7 @@ anything else uses the explicit `codex:<name>` form.
 | `branch_template` | `"pq/{key}"` | `{key}` = task key slug, `{id}` = short task id |
 | `fetch_before_start` | `true` | `git fetch` before creating a worktree; new branches then start from `origin/<default_branch>` |
 | `fast_forward_base` | `true` | after that fetch, before creating a branch, fast-forward the local default branch to `origin/<default_branch>` when it is safe (no local commits, no rebase/bisect, clean checkout; hooks off) |
-| `setup` | `[]` | commands run (`sh -c`) in a fresh worktree before Claude starts |
+| `setup` | `[]` | commands run (`sh -c`) in a fresh worktree before Claude starts, with `POWERQUEUE_TASK_ID`, `POWERQUEUE_TASK_KEY`, `POWERQUEUE_TASK_SLUG`, `POWERQUEUE_TASK_DIR`, `POWERQUEUE_BRANCH`, `POWERQUEUE_WORKTREE`, `POWERQUEUE_DATA_DIR` and `POWERQUEUE_STATE_DIR` in the environment |
 
 ### `[github]`
 
@@ -759,6 +759,7 @@ reproduces the built-in prompt.
 | `{{model}}`, `{{provider}}` | the model and provider of this session |
 | `{{working_rules}}` | the `## Working rules` block (branch rule, commit rule for the provider's sandbox, no pushing) |
 | `{{completion_protocol}}` | the `## Completion protocol` block with the `powerqueue task complete <id>` / `task block <id>` commands and the `[[POWERQUEUE:DONE]]` / `[[POWERQUEUE:BLOCKED]]` markers |
+| `{{powerqueue}}` | the `powerqueue` command the session should run: `powerqueue`, or the task's shim path with `<provider>.shim` (see [Running sessions in containers](#running-sessions-in-containers)) |
 | `{{attempt_notes}}` | the `## Attempt N` block; empty on the first attempt |
 | `{{instructions}}` | `prompt.instructions` |
 | `{{default_prompt}}` | the whole built-in prompt, so a template can wrap it |
@@ -789,7 +790,8 @@ without it the session has no way to tell powerqueue it is done.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `binary` | `"claude"` | Claude Code executable |
+| `binary` | `"claude"` | the command that runs Claude Code: a program, or a command line with leading arguments and per-task placeholders (`{key}`, `{slug}`, `{task_id}`, `{session_id}`, `{worktree}`, `{task_dir}`, `{repo}`, `{attempt}`, `{model}`), e.g. `"docker exec -it --env-file {task_dir}/env -w {worktree} pq-{slug} claude"`; see [Running sessions in containers](#running-sessions-in-containers) |
+| `shim` | `false` | the session runs where the daemon's `powerqueue` binary cannot (a container): hooks, the status line and `powerqueue task complete\|block` go through a shell shim at `<task dir>/bin/powerqueue` and the task inbox the daemon drains |
 | `permission_mode` | `"acceptEdits"` | `--permission-mode`; `auto` is the unattended choice, `bypassPermissions` never asks at all |
 | `effort` | none | `--effort` value |
 | `extra_args` | `[]` | flags appended verbatim |
@@ -797,7 +799,7 @@ without it the session has no way to tell powerqueue it is done.
 | `append_system_prompt` | none | appended to the system prompt for every task |
 | `fallback_models` | `[]` | passed as `--fallback-model` |
 | `trust_workspace` | `true` | mark the repository and each worktree as trusted in Claude Code's `~/.claude.json` before launching, so sessions never wait on the workspace-trust dialog |
-| `env` | `{}` | environment variables for the session |
+| `env` | `{}` | environment variables for the session; `CLAUDE_CONFIG_DIR` here is also where the daemon reads transcripts and seeds workspace trust |
 
 Allowed permission modes: `default`, `manual`, `acceptEdits`, `plan`, `auto`,
 `dontAsk`, `bypassPermissions`. `powerqueue init` offers them with a one-line
@@ -849,7 +851,8 @@ the completion command fails.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `binary` | `"codex"` | Codex CLI executable |
+| `binary` | `"codex"` | the command that runs Codex: a program or a command line with per-task placeholders (same rules as `claude.binary`) |
+| `shim` | `false` | route `notify` and `powerqueue task complete\|block` through the task inbox (same meaning as `claude.shim`) |
 | `approval` | `"workspace-write"` | `workspace-write` (`-a never -s workspace-write`), `approve-for-me` (`--approve-for-me`), `yolo` (`--dangerously-bypass-approvals-and-sandbox`) or `on-request` (`-a on-request -s workspace-write`) |
 | `reasoning_effort` | `"high"` | `-c model_reasoning_effort=…` (`low`, `medium`, `high`, `xhigh`, `max`, `ultra`); unset to leave Codex's default |
 | `extra_args` | `[]` | flags appended verbatim |
@@ -881,7 +884,8 @@ the daemon's environment) if agy keeps its state somewhere other than
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `binary` | `"agy"` | Antigravity CLI executable |
+| `binary` | `"agy"` | the command that runs the CLI: a program or a command line with per-task placeholders (same rules as `claude.binary`) |
+| `shim` | `false` | route the hook and `powerqueue task complete\|block` through the task inbox (same meaning as `claude.shim`) |
 | `mode` | `"skip-permissions"` | `skip-permissions` (`--dangerously-skip-permissions`), `accept-edits` or `plan` (`--mode`) |
 | `effort` | `"high"` | `--effort` (`low`, `medium`, `high`); unset to leave the default |
 | `extra_args` | `[]` | flags appended verbatim |
@@ -969,8 +973,8 @@ and `default_model` / `low_model` must belong to an enabled provider.
 
 `cleanup.run` commands execute with `sh -c` inside the worktree, before the
 auto-commit and the push, with `POWERQUEUE_TASK_ID`, `POWERQUEUE_TASK_KEY`,
-`POWERQUEUE_BRANCH`, `POWERQUEUE_WORKTREE` and `POWERQUEUE_SUCCEEDED`
-(`1`/`0`) in the environment. A failing command is logged
+`POWERQUEUE_TASK_SLUG`, `POWERQUEUE_BRANCH`, `POWERQUEUE_WORKTREE` and
+`POWERQUEUE_SUCCEEDED` (`1`/`0`) in the environment. A failing command is logged
 (`cleanup.command_failed`) and the worktree is kept. That is also the hook
 for an agent-driven teardown, e.g. a one-shot session that tidies up what
 the task left behind:
@@ -1014,6 +1018,41 @@ The session uses `claude.binary`, runs in the draft directory with
 `--permission-mode acceptEdits`, and may only call `powerqueue priority
 check --file`, `powerqueue priority simulate --file --config` and
 `powerqueue config validate --file` (all read-only against the drafts).
+
+### Running sessions in containers
+
+Sessions can run inside a per-task container (or anywhere the daemon's own
+`powerqueue` binary cannot run) with everything else unchanged: the tmux pane
+is the CLI's terminal, `attach` and `task send` work, crashes resume the same
+session, transcripts are tailed, `task complete` ends the task. Three
+settings do it, and every path involved must be mounted at the same absolute
+path inside the container:
+
+```toml
+[repo]
+setup = ["tools/agent-container.sh up"]        # docker run -d --name pq-$POWERQUEUE_TASK_SLUG ...
+[cleanup]
+run = ["tools/agent-container.sh down"]        # docker rm -f pq-$POWERQUEUE_TASK_SLUG
+
+[claude]
+binary = "docker exec -it --env-file {task_dir}/env -w {worktree} pq-{slug} claude"
+shim = true
+[claude.env]
+CLAUDE_CONFIG_DIR = "/home/me/.local/share/powerqueue/agent-home/claude"
+```
+
+`binary` is a command template (shell-style splitting, per-task
+placeholders), `shim = true` gives the session a shell shim at `<task
+dir>/bin/powerqueue` whose `hook` and `task complete|block` calls land in
+`<task dir>/inbox/` for the daemon to drain (`inbox.complete`, `inbox.block`,
+`inbox.rejected` events; `doctor` reports parked messages), and
+`CLAUDE_CONFIG_DIR` in the session env is where the daemon reads transcripts
+(mount it too; the subscription login lives there). The same works for
+`[codex]` with `CODEX_HOME`. [docs/containers.md](docs/containers.md) has the
+full recipe, an example image
+([docs/examples/Dockerfile.agent](docs/examples/Dockerfile.agent)) and the
+`up` / `down` / `exec` helper
+([docs/examples/agent-container.sh](docs/examples/agent-container.sh)).
 
 ### Per-repository overrides: `.powerqueue.toml`
 

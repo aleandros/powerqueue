@@ -1,0 +1,18 @@
+# A session image for powerqueue: Claude Code and Codex CLI on Node 22,
+# plus git and python3. Build it once, log each CLI in once into a
+# directory you mount on every start, then point `claude.binary` /
+# `codex.binary` at `docker exec … claude` / `docker exec … codex`
+# (see docs/containers.md).
+#
+#   docker build -t powerqueue-agent -f docs/examples/Dockerfile.agent docs/examples
+FROM node:22-bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates curl python3 openssh-client procps \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @anthropic-ai/claude-code @openai/codex
+
+# The working directory of a session comes from `docker exec -w <worktree>`;
+# the container itself just stays up between `docker exec` calls.
+CMD ["sleep", "infinity"]
