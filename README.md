@@ -5,13 +5,13 @@
 [![Rust 2024](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](Cargo.toml)
 
 **Get the most out of the Claude subscription you already pay for.** powerqueue
-is an autonomous work queue that turns Linear tickets into Claude Code sessions
+is an autonomous work queue that turns Linear tickets and GitHub Issues into Claude Code sessions
 and keeps them running around the clock, on a cheap VPS or on your own machine.
 
 You are paying for a weekly allowance that mostly goes unused: the 5-hour
 windows reset while you sleep, and the strongest model sits idle until
 something urgent comes up. powerqueue is a single Rust binary that puts that
-capacity to work. It polls Linear, scores tickets with rules you write in
+capacity to work. It polls Linear and GitHub, scores tickets with rules you write in
 Markdown, gives each task its own git worktree and tmux window, launches an
 interactive Claude Code session in it, and paces model usage so the week's
 budget is spent on the work that matters most: Fable is held back for critical
@@ -33,7 +33,7 @@ to turn.
 |----------|---------------|
 | A Claude subscription (Pro or Max) | you already have it; powerqueue only spends the allowance you are not using |
 | One machine that stays on | the smallest VPS you can rent, or your laptop; it runs git, tmux and Claude Code, nothing heavier |
-| Linear | optional; `powerqueue add` queues work by hand |
+| Linear / GitHub Issues | optional; use either or both, or queue work by hand with `powerqueue add` |
 
 That is the whole bill. Sessions run through your normal Claude Code login, so
 usage counts against the subscription, not an API account. The budget policy
@@ -54,6 +54,9 @@ rate limits, and `doctor` tells you when the pacing is off.
  task complete --pr ──▶ in_review ──gh poll──▶ merged: completed · conflict / failed check / review:
                         (no slot)               claude --resume <same session> "/ship-pr <n> --reason …"
 ```
+
+GitHub Issues can feed the same queue; optional labels, comments and closing
+follow the task lifecycle. See [GitHub configuration](#github).
 
 ## Requirements
 
@@ -215,7 +218,7 @@ Global flags work on every command.
 
 | Command | What it does |
 |---------|--------------|
-| `init [--repo PATH] [--team KEY]... [--linear-key K] [--jev-key K] [--no-linear] [--permission-mode MODE] [--provider P]... [--non-interactive] [--reconfigure] [--force]` | guided first-time setup; writes `config.toml` and `PRIORITY.md`, stores keys; `--no-linear` sets `linear.enabled = false` (manual tasks only); `--permission-mode` picks `acceptEdits` (default), `auto`, `bypassPermissions`, `dontAsk`, `plan` or `default`; when `codex` / `agy` are on PATH it asks whether to run tasks on them too (`--provider codex --provider gemini` answers yes non-interactively and warns when the CLI is not logged in); on an existing install the menu offers "Change settings", and `--reconfigure` walks the editable settings (repository, default branch, Linear team and states, concurrency, permission mode, weekly budget, reset anchor, providers) with the current values as defaults, keeping keys and every other key |
+| `init [--repo PATH] [--team KEY]... [--linear-key K] [--jev-key K] [--no-linear] [--permission-mode MODE] [--provider P]... [--non-interactive] [--reconfigure] [--force]` | guided first-time setup; writes `config.toml` and `PRIORITY.md`, stores keys; `--no-linear` sets `linear.enabled = false` (GitHub can be enabled separately); `--permission-mode` picks `acceptEdits` (default), `auto`, `bypassPermissions`, `dontAsk`, `plan` or `default`; when `codex` / `agy` are on PATH it asks whether to run tasks on them too (`--provider codex --provider gemini` answers yes non-interactively and warns when the CLI is not logged in); on an existing install the menu offers "Change settings", and `--reconfigure` walks the editable settings (repository, default branch, Linear team and states, concurrency, permission mode, weekly budget, reset anchor, providers) with the current values as defaults, keeping keys and every other key |
 | `run [--once] [--offline]` | run the scheduler in the foreground; `--once` does one pass; `--offline` skips Linear |
 | `stop` | ask the running daemon to exit (sessions keep running in tmux) |
 | `pause [--reason TEXT]` | stop launching sessions: running ones continue, the daemon keeps monitoring, cleaning up and syncing, nothing new starts (crashed sessions are not relaunched either) until `resume`; survives a daemon restart; `status`, `dashboard` and `doctor` show it |
@@ -293,6 +296,8 @@ state machine allows it. `complete` and `block` always write directly.
 | `linear states <team>` | workflow states of a team |
 | `linear test` | verify the key (prints the viewer) |
 | `linear sync [--apply]` | fetch queued issues and print what would change; `--apply` applies it |
+| `github test` | check token access to the configured GitHub repository |
+| `github sync [--apply]` | preview GitHub intake, metadata updates and confirmed closures; `--apply` updates the local queue; supports `--json` |
 
 ### Config and secrets
 
@@ -305,7 +310,7 @@ state machine allows it. `complete` and `block` always write directly.
 | `config unset <key>` | remove a key so its default applies again |
 | `config edit` | open `config.toml` in `$EDITOR` |
 | `config validate [--file PATH]` | validate `config.toml` (or a draft) and the repo's `.powerqueue.toml` |
-| `secrets set <linear\|jev> [value]` | store a key (prompts if omitted) |
+| `secrets set <linear\|github\|jev> [value]` | store a key (prompts if omitted) |
 | `secrets unset <name>` | remove a key |
 | `secrets list` | which keys are configured and where they come from |
 | `hook --task ID [--session SID] --event EVENT [--provider P] [PAYLOAD]` | internal; called by agent CLI hooks (hidden); `--event StatusLine` is the Claude status line (stores rate limits, prints a short status); `PAYLOAD` replaces stdin (Codex `notify`) |
@@ -574,6 +579,68 @@ anything else uses the explicit `codex:<name>` form.
 | `fast_forward_base` | `true` | after that fetch, before creating a branch, fast-forward the local default branch to `origin/<default_branch>` when it is safe (no local commits, no rebase/bisect, clean checkout; hooks off) |
 | `setup` | `[]` | commands run (`sh -c`) in a fresh worktree before Claude starts |
 
+### `[github]`
+
+GitHub Issues and Linear can feed the same queue independently. Each daemon works
+in one checkout: set `github.repository` to the `owner/repo` corresponding to
+`repo.path`. For a GitHub-only installation, start with `powerqueue init --no-linear`
+and add this to `config.toml`:
+
+```toml
+[github]
+enabled = true
+repository = "owner/repo"
+required_labels = ["powerqueue"]
+# Optional lifecycle labels; create these labels in the repository first:
+# in_progress_label = "agent:working"
+# done_label = "agent:review"
+# blocked_label = "agent:blocked"
+close_on_complete = false
+```
+
+Run `powerqueue secrets set github` (prompts for a token), then `powerqueue github test`
+and `powerqueue github sync` to preview intake. Use `github sync --apply` to import
+immediately, or let `powerqueue run` poll automatically. `GITHUB_TOKEN` overrides the
+stored token. A fine-grained token needs access to the repository and **Issues: read**
+for intake; comments, labels and closing need **Issues: write**. No GitHub CLI is required.
+API behavior follows the [GitHub Issues REST API](https://docs.github.com/en/rest/issues/issues).
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `enabled` | `false` | enable daemon intake and lifecycle updates |
+| `repository` | `""` | explicit `owner/repo`; required when enabled or using GitHub helpers |
+| `required_labels` | `["powerqueue"]` | require **all** labels; `[]` accepts any open issue |
+| `excluded_labels` | `["no-agent"]` | ignore issues with any listed label during intake |
+| `assignee` | unset | GitHub login, `*` for assigned issues, `none` for unassigned; unset accepts any |
+| `in_progress_label` | unset | lifecycle label added when an attempt starts |
+| `done_label` | unset | lifecycle label added on successful completion |
+| `blocked_label` | unset | lifecycle label added on blockage or permanent failure |
+| `post_comments` | `true` | post start, completion and blocker/failure comments |
+| `close_on_complete` | `false` | close the issue as completed when the task succeeds |
+| `poll_interval_secs` | `60` | polling interval, 1–86400 seconds (minimum effective interval: 5 seconds) |
+| `max_issues` | `100` | cap raw entries scanned per poll before PR/excluded-label filtering; locally finished tasks do not count; raise it for larger intake queues |
+| `endpoint` | `https://api.github.com` | REST API base URL; supports Enterprise `/api/v3` and test servers |
+
+Task keys are `owner/repo#123`; use quoted keys in commands, for example
+`powerqueue task show 'owner/repo#123'`. Priority rules accept `source: github` and
+issue labels. Linear-only priority, estimate, cycle, project and team fields remain
+unset. Issue titles, bodies and labels populate the task and agent prompt.
+
+Pull requests are excluded. Removing an intake label or changing the assignee does
+not cancel an imported task. A confirmed closed issue cancels queued, throttled,
+paused or crashed tasks; running sessions continue. API failures and missing access
+(including HTTP 404) never count as closure. Finished tasks are not re-imported;
+use `task retry` to deliberately run one again. Lifecycle labels replace only other
+configured lifecycle labels, preserving unrelated labels.
+
+Polling backs off on failures and respects GitHub rate-limit reset headers. Lifecycle
+writes are best effort: failures or writes skipped during backoff appear as
+`github.update_failed` / `github.update_skipped` events; check `task show` / `logs`
+and update the issue manually. `doctor` checks credentials and repository/Issues
+read access (write permissions cannot be verified without making a change).
+`run --offline` disables both remote sources. Explicit `github` helpers work even
+when `github.enabled = false`, so you can preview configuration before enabling it.
+
 ### `[linear]`
 
 | Key | Default | Meaning |
@@ -664,7 +731,7 @@ reproduces the built-in prompt.
 | Placeholder | Value |
 |-------------|-------|
 | `{{key}}`, `{{title}}`, `{{description}}` | task key, title and (trimmed) description |
-| `{{url}}`, `{{source}}`, `{{team}}` | Linear issue URL (empty for manual tasks), `linear` or `manual`, team key |
+| `{{url}}`, `{{source}}`, `{{team}}` | issue URL (empty for manual tasks), `linear`, `github` or `manual`, Linear team key |
 | `{{labels}}`, `{{project}}`, `{{priority}}`, `{{estimate}}`, `{{cycle}}`, `{{cycle_number}}` | labels (comma-joined), project name, priority word (`urgent`, `high`, ...), estimate, cycle status (`active`, `next`, `past`, `future`) and number; empty when unknown |
 | `{{branch}}`, `{{worktree}}` | the branch and worktree the session works in |
 | `{{task_id}}`, `{{attempt}}`, `{{max_attempts}}`, `{{previous_error}}` | task id (as used by `powerqueue task complete`), attempt number, attempt cap, how the previous attempt ended (empty on the first) |
@@ -1079,7 +1146,7 @@ Details and worked examples: [docs/budget.md](docs/budget.md).
 
 Keys are looked up in this order:
 
-1. environment: `LINEAR_API_KEY`, `JEV_API_KEY` (always win);
+1. environment: `LINEAR_API_KEY`, `GITHUB_TOKEN`, `JEV_API_KEY` (always win);
 2. the OS keychain (macOS Keychain, Secret Service on Linux, Windows Credential Manager) under service `powerqueue`;
 3. `<config>/secrets.toml`, mode 0600, used when no keychain is available.
 

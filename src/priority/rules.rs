@@ -581,7 +581,7 @@ fn field_text(field: &str, task: &Task) -> Option<String> {
         "cycle_number" => task.cycle_number.map(|n| n.to_string()),
         "team" => match &task.source {
             TaskSource::Linear { team_key, .. } => Some(team_key.clone()),
-            TaskSource::Manual => None,
+            TaskSource::Manual | TaskSource::GitHub { .. } => None,
         },
         "title" => Some(task.title.clone()),
         "description" => Some(task.description.clone()),
@@ -750,10 +750,10 @@ fn validate_value(field: &str, value: &str, line: usize) -> Result<(), RuleError
             }
         }
         "source" => {
-            if matches!(value.to_ascii_lowercase().as_str(), "linear" | "manual") {
+            if matches!(value.to_ascii_lowercase().as_str(), "linear" | "github" | "manual") {
                 Ok(())
             } else {
-                Err(RuleError::new(line, format!("`source` must be `linear` or `manual`, not `{value}`")))
+                Err(RuleError::new(line, format!("`source` must be `linear`, `github` or `manual`, not `{value}`")))
             }
         }
         _ => Ok(()),

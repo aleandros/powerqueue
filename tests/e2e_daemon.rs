@@ -152,6 +152,7 @@ push_branch = false
             .env("POWERQUEUE_SECRETS", "file")
             .env("CLAUDE_CONFIG_DIR", self.root.path().join("claude"))
             .env("NO_COLOR", "1")
+            .env_remove("GITHUB_TOKEN")
             .env_remove("TMUX")
             .envs(self.vars.iter().map(|(k, v)| (k, v)));
         c
@@ -616,4 +617,199 @@ fn review_hand_off_frees_the_slot_and_a_conflict_resumes_the_same_session() {
         .unwrap();
     assert!(String::from_utf8_lossy(&branches.stdout).trim().is_empty(), "local branch deleted after the merge");
     assert_eq!(env.task_state(&b), "in_review", "B's PR is still open");
+}
+
+/// Stateful REST fixture: the daemon must observe labels changed by earlier
+/// writes, while unrelated labels and non-issue entries exercise intake filtering.
+#[derive(Clone)]
+struct GitHubFixture(std::sync::Arc<std::sync::Mutex<GitHubFixtureState>>);
+
+struct GitHubFixtureState {
+    issue: serde_json::Value,
+    comments: Vec<String>,
+    operations: Vec<String>,
+}
+
+impl wiremock::Respond for GitHubFixture {
+    fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        use serde_json::json;
+        use wiremock::ResponseTemplate;
+        if request.headers.get("authorization").and_then(|h| h.to_str().ok()) != Some("Bearer github-e2e-token") {
+            return ResponseTemplate::new(401);
+        }
+        let mut state = self.0.lock().unwrap();
+        let method = request.method.as_str();
+        let path = request.url.path();
+        match (method, path) {
+            ("GET", "/repos/acme/app") => ResponseTemplate::new(200).set_body_json(json!({"full_name": "acme/app"})),
+            ("GET", "/repos/acme/app/issues") => {
+                let mut entries = Vec::new();
+                if state.issue["state"] == "open" {
+                    entries.push(state.issue.clone());
+                }
+                let mut pr = state.issue.clone();
+                pr["number"] = json!(2);
+                pr["state"] = json!("open");
+                pr["pull_request"] = json!({"url": "https://api.github.com/repos/acme/app/pulls/2"});
+                entries.push(pr);
+                let mut excluded = state.issue.clone();
+                excluded["number"] = json!(3);
+                excluded["state"] = json!("open");
+                excluded["labels"] = json!([{"name": "powerqueue"}, {"name": "no-agent"}]);
+                entries.push(excluded);
+                ResponseTemplate::new(200).set_body_json(entries)
+            }
+            ("GET", "/repos/acme/app/issues/1") => ResponseTemplate::new(200).set_body_json(&state.issue),
+            ("POST", "/repos/acme/app/issues/1/labels") => {
+                let body: serde_json::Value = request.body_json().unwrap();
+                for label in body["labels"].as_array().unwrap() {
+                    state.operations.push(format!("label:{}", label.as_str().unwrap()));
+                    let labels = state.issue["labels"].as_array_mut().unwrap();
+                    if !labels.iter().any(|l| l["name"] == *label) {
+                        labels.push(json!({"name": label}));
+                    }
+                }
+                ResponseTemplate::new(200).set_body_json(&state.issue["labels"])
+            }
+            ("DELETE", "/repos/acme/app/issues/1/labels/agent:working") => {
+                state.operations.push("remove:agent:working".into());
+                state.issue["labels"].as_array_mut().unwrap().retain(|l| l["name"] != "agent:working");
+                ResponseTemplate::new(200).set_body_json(&state.issue["labels"])
+            }
+            ("POST", "/repos/acme/app/issues/1/comments") => {
+                let body: serde_json::Value = request.body_json().unwrap();
+                state.comments.push(body["body"].as_str().unwrap().to_string());
+                state.operations.push("comment".into());
+                ResponseTemplate::new(201).set_body_json(json!({"id": state.comments.len()}))
+            }
+            ("PATCH", "/repos/acme/app/issues/1") => {
+                let body: serde_json::Value = request.body_json().unwrap();
+                if body != json!({"state": "closed", "state_reason": "completed"}) {
+                    return ResponseTemplate::new(422);
+                }
+                state.operations.push("close".into());
+                state.issue["state"] = json!("closed");
+                ResponseTemplate::new(200).set_body_json(&state.issue)
+            }
+            _ => ResponseTemplate::new(404),
+        }
+    }
+}
+
+async fn github_lifecycle_e2e(close_on_complete: bool) {
+    use serde_json::json;
+    use wiremock::{Mock, MockServer};
+    // Construct Env before the server so prerequisites still skip cleanly.
+    let Some(mut env) = Env::new("complete", "") else { return };
+    let server = MockServer::start().await;
+    let remote_state = GitHubFixture(std::sync::Arc::new(std::sync::Mutex::new(GitHubFixtureState {
+        issue: json!({
+            "number": 1, "title": "GitHub end-to-end task", "body": "Make the fixture commit in the dedicated worktree.",
+            "html_url": "https://github.com/acme/app/issues/1", "state": "open",
+            "labels": [{"name": "powerqueue"}, {"name": "bug"}], "created_at": chrono::Utc::now(),
+        }),
+        comments: Vec::new(),
+        operations: Vec::new(),
+    })));
+    Mock::given(wiremock::matchers::any()).respond_with(remote_state.clone()).mount(&server).await;
+
+    // Push to a disposable local origin, exercising the actual git push/remove flow.
+    let repo = env.root.path().join("repo");
+    let origin = env.root.path().join("origin.git");
+    git(env.root.path(), &["init", "--bare", "-q", "origin.git"]);
+    git(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+    git(&repo, &["push", "-u", "origin", "main"]);
+    let config_path = env.home().join("config/config.toml");
+    let mut cfg = powerqueue::config::Config::from_toml(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    cfg.repo.default_branch = Some("main".into());
+    cfg.cleanup.push_branch = true;
+    cfg.github.enabled = true;
+    cfg.github.repository = "acme/app".into();
+    cfg.github.endpoint = server.uri();
+    cfg.github.in_progress_label = Some("agent:working".into());
+    cfg.github.done_label = Some("agent:review".into());
+    cfg.github.close_on_complete = close_on_complete;
+    // Keep real account usage probes out of this isolated daemon.
+    cfg.budget.probe_interval_mins = 0;
+    std::fs::write(&config_path, cfg.to_toml().unwrap()).unwrap();
+
+    env.run_ok(&["secrets", "set", "github", "github-e2e-token"]);
+    env.run_ok(&["github", "test"]);
+    let preview: serde_json::Value = serde_json::from_str(&env.run_ok(&["--json", "github", "sync"])).unwrap();
+    assert_eq!(preview["changes"].as_array().unwrap().len(), 1);
+    assert_eq!(env.task_state("acme/app#1"), "?", "dry run must not import the issue");
+
+    // No `add` or `sync --apply`: daemon polling itself must create and launch it.
+    env.start_daemon();
+    assert_eq!(env.wait_for_state("acme/app#1", "completed", Duration::from_secs(60)), "completed", "{}", env.daemon_log());
+    let show = env.wait_for_show("acme/app#1", |v| {
+        v["usage"]["output_tokens"].as_u64().unwrap_or(0) >= 1400
+            && has_event(v, "cleanup.done")
+            && v["events"].as_array().unwrap().iter().filter(|e| e["kind"] == "github.comment").count() == 2
+    });
+    for expected in [
+        "task.created",
+        "worktree.ready",
+        "session.launched",
+        "task.completed",
+        "cleanup.pushed",
+        "cleanup.done",
+        "github.label",
+        "github.comment",
+    ] {
+        assert!(has_event(&show, expected), "missing {expected}: {show}; log: {}", env.daemon_log());
+    }
+    assert_eq!(has_event(&show, "github.closed"), close_on_complete);
+    assert!(!has_event(&show, "github.update_failed"), "{show}");
+    assert!(!has_event(&show, "github.update_skipped"), "{show}");
+    assert!(show["usage"]["output_tokens"].as_u64().unwrap_or(0) >= 1400, "{show}");
+    let cleanup = show["events"].as_array().unwrap().iter().find(|e| e["kind"] == "cleanup.done").unwrap();
+    for field in ["pushed", "worktree_removed", "window_closed"] {
+        assert_eq!(cleanup["data"][field], true, "{cleanup}");
+    }
+    assert_eq!(show["task"]["source"]["kind"], "github");
+    assert_eq!(show["task"]["attempts"], 1);
+    let worktree = show["events"].as_array().unwrap().iter().find(|e| e["kind"] == "worktree.ready").unwrap()["data"]["path"]
+        .as_str()
+        .unwrap();
+    assert!(!Path::new(worktree).exists());
+    let branch = show["task"]["branch"].as_str().unwrap();
+    git(&origin, &["cat-file", "-e", &format!("{branch}:FAKE_CLAUDE_TOUCHED.txt")]);
+    let id = show["task"]["id"].as_str().unwrap();
+    let prompt = std::fs::read_to_string(env.home().join(format!("state/tasks/{id}/prompt.md"))).unwrap();
+    assert!(prompt.contains("https://github.com/acme/app/issues/1"));
+    assert!(prompt.contains("Make the fixture commit"));
+
+    for _ in 0..2 {
+        let synced: serde_json::Value = serde_json::from_str(&env.run_ok(&["--json", "github", "sync", "--apply"])).unwrap();
+        assert!(synced["changes"].as_array().unwrap().is_empty(), "completed tasks must not be reimported");
+    }
+    let status: serde_json::Value = serde_json::from_str(&env.run_ok(&["--json", "status", "--all"])).unwrap();
+    assert_eq!(status["tasks"].as_array().unwrap().len(), 1, "PRs and excluded issues must not enter the queue");
+    let remote = remote_state.0.lock().unwrap();
+    assert_eq!(remote.issue["state"], if close_on_complete { "closed" } else { "open" });
+    let labels: Vec<_> = remote.issue["labels"].as_array().unwrap().iter().map(|l| l["name"].as_str().unwrap()).collect();
+    assert_eq!(labels, vec!["powerqueue", "bug", "agent:review"]);
+    assert_eq!(remote.comments.len(), 2, "start and completion comments only");
+    assert!(remote.comments[0].contains("started attempt 1"));
+    assert!(remote.comments[1].contains("fake-claude finished"));
+    let mut operations = vec!["label:agent:working", "comment", "label:agent:review", "remove:agent:working"];
+    if close_on_complete {
+        operations.push("close");
+    }
+    operations.push("comment");
+    assert_eq!(remote.operations, operations);
+    drop(remote);
+    // Shut down while the API fixture is still serving requests.
+    drop(env);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn github_issue_runs_to_completion_and_closes() {
+    github_lifecycle_e2e(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn github_issue_runs_to_completion_and_stays_open_for_review() {
+    github_lifecycle_e2e(false).await;
 }

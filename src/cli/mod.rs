@@ -13,6 +13,7 @@
 //! powerqueue tune "what you expect" [-y] [--dry-run] [--scope priority|config|all]   let Claude edit PRIORITY.md / config.toml for you; --apply [DIR], --undo
 //! powerqueue budget <show|set-reset|set-observed|clear-limits|estimate> [--provider <p>]
 //! powerqueue linear <teams|states|test|sync>
+//! powerqueue github <test|sync>
 //! powerqueue doctor [--fix]       diagnostics + tuning advice
 //! powerqueue update [--check]     self-update from GitHub releases (--check exits 10 when a newer release exists)
 //! powerqueue service <install|uninstall|start|stop|restart|status|logs>   run the daemon under systemd (Linux) / launchd (macOS)
@@ -36,7 +37,7 @@ use crate::domain::{Criticality, ModelTier, Provider};
 
 pub use context::Context;
 
-/// Autonomous Linear → Claude Code work queue, one tmux window per task.
+/// Autonomous Linear/GitHub → agent work queue, one tmux window per task.
 #[derive(Debug, Parser)]
 #[command(name = "powerqueue", version, about, long_about = None, propagate_version = true)]
 pub struct Cli {
@@ -98,6 +99,9 @@ pub enum Command {
     /// Linear helpers.
     #[command(subcommand)]
     Linear(LinearCommand),
+    /// GitHub Issues helpers.
+    #[command(subcommand)]
+    Github(GitHubCommand),
     /// Diagnose the installation, the data and the scheduling algorithm.
     Doctor(DoctorArgs),
     /// Update this binary to the latest GitHub release (or `--check` for a newer one).
@@ -157,7 +161,7 @@ pub struct InitArgs {
     /// Do not prompt; fail if something required is missing.
     #[arg(long)]
     pub non_interactive: bool,
-    /// Skip Linear entirely (manual tasks only); can be enabled later in config.toml.
+    /// Skip Linear; manual tasks and separately configured GitHub Issues still work.
     #[arg(long)]
     pub no_linear: bool,
     /// Overwrite an existing configuration.
@@ -180,7 +184,7 @@ pub struct RunArgs {
     /// Perform one scheduling pass and exit.
     #[arg(long)]
     pub once: bool,
-    /// Do not talk to Linear (manual tasks only).
+    /// Do not talk to Linear or GitHub (local tasks only).
     #[arg(long)]
     pub offline: bool,
 }
@@ -373,6 +377,18 @@ pub enum BudgetCommand {
     },
     /// Show the cost estimator's view of a task (or all history).
     Estimate { task: Option<String> },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GitHubCommand {
+    /// Verify token access to the configured repository.
+    Test,
+    /// Preview GitHub changes to the local queue.
+    Sync {
+        /// Apply the preview to the local queue.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -592,7 +608,7 @@ pub struct TuneArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SecretsCommand {
-    /// Store a key (prompts if value omitted). NAME: linear | jev
+    /// Store a key (prompts if value omitted). NAME: linear | github | jev
     Set { name: String, value: Option<String> },
     /// Remove a key.
     Unset { name: String },

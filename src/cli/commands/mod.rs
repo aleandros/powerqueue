@@ -7,6 +7,7 @@ pub mod budget;
 pub mod config;
 pub mod dashboard;
 pub mod doctor;
+pub mod github;
 pub mod hook;
 pub mod init;
 pub mod linear;
@@ -64,6 +65,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 Command::Tune(args) => tune::run(&mut ctx, args),
                 Command::Budget(cmd) => budget::run(&mut ctx, cmd),
                 Command::Linear(cmd) => linear::run(&mut ctx, cmd),
+                Command::Github(cmd) => github::run(&mut ctx, cmd),
                 Command::Doctor(args) => doctor::run(&mut ctx, args),
                 Command::Update(args) => update::run(&mut ctx, args),
                 Command::Service(cmd) => service::run(&mut ctx, cmd),

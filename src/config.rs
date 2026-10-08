@@ -28,6 +28,7 @@ pub const REPO_CONFIG_FILE: &str = ".powerqueue.toml";
 pub struct Config {
     pub repo: RepoConfig,
     pub linear: LinearConfig,
+    pub github: GitHubConfig,
     pub priority: PriorityConfig,
     pub prompt: PromptConfig,
     pub scheduler: SchedulerConfig,
@@ -211,6 +212,99 @@ impl<'de> Deserialize<'de> for PostComments {
                 serde::de::Error::custom(format!("unknown post_comments value `{s}` (expected {})", Self::NAMES.join(", ")))
             }),
         }
+    }
+}
+
+/// GitHub Issues integration for the repository worked on by this daemon.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GitHubConfig {
+    pub enabled: bool,
+    /// Explicit `owner/repo`; issues are executed in `repo.path`.
+    pub repository: String,
+    /// All these labels are required. Empty means any open issue.
+    pub required_labels: Vec<String>,
+    /// Any of these labels prevents intake.
+    pub excluded_labels: Vec<String>,
+    /// GitHub login, `*` (assigned), or `none` (unassigned).
+    pub assignee: Option<String>,
+    pub in_progress_label: Option<String>,
+    pub done_label: Option<String>,
+    pub blocked_label: Option<String>,
+    pub post_comments: bool,
+    pub close_on_complete: bool,
+    pub poll_interval_secs: u64,
+    /// Maximum raw issue/PR entries per poll, excluding locally finished tasks.
+    pub max_issues: u32,
+    pub endpoint: String,
+}
+
+impl Default for GitHubConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            repository: String::new(),
+            required_labels: vec!["powerqueue".into()],
+            excluded_labels: vec!["no-agent".into()],
+            assignee: None,
+            in_progress_label: None,
+            done_label: None,
+            blocked_label: None,
+            post_comments: true,
+            close_on_complete: false,
+            poll_interval_secs: 60,
+            max_issues: 100,
+            endpoint: "https://api.github.com".into(),
+        }
+    }
+}
+
+impl GitHubConfig {
+    /// Validate integration settings. Returns plain-language configuration errors.
+    pub fn validate(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        let parts: Vec<_> = self.repository.split('/').collect();
+        if (self.enabled || !self.repository.is_empty())
+            && (parts.len() != 2
+                || parts.iter().any(|p| {
+                    p.is_empty()
+                        || *p == "."
+                        || *p == ".."
+                        || !p.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+                }))
+        {
+            problems.push("github.repository must be owner/repo and must match repo.path".into());
+        }
+        if self.poll_interval_secs == 0 || self.poll_interval_secs > 86400 {
+            problems.push("github.poll_interval_secs must be between 1 and 86400 seconds".into());
+        }
+        if self.max_issues == 0 {
+            problems.push("github.max_issues must be greater than zero".into());
+        }
+        if self.required_labels.iter().chain(&self.excluded_labels).any(|s| s.trim().is_empty() || s.contains(',')) {
+            problems.push("github label filters must contain nonempty names without commas".into());
+        }
+        let labels: Vec<_> = [&self.in_progress_label, &self.done_label, &self.blocked_label].into_iter().flatten().collect();
+        if labels.iter().any(|l| l.trim().is_empty()) {
+            problems.push("github lifecycle labels must be nonempty or omitted".into());
+        }
+        if labels.iter().enumerate().any(|(i, l)| labels[..i].iter().any(|other| other.eq_ignore_ascii_case(l))) {
+            problems.push("github lifecycle labels must be distinct".into());
+        }
+        if self.assignee.as_ref().is_some_and(|a| a.trim().is_empty()) {
+            problems.push("github.assignee must be nonempty or omitted".into());
+        }
+        match reqwest::Url::parse(&self.endpoint) {
+            Ok(url)
+                if matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none() => {}
+            _ => problems.push("github.endpoint must be an HTTP(S) API URL without credentials, query or fragment".into()),
+        }
+        problems
     }
 }
 
@@ -1528,6 +1622,7 @@ impl Config {
         if !GEMINI_MODES.contains(&self.gemini.mode.as_str()) {
             problems.push(format!("gemini.mode `{}` is not one of {}", self.gemini.mode, GEMINI_MODES.join("|")));
         }
+        problems.extend(self.github.validate());
         if self.linear.enabled && self.linear.queued_states.is_empty() {
             problems.push("linear.queued_states is empty; no issues would ever be picked up".to_string());
         }

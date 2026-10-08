@@ -19,8 +19,8 @@ pub const NUDGE_TEXT: &str = "If the task is complete, run the completion comman
 /// How many pane lines the daemon captures for crash reports.
 pub const CRASH_TAIL_LINES: u32 = 40;
 
-/// Which Linear workflow transition an effect asks for; the daemon maps it
-/// to the configured state name (if any).
+/// Issue lifecycle target. The name is retained for API compatibility; the daemon
+/// maps it to Linear states or GitHub labels/closure according to the task source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LinearTarget {
     InProgress,
@@ -35,7 +35,8 @@ pub enum Effect {
     Log { level: EventLevel, kind: String, message: String, data: serde_json::Value },
     /// Run [`crate::scheduler::cleanup_task`].
     Cleanup { succeeded: bool },
-    /// Move the Linear issue and/or post a comment (best effort).
+    /// Update the task's issue source and/or post a comment (best effort).
+    /// The variant name is retained for compatibility with existing consumers.
     Linear { target: LinearTarget, comment: Option<String> },
     /// Type text into the session's pane.
     Nudge { text: String },

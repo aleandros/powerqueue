@@ -91,7 +91,7 @@ existing tasks are re-synced on the next Linear poll.
 | `team` | string | Linear team key (`ENG`); missing on manual tasks |
 | `title` | string | task title |
 | `description` | string | task description (Markdown) |
-| `source` | enum | `linear` or `manual` |
+| `source` | enum | `linear`, `github` or `manual` |
 | `key` | string | task key (`ENG-123`, `manual-1a2b3c4d`) |
 
 Comparing a missing field (no estimate, no project) with `:` or `~` never

@@ -807,6 +807,35 @@ async fn check_secrets(cfg: &Config, secrets: &Secrets, online: bool) -> Vec<Che
             "check the keychain / secrets file",
         )),
     }
+    if cfg.github.enabled {
+        let hint = "run `powerqueue secrets set github` or set GITHUB_TOKEN; check github.repository and token Issues permissions (read for intake, write for lifecycle updates)";
+        match secrets.get_with_origin(SecretKind::GitHubToken) {
+            Ok(Some((key, origin))) if online => {
+                let result = async {
+                    let client = crate::github::GitHubClient::new(&cfg.github.endpoint, key)?;
+                    client.test_repository(&cfg.github.repository).await?;
+                    let mut probe = cfg.github.clone();
+                    probe.max_issues = 1;
+                    client.fetch_issues(&probe).await?;
+                    anyhow::Ok(())
+                }
+                .await;
+                match result {
+                    Ok(()) => {
+                        out.push(CheckResult::ok(SEC, "github token", format!("{origin}; repository and Issues API accessible")))
+                    }
+                    Err(e) => out.push(CheckResult::fail(SEC, "github token", format!("{e:#}"), hint)),
+                }
+            }
+            Ok(Some((_, origin))) => {
+                out.push(CheckResult::ok(SEC, "github token", format!("present ({origin}); not verified offline")))
+            }
+            Ok(None) => out.push(CheckResult::fail(SEC, "github token", "no GitHub token configured", hint)),
+            Err(e) => out.push(CheckResult::fail(SEC, "github token", format!("cannot read token: {e:#}"), hint)),
+        }
+    } else {
+        out.push(CheckResult::skipped(SEC, "github token", "GitHub disabled"));
+    }
     if cfg.priority.jev.enabled {
         match secrets.get_with_origin(SecretKind::JevApiKey) {
             Ok(Some((key, origin))) if online => {
@@ -1731,6 +1760,18 @@ pub async fn run_all(
     results.push(check_workspace_trust(cfg, fix));
 
     results.extend(check_secrets(cfg, secrets, online).await);
+    if cfg.github.enabled {
+        let since = Utc::now() - Duration::days(1);
+        let errors = store.count_events_of_kind("github.error", since)?;
+        let missed = store.count_events_of_kind("github.update_failed", since)?
+            + store.count_events_of_kind("github.update_skipped", since)?;
+        results.push(if errors + missed == 0 {
+            CheckResult::ok(STATE, "GitHub sync", "no API failures or missed lifecycle updates in 24 h")
+        } else {
+            CheckResult::warn(STATE, "GitHub sync", format!("{errors} API error(s), {missed} missed lifecycle update(s) in 24 h"),
+                "inspect github.* events in logs/task show; verify token Issues permissions and repository access, wait for rate-limit reset, and manually reconcile missed labels/comments/closure")
+        });
+    }
 
     results.push(check_db(store));
     results.push(check_daemon(store));

@@ -182,6 +182,7 @@ pub fn prompt_variables(task: &Task, cfg: &Config, ctx: &PromptContext<'_>) -> B
     let branch = task.branch.clone().unwrap_or_else(|| branch_name(&cfg.repo.branch_template, &task.slug(), &task.id.short()));
     let (url, identifier, team) = match &task.source {
         TaskSource::Linear { url, identifier, team_key, .. } => (url.clone(), identifier.clone(), team_key.clone()),
+        TaskSource::GitHub { url, repository, number } => (url.clone(), format!("{repository}#{number}"), String::new()),
         TaskSource::Manual => (String::new(), String::new(), String::new()),
     };
     let description = task.description.trim().to_string();

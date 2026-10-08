@@ -5,6 +5,12 @@
 //! required checks of the head commit and review threads. Parsing is a pure function ([`parse_pr_status`]) so the
 //! decision table is tested without `gh`.
 
+pub mod client;
+pub mod sync;
+
+pub use client::GitHubClient;
+pub use sync::{apply_plan, plan_sync};
+
 use std::fmt;
 use std::process::{Command, Stdio};
 use std::str::FromStr;

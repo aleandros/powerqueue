@@ -12,8 +12,9 @@ use crate::secrets::{SecretKind, SecretOrigin, Secrets, mask};
 pub fn parse_secret_name(name: &str) -> Result<SecretKind> {
     match name.trim().to_ascii_lowercase().replace('-', "_").as_str() {
         "linear" | "linear_api_key" | "linear_key" => Ok(SecretKind::LinearApiKey),
+        "github" | "github_token" => Ok(SecretKind::GitHubToken),
         "jev" | "jev_api_key" | "jev_key" | "typesafe" => Ok(SecretKind::JevApiKey),
-        other => Err(anyhow!("unknown secret `{other}` (expected linear | jev)")),
+        other => Err(anyhow!("unknown secret `{other}` (expected linear | github | jev)")),
     }
 }
 
@@ -138,7 +139,7 @@ mod tests {
         let secrets = Secrets::with_backend(Box::new(FileBackend::new(dir.path().join("s.toml"))));
         secrets.set(SecretKind::LinearApiKey, "lin_api_1234567890").unwrap();
         let rows = secret_rows(&secrets).unwrap();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert!(rows[0].configured);
         assert_eq!(rows[0].masked.as_deref(), Some("lin_************90"));
         assert_eq!(rows[0].origin, Some(SecretOrigin::File));

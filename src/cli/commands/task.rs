@@ -340,6 +340,7 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     kv("model", model_line);
     let source = match &task.source {
         crate::domain::TaskSource::Linear { identifier, url, team_key, .. } => format!("linear {identifier} ({team_key}) {url}"),
+        crate::domain::TaskSource::GitHub { repository, number, url } => format!("github {repository}#{number} {url}"),
         crate::domain::TaskSource::Manual => "manual".to_string(),
     };
     kv("source", source);

@@ -61,7 +61,7 @@ just test
 Run one test with `cargo test name_of_test -- --nocapture`. Set
 `RUST_LOG=powerqueue=debug` for stderr logging in tests.
 
-### End-to-end test
+### End-to-end tests
 
 `tests/fixtures/fake-claude.sh` stands in for Claude Code. It accepts the
 flags the launcher passes, fires the command hooks declared in the
@@ -83,6 +83,25 @@ until the task reaches the expected state. It covers completion with usage
 and cleanup, crash + `--resume`, and a blocked session reaching
 `needs_attention`. It skips itself when `tmux`, `git` or `python3` is
 missing.
+
+The GitHub lifecycle tests run the same daemon against a stateful mock GitHub
+REST server, with the token stored through `secrets set github`. They cover dry-run
+intake, daemon polling, PR/excluded-label filtering, the agent prompt, commit and
+usage recording, push to a local bare origin, worktree/window cleanup, lifecycle
+labels and comments, optional closing, and duplicate prevention after completion.
+All state, credentials, remotes and tmux sockets are disposable. No live GitHub
+account or Claude subscription is used.
+
+Run just these tests before a release:
+
+```sh
+cargo test --test e2e_daemon github_issue -- --nocapture
+```
+
+Verify git, tmux and python3 are installed so the tests run rather than skip.
+These tests run in the existing Linux/macOS CI suite. They verify the complete
+powerqueue flow against controlled services; live GitHub token permissions and
+real agent behavior need a separate smoke test with a designated test repository.
 
 ## Pull requests
 

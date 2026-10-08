@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- GitHub Issues alongside Linear: configurable label/assignee intake, independent
+  polling and API backoff, optional lifecycle labels/comments/closing, GitHub
+  token storage, `github test` / `github sync`, and doctor diagnostics.
+- GitHub end-to-end coverage through the real daemon, git worktrees, tmux,
+  transcript accounting, push and cleanup, with stateful GitHub and agent fixtures.
+
+
 ## [0.8.1] - 2026-10-07
 
 Fixes for tasks that wait on a human, tasks in review and PR hand-offs.

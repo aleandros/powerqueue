@@ -1,6 +1,6 @@
 //! # powerqueue
 //!
-//! An autonomous work queue that turns Linear tickets into Claude Code
+//! An autonomous work queue that turns Linear tickets and GitHub Issues into Claude Code
 //! sessions running inside tmux, one git worktree per task.
 //!
 //! The crate is organised as a set of mostly independent modules that the
@@ -12,6 +12,7 @@
 //! | [`secrets`] | API keys in the OS keychain with an encrypted-file fallback |
 //! | [`store`] | SQLite persistence: tasks, sessions, usage, events, commands |
 //! | [`linear`] | Linear GraphQL client |
+//! | [`github`] | GitHub Issues REST client and synchronization |
 //! | [`priority`] | `PRIORITY.md` rules, live reload, optional Jev scoring |
 //! | [`budget`] | model-usage pacing, token accounting, cost estimation |
 //! | [`worktree`] / [`tmux`] / [`session`] | runtime: worktrees, tmux windows, Claude Code sessions |

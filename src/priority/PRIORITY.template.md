@@ -8,7 +8,7 @@ lines under `##` sections. A ticket's criticality is the first section
 Conditions: `field: value` (equals, case-insensitive), `field ~ regex`,
 `field > n` / `field < n`, `field != value`. Fields: `label`, `priority`
 (urgent|high|normal|low|none or 1-4), `estimate`, `project`, `team`,
-`title`, `description`, `source` (linear|manual), `key`. Join conditions
+`title`, `description`, `source` (linear|github|manual), `key`. Join conditions
 with ` and `.
 
 ## Critical

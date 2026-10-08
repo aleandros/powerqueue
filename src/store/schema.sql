@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     title           TEXT NOT NULL,
     description     TEXT NOT NULL DEFAULT '',
     source          TEXT NOT NULL,             -- JSON TaskSource
-    source_kind     TEXT NOT NULL,             -- linear | manual
+    source_kind     TEXT NOT NULL,             -- linear | github | manual
     linear_issue_id TEXT,
     state           TEXT NOT NULL,
     criticality     TEXT NOT NULL,

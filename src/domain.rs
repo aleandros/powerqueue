@@ -51,6 +51,9 @@ impl FromStr for TaskId {
 pub enum TaskSource {
     /// A Linear issue. `issue_id` is Linear's UUID, `identifier` the human key (`ENG-123`).
     Linear { issue_id: String, identifier: String, url: String, team_key: String },
+    /// A GitHub issue. Repository is `owner/repo`, number is repository-local.
+    #[serde(rename = "github")]
+    GitHub { repository: String, number: u64, url: String },
     /// Added by hand through `powerqueue add` or the dashboard.
     Manual,
 }
@@ -59,6 +62,7 @@ impl TaskSource {
     pub fn kind(&self) -> &'static str {
         match self {
             TaskSource::Linear { .. } => "linear",
+            TaskSource::GitHub { .. } => "github",
             TaskSource::Manual => "manual",
         }
     }
@@ -559,11 +563,11 @@ impl FromStr for TaskState {
     }
 }
 
-/// A unit of work: one Linear issue or one manual request.
+/// A unit of work: one Linear/GitHub issue or one manual request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
-    /// Human key: Linear identifier (`ENG-123`) or `manual-<short>`; unique and
+    /// Human key: `ENG-123`, `owner/repo#123` or `manual-<short>`; unique and
     /// used for branch, worktree and tmux window names.
     pub key: String,
     pub title: String,
@@ -684,14 +688,14 @@ impl Task {
     pub fn linear_identifier(&self) -> Option<&str> {
         match &self.source {
             TaskSource::Linear { identifier, .. } => Some(identifier),
-            TaskSource::Manual => None,
+            TaskSource::Manual | TaskSource::GitHub { .. } => None,
         }
     }
 
     pub fn linear_issue_id(&self) -> Option<&str> {
         match &self.source {
             TaskSource::Linear { issue_id, .. } => Some(issue_id),
-            TaskSource::Manual => None,
+            TaskSource::Manual | TaskSource::GitHub { .. } => None,
         }
     }
 
@@ -1173,7 +1177,7 @@ pub enum DaemonCommand {
         task_id: TaskId,
         model: Option<ModelTier>,
     },
-    /// Re-read Linear immediately.
+    /// Re-read enabled issue sources immediately.
     SyncNow,
     /// Reload config + PRIORITY.md.
     Reload,

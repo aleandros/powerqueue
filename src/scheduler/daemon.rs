@@ -21,9 +21,9 @@ use crate::budget::{
 use crate::config::Config;
 use crate::domain::{
     BRANCH_CREATED_EVENT, DaemonCommand, EventLevel, ModelTier, Provider, ReviewWatch, SCHEDULING_PAUSE_KEY, SchedulingPause,
-    Session, SessionState, Task, TaskId, TaskState, is_closed_state_type,
+    Session, SessionState, Task, TaskId, TaskSource, TaskState, is_closed_state_type,
 };
-use crate::github::{Gh, PrRef};
+use crate::github::{Gh, GitHubClient, PrRef, apply_plan, plan_sync};
 use crate::jev::{JevClient, JevQuestion, content_hash};
 use crate::linear::{
     IssueFilter, LinearClient, LinearIssue, WATCHED_PARENTS_KEY, WatchedParents, container_comment, container_finished,
@@ -106,6 +106,15 @@ impl DaemonHandle {
     }
 }
 
+#[derive(Default)]
+struct GitHubRuntime {
+    client: Option<GitHubClient>,
+    warned: bool,
+    last_poll: Option<DateTime<Utc>>,
+    backoff: Duration,
+    next_allowed: Option<DateTime<Utc>>,
+}
+
 /// Mutable runtime state that is not part of the public daemon surface.
 struct RuntimeState {
     tmux: Tmux,
@@ -119,6 +128,7 @@ struct RuntimeState {
     readers: HashMap<uuid::Uuid, TranscriptReader>,
     nudged: HashSet<uuid::Uuid>,
     rate_limits: RateLimitState,
+    github: GitHubRuntime,
     linear: Option<LinearClient>,
     linear_warned: bool,
     last_linear_poll: Option<DateTime<Utc>>,
@@ -179,6 +189,7 @@ impl Daemon {
             readers: HashMap::new(),
             nudged: HashSet::new(),
             rate_limits,
+            github: GitHubRuntime::default(),
             linear: None,
             linear_warned: false,
             last_linear_poll: None,
@@ -299,11 +310,14 @@ impl Daemon {
         if self.rt.shutdown {
             return Ok(());
         }
-        // Linear first, rules second: a ticket created this tick gets its
+        // Issue sources first, rules second: a ticket created this tick gets its
         // criticality, score and preferred model before `launch_tasks` sees
         // it (otherwise an urgent ticket is first scheduled as `normal`).
         let r = self.poll_linear(now).await;
         self.report_phase("linear", r);
+        let r = self.poll_github(now).await;
+        self.report_phase("github", r);
+        self.rt.force_sync = false;
         let r = self.refresh_rules(now).await;
         self.report_phase("rules", r);
         let r = self.process_hooks(now).await;
@@ -652,6 +666,7 @@ impl Daemon {
         self.rt.tmux = Tmux::new(&cfg.tmux.binary, cfg.tmux.socket_name.clone());
         self.rt.repo = Repo::new(cfg.repo_path());
         self.rt.launcher = Launcher::new(self.paths.clone(), self.rt.tmux.clone())?;
+        self.rt.github = GitHubRuntime::default();
         self.rt.linear = None;
         self.rt.linear_warned = false;
         self.rt.jev = None;
@@ -901,7 +916,6 @@ impl Daemon {
         }
         let Some(client) = self.linear_client() else { return Ok(()) };
         let forced = self.rt.force_sync;
-        self.rt.force_sync = false;
         self.rt.last_linear_poll = Some(now);
 
         let filter = IssueFilter::from_config(&self.cfg.linear);
@@ -1256,7 +1270,24 @@ impl Daemon {
             }
         }
         if let Some(body) = comment {
-            self.comment_linear(task, body, CommentKind::Progress).await;
+            self.comment_issue(task, body, CommentKind::Progress).await;
+        }
+    }
+
+    /// Route comments to the task's tracker without changing its lifecycle state.
+    async fn comment_issue(
+        &mut self,
+        task: &Task,
+        body: String,
+        kind: CommentKind,
+    ) -> Option<Option<crate::linear::IssueComment>> {
+        if matches!(&task.source, TaskSource::GitHub { .. }) {
+            if !self.cfg.github.post_comments {
+                return None;
+            }
+            self.update_github(task, None, Some(body)).await.then_some(None)
+        } else {
+            self.comment_linear(task, body, kind).await
         }
     }
 
@@ -1333,7 +1364,12 @@ impl Daemon {
     /// unconfirmed question (a turn that ended in `needs_attention`) is
     /// posted only when the session's agent ran `task block` itself.
     async fn post_question(&mut self, task: &Task, session_id: uuid::Uuid, text: &str, reason: Option<&str>, confirmed: bool) {
-        if task.linear_issue_id().is_none() || !self.cfg.linear.post_comments.questions() {
+        let allowed = match &task.source {
+            TaskSource::Linear { .. } => self.cfg.linear.post_comments.questions(),
+            TaskSource::GitHub { .. } => self.cfg.github.post_comments,
+            TaskSource::Manual => false,
+        };
+        if !allowed {
             return;
         }
         let state = self.store.kv_get::<RelayState>(&relay_key(task.id)).ok().flatten().unwrap_or_default();
@@ -1347,7 +1383,7 @@ impl Daemon {
         }
         let now = Utc::now();
         // `comment_linear` logs failures; the question is then not recorded.
-        let Some(posted) = self.comment_linear(task, relay::question_body(text, reason), CommentKind::Notice).await else {
+        let Some(posted) = self.comment_issue(task, relay::question_body(text, reason), CommentKind::Notice).await else {
             return;
         };
         let posted_at = posted.as_ref().map_or(now, |c| c.created_at);
@@ -1365,7 +1401,11 @@ impl Daemon {
             Some(session_id),
             EventLevel::Info,
             "relay.question_posted",
-            "asked the agent's question on the Linear issue; a reply there goes back to the session",
+            if matches!(&task.source, TaskSource::GitHub { .. }) {
+                "asked the agent's question on the GitHub issue; respond with task send or attach"
+            } else {
+                "asked the agent's question on the Linear issue; a reply there goes back to the session"
+            },
             serde_json::json!({ "question": text, "reason": reason }),
         );
     }
@@ -1554,7 +1594,7 @@ impl Daemon {
         // Undo the move to `linear.blocked_state` (a relaunch does the same
         // when it starts the session).
         if self.cfg.linear.blocked_state.as_deref().is_some_and(|s| !s.trim().is_empty()) {
-            self.update_linear(&task, LinearTarget::InProgress, None).await;
+            self.update_issue(&task, LinearTarget::InProgress, None).await;
         }
         Ok(Delivery::Sent)
     }
@@ -1585,6 +1625,162 @@ impl Daemon {
             serde_json::json!({ "comments": ids, "from": from }),
         );
         Ok(())
+    }
+
+    // -------------------------------------------------------------- github
+
+    fn github_client(&mut self) -> Option<GitHubClient> {
+        if self.offline || !self.cfg.github.enabled {
+            return None;
+        }
+        if self.rt.github.client.is_none() {
+            let result =
+                self.secrets.require(SecretKind::GitHubToken).and_then(|key| GitHubClient::new(&self.cfg.github.endpoint, key));
+            match result {
+                Ok(client) => self.rt.github.client = Some(client),
+                Err(e) if !self.rt.github.warned => {
+                    self.rt.github.warned = true;
+                    self.log(
+                        None,
+                        None,
+                        EventLevel::Warn,
+                        "github.unavailable",
+                        &format!("{e:#}; run `powerqueue secrets set github` and check github.endpoint"),
+                        serde_json::json!({}),
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+        self.rt.github.client.clone()
+    }
+
+    async fn poll_github(&mut self, now: DateTime<Utc>) -> Result<()> {
+        let interval = Duration::seconds(self.cfg.github.poll_interval_secs.clamp(5, 86400) as i64);
+        if self.rt.github.next_allowed.is_some_and(|t| now < t)
+            || (!self.rt.force_sync && self.rt.github.last_poll.is_some_and(|t| now - t < interval))
+        {
+            return Ok(());
+        }
+        let Some(client) = self.github_client() else { return Ok(()) };
+        self.rt.github.last_poll = Some(now);
+        let plan = match plan_sync(&self.store, &self.cfg.github, &client).await {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.github_failure(&error);
+                return Ok(());
+            }
+        };
+        apply_plan(&self.store, &plan)?;
+        self.rt.github.backoff = Duration::zero();
+        self.rt.github.next_allowed = None;
+        if !plan.changes.is_empty() {
+            self.log(
+                None,
+                None,
+                EventLevel::Info,
+                "github.sync",
+                &format!("GitHub sync: {} queue changes", plan.changes.len()),
+                serde_json::json!({"fetched": plan.fetched, "changes": plan.changes.len()}),
+            );
+        }
+        Ok(())
+    }
+
+    fn github_failure(&mut self, error: &anyhow::Error) {
+        let base = Duration::seconds(self.cfg.github.poll_interval_secs.clamp(5, 3600) as i64);
+        self.rt.github.backoff =
+            if self.rt.github.backoff.is_zero() { base } else { (self.rt.github.backoff * 2).min(Duration::hours(1)) };
+        let mut next = Utc::now() + self.rt.github.backoff;
+        if let Some(limit) = error.downcast_ref::<crate::github::client::RateLimited>() {
+            next = next.max(limit.retry_at);
+        }
+        self.rt.github.next_allowed = Some(self.rt.github.next_allowed.map_or(next, |old| old.max(next)));
+        self.log(
+            None,
+            None,
+            EventLevel::Warn,
+            "github.error",
+            &format!("{error:#}; GitHub calls paused until {next}"),
+            serde_json::json!({"retry_at": next}),
+        );
+    }
+
+    async fn update_issue(&mut self, task: &Task, target: LinearTarget, comment: Option<String>) {
+        if matches!(&task.source, TaskSource::GitHub { .. }) {
+            self.update_github(task, Some(target), comment).await;
+        } else {
+            self.update_linear(task, target, comment).await;
+        }
+    }
+
+    async fn update_github(&mut self, task: &Task, target: Option<LinearTarget>, comment: Option<String>) -> bool {
+        let TaskSource::GitHub { repository, number, .. } = &task.source else { return false };
+        // Configuration changes must not mutate issues in a previously configured repository.
+        if !repository.eq_ignore_ascii_case(&self.cfg.github.repository) {
+            return false;
+        }
+        if self.rt.github.next_allowed.is_some_and(|t| Utc::now() < t) {
+            self.log(
+                Some(task.id),
+                None,
+                EventLevel::Warn,
+                "github.update_skipped",
+                "GitHub lifecycle update skipped during API backoff; update the issue manually",
+                serde_json::json!({}),
+            );
+            return false;
+        }
+        let Some(client) = self.github_client() else { return false };
+        let cfg = self.cfg.github.clone();
+        let label = match target {
+            Some(LinearTarget::InProgress) => cfg.in_progress_label.as_deref(),
+            Some(LinearTarget::Done) => cfg.done_label.as_deref(),
+            Some(LinearTarget::Blocked) => cfg.blocked_label.as_deref(),
+            None => None,
+        };
+        let result: Result<()> = async {
+            if let Some(label) = label {
+                let managed: Vec<_> = [cfg.in_progress_label.as_deref(), cfg.done_label.as_deref(), cfg.blocked_label.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                client.set_label(repository, *number, label, &managed).await?;
+                self.log(
+                    Some(task.id),
+                    None,
+                    EventLevel::Info,
+                    "github.label",
+                    &format!("set lifecycle label {label}"),
+                    serde_json::json!({"label": label}),
+                );
+            }
+            if target == Some(LinearTarget::Done) && cfg.close_on_complete {
+                client.close_issue(repository, *number).await?;
+                self.log(Some(task.id), None, EventLevel::Info, "github.closed", "closed completed issue", serde_json::json!({}));
+            }
+            if cfg.post_comments
+                && let Some(body) = comment
+            {
+                client.comment(repository, *number, &body).await?;
+                self.log(Some(task.id), None, EventLevel::Info, "github.comment", "posted comment", serde_json::json!({}));
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            self.log(
+                Some(task.id),
+                None,
+                EventLevel::Warn,
+                "github.update_failed",
+                &format!("GitHub lifecycle update failed: {error:#}; update the issue manually"),
+                serde_json::json!({}),
+            );
+            self.github_failure(&error);
+            return false;
+        }
+        true
     }
 
     // ---------------------------------------------------------------- hooks
@@ -1684,7 +1880,7 @@ impl Daemon {
                         self.forget_session(id);
                     }
                 }
-                Effect::Linear { target, comment } => self.update_linear(task, target, comment).await,
+                Effect::Linear { target, comment } => self.update_issue(task, target, comment).await,
                 Effect::Nudge { text } => {
                     if let Some(s) = session {
                         match s.pane_id.as_deref() {
@@ -1750,7 +1946,7 @@ impl Daemon {
                     }
                 }
                 Effect::LinearComment { body } => {
-                    self.comment_linear(task, body, CommentKind::Notice).await;
+                    self.comment_issue(task, body, CommentKind::Notice).await;
                 }
                 Effect::Question { text, reason, confirmed } => {
                     if let Some(s) = session {
@@ -2213,6 +2409,14 @@ impl Daemon {
             let effects = review::on_pr_status(&mut task, &status, &self.cfg.scheduler, now);
             self.store.update_task(&task)?;
             self.apply_effects(&mut task, None, effects).await;
+            if task.state == TaskState::Completed && matches!(&task.source, TaskSource::GitHub { .. }) {
+                let comment = format!(
+                    "powerqueue completed this task: PR {} merged.\n\n{}",
+                    task.pr_url.as_deref().unwrap_or("?"),
+                    task.summary.as_deref().unwrap_or("")
+                );
+                self.update_issue(&task, LinearTarget::Done, Some(comment)).await;
+            }
             self.store.update_task(&task)?;
         }
         Ok(())
@@ -2564,7 +2768,7 @@ impl Daemon {
                 let detail = if r.detail.is_empty() { String::new() } else { format!(" ({})", r.detail) };
                 let comment =
                     format!("powerqueue resumed the session for PR #{}: {}{detail}. Prompt: `{prompt}`", r.pr_number, r.reason);
-                self.comment_linear(&task, comment, CommentKind::Progress).await;
+                self.comment_issue(&task, comment, CommentKind::Progress).await;
             }
             // A later attempt (crash, timeout) leaves the issue where it is:
             // the first start already moved it to In Progress, and since then
@@ -2572,13 +2776,18 @@ impl Daemon {
             // finished task starts over at attempt 1. With a
             // `linear.blocked_state` configured every attempt moves the
             // issue, so a block is undone.
-            _ if attempt > 1 && self.cfg.linear.blocked_state.as_deref().is_none_or(|s| s.trim().is_empty()) => {
+            _ if attempt > 1
+                && match &task.source {
+                    TaskSource::GitHub { .. } => self.cfg.github.blocked_label.is_none(),
+                    _ => self.cfg.linear.blocked_state.as_deref().is_none_or(|s| s.trim().is_empty()),
+                } =>
+            {
                 let comment = format!("powerqueue resumed attempt {attempt} on branch `{branch}` with model {model}.");
-                self.comment_linear(&task, comment, CommentKind::Progress).await;
+                self.comment_issue(&task, comment, CommentKind::Progress).await;
             }
             _ => {
                 let comment = format!("powerqueue started attempt {attempt} on branch `{branch}` with model {model}.");
-                self.update_linear(&task, LinearTarget::InProgress, Some(comment)).await;
+                self.update_issue(&task, LinearTarget::InProgress, Some(comment)).await;
             }
         }
         Ok(())
@@ -2821,6 +3030,85 @@ async fn wait_for_signal() {
 mod tests {
     use super::*;
     use crate::budget::{AnchorSource, Ledger, Period, TierLedger};
+
+    fn github_daemon(dir: &Path, endpoint: &str) -> Daemon {
+        let paths = Paths::rooted(dir);
+        let secrets = Secrets::with_backend(Box::new(crate::secrets::FileBackend::new(paths.secrets_file())));
+        secrets.set(SecretKind::GitHubToken, "test-token").unwrap();
+        let mut cfg = Config::default();
+        cfg.linear.enabled = false;
+        cfg.github.enabled = true;
+        cfg.github.repository = "acme/app".into();
+        cfg.github.endpoint = endpoint.into();
+        Daemon::new(cfg, paths, Store::open_in_memory().unwrap(), secrets).unwrap()
+    }
+
+    #[tokio::test]
+    async fn github_poll_is_independent_and_respects_offline_disabled_and_rate_limits() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut daemon = github_daemon(dir.path(), &server.uri());
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/app/issues"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "600"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        daemon.offline = true;
+        daemon.poll_github(Utc::now()).await.unwrap();
+        daemon.offline = false;
+        daemon.cfg.github.enabled = false;
+        daemon.poll_github(Utc::now()).await.unwrap();
+        assert!(server.received_requests().await.unwrap().is_empty());
+        daemon.cfg.github.enabled = true;
+        daemon.rt.force_sync = true;
+        daemon.poll_linear(Utc::now()).await.unwrap();
+        assert!(daemon.rt.force_sync, "Linear must not consume the shared sync request");
+        daemon.poll_github(Utc::now()).await.unwrap();
+        assert!(daemon.rt.github.next_allowed.unwrap() > Utc::now() + Duration::seconds(590));
+        daemon.poll_github(Utc::now()).await.unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), 1, "force sync must respect GitHub rate limits");
+    }
+
+    #[tokio::test]
+    async fn github_completion_dispatch_respects_closing_and_comment_settings() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut daemon = github_daemon(dir.path(), &server.uri());
+        let task = Task::new(
+            "acme/app#1",
+            "Fix bug",
+            TaskSource::GitHub { repository: "acme/app".into(), number: 1, url: "https://github.com/acme/app/issues/1".into() },
+        );
+        daemon.store.insert_task(&task).unwrap();
+        Mock::given(method("POST"))
+            .and(path("/repos/acme/app/issues/1/comments"))
+            .and(body_partial_json(serde_json::json!({"body": "Done"})))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+        daemon.update_issue(&task, LinearTarget::Done, Some("Done".into())).await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 1, "closing defaults off");
+        daemon.cfg.github.post_comments = false;
+        daemon.cfg.github.close_on_complete = true;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/acme/app/issues/1"))
+            .and(body_partial_json(serde_json::json!({"state": "closed"})))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        daemon.update_issue(&task, LinearTarget::Done, Some("Done again".into())).await;
+        assert_eq!(daemon.store.count_events_of_kind("github.closed", Utc::now() - Duration::minutes(1)).unwrap(), 1);
+        daemon.offline = true;
+        daemon.update_issue(&task, LinearTarget::Done, Some("offline".into())).await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
 
     #[tokio::test]
     async fn only_fresh_assistant_output_recovers_attention_after_replay() {
