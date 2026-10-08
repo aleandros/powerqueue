@@ -591,8 +591,13 @@ fn plist_strings(text: &str) -> Vec<String> {
 pub fn required_tools(cfg: &Config) -> Vec<String> {
     let mut tools = vec!["git".to_string(), cfg.tmux.binary.clone()];
     for p in cfg.budget.enabled_providers_in_order() {
-        // A command template (`docker exec … claude`) needs its program, not the whole line.
-        tools.push(crate::session::program_of(&cfg.launch_settings(p).binary));
+        // A command template (`docker exec … claude`) needs its program, not
+        // the whole line; a program that only exists once the placeholders
+        // are filled (`{repo}/tools/run.sh …`) cannot be checked here.
+        let binary = cfg.launch_settings(p).binary;
+        if !crate::session::program_is_per_task(&binary) {
+            tools.push(crate::session::program_of(&binary));
+        }
     }
     if cfg.scheduler.pr_poll_secs > 0 {
         tools.push(cfg.scheduler.gh_binary.clone());

@@ -335,8 +335,17 @@ fn per_task_binary(binary: &str) -> Option<String> {
 fn check_claude(cfg: &Config) -> Vec<CheckResult> {
     let binary = &cfg.claude.binary;
     let program = crate::session::program_of(binary);
-    let found = crate::session::which_program(binary);
     let mut out = Vec::new();
+    if crate::session::program_is_per_task(binary) {
+        out.push(CheckResult::ok(ENV, "claude", format!("per-task command `{binary}`; its program is resolved at launch")));
+        out.push(CheckResult::skipped(
+            ENV,
+            "claude auth",
+            "claude.binary is a per-task command; check the login where it runs (e.g. inside the container)",
+        ));
+        return out;
+    }
+    let found = crate::session::which_program(binary);
     match found {
         None => {
             out.push(CheckResult::fail(
@@ -692,61 +701,82 @@ fn check_providers(cfg: &Config) -> Vec<CheckResult> {
         let name = p.as_str();
         let auth_name = format!("{p} auth");
         let program = crate::session::program_of(&settings.binary);
-        match crate::session::which_program(&settings.binary) {
-            None => {
+        if crate::session::program_is_per_task(&settings.binary) {
+            out.push(CheckResult::ok(
+                ENV,
+                name,
+                format!("per-task command `{}`; its program is resolved at launch", settings.binary),
+            ));
+            out.push(CheckResult::skipped(
+                ENV,
+                &auth_name,
+                format!("{p}.binary is a per-task command; check the login where it runs (e.g. inside the container)"),
+            ));
+            if !agent.allowed_modes().contains(&settings.mode.as_str()) {
                 out.push(CheckResult::fail(
-                    ENV,
+                    CONF,
                     name,
-                    format!("budget.providers.{p}.enabled is true but `{program}` is not on PATH"),
-                    format!("{}, or set budget.providers.{p}.enabled = false", install_hint(p)),
+                    format!("{name} mode `{}` is not one of {}", settings.mode, agent.allowed_modes().join("|")),
+                    "fix it in config.toml",
                 ));
-                out.push(CheckResult::skipped(ENV, &auth_name, format!("{name} binary missing")));
             }
-            Some(path) if per_task_binary(&settings.binary).is_some() => {
-                out.push(CheckResult::ok(
-                    ENV,
-                    name,
-                    format!("per-task command `{}` (`{program}` at {})", settings.binary, path.display()),
-                ));
-                out.push(CheckResult::skipped(
-                    ENV,
-                    &auth_name,
-                    format!("{p}.binary is a per-task command; check the login where it runs (e.g. inside the container)"),
-                ));
-                if !agent.allowed_modes().contains(&settings.mode.as_str()) {
+        } else {
+            match crate::session::which_program(&settings.binary) {
+                None => {
                     out.push(CheckResult::fail(
-                        CONF,
+                        ENV,
                         name,
-                        format!("{name} mode `{}` is not one of {}", settings.mode, agent.allowed_modes().join("|")),
-                        "fix it in config.toml",
+                        format!("budget.providers.{p}.enabled is true but `{program}` is not on PATH"),
+                        format!("{}, or set budget.providers.{p}.enabled = false", install_hint(p)),
                     ));
+                    out.push(CheckResult::skipped(ENV, &auth_name, format!("{name} binary missing")));
                 }
-            }
-            Some(path) => {
-                match version_of(&settings.binary, "--version") {
-                    Ok(v) => out.push(CheckResult::ok(ENV, name, format!("{v} ({})", path.display()))),
-                    Err(e) => out.push(CheckResult::warn(ENV, name, format!("{e:#}"), install_hint(p))),
-                }
-                match agent.auth_status(&settings.binary) {
-                    Ok(a) if a.logged_in => out.push(CheckResult::ok(ENV, &auth_name, a.detail)),
-                    Ok(a) => out.push(CheckResult::fail(
+                Some(path) if per_task_binary(&settings.binary).is_some() => {
+                    out.push(CheckResult::ok(
+                        ENV,
+                        name,
+                        format!("per-task command `{}` (`{program}` at {})", settings.binary, path.display()),
+                    ));
+                    out.push(CheckResult::skipped(
                         ENV,
                         &auth_name,
-                        format!(
-                            "`{}` is not logged in ({}); its sessions would stop at the login prompt",
-                            settings.binary, a.detail
-                        ),
-                        login_hint(p, &settings.binary),
-                    )),
-                    Err(e) => out.push(CheckResult::fail(ENV, &auth_name, format!("{e:#}"), login_hint(p, &settings.binary))),
-                }
-                if !agent.allowed_modes().contains(&settings.mode.as_str()) {
-                    out.push(CheckResult::fail(
-                        CONF,
-                        name,
-                        format!("{name} mode `{}` is not one of {}", settings.mode, agent.allowed_modes().join("|")),
-                        "fix it in config.toml",
+                        format!("{p}.binary is a per-task command; check the login where it runs (e.g. inside the container)"),
                     ));
+                    if !agent.allowed_modes().contains(&settings.mode.as_str()) {
+                        out.push(CheckResult::fail(
+                            CONF,
+                            name,
+                            format!("{name} mode `{}` is not one of {}", settings.mode, agent.allowed_modes().join("|")),
+                            "fix it in config.toml",
+                        ));
+                    }
+                }
+                Some(path) => {
+                    match version_of(&settings.binary, "--version") {
+                        Ok(v) => out.push(CheckResult::ok(ENV, name, format!("{v} ({})", path.display()))),
+                        Err(e) => out.push(CheckResult::warn(ENV, name, format!("{e:#}"), install_hint(p))),
+                    }
+                    match agent.auth_status(&settings.binary) {
+                        Ok(a) if a.logged_in => out.push(CheckResult::ok(ENV, &auth_name, a.detail)),
+                        Ok(a) => out.push(CheckResult::fail(
+                            ENV,
+                            &auth_name,
+                            format!(
+                                "`{}` is not logged in ({}); its sessions would stop at the login prompt",
+                                settings.binary, a.detail
+                            ),
+                            login_hint(p, &settings.binary),
+                        )),
+                        Err(e) => out.push(CheckResult::fail(ENV, &auth_name, format!("{e:#}"), login_hint(p, &settings.binary))),
+                    }
+                    if !agent.allowed_modes().contains(&settings.mode.as_str()) {
+                        out.push(CheckResult::fail(
+                            CONF,
+                            name,
+                            format!("{name} mode `{}` is not one of {}", settings.mode, agent.allowed_modes().join("|")),
+                            "fix it in config.toml",
+                        ));
+                    }
                 }
             }
         }

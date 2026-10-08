@@ -177,9 +177,20 @@ pub fn host_command(binary: &str) -> Result<std::process::Command> {
     Ok(cmd)
 }
 
+/// True when the program word itself carries a placeholder
+/// (`{repo}/tools/agent-container.sh exec …`): it only resolves at launch,
+/// so there is nothing to look up on PATH.
+pub fn program_is_per_task(binary: &str) -> bool {
+    PLACEHOLDER.is_match(&program_of(binary))
+}
+
 /// Where the program of `binary` resolves: on PATH for a bare name, as a
-/// file for a path.
+/// file for a path. `None` when it is missing, or when the program word is
+/// per-task (see [`program_is_per_task`]) and so cannot be looked up here.
 pub fn which_program(binary: &str) -> Option<std::path::PathBuf> {
+    if program_is_per_task(binary) {
+        return None;
+    }
     let program = program_of(binary);
     if Path::new(&program).components().count() > 1 {
         let p = Path::new(&program);
@@ -255,5 +266,9 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
         assert!(which_program("sh -c x").is_some());
         assert!(which_program("/definitely/not/here/sh").is_none());
+        // A program that only exists once the placeholders are filled cannot be looked up.
+        assert!(program_is_per_task("{repo}/tools/agent-container.sh exec {slug} claude"));
+        assert!(!program_is_per_task("docker exec pq-{slug} claude"));
+        assert!(which_program("{repo}/tools/agent-container.sh exec {slug} claude").is_none());
     }
 }

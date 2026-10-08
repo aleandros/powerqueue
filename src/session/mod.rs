@@ -17,7 +17,7 @@ pub mod transcript;
 pub mod trust;
 
 pub use agent::{AgentCli, AgentLaunch, AuthStatus, ClaudeCli, CodexCli, GeminiCli, LaunchContext, agent_for};
-pub use binary::{BINARY_PLACEHOLDERS, BinaryTemplate, BinaryVars, host_command, program_of, which_program};
+pub use binary::{BINARY_PLACEHOLDERS, BinaryTemplate, BinaryVars, host_command, program_is_per_task, program_of, which_program};
 pub use hooks::{HookOutcome, interpret_hook};
 pub use launcher::{
     LaunchPlan, Launcher, PROMPT_PLACEHOLDERS, PromptContext, RenderedPrompt, build_prompt, hook_settings, prompt_variables,
