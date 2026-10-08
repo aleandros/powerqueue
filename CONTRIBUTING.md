@@ -122,8 +122,8 @@ POWERQUEUE_E2E_DOCKER=1 cargo test --test e2e_daemon container_
 Before you open one, go through the checklist from AGENTS.md:
 
 - [ ] `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test` pass
-- [ ] new config keys are documented in README.md and have defaults
-- [ ] new CLI flags are documented in README.md (and `src/cli/mod.rs` stays in sync)
+- [ ] new config keys are documented in `docs/configuration.md` and have defaults
+- [ ] new CLI flags are documented in `docs/commands.md` (and `src/cli/mod.rs` stays in sync)
 - [ ] events are logged for new state transitions
 - [ ] `doctor` knows about any new failure mode you introduced
 - [ ] `CHANGELOG.md` has an entry under `Unreleased`

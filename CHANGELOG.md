@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Shorten the README to an overview and quick start with a Mermaid workflow;
+  move detailed guides and references into `docs/`. The tuning assistant now
+  embeds the dedicated configuration reference.
+
 ## [0.10.0] - 2026-10-08
 
 Sessions can run inside containers (or anywhere the daemon's `powerqueue`

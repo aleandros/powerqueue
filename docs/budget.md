@@ -18,7 +18,8 @@ real probes per provider), `estimator.rs` (what a task will cost) and
 in `[budget]` of `config.toml`, everything about one subscription in
 `[budget.providers.<provider>]`. Most of this page uses the Claude provider
 as the example; Codex and Gemini have the same shape with their own defaults
-(see [Providers](#providers) and the README) and are experimental.
+(see [Providers](#providers) and the [configuration reference](configuration.md#providers)).
+Antigravity support is experimental.
 
 ```toml
 [budget]
@@ -76,6 +77,13 @@ powerqueue budget set-reset "in 3d4h"                # or relative to now
 ```
 
 ## Weighted tokens
+
+Task tables show cumulative **WEIGHTED TOKENS** (`WTOK` in the dashboard)
+across all attempts. These totals exclude the model multiplier used by the
+budget ledger. `task show` also displays raw input, output, cache-write and
+cache-read totals. These are cumulative usage, not the tokens currently in
+the context window or a subscription percentage; repeated calls can reuse
+and count cached context many times.
 
 Subscription limits do not count raw tokens. powerqueue approximates them with
 `TokenUsage::weighted` (`src/domain.rs`):

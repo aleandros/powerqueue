@@ -66,7 +66,8 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/powerqueue" dist/
           cp README.md LICENSE CHANGELOG.md dist/
-          tar -C dist -czf "${name}.tar.gz" powerqueue README.md LICENSE CHANGELOG.md
+          cp -R docs dist/
+          tar -C dist -czf "${name}.tar.gz" powerqueue README.md LICENSE CHANGELOG.md docs
           shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
 
       - uses: actions/upload-artifact@v4
