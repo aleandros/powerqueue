@@ -1207,12 +1207,6 @@ pub struct SchedulingPause {
 }
 
 impl SchedulingPause {
-    /// Read the pause, if scheduling is paused. Fails only when the
-    /// database cannot be read.
-    pub fn load(store: &crate::store::Store) -> anyhow::Result<Option<SchedulingPause>> {
-        store.kv_get(SCHEDULING_PAUSE_KEY)
-    }
-
     /// One line for status headers: `paused since 2026-10-06 21:40 UTC (reason)`.
     pub fn describe(&self) -> String {
         match &self.reason {

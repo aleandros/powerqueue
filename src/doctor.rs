@@ -1232,7 +1232,7 @@ fn check_service(cfg: &Config) -> CheckResult {
 
 /// `powerqueue pause` in effect: nothing launches until `resume`.
 fn check_scheduling_pause(store: &Store) -> CheckResult {
-    match crate::domain::SchedulingPause::load(store) {
+    match store.scheduling_pause() {
         Ok(Some(p)) => CheckResult::warn(
             STATE,
             "scheduling",

@@ -32,7 +32,8 @@ use crate::config::Config;
 use crate::domain::{EventLevel, Provider};
 use crate::store::Store;
 
-use super::probe::{ObservedUsage, load_observed, save_observed};
+use super::io::{load_observed, save_observed};
+use super::probe::ObservedUsage;
 
 /// Longest a single probe may take, including process start-up.
 pub const PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(15);

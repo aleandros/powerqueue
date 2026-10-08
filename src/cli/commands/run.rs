@@ -92,7 +92,7 @@ pub fn pause(ctx: &mut Context, args: PauseArgs) -> Result<i32> {
     let store = ctx.store()?;
     let now = chrono::Utc::now();
     let reason = args.reason.filter(|r| !r.trim().is_empty());
-    let already = SchedulingPause::load(store)?;
+    let already = store.scheduling_pause()?;
     let was_paused = already.is_some();
     let alive = store.daemon_alive(chrono::Duration::seconds(3 * tick_secs))?;
     // The kv row is the switch the daemon reads every tick, so write it
@@ -133,7 +133,7 @@ pub fn pause(ctx: &mut Context, args: PauseArgs) -> Result<i32> {
 pub fn resume(ctx: &mut Context) -> Result<i32> {
     let tick_secs = ctx.config_or_default()?.scheduler.tick_secs.max(1) as i64;
     let store = ctx.store()?;
-    let was = SchedulingPause::load(store)?;
+    let was = store.scheduling_pause()?;
     let alive = store.daemon_alive(chrono::Duration::seconds(3 * tick_secs))?;
     if was.is_some() {
         store.kv_delete(SCHEDULING_PAUSE_KEY).context("clear the pause")?;

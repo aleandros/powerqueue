@@ -181,7 +181,7 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
     let rows = load_rows(&store, args.all)?;
     let daemon = daemon_status(&store, now)?;
     let counts = store.counts()?;
-    let pause = crate::domain::SchedulingPause::load(&store)?;
+    let pause = store.scheduling_pause()?;
 
     if ctx.json {
         let out = serde_json::json!({

@@ -685,7 +685,7 @@ impl Daemon {
                 // The CLI writes the kv row itself (so the pause holds at
                 // once); the command is the daemon's cue to log it. A
                 // command without the row (an older CLI) writes it here.
-                if SchedulingPause::load(&self.store)?.is_none() {
+                if self.store.scheduling_pause()?.is_none() {
                     let pause = SchedulingPause { since: now, reason: reason.clone() };
                     self.store.kv_set(SCHEDULING_PAUSE_KEY, &pause)?;
                 }
@@ -2886,7 +2886,7 @@ impl Daemon {
     // --------------------------------------------------------------- launch
 
     async fn launch_tasks(&mut self, now: DateTime<Utc>) -> Result<()> {
-        if let Some(pause) = SchedulingPause::load(&self.store)? {
+        if let Some(pause) = self.store.scheduling_pause()? {
             tracing::debug!(since = %pause.since, "scheduling paused; launching nothing");
             return Ok(());
         }
@@ -3792,12 +3792,12 @@ mod tests {
         store.insert_task(&task).unwrap();
 
         daemon.apply_command(&DaemonCommand::PauseScheduling { reason: Some("budget review".into()) }, now).await.unwrap();
-        let pause = SchedulingPause::load(&store).unwrap().expect("pause recorded");
+        let pause = store.scheduling_pause().unwrap().expect("pause recorded");
         assert_eq!(pause.reason.as_deref(), Some("budget review"));
         assert_eq!(store.count_events_of_kind("daemon.paused", now - Duration::minutes(1)).unwrap(), 1);
         // A second pause command keeps the original instant (the CLI only sends one per transition).
         daemon.apply_command(&DaemonCommand::PauseScheduling { reason: None }, now + Duration::minutes(5)).await.unwrap();
-        assert_eq!(SchedulingPause::load(&store).unwrap().unwrap().since, pause.since);
+        assert_eq!(store.scheduling_pause().unwrap().unwrap().since, pause.since);
         // A pause the CLI wrote directly (kv row, no command yet) holds too.
         store.kv_delete(SCHEDULING_PAUSE_KEY).unwrap();
         store.kv_set(SCHEDULING_PAUSE_KEY, &SchedulingPause { since: now, reason: None }).unwrap();
@@ -3810,10 +3810,10 @@ mod tests {
         }
 
         daemon.apply_command(&DaemonCommand::ResumeScheduling, now).await.unwrap();
-        assert!(SchedulingPause::load(&store).unwrap().is_none());
+        assert!(store.scheduling_pause().unwrap().is_none());
         assert_eq!(store.count_events_of_kind("daemon.resumed", now - Duration::minutes(1)).unwrap(), 1);
         daemon.apply_command(&DaemonCommand::ResumeScheduling, now).await.unwrap();
-        assert!(SchedulingPause::load(&store).unwrap().is_none(), "resume is idempotent on the switch");
+        assert!(store.scheduling_pause().unwrap().is_none(), "resume is idempotent on the switch");
         daemon.launch_tasks(now).await.unwrap();
         let t = store.get_task_by_key("PAUSE-1").unwrap().unwrap();
         assert_ne!(t.state, TaskState::Queued, "resumed: the task was considered (started or failed to start): {:?}", t.state);

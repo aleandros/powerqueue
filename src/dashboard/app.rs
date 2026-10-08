@@ -100,7 +100,7 @@ impl Snapshot {
         let max_age = Duration::seconds(3 * cfg.scheduler.tick_secs.max(1) as i64);
         let daemon_alive = store.daemon_alive(max_age)?;
         let daemon_pid = store.daemon_heartbeat()?.map(|(pid, _)| pid);
-        let scheduling_pause = crate::domain::SchedulingPause::load(store)?;
+        let scheduling_pause = store.scheduling_pause()?;
         Ok(Snapshot {
             taken_at: Some(now),
             daemon_alive,
