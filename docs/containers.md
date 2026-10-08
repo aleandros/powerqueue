@@ -162,7 +162,9 @@ task when any provider has `shim = true`:
   `doctor` reports how many are parked;
 - when the session probe finds a pane dead, it drains that task's inbox
   first, so a `task complete` the session wrote right before exiting is
-  applied instead of the exit being read as a crash;
+  applied instead of the exit being read as a crash; the session is then
+  left to `finalize_terminal`, which releases it with cleanup and the
+  source-issue update exactly as a Stop hook would have;
 - a message from a session that already ended (its `session` id, or the
   task's latest session when the shim had none) is ignored and logged as
   `inbox.stale`: a Stop that arrived after `task complete` and was only

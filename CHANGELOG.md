@@ -49,6 +49,15 @@ binary cannot run); see docs/containers.md.
   with `POWERQUEUE_E2E_DOCKER=1`, of Claude and Codex sessions through
   `docker exec`.
 
+### Fixed
+
+- A task completed by `powerqueue task complete` whose session exited
+  between the hook and probe phases of one tick was released without
+  cleanup (no push, no `cleanup.run`, no source-issue update): the probe
+  marked the session exited and `finalize_terminal` never saw it. The
+  session is now left live for `finalize_terminal` (event
+  `session.pane_gone`).
+
 ## [0.9.0] - 2026-10-08
 
 ### Added
