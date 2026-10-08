@@ -45,6 +45,14 @@ fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
     let instruction = read_instruction(args.instruction.as_deref())?;
     let cfg = ctx.config()?.clone();
     let paths = ctx.paths.clone();
+    if args.scope.includes_priority() && cfg.overrides.sets("priority.file") {
+        bail!(
+            "the rules file is set by the repository ({} in {}); edit it in the repository (or run with `--scope config`) \
+             instead of letting tune write into the checkout",
+            cfg.priority_file(&paths).display(),
+            cfg.overrides.file.as_deref().map(|f| f.display().to_string()).unwrap_or_else(|| REPO_CONFIG_FILE.to_string())
+        );
+    }
 
     let model = match &args.model {
         Some(m) => m.clone(),
@@ -71,14 +79,6 @@ fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
     let timeout = Duration::from_secs(args.timeout.unwrap_or(cfg.tune.timeout_secs).max(1));
 
     // Live files.
-    if args.scope.includes_priority() && cfg.overrides.sets("priority.file") {
-        bail!(
-            "the rules file is set by the repository ({} in {}); edit it in the repository (or run with `--scope config`) \
-             instead of letting tune write into the checkout",
-            cfg.priority_file(&paths).display(),
-            cfg.overrides.file.as_deref().map(|f| f.display().to_string()).unwrap_or_else(|| REPO_CONFIG_FILE.to_string())
-        );
-    }
     let live_priority = cfg.priority_file(&paths);
     let live_config = paths.config_file();
     let priority_text = match std::fs::read_to_string(&live_priority) {
