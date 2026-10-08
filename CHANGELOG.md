@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-08
+
 Sessions can run inside containers (or anywhere the daemon's `powerqueue`
 binary cannot run); see docs/containers.md.
 
@@ -676,6 +678,7 @@ it: older versions reject them and fail to load the whole file.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
 [Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.9.0...HEAD
+[0.10.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.10.0
 [0.9.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.9.0
 [0.8.1]: https://github.com/aleandros/powerqueue/releases/tag/v0.8.1
 [0.8.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.8.0
