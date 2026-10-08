@@ -169,6 +169,54 @@ impl Repo {
         self.git_succeeds(None, &["show-ref", "--verify", "--quiet", &r])
     }
 
+    /// The checked-out branch of the main checkout, or `None` for a detached
+    /// HEAD. Fails when git cannot run.
+    pub fn current_branch(&self) -> Result<Option<String>> {
+        let name = self.git(None, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim().to_string();
+        Ok((!name.is_empty() && name != "HEAD").then_some(name))
+    }
+
+    /// Contents of `path` (relative to the repository root) as committed on
+    /// `rev` (`git show <rev>:<path>`), or `None` when the commit has no such
+    /// file. Fails when `rev` does not resolve or git cannot run; the working
+    /// tree is never consulted.
+    pub fn show_file(&self, rev: &str, path: &str) -> Result<Option<String>> {
+        if self.try_rev_sha(rev)?.is_none() {
+            bail!("`{rev}` does not resolve to a commit in {}", self.path.display());
+        }
+        let spec = format!("{rev}:{path}");
+        let out = self.git_output(None, &["show", &spec])?;
+        if out.status.success() {
+            return Ok(Some(String::from_utf8_lossy(&out.stdout).to_string()));
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("does not exist in") || stderr.contains("exists on disk, but not in") {
+            return Ok(None);
+        }
+        bail!("`{}` failed ({}) in {}: {}", self.describe(&["show", &spec]), out.status, self.path.display(), stderr.trim());
+    }
+
+    /// Blob ids of `paths` (relative to the repository root) on `rev`, keyed
+    /// by path; a path the commit lacks is simply absent. One `git ls-tree`
+    /// call, so the result is a cheap fingerprint of "did any of these files
+    /// change on that branch". Fails when `rev` does not resolve.
+    pub fn blob_ids(&self, rev: &str, paths: &[&str]) -> Result<std::collections::BTreeMap<String, String>> {
+        if self.try_rev_sha(rev)?.is_none() {
+            bail!("`{rev}` does not resolve to a commit in {}", self.path.display());
+        }
+        let mut args = vec!["ls-tree", rev, "--"];
+        args.extend(paths);
+        let out = self.git(None, &args)?;
+        Ok(out
+            .lines()
+            .filter_map(|line| {
+                let (meta, path) = line.split_once('\t')?;
+                let sha = meta.split_whitespace().nth(2)?;
+                Some((path.to_string(), sha.to_string()))
+            })
+            .collect())
+    }
+
     /// Full SHA of the commit `rev` names, or `None` when it does not resolve.
     pub fn try_rev_sha(&self, rev: &str) -> Result<Option<String>> {
         let spec = format!("{rev}^{{commit}}");

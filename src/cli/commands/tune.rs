@@ -71,6 +71,14 @@ fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
     let timeout = Duration::from_secs(args.timeout.unwrap_or(cfg.tune.timeout_secs).max(1));
 
     // Live files.
+    if args.scope.includes_priority() && cfg.overrides.sets("priority.file") {
+        bail!(
+            "the rules file is set by the repository ({} in {}); edit it in the repository (or run with `--scope config`) \
+             instead of letting tune write into the checkout",
+            cfg.priority_file(&paths).display(),
+            cfg.overrides.file.as_deref().map(|f| f.display().to_string()).unwrap_or_else(|| REPO_CONFIG_FILE.to_string())
+        );
+    }
     let live_priority = cfg.priority_file(&paths);
     let live_config = paths.config_file();
     let priority_text = match std::fs::read_to_string(&live_priority) {
@@ -97,10 +105,7 @@ fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
     let tasks = ctx.store()?.list_open_tasks()?;
     let ledgers = Ledgers::load(ctx.store()?, &cfg.budget, chrono::Utc::now())?;
     let context_md = context_markdown(&cfg, &live_priority, priority_text.is_some(), &live_sim, &sim_args, &tasks, &ledgers);
-    let repo_overrides = {
-        let file = cfg.repo_path().join(REPO_CONFIG_FILE);
-        std::fs::read_to_string(&file).ok()
-    };
+    let repo_overrides = cfg.read_repo_overrides(&cfg.repo_path()).ok().flatten().map(|l| l.text);
 
     // Draft directory + prompt.
     let id = new_draft_id(chrono::Utc::now());

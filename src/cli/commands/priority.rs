@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use crate::budget::{Estimator, Ledgers, Policy, RATE_LIMITS_KEY, RateLimitState, tier_weight};
 use crate::cli::output::{criticality_colored, model_colored, model_list_colored, table, truncate};
 use crate::cli::{CheckArgs, Context, PriorityCommand, SimulateArgs, TaskRef};
-use crate::config::Config;
+use crate::config::{Config, RulesSource};
 use crate::domain::{Criticality, ModelTier, Task, TaskState};
 use crate::priority::{Evaluation, PriorityRules, RuleError, fmt_conditions};
 use crate::scheduler::pick_next;
@@ -34,10 +34,17 @@ pub fn run(ctx: &mut Context, cmd: PriorityCommand) -> Result<i32> {
     }
 }
 
-/// Resolved location of `PRIORITY.md` (config or default).
+/// Resolved location of `PRIORITY.md` (config, the repo's `priority_file`,
+/// or the default), as a path in the checkout.
 fn rules_path(ctx: &mut Context) -> Result<PathBuf> {
+    Ok(live_source(ctx)?.path())
+}
+
+/// Where the live rules come from: the file, or the committed copy when the
+/// repository's `.powerqueue.toml` is read from the default branch.
+fn live_source(ctx: &mut Context) -> Result<RulesSource> {
     let paths = ctx.paths.clone();
-    Ok(ctx.config_or_default()?.priority_file(&paths))
+    Ok(ctx.config_or_default()?.rules_source(&paths))
 }
 
 fn missing_message(path: &Path) -> String {
@@ -47,30 +54,46 @@ fn missing_message(path: &Path) -> String {
     )
 }
 
-/// Parse the file, printing problems. `Ok(None)` when it does not exist or has errors.
-fn parse_file(ctx: &mut Context, path: &Path) -> Result<Option<PriorityRules>> {
-    if !path.exists() {
+/// Outcome of reading and parsing a rules source.
+enum Parsed {
+    Missing,
+    Invalid,
+    Rules(Box<PriorityRules>),
+}
+
+/// Read and parse `source`, printing problems (and the missing-file hint).
+fn parse_source(ctx: &mut Context, source: &RulesSource) -> Result<Parsed> {
+    let path = source.path();
+    let Some(text) = source.read()? else {
         if ctx.json {
-            println!("{}", serde_json::json!({ "ok": false, "path": path, "error": "missing", "hint": "run `powerqueue init`" }));
+            println!(
+                "{}",
+                serde_json::json!({ "ok": false, "path": path, "rev": source.rev(), "error": "missing", "hint": "run `powerqueue init`" })
+            );
         } else {
             println!(
                 "{} {}",
                 "missing:".if_supports_color(Stream::Stdout, |t| t.style(owo_colors::Style::new().yellow().bold())),
-                missing_message(path)
+                match source.rev() {
+                    Some(rev) => format!(
+                        "{} does not exist on {rev}; commit it there (the daemon reads the rules from that branch)",
+                        path.display()
+                    ),
+                    None => missing_message(&path),
+                }
             );
         }
-        return Ok(None);
-    }
-    let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+        return Ok(Parsed::Missing);
+    };
     match PriorityRules::parse(&text) {
-        Ok(rules) => Ok(Some(rules)),
+        Ok(rules) => Ok(Parsed::Rules(Box::new(rules))),
         Err(errors) => {
             if ctx.json {
-                println!("{}", serde_json::json!({ "ok": false, "path": path, "errors": errors }));
+                println!("{}", serde_json::json!({ "ok": false, "path": path, "rev": source.rev(), "errors": errors }));
             } else {
                 print_problems(&errors, "error");
             }
-            Ok(None)
+            Ok(Parsed::Invalid)
         }
     }
 }
@@ -88,35 +111,46 @@ fn print_problems(problems: &[RuleError], level: &str) {
 }
 
 fn show(ctx: &mut Context) -> Result<i32> {
-    let path = rules_path(ctx)?;
-    let Some(rules) = parse_file(ctx, &path)? else {
-        return Ok(if path.exists() { 1 } else { 0 });
+    let source = live_source(ctx)?;
+    let rules = match parse_source(ctx, &source)? {
+        Parsed::Rules(r) => *r,
+        Parsed::Missing => return Ok(0),
+        Parsed::Invalid => return Ok(1),
     };
     if ctx.json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "ok": true, "path": path, "rules": rules }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({ "ok": true, "path": source.path(), "rev": source.rev(), "rules": rules })
+            )?
+        );
         return Ok(0);
     }
-    println!("{} {}", "Rules from".if_supports_color(Stream::Stdout, |t| t.bold()), path.display());
+    println!("{} {}", "Rules from".if_supports_color(Stream::Stdout, |t| t.bold()), source);
     print!("{}", rules.describe());
     Ok(0)
 }
 
 fn check(ctx: &mut Context, args: &CheckArgs) -> Result<i32> {
-    let path = match &args.file {
-        Some(p) => p.clone(),
-        None => rules_path(ctx)?,
+    let source = match &args.file {
+        Some(p) => {
+            if !p.exists() {
+                bail!("{} does not exist", p.display());
+            }
+            RulesSource::File(p.clone())
+        }
+        None => live_source(ctx)?,
     };
-    if args.file.is_some() && !path.exists() {
-        bail!("{} does not exist", path.display());
-    }
-    let Some(rules) = parse_file(ctx, &path)? else {
+    let Parsed::Rules(rules) = parse_source(ctx, &source)? else {
         return Ok(1);
     };
+    let rules = *rules;
+    let path = source.path();
     if ctx.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "ok": true, "path": path, "rules": rules.rule_count(), "scoring": rules.scoring.len(),
+                "ok": true, "path": path, "rev": source.rev(), "rules": rules.rule_count(), "scoring": rules.scoring.len(),
                 "overrides": rules.overrides.len(), "model_rules": rules.model_rules.len(), "warnings": rules.warnings,
             }))?
         );
@@ -126,7 +160,7 @@ fn check(ctx: &mut Context, args: &CheckArgs) -> Result<i32> {
     println!(
         "{} {}: {} rule(s), {} scoring rule(s), {} override(s), {} model if-row(s), {} warning(s)",
         "ok:".if_supports_color(Stream::Stdout, |t| t.style(owo_colors::Style::new().green().bold())),
-        path.display(),
+        source,
         rules.rule_count(),
         rules.scoring.len(),
         rules.overrides.len(),
@@ -191,7 +225,15 @@ fn print_model_lists(rules: &PriorityRules) {
 }
 
 fn edit(ctx: &mut Context) -> Result<i32> {
-    let path = rules_path(ctx)?;
+    let source = live_source(ctx)?;
+    let path = source.path();
+    if let Some(rev) = source.rev() {
+        println!(
+            "{} the daemon reads {} from {rev}; commit and push your change for it to apply.",
+            "note:".if_supports_color(Stream::Stdout, |t| t.style(owo_colors::Style::new().yellow().bold())),
+            path.display()
+        );
+    }
     if !path.exists() {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -218,20 +260,27 @@ fn edit(ctx: &mut Context) -> Result<i32> {
 }
 
 fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
-    let path = rules_path(ctx)?;
+    let source = live_source(ctx)?;
+    let path = source.path();
     let full_cfg = ctx.config_or_default()?.clone();
     let cfg = full_cfg.priority.clone();
     let store = ctx.store()?.clone();
     let task = store.find_task(&task_ref.task)?.ok_or_else(|| anyhow!("no task matches `{}`", task_ref.task))?;
-    let rules = if path.exists() {
-        PriorityRules::load(&path)?
-    } else {
-        println!(
-            "{} {}",
-            "note:".if_supports_color(Stream::Stdout, |t| t.style(owo_colors::Style::new().yellow().bold())),
-            missing_message(&path)
-        );
-        PriorityRules::default()
+    let rules = match source.read()? {
+        Some(text) => PriorityRules::parse(&text).map_err(|errors| {
+            anyhow!(
+                "{source} has errors:\n  - {}",
+                errors.iter().map(|e| format!("line {}: {}", e.line, e.message)).collect::<Vec<_>>().join("\n  - ")
+            )
+        })?,
+        None => {
+            println!(
+                "{} {}",
+                "note:".if_supports_color(Stream::Stdout, |t| t.style(owo_colors::Style::new().yellow().bold())),
+                missing_message(&path)
+            );
+            PriorityRules::default()
+        }
     };
     let jev_normalized = if rules.jev.enabled && cfg.jev.enabled {
         store.jev_cached(task.id)?.map(|c| {
@@ -246,14 +295,14 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "task": task.key, "id": task.id, "rules": path, "evaluation": eval,
+                "task": task.key, "id": task.id, "rules": path, "rev": source.rev(), "evaluation": eval,
                 "stored": { "criticality": task.criticality, "score": task.score, "reasons": task.score_reasons },
             }))?
         );
         return Ok(0);
     }
     println!("{} {} — {}", "Task".if_supports_color(Stream::Stdout, |t| t.bold()), task.key, task.title);
-    println!("  rules:       {}", path.display());
+    println!("  rules:       {source}");
     println!("  criticality: {}", criticality_colored(eval.criticality));
     println!("  score:       {:.1}", eval.score);
     println!("  model:       {}", with_model_source(model_list_colored(&eval.models), eval.model_source.as_deref()));
@@ -327,10 +376,11 @@ pub struct Simulation {
 /// the budget policy, so the effect of an edit is visible before the daemon
 /// picks it up. Nothing is written.
 fn simulate(ctx: &mut Context, args: SimulateArgs) -> Result<i32> {
-    let path = match &args.file {
-        Some(p) => p.clone(),
-        None => rules_path(ctx)?,
+    let source = match &args.file {
+        Some(p) => RulesSource::File(p.clone()),
+        None => live_source(ctx)?,
     };
+    let path = source.path();
     let cfg = match &args.config {
         Some(file) => {
             let cfg = Config::load_draft(&ctx.paths, file)?;
@@ -343,20 +393,13 @@ fn simulate(ctx: &mut Context, args: SimulateArgs) -> Result<i32> {
         None => ctx.config_or_default()?.clone(),
     };
 
-    let rules = if path.exists() {
-        match parse_file(ctx, &path)? {
-            Some(r) => r,
-            None => return Ok(1),
-        }
-    } else if args.file.is_some() {
+    if args.file.is_some() && !path.exists() {
         bail!("{} does not exist", path.display());
-    } else {
-        println!(
-            "{} {}",
-            "note:".if_supports_color(Stream::Stdout, |t| t.style(owo_colors::Style::new().yellow().bold())),
-            missing_message(&path)
-        );
-        PriorityRules::default()
+    }
+    let rules = match parse_source(ctx, &source)? {
+        Parsed::Rules(r) => *r,
+        Parsed::Invalid => return Ok(1),
+        Parsed::Missing => PriorityRules::default(),
     };
     if !ctx.json {
         print_problems(&rules.warnings, "warning");

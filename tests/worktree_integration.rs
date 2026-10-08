@@ -343,3 +343,26 @@ fn review_round_branch_catches_up_with_commits_pushed_to_the_pr() {
     assert_eq!(rev(&wt, "HEAD"), pushed);
     assert!(wt.join("suggestion.txt").exists(), "the session sees the reviewer's commit");
 }
+
+#[test]
+fn show_file_blob_ids_and_current_branch() {
+    let Some((_dir, repo)) = fixture() else { return };
+    assert_eq!(repo.current_branch().unwrap().as_deref(), Some("main"));
+    assert_eq!(repo.show_file("main", "README.md").unwrap().as_deref(), Some("hello\n"));
+    assert_eq!(repo.show_file("main", "missing.txt").unwrap(), None);
+    std::fs::write(repo.path.join("README.md"), "dirty\n").unwrap();
+    assert_eq!(repo.show_file("main", "README.md").unwrap().as_deref(), Some("hello\n"), "working tree ignored");
+    let err = repo.show_file("nope", "README.md").unwrap_err().to_string();
+    assert!(err.contains("does not resolve"), "{err}");
+
+    let before = repo.blob_ids("main", &["README.md", "missing.txt"]).unwrap();
+    assert_eq!(before.len(), 1);
+    assert!(before.contains_key("README.md"));
+    commit_file(&repo.path, "README.md", "change");
+    let after = repo.blob_ids("main", &["README.md"]).unwrap();
+    assert_ne!(before["README.md"], after["README.md"]);
+    assert!(repo.blob_ids("nope", &["README.md"]).is_err());
+
+    git(&repo.path, &["checkout", "-q", "--detach"]);
+    assert_eq!(repo.current_branch().unwrap(), None);
+}

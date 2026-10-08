@@ -18,7 +18,7 @@ use toml_edit::{DocumentMut, Item, Table};
 
 use crate::cli::commands::status::daemon_status;
 use crate::cli::{ConfigCommand, Context};
-use crate::config::{Config, LEGACY_BUDGET_KEYS, REPO_CONFIG_FILE, RepoOverrides, rewrite_legacy_key, write_private};
+use crate::config::{Config, LEGACY_BUDGET_KEYS, REPO_CONFIG_FILE, rewrite_legacy_key, write_private};
 use crate::domain::DaemonCommand;
 use crate::paths::Paths;
 
@@ -206,26 +206,81 @@ pub fn path_entries(cfg: &Config, paths: &Paths) -> Vec<(&'static str, PathBuf)>
         ("tasks", paths.tasks_dir()),
         ("worktrees", if cfg.repo.path.is_empty() { paths.worktrees_dir() } else { cfg.worktree_root(paths) }),
         ("repo", cfg.repo_path()),
+        ("repo_config", cfg.repo_path().join(REPO_CONFIG_FILE)),
     ]
 }
 
-/// Problems found by `config validate`: config.toml problems plus a parse
-/// error of the repo override file, if any.
-pub fn validation_problems(cfg: &Config, repo_override: Option<&Path>) -> Vec<String> {
-    let mut problems = cfg.validate();
-    if let Some(file) = repo_override
-        && file.exists()
+/// Problems found by `config validate`: the repository's `.powerqueue.toml`
+/// is applied first (from wherever `repo.overrides_from` says), so a bad
+/// value the repo sets (`[scheduler] max_concurrent = 0`) is reported too;
+/// a file that cannot be read or parsed is one problem and the global
+/// config is validated alone. Returns the config that was validated.
+pub fn validation_problems(cfg: &Config) -> (Config, Vec<String>) {
+    let mut merged = cfg.clone();
+    let mut problems = Vec::new();
+    let repo = cfg.repo_path();
+    if !cfg.repo.path.trim().is_empty()
+        && repo.exists()
+        && let Err(e) = merged.apply_repo_overrides(&repo)
     {
-        match std::fs::read_to_string(file) {
-            Ok(text) => {
-                if let Err(e) = toml::from_str::<RepoOverrides>(&text) {
-                    problems.push(format!("{}: {}", file.display(), e.message()));
-                }
-            }
-            Err(e) => problems.push(format!("cannot read {}: {e}", file.display())),
-        }
+        problems.push(format!("{e:#}"));
+        merged = cfg.clone();
     }
-    problems
+    problems.extend(merged.validate());
+    (merged, problems)
+}
+
+/// One line saying what `.powerqueue.toml` contributed, for `config show`
+/// and `config validate`.
+pub fn overrides_summary(cfg: &Config) -> String {
+    match &cfg.overrides.file {
+        Some(file) if cfg.overrides.keys.is_empty() => {
+            format!("repository overrides from {} ({}): no keys set", file.display(), cfg.overrides.origin())
+        }
+        Some(file) => format!(
+            "repository overrides from {} ({}): {}",
+            file.display(),
+            cfg.overrides.origin(),
+            cfg.overrides.keys.join(", ")
+        ),
+        None => format!(
+            "no repository overrides ({} not present in the {})",
+            cfg.repo_path().join(REPO_CONFIG_FILE).display(),
+            match cfg.repo.overrides_from {
+                crate::config::OverridesSource::WorkingTree => "working tree".to_string(),
+                crate::config::OverridesSource::DefaultBranch => "default branch".to_string(),
+            }
+        ),
+    }
+}
+
+/// Mark every `key = value` line of a pretty-printed config that came from
+/// `.powerqueue.toml` with a trailing comment. Table headers (`[linear]`)
+/// set the prefix; only the first line of a multi-line value is marked.
+pub fn annotate_overrides(toml: &str, keys: &[String]) -> String {
+    let mut table = String::new();
+    let mut out = String::with_capacity(toml.len() + keys.len() * 24);
+    for line in toml.lines() {
+        let trimmed = line.trim();
+        if let Some(name) = trimmed.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+            table = name.trim_matches('[').trim_matches(']').to_string();
+            out.push_str(line);
+        } else if let Some((key, _)) = trimmed.split_once('=')
+            && !trimmed.starts_with('#')
+            && key.trim().chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '"')
+        {
+            let key = key.trim().trim_matches('"');
+            let full = if table.is_empty() { key.to_string() } else { format!("{table}.{key}") };
+            out.push_str(line);
+            if keys.iter().any(|k| k == &full) {
+                out.push_str("  # .powerqueue.toml");
+            }
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// The editor command from `$VISUAL`, then `$EDITOR`, falling back to `vi`.
@@ -287,18 +342,28 @@ pub fn run(ctx: &mut Context, cmd: ConfigCommand) -> Result<i32> {
             super::status::ensure_initialised(ctx)?;
             let cfg = ctx.config_cloned()?;
             if ctx.json {
-                println!("{}", serde_json::to_string_pretty(&cfg)?);
+                let mut value = serde_json::to_value(&cfg)?;
+                if let serde_json::Value::Object(map) = &mut value {
+                    map.insert(
+                        "repo_overrides".to_string(),
+                        serde_json::json!({
+                            "file": cfg.overrides.file,
+                            "source": cfg.repo.overrides_from,
+                            "rev": cfg.overrides.rev,
+                            "keys": cfg.overrides.keys,
+                        }),
+                    );
+                }
+                println!("{}", serde_json::to_string_pretty(&value)?);
                 return Ok(0);
             }
-            let override_file = cfg.repo_path().join(REPO_CONFIG_FILE);
             println!("# effective configuration (from {})", ctx.paths.config_file().display());
-            if override_file.exists() {
-                println!("# repository overrides applied from {}", override_file.display());
-            } else {
-                println!("# no repository overrides ({} not present)", override_file.display());
+            println!("# {}", overrides_summary(&cfg));
+            if !cfg.overrides.keys.is_empty() {
+                println!("# keys marked `# .powerqueue.toml` come from the repository");
             }
             println!();
-            print!("{}", cfg.to_toml()?);
+            print!("{}", annotate_overrides(&cfg.to_toml()?, &cfg.overrides.keys));
             Ok(0)
         }
         ConfigCommand::Get { key } => {
@@ -409,7 +474,7 @@ pub fn run(ctx: &mut Context, cmd: ConfigCommand) -> Result<i32> {
             open_in_editor(&file)?;
             match Config::load(&ctx.paths) {
                 Ok(cfg) => {
-                    let problems = validation_problems(&cfg, Some(&cfg.repo_path().join(REPO_CONFIG_FILE)));
+                    let (_, problems) = validation_problems(&cfg);
                     if problems.is_empty() {
                         println!("{} {} is valid", "ok".if_supports_color(Stream::Stdout, |t| t.green()), file.display());
                         Ok(0)
@@ -449,14 +514,28 @@ pub fn run(ctx: &mut Context, cmd: ConfigCommand) -> Result<i32> {
                     (Config::load(&ctx.paths)?, ctx.paths.config_file())
                 }
             };
-            let override_file = cfg.repo_path().join(REPO_CONFIG_FILE);
-            let problems = validation_problems(&cfg, Some(&override_file));
+            let (merged, problems) = validation_problems(&cfg);
             if ctx.json {
-                println!("{}", serde_json::json!({ "ok": problems.is_empty(), "file": shown, "problems": problems }));
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": problems.is_empty(), "file": shown, "problems": problems,
+                        "repo_overrides": {
+                            "file": merged.overrides.file, "source": merged.repo.overrides_from,
+                            "rev": merged.overrides.rev, "keys": merged.overrides.keys,
+                        },
+                    })
+                );
             } else if problems.is_empty() {
                 println!("{} {} is valid", "ok".if_supports_color(Stream::Stdout, |t| t.green()), shown.display());
-                if override_file.exists() {
-                    println!("{} {} is valid", "ok".if_supports_color(Stream::Stdout, |t| t.green()), override_file.display());
+                if let Some(file) = &merged.overrides.file {
+                    println!(
+                        "{} {} ({}) is valid and sets {}",
+                        "ok".if_supports_color(Stream::Stdout, |t| t.green()),
+                        file.display(),
+                        merged.overrides.origin(),
+                        if merged.overrides.keys.is_empty() { "no keys".to_string() } else { merged.overrides.keys.join(", ") }
+                    );
                 }
             } else {
                 print_problems(&problems);
@@ -490,22 +569,52 @@ mod tests {
         let keys: Vec<_> = entries.iter().map(|(k, _)| *k).collect();
         assert_eq!(
             keys,
-            vec!["config", "priority", "secrets_file", "data", "database", "state", "logs", "tasks", "worktrees", "repo"]
+            vec![
+                "config",
+                "priority",
+                "secrets_file",
+                "data",
+                "database",
+                "state",
+                "logs",
+                "tasks",
+                "worktrees",
+                "repo",
+                "repo_config"
+            ]
         );
         assert_eq!(entries[8].1, PathBuf::from("/tmp/pq/data/worktrees/repo"));
     }
 
     #[test]
-    fn validation_includes_override_parse_errors() {
+    fn validation_includes_override_parse_errors_and_merged_values() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(REPO_CONFIG_FILE);
         std::fs::write(&file, "bogus = 1\n").unwrap();
         let mut cfg = Config::default();
         cfg.repo.path = dir.path().display().to_string();
-        let problems = validation_problems(&cfg, Some(&file));
+        let (_, problems) = validation_problems(&cfg);
         assert!(problems.iter().any(|p| p.contains("bogus")), "{problems:?}");
         std::fs::write(&file, "setup = ['make']\n").unwrap();
-        assert!(validation_problems(&cfg, Some(&file)).is_empty());
+        let (merged, problems) = validation_problems(&cfg);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(merged.overrides.keys, vec!["repo.setup".to_string()]);
+        // A bad value set by the repo is a problem of the merged config.
+        std::fs::write(&file, "[scheduler]\nmax_concurrent = 0\n").unwrap();
+        let (_, problems) = validation_problems(&cfg);
+        assert!(problems.iter().any(|p| p.contains("scheduler.max_concurrent")), "{problems:?}");
+    }
+
+    #[test]
+    fn annotate_marks_only_repo_keys() {
+        let toml = "[repo]\npath = \"/r\"\nsetup = [\n    \"make\",\n]\n\n[linear]\nexcluded_labels = [\"x\"]\ncycle = \"any\"\n";
+        let keys = vec!["repo.setup".to_string(), "linear.cycle".to_string()];
+        let out = annotate_overrides(toml, &keys);
+        assert!(out.contains("setup = [  # .powerqueue.toml\n"), "{out}");
+        assert!(out.contains("cycle = \"any\"  # .powerqueue.toml\n"), "{out}");
+        assert!(out.contains("path = \"/r\"\n"), "{out}");
+        assert!(out.contains("excluded_labels = [\"x\"]\n"), "{out}");
+        assert_eq!(annotate_overrides(toml, &[]), toml);
     }
 
     #[test]

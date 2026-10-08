@@ -18,7 +18,7 @@ use tokio::sync::Notify;
 use crate::budget::{
     Decision, Estimator, Ledgers, PeriodClock, Policy, RATE_LIMITS_KEY, RateLimitState, load_observed, probe_all, tier_weight,
 };
-use crate::config::Config;
+use crate::config::{Config, OverridesSource, REPO_CONFIG_FILE, RulesSource};
 use crate::domain::{
     BRANCH_CREATED_EVENT, DaemonCommand, EventLevel, ModelTier, Provider, ReviewWatch, SCHEDULING_PAUSE_KEY, SchedulingPause,
     Session, SessionState, Task, TaskId, TaskSource, TaskState, is_closed_state_type,
@@ -49,6 +49,9 @@ use super::transitions::{self, CRASH_TAIL_LINES, Effect, LinearTarget, ProbeCont
 pub const SKIP_REASON: &str = "skipped by PRIORITY.md";
 /// Longest pause between Linear polls after repeated failures.
 const LINEAR_MAX_BACKOFF: Duration = Duration::minutes(10);
+/// How often `.powerqueue.toml` (and committed rules) are fingerprinted for
+/// an automatic reload.
+const OVERRIDES_CHECK_SECS: i64 = 10;
 /// How long resource samples are kept.
 const RESOURCE_RETENTION: Duration = Duration::days(7);
 /// Ended sessions keep having their transcript tailed for this long.
@@ -115,6 +118,15 @@ struct GitHubRuntime {
     next_allowed: Option<DateTime<Utc>>,
 }
 
+/// See [`Daemon::refresh_overrides`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OverridesFingerprint {
+    /// `.powerqueue.toml`: mtime and size, or `<rev>:<blob>`; `None` = absent.
+    overrides: Option<String>,
+    /// The committed rules blob, when the rules come from the branch.
+    rules: Option<String>,
+}
+
 /// Mutable runtime state that is not part of the public daemon surface.
 struct RuntimeState {
     tmux: Tmux,
@@ -146,6 +158,12 @@ struct RuntimeState {
     jev_error_logged: bool,
     last_resource_sample: Option<DateTime<Utc>>,
     last_prune: Option<DateTime<Utc>>,
+    /// What `.powerqueue.toml` (and committed rules) looked like at the last
+    /// check; a change reloads without a `Reload` command.
+    overrides_fingerprint: Option<OverridesFingerprint>,
+    last_overrides_check: Option<DateTime<Utc>>,
+    /// Last periodic `git fetch` (`repo.fetch_interval_secs`).
+    last_fetch: Option<DateTime<Utc>>,
     /// Usage probes running on a blocking thread (they record their own results).
     usage_probe: Option<tokio::task::JoinHandle<()>>,
     last_usage_probe: Option<DateTime<Utc>>,
@@ -204,6 +222,9 @@ impl Daemon {
             jev_error_logged: false,
             last_resource_sample: None,
             last_prune: None,
+            overrides_fingerprint: None,
+            last_overrides_check: None,
+            last_fetch: None,
             usage_probe: None,
             last_usage_probe: None,
             system: sysinfo::System::new(),
@@ -313,6 +334,8 @@ impl Daemon {
         // Issue sources first, rules second: a ticket created this tick gets its
         // criticality, score and preferred model before `launch_tasks` sees
         // it (otherwise an urgent ticket is first scheduled as `normal`).
+        let r = self.refresh_overrides(now);
+        self.report_phase("config", r);
         let force_sync = self.rt.force_sync;
         let r = self.poll_linear(now).await;
         self.report_phase("linear", r);
@@ -688,9 +711,15 @@ impl Daemon {
     // --------------------------------------------------------------- rules
 
     async fn refresh_rules(&mut self, now: DateTime<Utc>) -> Result<()> {
-        let path = self.cfg.priority_file(&self.paths);
-        if self.rt.watcher.is_none() && !self.rt.watcher_failed && self.cfg.priority.live_reload {
-            match RulesWatcher::new(&path) {
+        let source = self.cfg.rules_source(&self.paths);
+        // Rules on disk are watched; committed rules are polled through git
+        // by `refresh_overrides`, which clears `rules_loaded` on a change.
+        if let RulesSource::File(path) = &source
+            && self.rt.watcher.is_none()
+            && !self.rt.watcher_failed
+            && self.cfg.priority.live_reload
+        {
+            match RulesWatcher::new(path) {
                 Ok(w) => self.rt.watcher = Some(w),
                 Err(e) => {
                     self.rt.watcher_failed = true;
@@ -700,7 +729,7 @@ impl Daemon {
         }
         let changed = !self.rt.rules_loaded || self.rt.watcher.as_mut().is_some_and(|w| w.take_changed());
         if changed {
-            self.load_rules(&path);
+            self.load_rules(&source);
         }
 
         let tasks = self.store.list_open_tasks()?;
@@ -768,11 +797,13 @@ impl Daemon {
         Ok(())
     }
 
-    fn load_rules(&mut self, path: &Path) {
+    fn load_rules(&mut self, source: &RulesSource) {
         self.rt.rules_loaded = true;
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) => {
+        let shown = source.describe();
+        let path = source.path();
+        let text = match source.read() {
+            Ok(Some(t)) => t,
+            Ok(None) => {
                 if !self.rt.rules_missing_logged {
                     self.rt.rules_missing_logged = true;
                     self.log(
@@ -780,14 +811,28 @@ impl Daemon {
                         None,
                         EventLevel::Warn,
                         "rules.missing",
-                        &format!("cannot read {} ({e}); using default rules", path.display()),
-                        serde_json::json!({ "path": path }),
+                        &format!("{shown} does not exist; using default rules"),
+                        serde_json::json!({ "path": path, "rev": source.rev() }),
                     );
                 }
                 self.rt.rules = PriorityRules::default();
                 return;
             }
+            Err(e) => {
+                // Unreadable (permissions, git failure): keep what we have
+                // rather than silently dropping every rule.
+                self.log(
+                    None,
+                    None,
+                    EventLevel::Warn,
+                    "rules.unreadable",
+                    &format!("cannot read {shown} ({e:#}); keeping the previous rules"),
+                    serde_json::json!({ "path": path, "rev": source.rev(), "error": format!("{e:#}") }),
+                );
+                return;
+            }
         };
+        self.rt.rules_missing_logged = false;
         match PriorityRules::parse(&text) {
             Ok(rules) => {
                 let warnings: Vec<String> = rules.warnings.iter().map(|w| w.to_string()).collect();
@@ -796,8 +841,8 @@ impl Daemon {
                     None,
                     EventLevel::Info,
                     "rules.loaded",
-                    &format!("loaded {} ({} warning(s))", path.display(), warnings.len()),
-                    serde_json::json!({ "path": path, "warnings": warnings }),
+                    &format!("loaded {shown} ({} warning(s))", warnings.len()),
+                    serde_json::json!({ "path": path, "rev": source.rev(), "warnings": warnings }),
                 );
                 self.rt.rules = rules;
             }
@@ -808,9 +853,108 @@ impl Daemon {
                     None,
                     EventLevel::Warn,
                     "rules.invalid",
-                    &format!("{} has errors; keeping the previous rules: {}", path.display(), errors.join("; ")),
-                    serde_json::json!({ "path": path, "errors": errors }),
+                    &format!("{shown} has errors; keeping the previous rules: {}", errors.join("; ")),
+                    serde_json::json!({ "path": path, "rev": source.rev(), "errors": errors }),
                 );
+            }
+        }
+    }
+
+    // ----------------------------------------------------------- overrides
+
+    /// Pick up a changed `.powerqueue.toml` without a `Reload` command. Every
+    /// [`OVERRIDES_CHECK_SECS`] the file is fingerprinted (working tree:
+    /// mtime and size; default branch: the blob ids of the file and of the
+    /// committed rules, after a periodic `git fetch` every
+    /// `repo.fetch_interval_secs`). A change reloads the configuration
+    /// (event `daemon.reloaded`), or only the rules when nothing but the
+    /// committed rules changed. A file that no longer loads keeps the
+    /// previous configuration (event `daemon.reload_failed`) until it
+    /// changes again.
+    fn refresh_overrides(&mut self, now: DateTime<Utc>) -> Result<()> {
+        if self.rt.last_overrides_check.is_some_and(|t| now - t < Duration::seconds(OVERRIDES_CHECK_SECS)) {
+            return Ok(());
+        }
+        self.rt.last_overrides_check = Some(now);
+        if !self.cfg.repo_path().exists() {
+            return Ok(());
+        }
+        let from_branch = self.cfg.repo.overrides_from == OverridesSource::DefaultBranch;
+        if from_branch && self.cfg.repo.fetch_interval_secs > 0 && !self.offline {
+            let interval = Duration::seconds(self.cfg.repo.fetch_interval_secs.min(i64::MAX as u64) as i64);
+            if self.rt.last_fetch.is_none_or(|t| now - t >= interval) {
+                self.rt.last_fetch = Some(now);
+                if let Err(e) = self.rt.repo.fetch() {
+                    tracing::warn!(error = %format!("{e:#}"), "periodic fetch failed; repository overrides stay as last read");
+                }
+            }
+        }
+        let current = self.overrides_fingerprint();
+        let Some(previous) = self.rt.overrides_fingerprint.replace(current.clone()) else {
+            return Ok(());
+        };
+        if previous == current {
+            return Ok(());
+        }
+        let file = self.cfg.repo_path().join(REPO_CONFIG_FILE);
+        if previous.overrides == current.overrides {
+            // Only the committed rules moved: no need to rebuild clients.
+            self.rt.rules_loaded = false;
+            return Ok(());
+        }
+        match self.reload_config() {
+            Ok(()) => {
+                let ov = &self.cfg.overrides;
+                let keys = if ov.keys.is_empty() { "no keys".to_string() } else { ov.keys.join(", ") };
+                self.log(
+                    None,
+                    None,
+                    EventLevel::Info,
+                    "daemon.reloaded",
+                    &format!("{} changed ({}); configuration and rules reloaded: {keys}", file.display(), ov.origin()),
+                    serde_json::json!({ "reason": "repo_overrides", "file": file, "rev": ov.rev, "keys": ov.keys }),
+                );
+            }
+            Err(e) => self.log(
+                None,
+                None,
+                EventLevel::Warn,
+                "daemon.reload_failed",
+                &format!("{} changed but cannot be applied; keeping the previous configuration: {e:#}", file.display()),
+                serde_json::json!({ "reason": "repo_overrides", "file": file, "error": format!("{e:#}") }),
+            ),
+        }
+        Ok(())
+    }
+
+    /// What `.powerqueue.toml` and the committed rules currently look like.
+    /// A git failure is part of the fingerprint, so it is reported once (as
+    /// a failed reload) rather than every check.
+    fn overrides_fingerprint(&self) -> OverridesFingerprint {
+        let repo = self.cfg.repo_path();
+        match self.cfg.repo.overrides_from {
+            OverridesSource::WorkingTree => {
+                let overrides =
+                    std::fs::metadata(repo.join(REPO_CONFIG_FILE)).ok().map(|m| format!("{:?}:{}", m.modified().ok(), m.len()));
+                OverridesFingerprint { overrides, rules: None }
+            }
+            OverridesSource::DefaultBranch => {
+                let rules_path = self.cfg.overrides.priority_file_in_repo.clone();
+                let ids = self.cfg.overrides_rev(&self.rt.repo).and_then(|rev| {
+                    let mut paths = vec![REPO_CONFIG_FILE];
+                    if let Some(p) = &rules_path {
+                        paths.push(p);
+                    }
+                    let ids = self.rt.repo.blob_ids(&rev, &paths)?;
+                    Ok((rev, ids))
+                });
+                match ids {
+                    Ok((rev, ids)) => OverridesFingerprint {
+                        overrides: ids.get(REPO_CONFIG_FILE).map(|sha| format!("{rev}:{sha}")),
+                        rules: rules_path.and_then(|p| ids.get(&p).cloned()),
+                    },
+                    Err(e) => OverridesFingerprint { overrides: Some(format!("error: {e:#}")), rules: None },
+                }
             }
         }
     }
@@ -4121,5 +4265,134 @@ mod tests {
         let _ = tmux.kill_session("pq-relay");
         assert_eq!(store.get_task(task.id).unwrap().unwrap().state, TaskState::Running);
         assert_eq!(*mock.state_updates.lock().unwrap(), vec!["state-progress".to_string()]);
+    }
+    fn git_in(cwd: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[tokio::test]
+    async fn committed_overrides_and_rules_reload_without_a_command() {
+        use crate::secrets::FileBackend;
+        if which::which("git").is_err() {
+            eprintln!("git not available; skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("docs")).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "priority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 3\n")
+            .unwrap();
+        std::fs::write(repo.join("docs/PRIORITY.md"), "## High\n- source: manual\n").unwrap();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-qm", "config"]);
+
+        let mut cfg = Config::default();
+        cfg.repo.path = repo.display().to_string();
+        cfg.repo.overrides_from = OverridesSource::DefaultBranch;
+        cfg.repo.fetch_interval_secs = 0;
+        cfg.save(&paths).unwrap();
+        cfg.apply_repo_overrides(&repo).unwrap();
+        assert_eq!(cfg.scheduler.max_concurrent, 3);
+        let store = Store::open_in_memory().unwrap();
+        let secrets = Secrets::with_backend(Box::new(FileBackend::new(paths.secrets_file())));
+        let mut daemon = Daemon::new(cfg, paths, store.clone(), secrets).unwrap();
+        daemon.offline = true;
+        let since = Utc::now() - Duration::minutes(1);
+        let mut now = Utc::now();
+
+        daemon.refresh_overrides(now).unwrap();
+        daemon.refresh_rules(now).await.unwrap();
+        assert!(daemon.rt.rules_loaded);
+        assert_eq!(daemon.rt.rules.rule_count(), 1);
+        assert!(daemon.rt.watcher.is_none(), "committed rules are polled, not watched");
+
+        // Only the rules change on the branch: the rules reload, the config does not.
+        std::fs::write(repo.join("docs/PRIORITY.md"), "## High\n- source: manual\n## Low\n- label: chore\n").unwrap();
+        git_in(&repo, &["commit", "-qam", "rules"]);
+        daemon.refresh_overrides(now).unwrap();
+        assert!(daemon.rt.rules_loaded, "throttled: nothing is checked within OVERRIDES_CHECK_SECS");
+        now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
+        daemon.refresh_overrides(now).unwrap();
+        assert!(!daemon.rt.rules_loaded);
+        daemon.refresh_rules(now).await.unwrap();
+        assert_eq!(daemon.rt.rules.rule_count(), 2);
+        assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 0);
+
+        // The config changes on the branch: full reload with the keys named.
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "priority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 5\n")
+            .unwrap();
+        git_in(&repo, &["commit", "-qam", "concurrency"]);
+        now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
+        daemon.refresh_overrides(now).unwrap();
+        assert_eq!(daemon.cfg.scheduler.max_concurrent, 5);
+        assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 1);
+        let events = store.recent_events(5).unwrap();
+        let reloaded = events.iter().find(|e| e.kind == "daemon.reloaded").unwrap();
+        assert_eq!(reloaded.data["rev"], "main");
+        assert_eq!(reloaded.data["keys"], serde_json::json!(["priority.file", "scheduler.max_concurrent"]));
+
+        // A broken file keeps the previous configuration, reported once.
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "[scheduler]\nmax_concurrent = 0\n").unwrap();
+        git_in(&repo, &["commit", "-qam", "broken"]);
+        now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
+        daemon.refresh_overrides(now).unwrap();
+        now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
+        daemon.refresh_overrides(now).unwrap();
+        assert_eq!(daemon.cfg.scheduler.max_concurrent, 5);
+        assert_eq!(store.count_events_of_kind("daemon.reload_failed", since).unwrap(), 1);
+
+        // The working tree never matters: a checkout of another branch with
+        // other values is invisible.
+        git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "[scheduler]\nmax_concurrent = 9\n").unwrap();
+        git_in(&repo, &["commit", "-qam", "feature"]);
+        now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
+        daemon.refresh_overrides(now).unwrap();
+        assert_eq!(daemon.cfg.scheduler.max_concurrent, 5);
+        assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn working_tree_overrides_reload_when_the_file_changes() {
+        use crate::secrets::FileBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut cfg = Config::default();
+        cfg.repo.path = repo.display().to_string();
+        cfg.priority.live_reload = false;
+        cfg.save(&paths).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let secrets = Secrets::with_backend(Box::new(FileBackend::new(paths.secrets_file())));
+        let mut daemon = Daemon::new(cfg, paths, store.clone(), secrets).unwrap();
+        let since = Utc::now() - Duration::minutes(1);
+        let mut now = Utc::now();
+        daemon.refresh_overrides(now).unwrap();
+        assert_eq!(daemon.cfg.scheduler.max_concurrent, 2);
+
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "[scheduler]\nmax_concurrent = 4\n[linear]\nexcluded_labels = ['x']\n")
+            .unwrap();
+        now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
+        daemon.refresh_overrides(now).unwrap();
+        assert_eq!(daemon.cfg.scheduler.max_concurrent, 4);
+        assert_eq!(daemon.cfg.linear.excluded_labels, vec!["x".to_string()]);
+        assert_eq!(daemon.cfg.overrides.rev, None);
+        assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 1);
+
+        // Removing the file restores the global values.
+        std::fs::remove_file(repo.join(REPO_CONFIG_FILE)).unwrap();
+        now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
+        daemon.refresh_overrides(now).unwrap();
+        assert_eq!(daemon.cfg.scheduler.max_concurrent, 2);
+        assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 2);
     }
 }
