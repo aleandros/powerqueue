@@ -1706,49 +1706,58 @@ impl Daemon {
     /// (logged as `inbox.rejected`, reported by `doctor`); a message that
     /// cannot be applied is logged as `inbox.error` and dropped.
     async fn process_inbox(&mut self, now: DateTime<Utc>) -> Result<()> {
-        use crate::session::inbox;
         if !self.cfg.shim_enabled() {
             return Ok(());
         }
         let tasks = self.store.list_tasks()?;
         for task in tasks.iter().filter(|t| !t.state.is_terminal()) {
-            let inbox_dir = inbox::inbox_dir(&self.paths.task_dir(&task.id.to_string()));
-            if !inbox_dir.is_dir() {
-                continue;
-            }
-            for (path, parsed) in inbox::drain(&inbox_dir)? {
-                let file = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                match parsed {
-                    Ok(msg) => {
-                        let kind = msg.header.kind();
-                        tracing::debug!(task = %task.key, kind, file = %file, "inbox message");
-                        if let Err(e) = self.apply_inbox_message(task, &msg, now) {
-                            tracing::warn!(task = %task.key, kind, error = %format!("{e:#}"), "inbox message could not be applied");
-                            self.log(
-                                Some(task.id),
-                                msg.header.session(),
-                                EventLevel::Error,
-                                "inbox.error",
-                                &format!("{kind} message from the session shim: {e:#}"),
-                                serde_json::json!({ "kind": kind, "file": file }),
-                            );
-                        }
-                        if let Err(e) = std::fs::remove_file(&path) {
-                            tracing::warn!(file = %path.display(), error = %e, "cannot remove a drained inbox message");
-                        }
-                    }
-                    Err(e) => {
-                        let moved = inbox::reject(&path);
-                        tracing::warn!(task = %task.key, file = %file, error = %format!("{e:#}"), "rejected an inbox message");
+            self.drain_task_inbox(task, now)?;
+        }
+        Ok(())
+    }
+
+    /// Drain and apply the inbox of one task (see [`Self::process_inbox`]).
+    /// Also called when a pane is found dead, so a `task complete` the
+    /// session queued right before exiting is applied before the exit is
+    /// read as a crash.
+    fn drain_task_inbox(&self, task: &Task, now: DateTime<Utc>) -> Result<()> {
+        use crate::session::inbox;
+        let inbox_dir = inbox::inbox_dir(&self.paths.task_dir(&task.id.to_string()));
+        if !inbox_dir.is_dir() {
+            return Ok(());
+        }
+        for (path, parsed) in inbox::drain(&inbox_dir)? {
+            let file = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            match parsed {
+                Ok(msg) => {
+                    let kind = msg.header.kind();
+                    tracing::debug!(task = %task.key, kind, file = %file, "inbox message");
+                    if let Err(e) = self.apply_inbox_message(task, &msg, now) {
+                        tracing::warn!(task = %task.key, kind, error = %format!("{e:#}"), "inbox message could not be applied");
                         self.log(
                             Some(task.id),
-                            None,
-                            EventLevel::Warn,
-                            "inbox.rejected",
-                            &format!("unreadable message from the session shim ({file}): {e:#}"),
-                            serde_json::json!({ "file": file, "moved_to": moved.ok().map(|p| p.display().to_string()) }),
+                            msg.header.session(),
+                            EventLevel::Error,
+                            "inbox.error",
+                            &format!("{kind} message from the session shim: {e:#}"),
+                            serde_json::json!({ "kind": kind, "file": file }),
                         );
                     }
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        tracing::warn!(file = %path.display(), error = %e, "cannot remove a drained inbox message");
+                    }
+                }
+                Err(e) => {
+                    let moved = inbox::reject(&path);
+                    tracing::warn!(task = %task.key, file = %file, error = %format!("{e:#}"), "rejected an inbox message");
+                    self.log(
+                        Some(task.id),
+                        None,
+                        EventLevel::Warn,
+                        "inbox.rejected",
+                        &format!("unreadable message from the session shim ({file}): {e:#}"),
+                        serde_json::json!({ "file": file, "moved_to": moved.ok().map(|p| p.display().to_string()) }),
+                    );
                 }
             }
         }
@@ -2327,6 +2336,15 @@ impl Daemon {
                     continue;
                 }
             };
+            // A shim session may have queued `task complete` and exited
+            // between the inbox phase and this probe: apply what it left
+            // before reading the dead pane as a crash.
+            if !probe.is_alive() && self.cfg.shim_enabled() {
+                self.drain_task_inbox(&task, now)?;
+                if let Some(fresh) = self.store.get_task(task.id)? {
+                    task = fresh;
+                }
+            }
             let sc = &self.cfg.scheduler;
             let silent = now - session.last_activity_at;
             let stale = matches!(task.state, TaskState::Running | TaskState::Starting)

@@ -41,6 +41,9 @@ pub const INBOX_RELATIVE: &str = "inbox";
 pub const REJECTED_RELATIVE: &str = "rejected";
 /// Extension of a complete message file.
 const MESSAGE_EXT: &str = "msg";
+/// The per-inbox counter that numbers messages (`<seq>-<epoch>-<pid>-<kind>.msg`),
+/// so draining by file name applies them in the order they were written.
+const SEQ_FILE: &str = ".seq";
 
 /// `<task dir>/bin/powerqueue`.
 pub fn shim_path(task_dir: &Path) -> PathBuf {
@@ -143,16 +146,14 @@ pub fn render_message(header: &InboxHeader, body: &str) -> String {
 }
 
 /// Write `header` + `body` as a new message in `inbox` (created if needed),
-/// atomically. Returns the file written.
+/// atomically, numbered from the inbox's `.seq` counter like the shim does.
+/// Returns the file written.
 pub fn write_message(inbox: &Path, header: &InboxHeader, body: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(inbox).with_context(|| format!("cannot create {}", inbox.display()))?;
-    let name = format!(
-        "{}-{}-{}-{}.{MESSAGE_EXT}",
-        chrono::Utc::now().timestamp(),
-        std::process::id(),
-        uuid::Uuid::new_v4().simple(),
-        header.kind()
-    );
+    let seq_file = inbox.join(SEQ_FILE);
+    let n: u64 = std::fs::read_to_string(&seq_file).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0) + 1;
+    std::fs::write(&seq_file, format!("{n}\n")).with_context(|| format!("cannot write {}", seq_file.display()))?;
+    let name = format!("{n:08}-{}-{}-{}.{MESSAGE_EXT}", chrono::Utc::now().timestamp(), std::process::id(), header.kind());
     let tmp = inbox.join(format!(".{name}.tmp"));
     let path = inbox.join(name);
     std::fs::write(&tmp, render_message(header, body)).with_context(|| format!("cannot write {}", tmp.display()))?;
@@ -161,9 +162,10 @@ pub fn write_message(inbox: &Path, header: &InboxHeader, body: &str) -> Result<P
 }
 
 /// Every complete message in `inbox`, oldest first (by file name: the shim
-/// names files `<epoch>-<pid>-<kind>.msg`), each with the result of parsing
-/// it. Temporary files, dot-files and directories are skipped. A missing
-/// inbox is empty.
+/// names files `<seq>-<epoch>-<pid>-<kind>.msg` with a zero-padded
+/// per-inbox sequence number), each with the result of parsing it.
+/// Temporary files, dot-files (including the `.seq` counter) and
+/// directories are skipped. A missing inbox is empty.
 pub fn drain(inbox: &Path) -> Result<Vec<(PathBuf, Result<InboxMessage>)>> {
     let entries = match std::fs::read_dir(inbox) {
         Ok(e) => e,
@@ -240,17 +242,27 @@ inbox="${{POWERQUEUE_INBOX:-}}"
 [ -n "$inbox" ] || inbox={inbox_q}
 
 die() {{ echo "powerqueue (shim): $*" >&2; exit 2; }}
-# A plain token: letters, digits, _ . : - (ids, keys, event names).
+# A plain token: letters, digits, _ . : - (ids, event names, providers).
 token() {{ case "$2" in ''|*[!A-Za-z0-9_.:-]*) die "invalid $1 \`$2\`" ;; esac; }}
+# A task reference: a token, plus / and # for GitHub keys (owner/repo#7).
+task_ref() {{ case "$2" in ''|*[!A-Za-z0-9_.:/#-]*) die "invalid $1 \`$2\`" ;; esac; }}
 url() {{ case "$2" in ''|*[!A-Za-z0-9_.:/#?=\&%+@~-]*) die "invalid $1 \`$2\`" ;; esac; }}
 session_json() {{
   s="${{POWERQUEUE_SESSION_ID:-}}"
   case "$s" in ''|*[!A-Za-z0-9-]*) echo null ;; *) echo "\"$s\"" ;; esac
 }}
-# emit <header json> <kind>: body on stdin; written to a temp name, then renamed.
+# emit <header json> <kind>: body on stdin; written to a temp name, then
+# renamed. Files are numbered from the inbox's .seq counter so the daemon
+# applies them in the order they were written (a Stop hook after `task
+# complete --pr` must not overtake it). Callers check the status: in a
+# pipeline, `die` only ends this function's subshell.
 emit() {{
   mkdir -p "$inbox" || die "cannot create $inbox"
-  name="$(date +%s)-$$-$2"
+  n=$(cat "$inbox/.seq" 2>/dev/null || echo 0)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  n=$((n + 1))
+  echo "$n" > "$inbox/.seq" || die "cannot write to $inbox"
+  name="$(printf '%08d' "$n")-$(date +%s)-$$-$2"
   tmp="$inbox/.$name.tmp"
   {{ printf '%s\n' "$1"; cat; }} > "$tmp" && mv "$tmp" "$inbox/$name.msg" || die "cannot write to $inbox"
 }}
@@ -273,7 +285,7 @@ case "$cmd" in
           *) payload="$1"; has_payload=1; shift ;;
         esac
       done
-      token provider "$provider"; token task "$task"; token event "$event"
+      token provider "$provider"; task_ref task "$task"; token event "$event"
       if [ -n "$session" ]; then token session "$session"; session_json="\"$session\""; else session_json="$(session_json)"; fi
       header="{{\"kind\":\"hook\",\"provider\":\"$provider\",\"task\":\"$task\",\"session\":$session_json,\"event\":\"$event\"}}"
       if [ "$has_payload" = 1 ]; then printf '%s\n' "$payload" | emit "$header" hook; else emit "$header" hook; fi
@@ -297,9 +309,9 @@ case "$cmd" in
           esac
         done
         [ -n "$id" ] || die "$usage"
-        token task "$id"
+        task_ref task "$id"
         if [ -n "$pr" ]; then url pr "$pr"; pr_json="\"$pr\""; else pr_json=null; fi
-        printf '%s' "$summary" | emit "{{\"kind\":\"complete\",\"task\":\"$id\",\"pr\":$pr_json,\"session\":$(session_json)}}" complete
+        printf '%s' "$summary" | emit "{{\"kind\":\"complete\",\"task\":\"$id\",\"pr\":$pr_json,\"session\":$(session_json)}}" complete || exit 2
         if [ -n "$pr" ]; then
           echo "in review: $id ($pr); the daemon releases its slot and worktree and watches the PR"
         else
@@ -317,8 +329,8 @@ case "$cmd" in
           esac
         done
         [ -n "$id" ] || die "$usage"
-        token task "$id"
-        printf '%s' "$reason" | emit "{{\"kind\":\"block\",\"task\":\"$id\",\"session\":$(session_json)}}" block
+        task_ref task "$id"
+        printf '%s' "$reason" | emit "{{\"kind\":\"block\",\"task\":\"$id\",\"session\":$(session_json)}}" block || exit 2
         echo "blocked: $id needs attention; the daemon has been told"
         ;;
       *) die "only \`task complete\` and \`task block\` are available inside this session" ;;
@@ -461,13 +473,21 @@ mod tests {
         );
         assert_eq!(code, 0, "{err}");
         assert!(out.contains("in review"), "{out}");
-        let (code, out, _) = run(&shim, &["task", "block", "abc-1", "--reason=waiting on creds"], None, &[]);
-        assert_eq!(code, 0);
+        // A GitHub task key (owner/repo#7) is a valid reference.
+        let (code, out, err) = run(&shim, &["task", "block", "acme/widgets#7", "--reason=waiting on creds"], None, &[]);
+        assert_eq!(code, 0, "{err}");
         assert!(out.contains("blocked"), "{out}");
 
         let drained = drain(&inbox).unwrap();
+        // Drained in the order the calls were made: the names carry the
+        // inbox's sequence number, not the (unordered) pid.
+        let names: Vec<String> = drained.iter().map(|(p, _)| p.file_name().unwrap().to_string_lossy().to_string()).collect();
+        assert!(names[0].starts_with("00000001-") && names[3].starts_with("00000004-"), "{names:?}");
+        assert_eq!(std::fs::read_to_string(inbox.join(".seq")).unwrap().trim(), "4");
         let msgs: Vec<InboxMessage> = drained.into_iter().map(|(_, m)| m.unwrap()).collect();
         assert_eq!(msgs.len(), 4, "{msgs:?}");
+        assert_eq!(msgs.iter().map(|m| m.header.kind()).collect::<Vec<_>>(), ["hook", "hook", "complete", "block"]);
+        assert_eq!(msgs[3].header.task(), "acme/widgets#7");
         let hook = msgs.iter().find(|m| matches!(&m.header, InboxHeader::Hook { provider: Provider::Claude, .. })).unwrap();
         assert_eq!(hook.body, r#"{"a":1}"#);
         assert_eq!(hook.header.session().map(|u| u.to_string()), Some(sid.clone()));
@@ -514,5 +534,32 @@ mod tests {
         let (code, _, _) = run(&shim, &["task", "complete", "abc-1"], None, &[("POWERQUEUE_INBOX", &other.to_string_lossy())]);
         assert_eq!(code, 0);
         assert_eq!(drain(&other).unwrap().len(), 1);
+        // An inbox that cannot be written fails `task complete|block` loudly
+        // (exit 2, no success line); a hook still exits 0 and says so.
+        let unwritable = dir.path().join("a-file");
+        std::fs::write(&unwritable, "not a directory").unwrap();
+        let bad = unwritable.join("inbox").to_string_lossy().to_string();
+        let (code, out, err) = run(&shim, &["task", "complete", "abc-1", "--summary", "x"], None, &[("POWERQUEUE_INBOX", &bad)]);
+        assert_eq!(code, 2, "{out}{err}");
+        assert!(!out.contains("done"), "{out}");
+        assert!(err.contains("cannot"), "{err}");
+        let (code, _, err) = run(&shim, &["task", "block", "abc-1"], None, &[("POWERQUEUE_INBOX", &bad)]);
+        assert_eq!(code, 2, "{err}");
+        let (code, _, err) =
+            run(&shim, &["hook", "--task", "abc-1", "--event", "Stop"], Some("{}"), &[("POWERQUEUE_INBOX", &bad)]);
+        assert_eq!(code, 0);
+        assert!(err.contains("not delivered"), "{err}");
+    }
+
+    #[test]
+    fn write_message_numbers_files_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = inbox_dir(dir.path());
+        let a = write_message(&inbox, &InboxHeader::Complete { task: "t".into(), pr: None, session: None }, "first").unwrap();
+        let b = write_message(&inbox, &InboxHeader::Block { task: "t".into(), session: None }, "second").unwrap();
+        assert!(a.file_name().unwrap().to_string_lossy().starts_with("00000001-"), "{}", a.display());
+        assert!(b.file_name().unwrap().to_string_lossy().starts_with("00000002-"), "{}", b.display());
+        let bodies: Vec<String> = drain(&inbox).unwrap().into_iter().map(|(_, m)| m.unwrap().body).collect();
+        assert_eq!(bodies, ["first", "second"]);
     }
 }

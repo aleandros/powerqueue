@@ -42,7 +42,10 @@ case "$cmd" in
     repo="${repo%/.git}"
     mkdir -p "$AGENT_HOME"
     docker rm -f "$name" >/dev/null 2>&1 || true
+    # The worktree is mounted on its own: `repo.worktree_root` may live
+    # outside the data directory.
     docker run -d --name "$name" \
+      -v "$POWERQUEUE_WORKTREE:$POWERQUEUE_WORKTREE" \
       -v "$POWERQUEUE_DATA_DIR:$POWERQUEUE_DATA_DIR" \
       -v "$POWERQUEUE_STATE_DIR:$POWERQUEUE_STATE_DIR" \
       -v "$repo:$repo" \

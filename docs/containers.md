@@ -125,11 +125,14 @@ recreates the worktree and runs `setup` (and so `up`) again.
   a message saying so (exit 2). A hook never fails (a non-zero hook exit
   would stop the agent's turn); when it cannot write, it says so on stderr
   and exits 0.
-- The inbox is `<task dir>/inbox/`: one `<epoch>-<pid>-<kind>.msg` per call,
-  a JSON header line (`{"kind":"complete","task":"…","pr":null,"session":"…"}`)
-  followed by the body (the summary, the reason, or the hook's JSON payload).
-  Files are written under a temporary name and renamed, so the daemon never
-  reads a partial one.
+- The inbox is `<task dir>/inbox/`: one `<seq>-<epoch>-<pid>-<kind>.msg` per
+  call (the sequence number comes from the inbox's `.seq` counter, so the
+  daemon applies messages in the order they were written), a JSON header
+  line (`{"kind":"complete","task":"…","pr":null,"session":"…"}`) followed by
+  the body (the summary, the reason, or the hook's JSON payload). Files are
+  written under a temporary name and renamed, so the daemon never reads a
+  partial one. A `task complete|block` that cannot write the inbox exits 2
+  and says so.
 
 ## What the daemon does
 
@@ -147,7 +150,10 @@ task when any provider has `shim = true`:
 - a message that cannot be applied (unknown task, a task in a state that
   cannot complete) is logged as `inbox.error` and dropped; an unreadable
   file is moved to `inbox/rejected/`, logged as `inbox.rejected`, and
-  `doctor` reports how many are parked.
+  `doctor` reports how many are parked;
+- when the session probe finds a pane dead, it drains that task's inbox
+  first, so a `task complete` the session wrote right before exiting is
+  applied instead of the exit being read as a crash.
 
 Everything else is unchanged: tmux liveness, `--resume` after a crash (the
 relaunch runs the same `docker exec` against the same container, so keep the
