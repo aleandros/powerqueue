@@ -69,7 +69,7 @@ docs/                user docs (priority grammar, budget algorithm, troubleshoot
 - Public functions get a doc comment stating behaviour and failure modes.
 - Tests: unit tests next to the code; integration tests in `tests/` using `POWERQUEUE_HOME` + `POWERQUEUE_SECRETS=file` in a tempdir. Network via `wiremock`. tmux/git tests skip themselves with `which::which(...)` when the tool is not on PATH and use a private tmux socket (`-L powerqueue-test-<pid>-<random>`); see CONTRIBUTING.md.
 - UX: output goes through `cli::output` helpers; colours respect `--no-color`/`NO_COLOR`; `--json` prints machine-readable output for status/task/budget/doctor.
-- Keep the CLI surface in `cli/mod.rs` in sync with README.md.
+- Keep the CLI surface in `cli/mod.rs` in sync with `docs/commands.md`; keep README.md focused on the overview and quick start.
 
 ## Working in parallel
 
@@ -89,7 +89,7 @@ signature another area depends on, say so in your PR/report.
 ## Checklist before you finish
 
 - [ ] `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test`
-- [ ] New config keys documented in README.md and have defaults
-- [ ] New CLI flags documented in README.md
+- [ ] New config keys documented in `docs/configuration.md` and have defaults
+- [ ] New CLI flags documented in `docs/commands.md`
 - [ ] Events logged for new state transitions
 - [ ] `doctor` knows about any new failure mode you introduced

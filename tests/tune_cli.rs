@@ -157,7 +157,7 @@ fn tune_proposes_applies_and_undoes() {
     assert!(prompt.contains("Simulated queue with"), "the current simulation is in the prompt");
     assert!(prompt.contains("| FAKE-1 | queued |"), "{prompt}");
     assert!(prompt.contains("# Reference: PRIORITY.md grammar"));
-    assert!(prompt.contains("### `[scheduler]`"), "config reference is embedded");
+    assert!(prompt.contains("## `[scheduler]`"), "config reference is embedded");
     assert_eq!(prompt, std::fs::read_to_string(draft.join("prompt.md")).unwrap());
     // `powerqueue` resolved through PATH inside the session, against the same home.
     assert_eq!(env.state_file("tune-check-exit.txt").unwrap().trim(), "0");

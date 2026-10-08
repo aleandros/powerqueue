@@ -315,8 +315,8 @@ up to date when they unblock), and a `skip` override still wins: a skipped
 task is `paused`, not `blocked`. There is no `PRIORITY.md` field for
 relations; `task explain` prints a `dependencies` block with each blocker
 and why it does or does not hold the task back, and `status` / the
-dashboard show a `WAITING ON` column. See the README's
-[Dependencies](../README.md#dependencies-blocked-by-and-parent-issues).
+dashboard show a `WAITING ON` column. See
+[Dependencies](configuration.md#dependencies-blocked-by-and-parent-issues).
 
 ## Live reload
 
@@ -402,6 +402,12 @@ low and runs on sonnet", "skip ENG-77, someone else took it", "tasks from the
 active cycle before everything else". `--scope priority` keeps Claude out of
 `config.toml`; `--scope config` is for "run three tasks at once" or "give
 fable 40% of the week".
+
+Draft directories retain `original/` (the previous live files), `CONTEXT.md`
+(the queue and budget snapshot), `prompt.md`, `result.json` and `meta.json`.
+`doctor` reports proposals that have not been applied. The
+[`[tune]` settings](configuration.md#tune) control model, timeout and retention.
+For a complete rules example, see [Priority rules example](examples/priority-rules.md).
 
 ## Idioms
 

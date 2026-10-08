@@ -520,21 +520,10 @@ pub fn priority_reference() -> &'static str {
     include_str!("../docs/priority.md")
 }
 
-/// The `## Configuration` chapter of the README (every `[section]` with its
-/// keys, defaults and meaning), as shipped with the binary.
+/// The configuration reference (every `[section]` with its keys, defaults
+/// and meaning), as shipped with the binary.
 pub fn config_reference() -> &'static str {
-    static README: &str = include_str!("../README.md");
-    section(README, "\n## Configuration", "\n## ").unwrap_or(README)
-}
-
-/// The text from the line starting with `start` up to (not including) the
-/// next line starting with `next_heading`.
-fn section<'a>(text: &'a str, start: &str, next_heading: &str) -> Option<&'a str> {
-    let from = text.find(start)?;
-    let body = &text[from..];
-    let after_heading = body.find('\n').map(|i| i + 1).unwrap_or(body.len());
-    let end = body[after_heading..].find(next_heading).map(|i| after_heading + i).unwrap_or(body.len());
-    Some(body[..end].trim())
+    include_str!("../docs/configuration.md")
 }
 
 /// Build the prompt for the tuning session.
@@ -1047,12 +1036,11 @@ mod tests {
     fn references_are_embedded() {
         assert!(priority_reference().starts_with("# PRIORITY.md: the rules grammar"));
         let cfg = config_reference();
-        assert!(cfg.starts_with("## Configuration"), "{}", &cfg[..60]);
-        assert!(cfg.contains("### `[scheduler]`"));
-        assert!(cfg.contains("### `[tune]`"), "the README must document [tune]");
-        assert!(!cfg.contains("## Priority rules (PRIORITY.md)"), "the slice stops at the next chapter");
-        assert_eq!(section("a\n## B\nbody\n## C\n", "\n## B", "\n## "), Some("## B\nbody"));
-        assert_eq!(section("none", "\n## B", "\n## "), None);
+        assert!(cfg.starts_with("# Configuration"), "{}", &cfg[..60]);
+        assert!(cfg.contains("## `[scheduler]`"));
+        assert!(cfg.contains("## `[tune]`"), "the configuration reference must document [tune]");
+        assert!(cfg.contains("## `[github]`"));
+        assert!(cfg.contains("## Per-repository overrides: `.powerqueue.toml`"));
     }
 
     #[test]
