@@ -1,0 +1,642 @@
+//! Launch planning, pure: which task starts next and on which model, how a
+//! previous session is resumed, and the task's state around a start.
+//!
+//! The daemon drives a [`LaunchPlanner`] one candidate at a time ([`next`],
+//! then [`started`] once the session really launched, so a failed start
+//! frees its slot for the next candidate in the same tick); simulations
+//! take the whole plan at once ([`plan_all`]). Everything in between
+//! (`git`, the launcher, tmux) stays in the daemon and reports back through
+//! [`on_starting`] / [`on_launched`] / [`crate::scheduler::transitions::on_crash`].
+//!
+//! [`next`]: LaunchPlanner::next
+//! [`started`]: LaunchPlanner::started
+//! [`plan_all`]: LaunchPlanner::plan_all
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::budget::{Decision, Estimator, Ledgers, Policy, RateLimitState, WINDOW_RECHECK, tier_weight};
+use crate::config::{BudgetConfig, Config};
+use crate::domain::{EventLevel, ModelTier, ReviewRelaunch, Session, SessionState, Task, TaskId, TaskSource, TaskState};
+use crate::priority::PriorityRules;
+use crate::session::agent_for;
+use crate::worktree::branch_name;
+
+use super::lifecycle::{pick_next, worktree_dir};
+use super::transitions::{Effect, LinearTarget};
+
+/// The rules' preference list for a task, most wanted first: the per-task
+/// override line (`KEY: model = ...`), else the first matching `## Models`
+/// `if` row, else the `## Models` entry for its criticality. Empty when the
+/// rules say nothing. (`task.model_override` is read by the policy itself.)
+pub fn preferred_models(rules: &PriorityRules, task: &Task, now: DateTime<Utc>) -> Vec<ModelTier> {
+    let evaluated = rules.evaluate(task, now, None, 0.0, 0.0).models;
+    if evaluated.is_empty() { rules.model_for(task.criticality).to_vec() } else { evaluated }
+}
+
+/// Count a predicted cost against the in-memory ledger of the model's
+/// provider so several launches in one pass do not each think they are the
+/// only one. A model whose provider has no ledger is ignored.
+pub fn reserve(ledgers: &mut Ledgers, tier: &ModelTier, weighted_cost: f64) {
+    if let Some(ledger) = ledgers.for_model_mut(tier) {
+        ledger.add_spend(tier, weighted_cost);
+    }
+}
+
+/// One task the planner handed out, with the policy's verdict.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Candidate {
+    pub task: Task,
+    /// The rules' preference list the policy was given.
+    pub preferred: Vec<ModelTier>,
+    pub decision: Decision,
+}
+
+impl Candidate {
+    /// Predicted weighted cost on the chosen model (0 when throttled).
+    pub fn weighted_cost(&self, cfg: &BudgetConfig) -> f64 {
+        self.decision.model.as_ref().map_or(0.0, |m| self.decision.prediction.weighted_tokens * tier_weight(cfg, m))
+    }
+}
+
+/// Hands out schedulable tasks in [`pick_next`] order with a model decision
+/// each, while slots remain. Owns a copy of the ledgers so reservations
+/// made during the pass do not touch the stored usage.
+#[derive(Debug, Clone)]
+pub struct LaunchPlanner {
+    cfg: BudgetConfig,
+    rules: PriorityRules,
+    estimator: Estimator,
+    rate_limits: RateLimitState,
+    ledgers: Ledgers,
+    candidates: Vec<Task>,
+    considered: HashSet<TaskId>,
+    slots: u32,
+}
+
+impl LaunchPlanner {
+    /// `candidates` are the open tasks without a live session; `slots` how
+    /// many sessions may still start. Expired rate-limit marks should be
+    /// cleared by the caller first.
+    pub fn new(
+        cfg: BudgetConfig,
+        rules: PriorityRules,
+        estimator: Estimator,
+        rate_limits: RateLimitState,
+        ledgers: Ledgers,
+        candidates: Vec<Task>,
+        slots: u32,
+    ) -> Self {
+        Self { cfg, rules, estimator, rate_limits, ledgers, candidates, considered: HashSet::new(), slots }
+    }
+
+    /// Sessions that may still start in this pass.
+    pub fn slots(&self) -> u32 {
+        self.slots
+    }
+
+    /// The ledgers with every confirmed start reserved.
+    pub fn ledgers(&self) -> &Ledgers {
+        &self.ledgers
+    }
+
+    /// The next task to consider and the policy's decision for it: the best
+    /// schedulable task not handed out yet. `None` when no slot is left or
+    /// nothing else can start now. A task is handed out once per pass
+    /// whether or not it starts.
+    pub fn next(&mut self, now: DateTime<Utc>) -> Option<Candidate> {
+        if self.slots == 0 {
+            return None;
+        }
+        let task = {
+            let remaining: Vec<Task> = self.candidates.iter().filter(|t| !self.considered.contains(&t.id)).cloned().collect();
+            pick_next(&remaining, now).cloned()?
+        };
+        self.considered.insert(task.id);
+        let prediction = self.estimator.predict(&task);
+        // Rules express a *preference* (`## Models`, `KEY: model = x`); only
+        // `task model <tier>` on the CLI is a hard override. Either way the
+        // policy may still downgrade when the tier is out of budget.
+        let preferred = preferred_models(&self.rules, &task, now);
+        let decision = Policy::new(&self.cfg, &self.ledgers, &self.rate_limits).decide(&task, prediction, &preferred);
+        Some(Candidate { task, preferred, decision })
+    }
+
+    /// A candidate's session launched: its slot is used and its predicted
+    /// cost reserved against the ledgers for the rest of the pass. A
+    /// throttled decision (no model) changes nothing.
+    pub fn started(&mut self, decision: &Decision) {
+        let Some(model) = &decision.model else { return };
+        self.slots = self.slots.saturating_sub(1);
+        reserve(&mut self.ledgers, model, decision.prediction.weighted_tokens * tier_weight(&self.cfg, model));
+    }
+
+    /// Every candidate of the pass, assuming each start succeeds (what a
+    /// simulation shows). Throttled tasks are included with `model = None`.
+    pub fn plan_all(mut self, now: DateTime<Utc>) -> Vec<Candidate> {
+        let mut out = Vec::new();
+        while let Some(candidate) = self.next(now) {
+            self.started(&candidate.decision);
+            out.push(candidate);
+        }
+        out
+    }
+}
+
+/// No model fits the budget right now: the task waits until the policy's
+/// `retry_at` (or [`WINDOW_RECHECK`] from now). Logged only when the task
+/// was not already throttled.
+pub fn on_throttled(task: &mut Task, decision: &Decision, now: DateTime<Utc>) -> Vec<Effect> {
+    let retry_at = decision.retry_at.unwrap_or(now + WINDOW_RECHECK);
+    let was = task.state;
+    task.state = TaskState::Throttled;
+    task.not_before = Some(retry_at);
+    if was == TaskState::Throttled {
+        return Vec::new();
+    }
+    vec![Effect::log(
+        EventLevel::Info,
+        "task.throttled",
+        format!("no model fits the budget; retry at {}", retry_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        serde_json::json!({ "retry_at": retry_at, "reasons": decision.reasons, "prediction": decision.prediction }),
+    )]
+}
+
+/// What [`on_starting`] settled for the attempt.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Start {
+    /// `pq/<slug>` (or the branch of an earlier attempt).
+    pub branch: String,
+    /// Where the worktree goes (an earlier attempt's or the review's path is reused).
+    pub worktree: PathBuf,
+    pub attempt: u32,
+    pub effects: Vec<Effect>,
+}
+
+/// The policy chose `model` for the task: it goes `starting` with the
+/// branch, worktree path and attempt number of this try. `resuming_with_prompt`
+/// says a review round or a relayed answer is about to be resumed, which
+/// un-parks a review watch (`task retry` of a task parked with its rounds
+/// used up). `root` is the worktree root directory.
+pub fn on_starting(
+    task: &mut Task,
+    model: &ModelTier,
+    decision: &Decision,
+    cfg: &Config,
+    root: &Path,
+    resuming_with_prompt: bool,
+) -> Start {
+    let attempt = task.attempts + 1;
+    if resuming_with_prompt && let Some(watch) = task.review.as_mut() {
+        watch.parked = false;
+    }
+    task.state = TaskState::Starting;
+    task.model = Some(model.clone());
+    let branch = task.branch.clone().unwrap_or_else(|| branch_name(&cfg.repo.branch_template, &task.slug(), &task.id.short()));
+    let worktree = task
+        .worktree_path
+        .clone()
+        .or_else(|| task.review.as_ref().and_then(|r| r.worktree_path.clone()))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| worktree_dir(root, task));
+    task.branch = Some(branch.clone());
+    task.worktree_path = Some(worktree.display().to_string());
+    task.attempts = attempt;
+    let effects = vec![Effect::log(
+        EventLevel::Info,
+        "task.starting",
+        format!("starting attempt {attempt} with {model}"),
+        serde_json::json!({ "model": model, "attempt": attempt, "reasons": decision.reasons, "prediction": decision.prediction }),
+    )];
+    Start { branch, worktree, attempt, effects }
+}
+
+/// How to start the next attempt: `(session id, resume?, provider session id)`.
+///
+/// A crashed previous session — or, for a review round (`review`), the
+/// session that armed the merge, whatever its state — is resumed when it ran
+/// on the same provider and, for CLIs that generate their own ids, its id
+/// was discovered; otherwise the attempt starts fresh with a new session id.
+/// `transcript_present` says whether the crashed session left the transcript
+/// its provider resumes from. A session that died before its first prompt
+/// has nothing to resume: `--resume` would fail on every remaining attempt
+/// ("No conversation found with session ID"), so it starts over instead.
+pub fn resume_plan(
+    previous: Option<&Session>,
+    model: &ModelTier,
+    transcript_present: bool,
+    review: bool,
+) -> (uuid::Uuid, bool, Option<String>) {
+    match previous {
+        Some(p)
+            if (p.state == SessionState::Crashed || review) && p.model.provider() == model.provider() && transcript_present =>
+        {
+            if agent_for(model.provider()).accepts_session_id() {
+                (p.id, true, None)
+            } else if let Some(id) = &p.agent_session_id {
+                (p.id, true, Some(id.clone()))
+            } else {
+                (uuid::Uuid::new_v4(), false, None)
+            }
+        }
+        _ => (uuid::Uuid::new_v4(), false, None),
+    }
+}
+
+/// What the next attempt is told, from [`resume_prompt`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResumePrompt {
+    /// The review prompt and/or the relayed answer, joined (for the launch event).
+    pub resume_prompt: Option<String>,
+    /// Replaces the task prompt when the session is resumed (it knows the task).
+    pub prompt_override: Option<String>,
+    /// Goes into the task prompt's "previous error" slot when starting over.
+    pub previous_error: Option<String>,
+}
+
+/// Compose what a resumed or restarted session is told. Resumed: only the
+/// review prompt and/or the relayed answer. Started over (other provider,
+/// no transcript): the full task prompt, with them as what to do first;
+/// without either, the last error as before.
+pub fn resume_prompt(
+    review_prompt: Option<&str>,
+    answer: Option<&str>,
+    resume: bool,
+    pr_url: Option<&str>,
+    last_error: Option<&str>,
+) -> ResumePrompt {
+    let resume_prompt = match (review_prompt, answer) {
+        (Some(r), Some(a)) => Some(format!("{r}\n\n{a}")),
+        (Some(r), None) => Some(r.to_string()),
+        (None, Some(a)) => Some(a.to_string()),
+        (None, None) => None,
+    };
+    let (prompt_override, previous_error) = match &resume_prompt {
+        Some(text) if resume => (Some(text.clone()), last_error.map(str::to_string)),
+        Some(text) if review_prompt.is_some() => (
+            None,
+            Some(format!(
+                "the pull request {} needs work; the previous session cannot be resumed. Start with: {text}",
+                pr_url.unwrap_or("?")
+            )),
+        ),
+        Some(text) => (None, Some(format!("the previous session asked a question and cannot be resumed. {text}"))),
+        None => (None, last_error.map(str::to_string)),
+    };
+    ResumePrompt { resume_prompt, prompt_override, previous_error }
+}
+
+/// Facts about a session that just launched, for [`on_launched`].
+#[derive(Debug, Clone, Copy)]
+pub struct Launched<'a> {
+    pub model: &'a ModelTier,
+    pub attempt: u32,
+    pub resume: bool,
+    /// The review round being run, if any.
+    pub relaunch: Option<&'a ReviewRelaunch>,
+    pub review_prompt: Option<&'a str>,
+    pub resume_prompt: Option<&'a str>,
+    pub branch: &'a str,
+    pub worktree: &'a Path,
+    /// A relayed answer was handed to the session (it is forgotten now).
+    pub answered: bool,
+}
+
+/// The session is up: the task runs. Tells the source issue: a review round
+/// only comments (the PR already moved the issue); a later attempt after a
+/// crash or timeout comments, since the first start already moved the issue
+/// and a PR may have moved it since (unless a blocked state/label is
+/// configured, in which case every attempt moves it, undoing a block); a
+/// first attempt moves it to in progress.
+pub fn on_launched(task: &mut Task, session: &Session, launched: &Launched<'_>, cfg: &Config, now: DateTime<Utc>) -> Vec<Effect> {
+    let Launched { model, attempt, resume, relaunch, review_prompt, resume_prompt, branch, worktree, answered } = *launched;
+    task.state = TaskState::Running;
+    task.not_before = None;
+    task.started_at = task.started_at.or(Some(now));
+    let mut effects = Vec::new();
+    if answered {
+        effects.push(Effect::ForgetAnswer);
+    }
+    effects.push(Effect::log(
+        EventLevel::Info,
+        "session.launched",
+        format!(
+            "launched {model} session (attempt {attempt}{}{}) in window {}",
+            if resume { ", resumed" } else { "" },
+            relaunch.map(|r| format!(", review: {}", r.reason)).unwrap_or_default(),
+            session.tmux_window
+        ),
+        serde_json::json!({
+            "model": model,
+            "attempt": attempt,
+            "resume": resume,
+            "review": relaunch,
+            "prompt": resume_prompt,
+            "answer": answered,
+            "branch": branch,
+            "worktree": worktree,
+            "window": session.tmux_window,
+            "pane": session.pane_id,
+        }),
+    ));
+    let blocked_configured = match &task.source {
+        TaskSource::GitHub { .. } => cfg.github.blocked_label.is_some(),
+        _ => cfg.linear.blocked_state.as_deref().is_some_and(|s| !s.trim().is_empty()),
+    };
+    match (relaunch, review_prompt) {
+        (Some(r), Some(prompt)) => {
+            let detail = if r.detail.is_empty() { String::new() } else { format!(" ({})", r.detail) };
+            effects.push(Effect::ProgressComment {
+                body: format!("powerqueue resumed the session for PR #{}: {}{detail}. Prompt: `{prompt}`", r.pr_number, r.reason),
+            });
+        }
+        _ if attempt > 1 && !blocked_configured => effects.push(Effect::ProgressComment {
+            body: format!("powerqueue resumed attempt {attempt} on branch `{branch}` with model {model}."),
+        }),
+        _ => effects.push(Effect::Linear {
+            target: LinearTarget::InProgress,
+            comment: Some(format!("powerqueue started attempt {attempt} on branch `{branch}` with model {model}.")),
+        }),
+    }
+    effects
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Duration;
+
+    use super::*;
+    use crate::budget::{AnchorSource, Ledger, Period, Prediction, TierLedger};
+    use crate::domain::{Provider, ReviewWatch, SessionState};
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-10-01T12:00:00Z").unwrap().with_timezone(&Utc)
+    }
+
+    fn task(key: &str, state: TaskState, score: f64) -> Task {
+        let mut t = Task::new(key, "t", TaskSource::Manual);
+        t.state = state;
+        t.score = score;
+        t
+    }
+
+    fn session(task: &Task, state: SessionState, model: ModelTier, agent: Option<&str>) -> Session {
+        Session {
+            id: uuid::Uuid::new_v4(),
+            task_id: task.id,
+            attempt: 1,
+            model,
+            state,
+            tmux_session: "pq".into(),
+            tmux_window: "@1".into(),
+            pane_id: Some("%1".into()),
+            pid: None,
+            transcript_path: None,
+            exit_code: Some(1),
+            started_at: now(),
+            ended_at: None,
+            last_activity_at: now(),
+            error: None,
+            agent_session_id: agent.map(str::to_string),
+            waiting_since: None,
+            waited_secs: 0,
+        }
+    }
+
+    fn decision(model: Option<&str>) -> Decision {
+        Decision {
+            model: model.map(ModelTier::new),
+            retry_at: None,
+            prediction: Prediction { weighted_tokens: 1000.0, wall_secs: 60.0, confidence: 0.0, basis: "test".into() },
+            reasons: vec!["test".into()],
+        }
+    }
+
+    fn claude_ledger(budget: f64) -> Ledger {
+        let mut ledger = Ledger::blank(
+            Provider::Claude,
+            now(),
+            Period { start: now() - Duration::days(1), end: now() + Duration::days(6) },
+            Period { start: now() - Duration::hours(5), end: now() },
+        );
+        ledger.tiers = vec![
+            TierLedger { tier: ModelTier::opus(), period_budget: budget * 0.5, ..Default::default() },
+            TierLedger { tier: ModelTier::sonnet(), period_budget: budget * 0.5, ..Default::default() },
+        ];
+        ledger.period_budget = budget;
+        ledger.window_budget = budget;
+        ledger.anchor_source = AnchorSource::Default;
+        ledger
+    }
+
+    fn planner(tasks: Vec<Task>, slots: u32) -> LaunchPlanner {
+        let cfg = Config::default();
+        LaunchPlanner::new(
+            cfg.budget.clone(),
+            PriorityRules::default(),
+            Estimator::from_summaries(&[]),
+            RateLimitState::default(),
+            Ledgers::single(claude_ledger(1.0e9)),
+            tasks,
+            slots,
+        )
+    }
+
+    #[test]
+    fn reserve_counts_against_tier_and_totals() {
+        let mut ledger = claude_ledger(100.0);
+        ledger.tiers.truncate(1);
+        let mut ledgers = Ledgers::single(ledger);
+        reserve(&mut ledgers, &ModelTier::opus(), 30.0);
+        reserve(&mut ledgers, &ModelTier::haiku(), 5.0);
+        reserve(&mut ledgers, &ModelTier::new("gpt-6-luna"), 7.0);
+        let ledger = ledgers.get(Provider::Claude).unwrap();
+        assert_eq!(ledger.tier(&ModelTier::opus()).period_weighted, 30.0);
+        assert_eq!(ledger.tier(&ModelTier::opus()).window_weighted, 30.0);
+        assert_eq!(ledger.total_period_weighted, 35.0);
+        assert_eq!(ledger.total_window_weighted, 35.0, "another provider's model never lands in claude's ledger");
+    }
+
+    #[test]
+    fn the_planner_hands_out_tasks_by_score_until_slots_run_out() {
+        let tasks = vec![
+            task("low", TaskState::Queued, 10.0),
+            task("high", TaskState::Queued, 90.0),
+            task("paused", TaskState::Paused, 100.0),
+            task("mid", TaskState::Crashed, 50.0),
+        ];
+        let mut p = planner(tasks.clone(), 2);
+        let first = p.next(now()).expect("a candidate");
+        assert_eq!(first.task.key, "high");
+        assert!(first.decision.model.is_some(), "{:?}", first.decision.reasons);
+        p.started(&first.decision);
+        assert_eq!(p.slots(), 1);
+        let spent = p.ledgers().get(Provider::Claude).unwrap().total_period_weighted;
+        assert!(spent > 0.0, "the predicted cost is reserved");
+        let second = p.next(now()).expect("a second candidate");
+        assert_eq!(second.task.key, "mid");
+        // Not started (launch failed): the slot stays free for the next one.
+        let third = p.next(now()).expect("the slot is still free");
+        assert_eq!(third.task.key, "low");
+        p.started(&third.decision);
+        assert!(p.next(now()).is_none(), "no slot left");
+
+        let all = planner(tasks, 10).plan_all(now());
+        assert_eq!(all.iter().map(|c| c.task.key.as_str()).collect::<Vec<_>>(), ["high", "mid", "low"]);
+        assert!(planner(Vec::new(), 3).next(now()).is_none());
+        assert!(planner(vec![task("x", TaskState::Queued, 1.0)], 0).next(now()).is_none(), "no slot: nothing is handed out");
+    }
+
+    #[test]
+    fn a_throttled_decision_consumes_nothing() {
+        let mut p = planner(vec![task("x", TaskState::Queued, 1.0)], 1);
+        p.started(&decision(None));
+        assert_eq!(p.slots(), 1);
+        assert_eq!(p.ledgers().get(Provider::Claude).unwrap().total_period_weighted, 0.0);
+    }
+
+    #[test]
+    fn throttling_sets_the_retry_time_and_logs_once() {
+        let mut t = task("x", TaskState::Queued, 1.0);
+        let mut d = decision(None);
+        d.retry_at = Some(now() + Duration::minutes(7));
+        let effects = on_throttled(&mut t, &d, now());
+        assert!(
+            matches!(&effects[..], [Effect::Log { kind, data, .. }] if kind == "task.throttled" && data["reasons"][0] == "test")
+        );
+        assert_eq!((t.state, t.not_before), (TaskState::Throttled, Some(now() + Duration::minutes(7))));
+        d.retry_at = None;
+        assert!(on_throttled(&mut t, &d, now()).is_empty(), "still throttled: quiet");
+        assert_eq!(t.not_before, Some(now() + WINDOW_RECHECK));
+    }
+
+    #[test]
+    fn starting_settles_branch_worktree_and_attempt() {
+        let cfg = Config::default();
+        let root = Path::new("/tmp/wt");
+        let mut t = task("ENG-7", TaskState::Queued, 1.0);
+        let start = on_starting(&mut t, &ModelTier::opus(), &decision(Some("opus")), &cfg, root, false);
+        assert_eq!((t.state, t.attempts, t.model.clone()), (TaskState::Starting, 1, Some(ModelTier::opus())));
+        assert_eq!(start.attempt, 1);
+        assert_eq!(t.branch.as_deref(), Some(start.branch.as_str()));
+        assert!(start.branch.contains("eng-7"), "{}", start.branch);
+        assert!(start.worktree.starts_with(root));
+        assert_eq!(t.worktree_path.as_deref(), Some(start.worktree.to_str().unwrap()));
+        assert!(
+            matches!(&start.effects[..], [Effect::Log { kind, message, .. }] if kind == "task.starting" && message == "starting attempt 1 with opus")
+        );
+
+        // A later attempt keeps its branch; a review round reuses the
+        // remembered worktree path and un-parks the watch.
+        let mut t = task("ENG-7", TaskState::Crashed, 1.0);
+        t.attempts = 2;
+        t.branch = Some("pq/keep".into());
+        let mut watch = ReviewWatch::armed(now(), None);
+        watch.worktree_path = Some("/elsewhere/eng-7".into());
+        watch.parked = true;
+        t.review = Some(watch);
+        let start = on_starting(&mut t, &ModelTier::sonnet(), &decision(Some("sonnet")), &cfg, root, true);
+        assert_eq!((start.branch.as_str(), start.attempt), ("pq/keep", 3));
+        assert_eq!(start.worktree, PathBuf::from("/elsewhere/eng-7"));
+        assert!(!t.review.unwrap().parked);
+    }
+
+    #[test]
+    fn resume_plan_needs_same_provider_and_a_known_id() {
+        let t = task("x", TaskState::Crashed, 1.0);
+        let crashed = |model: ModelTier, agent: Option<&str>| session(&t, SessionState::Crashed, model, agent);
+        let claude = crashed(ModelTier::opus(), None);
+        assert_eq!(resume_plan(Some(&claude), &ModelTier::sonnet(), true, false), (claude.id, true, None));
+        let (id, resume, _) = resume_plan(Some(&claude), &ModelTier::sonnet(), false, false);
+        assert!(!resume && id != claude.id, "no transcript to resume from: start fresh");
+        let codex = ModelTier::new("gpt-6-astra");
+        let (id, resume, _) = resume_plan(Some(&claude), &codex, true, false);
+        assert!(!resume && id != claude.id, "never resume across providers");
+        let found = crashed(codex.clone(), Some("thread-1"));
+        assert_eq!(resume_plan(Some(&found), &codex, true, false), (found.id, true, Some("thread-1".into())));
+        assert!(!resume_plan(Some(&found), &codex, false, false).1);
+        let unknown = crashed(codex.clone(), None);
+        let (id, resume, _) = resume_plan(Some(&unknown), &codex, true, false);
+        assert!(!resume && id != unknown.id, "no discovered id: start fresh");
+        let mut exited = found.clone();
+        exited.state = SessionState::Exited;
+        assert!(!resume_plan(Some(&exited), &codex, true, false).1);
+        assert!(!resume_plan(None, &codex, true, false).1);
+        // A review round resumes the session that armed the merge, even though it exited.
+        assert_eq!(resume_plan(Some(&exited), &codex, true, true), (exited.id, true, Some("thread-1".into())));
+        assert!(!resume_plan(Some(&exited), &ModelTier::sonnet(), true, true).1, "still never across providers");
+    }
+
+    #[test]
+    fn resume_prompts_depend_on_whether_the_session_is_resumed() {
+        assert_eq!(
+            resume_prompt(None, None, true, None, Some("err")),
+            ResumePrompt { resume_prompt: None, prompt_override: None, previous_error: Some("err".into()) }
+        );
+        let p = resume_prompt(Some("fix CI"), Some("yes, nullable"), true, Some("u"), Some("err"));
+        assert_eq!(p.resume_prompt.as_deref(), Some("fix CI\n\nyes, nullable"));
+        assert_eq!(p.prompt_override.as_deref(), Some("fix CI\n\nyes, nullable"), "resumed: the prompt is the message");
+        assert_eq!(p.previous_error.as_deref(), Some("err"));
+        let p = resume_prompt(Some("fix CI"), None, false, Some("https://pr/1"), None);
+        assert_eq!(p.prompt_override, None, "started over: the full task prompt");
+        assert_eq!(
+            p.previous_error.as_deref(),
+            Some("the pull request https://pr/1 needs work; the previous session cannot be resumed. Start with: fix CI")
+        );
+        let p = resume_prompt(None, Some("use the users table"), false, None, Some("ignored"));
+        assert_eq!(
+            p.previous_error.as_deref(),
+            Some("the previous session asked a question and cannot be resumed. use the users table")
+        );
+    }
+
+    #[test]
+    fn launched_runs_the_task_and_tells_the_issue_the_right_thing() {
+        let cfg = Config::default();
+        let mut t = task("ENG-7", TaskState::Starting, 1.0);
+        let s = session(&t, SessionState::Launching, ModelTier::opus(), None);
+        let base = Launched {
+            model: &ModelTier::opus(),
+            attempt: 1,
+            resume: false,
+            relaunch: None,
+            review_prompt: None,
+            resume_prompt: None,
+            branch: "pq/eng-7",
+            worktree: Path::new("/wt/eng-7"),
+            answered: false,
+        };
+        let effects = on_launched(&mut t, &s, &base, &cfg, now());
+        assert_eq!((t.state, t.started_at), (TaskState::Running, Some(now())));
+        assert!(
+            matches!(&effects[0], Effect::Log { kind, message, .. } if kind == "session.launched" && message.contains("in window @1"))
+        );
+        assert!(
+            matches!(&effects[1], Effect::Linear { target: LinearTarget::InProgress, comment: Some(c) } if c.starts_with("powerqueue started attempt 1"))
+        );
+
+        // A later attempt only comments, and a relayed answer is forgotten.
+        let effects = on_launched(&mut t, &s, &Launched { attempt: 2, resume: true, answered: true, ..base }, &cfg, now());
+        assert!(matches!(&effects[0], Effect::ForgetAnswer));
+        assert!(matches!(&effects[2], Effect::ProgressComment { body } if body.starts_with("powerqueue resumed attempt 2")));
+        assert_eq!(t.started_at, Some(now()), "the first start is kept");
+
+        // With a blocked state configured every attempt moves the issue (undoing a block).
+        let mut blocked = Config::default();
+        blocked.linear.blocked_state = Some("Blocked".into());
+        let effects = on_launched(&mut t, &s, &Launched { attempt: 2, ..base }, &blocked, now());
+        assert!(matches!(&effects[1], Effect::Linear { target: LinearTarget::InProgress, .. }));
+
+        // A review round comments with the prompt.
+        let relaunch = ReviewRelaunch { pr_number: 9, reason: "ci_failed".into(), detail: "lint".into(), requested_at: now() };
+        let launched =
+            Launched { relaunch: Some(&relaunch), review_prompt: Some("fix lint"), resume_prompt: Some("fix lint"), ..base };
+        let effects = on_launched(&mut t, &s, &launched, &cfg, now());
+        assert!(
+            matches!(&effects[1], Effect::ProgressComment { body } if body == "powerqueue resumed the session for PR #9: ci_failed (lint). Prompt: `fix lint`")
+        );
+    }
+}

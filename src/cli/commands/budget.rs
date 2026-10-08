@@ -309,13 +309,10 @@ fn queued_decisions(
     let mut out = Vec::new();
     let mut considered: std::collections::HashSet<crate::domain::TaskId> = std::collections::HashSet::new();
     let decide = |task: Task, ledgers: &mut Ledgers| {
-        let evaluated = rules.evaluate(&task, now, None, 0.0, 0.0).models;
-        let preferred = if evaluated.is_empty() { rules.model_for(task.criticality).to_vec() } else { evaluated };
+        let preferred = crate::scheduler::preferred_models(&rules, &task, now);
         let decision = Policy::new(&cfg.budget, ledgers, limits).decide(&task, estimator.predict(&task), &preferred);
-        if let Some(model) = &decision.model
-            && let Some(ledger) = ledgers.for_model_mut(model)
-        {
-            ledger.add_spend(model, decision.prediction.weighted_tokens * tier_weight(&cfg.budget, model));
+        if let Some(model) = &decision.model {
+            crate::scheduler::reserve(ledgers, model, decision.prediction.weighted_tokens * tier_weight(&cfg.budget, model));
         }
         QueuedDecision { task, preferred, decision }
     };

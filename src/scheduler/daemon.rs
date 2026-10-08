@@ -16,7 +16,7 @@ use chrono::{DateTime, Duration, Utc};
 use tokio::sync::Notify;
 
 use crate::budget::{
-    Decision, Estimator, Ledgers, PeriodClock, Policy, RATE_LIMITS_KEY, RateLimitState, load_observed, probe_all, tier_weight,
+    Decision, Estimator, Ledgers, PeriodClock, RATE_LIMITS_KEY, RateLimitState, load_observed, probe_all, tier_weight,
 };
 use crate::config::{Config, OverridesSource, REPO_CONFIG_FILE, RulesSource};
 use crate::domain::{
@@ -38,10 +38,11 @@ use crate::session::{
 };
 use crate::store::{JevCached, PendingHookEvent, Store};
 use crate::tmux::Tmux;
-use crate::worktree::{BasePreference, FastForward, Repo, branch_name, run_commands};
+use crate::worktree::{BasePreference, FastForward, Repo, run_commands};
 
 use super::commands;
-use super::lifecycle::{cleanup_task, pick_next, worktree_dir};
+use super::launch::{self, Candidate, LaunchPlanner};
+use super::lifecycle::cleanup_task;
 use super::relay::{self, PostedQuestion, RelayState, relay_key};
 use super::review;
 pub use super::transitions::SKIP_REASON;
@@ -2652,7 +2653,7 @@ impl Daemon {
             return Ok(());
         }
         let live = self.store.list_live_sessions()?;
-        let mut slots = self.cfg.scheduler.max_concurrent.saturating_sub(live.len() as u32);
+        let slots = self.cfg.scheduler.max_concurrent.saturating_sub(live.len() as u32);
         if slots == 0 {
             return Ok(());
         }
@@ -2662,33 +2663,24 @@ impl Daemon {
             return Ok(());
         }
         let estimator = Estimator::from_summaries(&self.store.task_usage_summaries()?);
-        let mut ledgers = Ledgers::load(&self.store, &self.cfg.budget, now)?;
+        let ledgers = Ledgers::load(&self.store, &self.cfg.budget, now)?;
         self.rt.rate_limits.clear_expired(now);
-
-        let mut considered: HashSet<TaskId> = HashSet::new();
-        while slots > 0 {
-            let candidates: Vec<Task> = tasks.iter().filter(|t| !considered.contains(&t.id)).cloned().collect();
-            let Some(task) = pick_next(&candidates, now).cloned() else { break };
-            considered.insert(task.id);
-            let prediction = estimator.predict(&task);
-            // Rules express a *preference* (`## Models`, `KEY: model = x`); only
-            // `task model <tier>` on the CLI is a hard override. Either way the
-            // policy may still downgrade when the tier is out of budget.
-            // `task.model_override` is read by the policy itself (it never
-            // crosses providers); `preferred` is the rules' list.
-            let preferred = self.preferred_models(&task, now);
-            let decision = Policy::new(&self.cfg.budget, &ledgers, &self.rt.rate_limits).decide(&task, prediction, &preferred);
+        let mut planner = LaunchPlanner::new(
+            self.cfg.budget.clone(),
+            self.rt.rules.clone(),
+            estimator,
+            self.rt.rate_limits.clone(),
+            ledgers,
+            tasks,
+            slots,
+        );
+        while let Some(Candidate { task, decision, .. }) = planner.next(now) {
             match decision.model.clone() {
                 None => self.throttle(task, &decision, now)?,
                 Some(model) => {
-                    let cost = decision.prediction.weighted_tokens * tier_weight(&self.cfg.budget, &model);
-                    let key = task.key.clone();
-                    let id = task.id;
-                    match self.start_task(task, model.clone(), &decision, now).await {
-                        Ok(()) => {
-                            slots -= 1;
-                            reserve(&mut ledgers, &model, cost);
-                        }
+                    let (key, id) = (task.key.clone(), task.id);
+                    match self.start_task(task, model, &decision, now).await {
+                        Ok(()) => planner.started(&decision),
                         Err(e) => {
                             tracing::error!(task = %key, error = %format!("{e:#}"), "start failed");
                             self.log(
@@ -2707,39 +2699,21 @@ impl Daemon {
         Ok(())
     }
 
-    /// The rules' preference list for a task, most wanted first: the
-    /// per-task override line (`KEY: model = ...`), else the first matching
-    /// `## Models` `if` row, else the `## Models` entry for its criticality.
-    /// Empty when the rules say nothing.
-    fn preferred_models(&self, task: &Task, now: DateTime<Utc>) -> Vec<ModelTier> {
-        let evaluated = self.rt.rules.evaluate(task, now, None, 0.0, 0.0).models;
-        if evaluated.is_empty() { self.rt.rules.model_for(task.criticality).to_vec() } else { evaluated }
-    }
-
     fn throttle(&mut self, mut task: Task, decision: &Decision, now: DateTime<Utc>) -> Result<()> {
-        let retry_at = decision.retry_at.unwrap_or(now + crate::budget::WINDOW_RECHECK);
-        let was = task.state;
-        task.state = TaskState::Throttled;
-        task.not_before = Some(retry_at);
-        self.store.update_task(&task)?;
-        if was != TaskState::Throttled {
-            self.log(
-                Some(task.id),
-                None,
-                EventLevel::Info,
-                "task.throttled",
-                &format!("no model fits the budget; retry at {}", retry_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
-                serde_json::json!({ "retry_at": retry_at, "reasons": decision.reasons, "prediction": decision.prediction }),
-            );
-        } else {
-            tracing::debug!(task = %task.key, retry_at = %retry_at, "still throttled");
+        let before = task.clone();
+        let effects = launch::on_throttled(&mut task, decision, now);
+        if effects.is_empty() {
+            tracing::debug!(task = %task.key, retry_at = ?task.not_before, "still throttled");
         }
+        if task != before {
+            self.store.update_task(&task)?;
+        }
+        self.log_only(&task, None, effects);
         Ok(())
     }
 
-    /// Create the worktree, run setup, launch Claude and record the session.
+    /// Create the worktree, run setup, launch the agent and record the session.
     async fn start_task(&mut self, mut task: Task, model: ModelTier, decision: &Decision, now: DateTime<Utc>) -> Result<()> {
-        let attempt = task.attempts + 1;
         // A review round resumes the session that armed the merge, in the
         // same worktree path, told only what changed on the PR.
         let relaunch = task.review_relaunch().cloned();
@@ -2747,36 +2721,11 @@ impl Daemon {
         // the session with it as the prompt.
         let latest = self.store.latest_session(task.id)?.map(|s| s.id);
         let answer = self.store.kv_get::<RelayState>(&relay_key(task.id))?.and_then(|r| r.answer_for(latest).map(str::to_string));
-        if (relaunch.is_some() || answer.is_some())
-            && let Some(watch) = task.review.as_mut()
-        {
-            // `task retry` of a task parked with its rounds used up.
-            watch.parked = false;
-        }
-        task.state = TaskState::Starting;
-        task.model = Some(model.clone());
-        self.store.update_task(&task)?;
-        self.log(
-            Some(task.id),
-            None,
-            EventLevel::Info,
-            "task.starting",
-            &format!("starting attempt {attempt} with {model}"),
-            serde_json::json!({ "model": model, "attempt": attempt, "reasons": decision.reasons, "prediction": decision.prediction }),
-        );
-
-        let branch =
-            task.branch.clone().unwrap_or_else(|| branch_name(&self.cfg.repo.branch_template, &task.slug(), &task.id.short()));
         let root = self.cfg.worktree_root(&self.paths);
-        let worktree = task
-            .worktree_path
-            .clone()
-            .or_else(|| task.review.as_ref().and_then(|r| r.worktree_path.clone()))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| worktree_dir(&root, &task));
-        task.branch = Some(branch.clone());
-        task.worktree_path = Some(worktree.display().to_string());
-        task.attempts = attempt;
+        let before = task.clone();
+        let start = launch::on_starting(&mut task, &model, decision, &self.cfg, &root, relaunch.is_some() || answer.is_some());
+        let launch::Start { branch, worktree, attempt, effects } = start;
+        self.commit(&before, &mut task, None, effects).await?;
 
         let prepared = self.prepare_worktree(&task, &root, &worktree, &branch);
         if let Ok(true) = prepared {
@@ -2784,6 +2733,7 @@ impl Daemon {
             self.rt.last_fetch = Some(now);
         }
         if let Err(e) = prepared {
+            let before = task.clone();
             let effects = transitions::on_crash(
                 &mut task,
                 None,
@@ -2793,9 +2743,7 @@ impl Daemon {
                 now,
                 None,
             );
-            self.store.update_task(&task)?;
-            self.apply_effects(&mut task, None, effects).await;
-            self.store.update_task(&task)?;
+            self.commit(&before, &mut task, None, effects).await?;
             return Ok(());
         }
 
@@ -2817,31 +2765,17 @@ impl Daemon {
             );
         }
         let (session_id, resume, resume_id) =
-            resume_plan(previous.as_ref(), &model, transcript_present, relaunch.is_some() || answer.is_some());
+            launch::resume_plan(previous.as_ref(), &model, transcript_present, relaunch.is_some() || answer.is_some());
         let review_prompt = relaunch
             .as_ref()
             .map(|r| review::review_prompt(&self.cfg.scheduler.review_prompt, r, task.pr_url.as_deref().unwrap_or_default()));
-        let resume_prompt = match (&review_prompt, &answer) {
-            (Some(r), Some(a)) => Some(format!("{r}\n\n{a}")),
-            (Some(r), None) => Some(r.clone()),
-            (None, Some(a)) => Some(a.clone()),
-            (None, None) => None,
-        };
-        // Resumed: the session knows the task, so it only gets the review
-        // prompt and/or the relayed answer. Started over (other provider, no
-        // transcript): the full task prompt, with them as what to do first.
-        let (prompt_override, previous_error) = match &resume_prompt {
-            Some(text) if resume => (Some(text.clone()), task.last_error.clone()),
-            Some(text) if review_prompt.is_some() => (
-                None,
-                Some(format!(
-                    "the pull request {} needs work; the previous session cannot be resumed. Start with: {text}",
-                    task.pr_url.as_deref().unwrap_or("?")
-                )),
-            ),
-            Some(text) => (None, Some(format!("the previous session asked a question and cannot be resumed. {text}"))),
-            None => (None, task.last_error.clone()),
-        };
+        let prompts = launch::resume_prompt(
+            review_prompt.as_deref(),
+            answer.as_deref(),
+            resume,
+            task.pr_url.as_deref(),
+            task.last_error.as_deref(),
+        );
         let prepared = self.rt.launcher.prepare_with_prompt(
             &self.cfg,
             &task,
@@ -2850,8 +2784,8 @@ impl Daemon {
             attempt,
             resume,
             resume_id.as_deref(),
-            previous_error.as_deref(),
-            prompt_override.as_deref(),
+            prompts.previous_error.as_deref(),
+            prompts.prompt_override.as_deref(),
         );
         let launched = match prepared {
             Ok(plan) => {
@@ -2872,6 +2806,7 @@ impl Daemon {
         let mut session = match launched {
             Ok(s) => s,
             Err(e) => {
+                let before = task.clone();
                 let effects = transitions::on_crash(
                     &mut task,
                     None,
@@ -2881,9 +2816,7 @@ impl Daemon {
                     now,
                     None,
                 );
-                self.store.update_task(&task)?;
-                self.apply_effects(&mut task, None, effects).await;
-                self.store.update_task(&task)?;
+                self.commit(&before, &mut task, None, effects).await?;
                 return Ok(());
             }
         };
@@ -2899,68 +2832,20 @@ impl Daemon {
         }
         self.forget_session(session.id);
 
-        task.state = TaskState::Running;
-        task.not_before = None;
-        task.started_at = task.started_at.or(Some(now));
-        self.store.update_task(&task)?;
-        if answer.is_some() {
-            self.update_relay(&task, |state| {
-                state.pending_answer = None;
-                state.pending_session = None;
-            });
-        }
-        self.log(
-            Some(task.id),
-            Some(session.id),
-            EventLevel::Info,
-            "session.launched",
-            &format!(
-                "launched {model} session (attempt {attempt}{}{}) in window {}",
-                if resume { ", resumed" } else { "" },
-                relaunch.as_ref().map(|r| format!(", review: {}", r.reason)).unwrap_or_default(),
-                session.tmux_window
-            ),
-            serde_json::json!({
-                "model": model,
-                "attempt": attempt,
-                "resume": resume,
-                "review": relaunch,
-                "prompt": resume_prompt,
-                "answer": answer.is_some(),
-                "branch": branch,
-                "worktree": worktree,
-                "window": session.tmux_window,
-                "pane": session.pane_id,
-            }),
-        );
-        match (&relaunch, &review_prompt) {
-            // The issue stays where the PR put it (In Review); only say why.
-            (Some(r), Some(prompt)) => {
-                let detail = if r.detail.is_empty() { String::new() } else { format!(" ({})", r.detail) };
-                let comment =
-                    format!("powerqueue resumed the session for PR #{}: {}{detail}. Prompt: `{prompt}`", r.pr_number, r.reason);
-                self.comment_issue(&task, comment, CommentKind::Progress).await;
-            }
-            // A later attempt (crash, timeout) leaves the issue where it is:
-            // the first start already moved it to In Progress, and since then
-            // a PR may have moved it to In Review (AVS-1618). A retry of a
-            // finished task starts over at attempt 1. With a
-            // `linear.blocked_state` configured every attempt moves the
-            // issue, so a block is undone.
-            _ if attempt > 1
-                && match &task.source {
-                    TaskSource::GitHub { .. } => self.cfg.github.blocked_label.is_none(),
-                    _ => self.cfg.linear.blocked_state.as_deref().is_none_or(|s| s.trim().is_empty()),
-                } =>
-            {
-                let comment = format!("powerqueue resumed attempt {attempt} on branch `{branch}` with model {model}.");
-                self.comment_issue(&task, comment, CommentKind::Progress).await;
-            }
-            _ => {
-                let comment = format!("powerqueue started attempt {attempt} on branch `{branch}` with model {model}.");
-                self.update_issue(&task, LinearTarget::InProgress, Some(comment)).await;
-            }
-        }
+        let before = task.clone();
+        let facts = launch::Launched {
+            model: &model,
+            attempt,
+            resume,
+            relaunch: relaunch.as_ref(),
+            review_prompt: review_prompt.as_deref(),
+            resume_prompt: prompts.resume_prompt.as_deref(),
+            branch: &branch,
+            worktree: &worktree,
+            answered: answer.is_some(),
+        };
+        let effects = launch::on_launched(&mut task, &session, &facts, &self.cfg, now);
+        self.commit(&before, &mut task, Some(&session), effects).await?;
         Ok(())
     }
 
@@ -3125,47 +3010,6 @@ fn short_sha(sha: &str) -> &str {
     sha.get(..12).unwrap_or(sha)
 }
 
-/// How to start the next attempt: `(session id, resume?, provider session id)`.
-///
-/// A crashed previous session — or, for a review round (`review`), the
-/// session that armed the merge, whatever its state — is resumed when it ran
-/// on the same provider and, for CLIs that generate their own ids, its id
-/// was discovered; otherwise the attempt starts fresh with a new session id.
-/// `transcript_present` says whether the crashed session left the transcript
-/// its provider resumes from. A session that died before its first prompt
-/// has nothing to resume: `--resume` would fail on every remaining attempt
-/// ("No conversation found with session ID"), so it starts over instead.
-fn resume_plan(
-    previous: Option<&Session>,
-    model: &ModelTier,
-    transcript_present: bool,
-    review: bool,
-) -> (uuid::Uuid, bool, Option<String>) {
-    match previous {
-        Some(p)
-            if (p.state == SessionState::Crashed || review) && p.model.provider() == model.provider() && transcript_present =>
-        {
-            if agent_for(model.provider()).accepts_session_id() {
-                (p.id, true, None)
-            } else if let Some(id) = &p.agent_session_id {
-                (p.id, true, Some(id.clone()))
-            } else {
-                (uuid::Uuid::new_v4(), false, None)
-            }
-        }
-        _ => (uuid::Uuid::new_v4(), false, None),
-    }
-}
-
-/// Count a predicted cost against the in-memory ledger of the model's
-/// provider so several launches in one tick do not each think they are the
-/// only one. A model whose provider has no ledger is ignored.
-fn reserve(ledgers: &mut Ledgers, tier: &ModelTier, weighted_cost: f64) {
-    if let Some(ledger) = ledgers.for_model_mut(tier) {
-        ledger.add_spend(tier, weighted_cost);
-    }
-}
-
 /// Resolve on SIGINT (ctrl-c) or, on unix, SIGTERM.
 async fn wait_for_signal() {
     #[cfg(unix)]
@@ -3194,7 +3038,7 @@ async fn wait_for_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::budget::{AnchorSource, Ledger, Period, TierLedger};
+    use crate::scheduler::pick_next;
 
     fn github_daemon(dir: &Path, endpoint: &str) -> Daemon {
         let paths = Paths::rooted(dir);
@@ -3707,74 +3551,6 @@ mod tests {
             "cleanup ran for the container: {events:?}"
         );
         assert_eq!(p.worktree_path, None, "the stale worktree path is cleared");
-    }
-
-    #[test]
-    fn reserve_counts_against_tier_and_totals() {
-        let now = Utc::now();
-        let mut ledger = Ledger::blank(
-            Provider::Claude,
-            now,
-            Period { start: now, end: now + Duration::days(7) },
-            Period { start: now - Duration::hours(5), end: now },
-        );
-        ledger.tiers = vec![TierLedger { tier: ModelTier::opus(), period_budget: 100.0, ..Default::default() }];
-        ledger.period_budget = 100.0;
-        ledger.window_budget = 50.0;
-        ledger.anchor_source = AnchorSource::Default;
-        let mut ledgers = Ledgers::single(ledger);
-        reserve(&mut ledgers, &ModelTier::opus(), 30.0);
-        reserve(&mut ledgers, &ModelTier::haiku(), 5.0);
-        reserve(&mut ledgers, &ModelTier::new("gpt-6-luna"), 7.0);
-        let ledger = ledgers.get(Provider::Claude).unwrap();
-        assert_eq!(ledger.tier(&ModelTier::opus()).period_weighted, 30.0);
-        assert_eq!(ledger.tier(&ModelTier::opus()).window_weighted, 30.0);
-        assert_eq!(ledger.total_period_weighted, 35.0);
-        assert_eq!(ledger.total_window_weighted, 35.0, "another provider's model never lands in claude's ledger");
-    }
-
-    #[test]
-    fn resume_plan_needs_same_provider_and_a_known_id() {
-        let crashed = |model: ModelTier, agent: Option<&str>| Session {
-            id: uuid::Uuid::new_v4(),
-            task_id: TaskId::new(),
-            attempt: 1,
-            model,
-            state: SessionState::Crashed,
-            tmux_session: "pq".into(),
-            tmux_window: "@1".into(),
-            pane_id: None,
-            pid: None,
-            transcript_path: None,
-            exit_code: Some(1),
-            started_at: Utc::now(),
-            ended_at: None,
-            last_activity_at: Utc::now(),
-            error: None,
-            agent_session_id: agent.map(str::to_string),
-            waiting_since: None,
-            waited_secs: 0,
-        };
-        let claude = crashed(ModelTier::opus(), None);
-        assert_eq!(resume_plan(Some(&claude), &ModelTier::sonnet(), true, false), (claude.id, true, None));
-        let (id, resume, _) = resume_plan(Some(&claude), &ModelTier::sonnet(), false, false);
-        assert!(!resume && id != claude.id, "no transcript to resume from: start fresh");
-        let codex = ModelTier::new("gpt-6-astra");
-        let (id, resume, _) = resume_plan(Some(&claude), &codex, true, false);
-        assert!(!resume && id != claude.id, "never resume across providers");
-        let found = crashed(codex.clone(), Some("thread-1"));
-        assert_eq!(resume_plan(Some(&found), &codex, true, false), (found.id, true, Some("thread-1".into())));
-        assert!(!resume_plan(Some(&found), &codex, false, false).1);
-        let unknown = crashed(codex.clone(), None);
-        let (id, resume, _) = resume_plan(Some(&unknown), &codex, true, false);
-        assert!(!resume && id != unknown.id, "no discovered id: start fresh");
-        let mut exited = found.clone();
-        exited.state = SessionState::Exited;
-        assert!(!resume_plan(Some(&exited), &codex, true, false).1);
-        assert!(!resume_plan(None, &codex, true, false).1);
-        // A review round resumes the session that armed the merge, even though it exited.
-        assert_eq!(resume_plan(Some(&exited), &codex, true, true), (exited.id, true, Some("thread-1".into())));
-        assert!(!resume_plan(Some(&exited), &ModelTier::sonnet(), true, true).1, "still never across providers");
     }
 
     #[test]
