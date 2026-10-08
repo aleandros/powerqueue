@@ -313,8 +313,12 @@ impl Daemon {
         // Issue sources first, rules second: a ticket created this tick gets its
         // criticality, score and preferred model before `launch_tasks` sees
         // it (otherwise an urgent ticket is first scheduled as `normal`).
+        let force_sync = self.rt.force_sync;
         let r = self.poll_linear(now).await;
         self.report_phase("linear", r);
+        // Each source gets the request once; Linear also consumes it when
+        // polled directly (including its throttled parent checks).
+        self.rt.force_sync = force_sync;
         let r = self.poll_github(now).await;
         self.report_phase("github", r);
         self.rt.force_sync = false;
@@ -916,6 +920,7 @@ impl Daemon {
         }
         let Some(client) = self.linear_client() else { return Ok(()) };
         let forced = self.rt.force_sync;
+        self.rt.force_sync = false;
         self.rt.last_linear_poll = Some(now);
 
         let filter = IssueFilter::from_config(&self.cfg.linear);

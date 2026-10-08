@@ -14,6 +14,7 @@ fn pq(home: &Path) -> Command {
         // clap parses it as a bool and rejects the conventional `1`.
         .env_remove("NO_COLOR")
         .env_remove("LINEAR_API_KEY")
+        .env_remove("GITHUB_TOKEN")
         .env_remove("JEV_API_KEY");
     cmd
 }
@@ -27,10 +28,11 @@ fn write_minimal_config(home: &Path, repo: &Path) {
 #[test]
 fn help_and_completions() {
     let home = tempfile::tempdir().unwrap();
-    pq(home.path()).arg("--help").assert().success().stdout(
-        predicate::str::contains("Linear tickets\ninto Claude Code sessions")
-            .or(predicate::str::contains("Linear tickets into Claude Code")),
-    );
+    pq(home.path())
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Linear tickets").and(predicate::str::contains("GitHub Issues")));
     pq(home.path()).args(["completions", "zsh"]).assert().success().stdout(predicate::str::contains("#compdef powerqueue"));
 }
 

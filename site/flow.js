@@ -12,7 +12,7 @@
   const packets = [...svg.querySelectorAll('[data-packet]')];
   const tasks = [
     { key: 'ENG-412', model: 'fable', start: 0, duration: 5.5 },
-    { key: 'ENG-398', model: 'sonnet', start: 2.4, duration: 7 },
+    { key: 'api/app#398', model: 'sonnet', start: 2.4, duration: 7 },
     { key: 'ENG-401', model: 'opus', start: 4.8, duration: 6 },
   ];
   const routes = tasks.map(() => ({ incoming: [], outgoing: [] }));

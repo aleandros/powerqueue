@@ -68,7 +68,8 @@ follow the task lifecycle. See [GitHub configuration](#github).
 | Codex CLI | optional | `codex login status` must succeed; adds OpenAI's weekly budget (see [Providers](#providers)) |
 | Antigravity CLI (`agy`) | optional, experimental | signed in to Google AI Pro/Ultra |
 | GitHub CLI (`gh`) | optional, logged in | needed for the PR watcher (`task complete --pr`); `gh auth status` must succeed |
-| Linear API key | personal key | stored in the OS keychain by `init` |
+| Linear API key | optional, personal key | needed for Linear; stored in the OS keychain by `init` |
+| GitHub token | optional | needed for GitHub Issues; stored with `secrets set github` or supplied as `GITHUB_TOKEN` |
 | Jev (TypeSafe) API key | optional | adds a model-based urgency score |
 
 Linux and macOS are supported. Windows is untested.
@@ -117,6 +118,21 @@ powerqueue init --team ENG          # keys, repo, Linear team, PRIORITY.md
 powerqueue doctor                   # checks git/tmux/claude, keys, config
 powerqueue run                      # daemon, foreground
 ```
+
+For GitHub Issues, from the matching local checkout:
+
+```sh
+powerqueue init --no-linear
+powerqueue secrets set github
+powerqueue config set github.repository '"owner/repo"'
+powerqueue config set github.enabled true
+powerqueue github test
+powerqueue github sync              # preview open issues labeled powerqueue
+powerqueue run
+```
+
+To use both trackers, keep Linear enabled and add the GitHub token and settings.
+See [GitHub configuration](#github) for filters and optional lifecycle updates.
 
 ### On a VPS
 
@@ -211,7 +227,7 @@ Global flags work on every command.
 | `-v`, `-vv` | debug / trace logging on stderr |
 | `-q`, `--quiet` | only print errors |
 | `--home DIR` | base directory for config/data/state (env `POWERQUEUE_HOME`) |
-| `--json` | machine-readable output where supported (status, add, task, priority, tune, budget, linear, doctor, update, service, config, `logs --events`) |
+| `--json` | machine-readable output where supported (status, add, task, priority, tune, budget, linear, github, doctor, update, service, config, `logs --events`) |
 | `--no-color` | disable colours (env `NO_COLOR`) |
 
 ### Setup and daemon
@@ -219,7 +235,7 @@ Global flags work on every command.
 | Command | What it does |
 |---------|--------------|
 | `init [--repo PATH] [--team KEY]... [--linear-key K] [--jev-key K] [--no-linear] [--permission-mode MODE] [--provider P]... [--non-interactive] [--reconfigure] [--force]` | guided first-time setup; writes `config.toml` and `PRIORITY.md`, stores keys; `--no-linear` sets `linear.enabled = false` (GitHub can be enabled separately); `--permission-mode` picks `acceptEdits` (default), `auto`, `bypassPermissions`, `dontAsk`, `plan` or `default`; when `codex` / `agy` are on PATH it asks whether to run tasks on them too (`--provider codex --provider gemini` answers yes non-interactively and warns when the CLI is not logged in); on an existing install the menu offers "Change settings", and `--reconfigure` walks the editable settings (repository, default branch, Linear team and states, concurrency, permission mode, weekly budget, reset anchor, providers) with the current values as defaults, keeping keys and every other key |
-| `run [--once] [--offline]` | run the scheduler in the foreground; `--once` does one pass; `--offline` skips Linear |
+| `run [--once] [--offline]` | run the scheduler in the foreground; `--once` does one pass; `--offline` skips Linear and GitHub |
 | `stop` | ask the running daemon to exit (sessions keep running in tmux) |
 | `pause [--reason TEXT]` | stop launching sessions: running ones continue, the daemon keeps monitoring, cleaning up and syncing, nothing new starts (crashed sessions are not relaunched either) until `resume`; survives a daemon restart; `status`, `dashboard` and `doctor` show it |
 | `resume` | launch sessions again after `pause` |
@@ -288,7 +304,7 @@ state machine allows it. `complete` and `block` always write directly.
 
 `--provider` accepts `claude`, `codex` or `gemini` (`antigravity`/`agy` are aliases of `gemini`).
 
-### Linear
+### Linear and GitHub Issues
 
 | Command | What it does |
 |---------|--------------|
@@ -363,7 +379,7 @@ state machine allows it. `complete` and `block` always write directly.
 ### The prompt protocol
 
 The prompt (`src/session/launcher.rs::build_prompt`) contains the key and
-title, the description, the Linear link, the working rules (stay on the
+title, the description, the source issue link, the working rules (stay on the
 branch, commit as you go, do not push), the completion protocol and, when
 set, `prompt.instructions`. A `[prompt] template` replaces the whole text
 with your own Markdown (see [`[prompt]`](#prompt)); `powerqueue task prompt
@@ -517,8 +533,10 @@ in that case. Replies are collapsed to one line before they are typed.
 ### Cleanup
 
 On completion the daemon pushes the branch, removes the worktree, closes the
-tmux window, moves the Linear issue to `linear.done_state` and posts a comment
-with the summary. Unpushed work is never deleted: if the push fails or there is
+tmux window, and updates the source issue: Linear uses `linear.done_state`;
+GitHub uses the optional `github.done_label` and `github.close_on_complete`.
+Each integration controls summary comments independently. For GitHub tasks with
+a PR, completion updates happen after the PR merges. Unpushed work is never deleted: if the push fails or there is
 no remote, the worktree stays and an event says why. Failed tasks keep their
 worktree when `cleanup.keep_failed` is true.
 
@@ -629,7 +647,10 @@ unset. Issue titles, bodies and labels populate the task and agent prompt.
 Pull requests are excluded. Removing an intake label or changing the assignee does
 not cancel an imported task. A confirmed closed issue cancels queued, throttled,
 paused or crashed tasks; running sessions continue. API failures and missing access
-(including HTTP 404) never count as closure. Finished tasks are not re-imported;
+(including HTTP 404) never count as closure. GitHub questions are posted when comments are enabled; answer them with `task send`
+or `attach` (GitHub replies are not relayed). For tasks handed off with `--pr`,
+the issue stays open during review and completion updates run when the PR merges.
+Finished tasks are not re-imported;
 use `task retry` to deliberately run one again. Lifecycle labels replace only other
 configured lifecycle labels, preserving unrelated labels.
 

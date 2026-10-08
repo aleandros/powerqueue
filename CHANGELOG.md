@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-08
+
 ### Added
 
 - GitHub Issues alongside Linear: configurable label/assignee intake, independent
@@ -14,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   token storage, `github test` / `github sync`, and doctor diagnostics.
 - GitHub end-to-end coverage through the real daemon, git worktrees, tmux,
   transcript accounting, push and cleanup, with stateful GitHub and agent fixtures.
+- GitHub issue lifecycle updates after watched PR merges, including opt-in closing.
+
+### Changed
+
+- Document both Linear and GitHub Issues in the README, troubleshooting guide,
+  architecture notes and project landing page, with a GitHub setup example.
 
 
 ## [0.8.1] - 2026-10-07
@@ -628,7 +636,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.9.0
 [0.8.1]: https://github.com/aleandros/powerqueue/releases/tag/v0.8.1
 [0.8.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.8.0
 [0.7.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.7.0

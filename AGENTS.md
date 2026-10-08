@@ -4,7 +4,7 @@ This file is for AI agents and humans alike. Read it before changing code.
 
 ## What powerqueue is
 
-A Rust CLI/daemon that turns Linear tickets (and manual tasks) into Claude Code
+A Rust CLI/daemon that turns Linear tickets, GitHub Issues (and manual tasks) into Claude Code
 sessions. Each task gets its own git worktree and its own tmux window. The
 daemon learns token/CPU/memory usage per task, restarts crashed sessions,
 paces model usage across the subscription period (Fable is reserved for
@@ -28,6 +28,7 @@ src/
   priority/          PRIORITY.md parser/evaluator + live reload
   jev.rs             TypeSafe Jev "score" client (optional scoring)
   github.rs          `gh api graphql` PR status for the PR watcher
+  github/            REST issue client, intake and sync
   budget/            period clock, ledger (one per provider: Ledgers), probe.rs (observed usage + UsageProbe), cost estimator, model policy
   worktree.rs        git worktree ops (shell out to git)
   tmux.rs            tmux ops (shell out to tmux)
@@ -54,7 +55,7 @@ docs/                user docs (priority grammar, budget algorithm, troubleshoot
 6. Claude Code hooks (`SessionStart`, `Stop`, `StopFailure`, `SessionEnd`, `Notification`, ...) call `powerqueue hook`, which stores the payload in `hook_events`.
 7. The daemon drains hook events + tails the transcript JSONL for usage (dedupe by `message.id`), samples CPU/RSS via sysinfo, probes tmux panes.
 8. Completion: Claude runs `powerqueue task complete <id> --summary ...` and/or prints `[[POWERQUEUE:DONE]]` (either suffices). Dead pane without completion ⇒ `crashed` ⇒ backoff ⇒ relaunch with `--resume <same session id>`. With `--pr <url>` the task goes `in_review` instead: session and slot released, worktree removed, branch kept; `scheduler::review` watches the PR via `gh` and re-queues a review round (same worktree path, `--resume` of the same session, `scheduler.review_prompt`) on conflict / failed required check / new review threads, or completes it when merged.
-9. `cleanup_task`: push branch, remove worktree, close window (per config + repo overrides), update Linear state, post comment.
+9. `cleanup_task`: push branch, remove worktree, close window (per config + repo overrides), update source issue state/labels, post comment.
 
 ## Conventions
 

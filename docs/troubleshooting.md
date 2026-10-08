@@ -129,6 +129,35 @@ merge and is never reported stale. After `scheduler.review_rounds_max` relaunche
 parked in `needs_attention`: `task retry` runs one more round, `task resume`
 watches the PR again.
 
+## GitHub Issues are not picked up or updated
+
+```sh
+powerqueue github test
+powerqueue github sync                 # read-only preview
+powerqueue config get github
+powerqueue doctor
+powerqueue task show 'owner/repo#123'
+```
+
+- Set `github.enabled = true` and `github.repository = "owner/repo"` matching
+  your checkout. `run --offline` disables both trackers.
+- Store the token with `secrets set github`; `GITHUB_TOKEN` takes precedence.
+  Grant repository access and Issues read permission for intake, write permission
+  for comments, labels and closing. HTTP 404 can mean missing repository access.
+- Issues must be open, match **all** `github.required_labels` (default
+  `powerqueue`) and the optional assignee, and have no excluded label (default
+  `no-agent`). Pull requests are not intake tasks. Raise `github.max_issues`
+  if the intake queue exceeds the scan limit.
+- Finished tasks are not re-imported. Retry deliberately with `task retry`.
+  Removing an intake label alone does not cancel a task already imported.
+- `github.update_failed` and `github.update_skipped` events identify missed
+  lifecycle writes. Check permissions and configured labels, wait for API
+  backoff, and reconcile missed updates manually. `doctor` reports recent errors.
+- Automatic closing defaults off. With `close_on_complete = true`, tasks
+  handed off for PR review close their issue when the PR merges.
+- Reply to agent questions with `task send` or `attach`; GitHub issue comments
+  are not read back into sessions.
+
 ## A task keeps crashing
 
 **Symptom**: state cycles `starting` → `crashed`, then `failed` after

@@ -4,9 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>powerqueue — get the most out of your Claude subscription</title>
-<meta name="description" content="An autonomous work queue that turns Linear tickets into Claude Code sessions and runs them around the clock on a cheap VPS or your laptop, paced so your whole weekly subscription allowance goes to the work that matters.">
+<meta name="description" content="An autonomous work queue that turns Linear tickets and GitHub Issues into Claude Code sessions and runs them around the clock on a cheap VPS or your laptop, paced so your whole weekly subscription allowance goes to the work that matters.">
 <meta property="og:title" content="powerqueue — get the most out of your Claude subscription">
-<meta property="og:description" content="Autonomous Claude Code sessions from your Linear queue, 24/7, on one cheap VPS. Spends the subscription allowance you are not using, nothing else.">
+<meta property="og:description" content="Autonomous Claude Code sessions from Linear and GitHub Issues, 24/7, on one cheap VPS. Spends the subscription allowance you are not using, nothing else.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://aleandros.github.io/powerqueue/">
 <meta name="twitter:card" content="summary">
@@ -59,7 +59,7 @@
         on <span class="accent-alt">one cheap VPS</span>.
       </h1>
       <p class="tagline">
-        powerqueue turns your Linear queue into autonomous Claude Code sessions and keeps them
+        powerqueue turns Linear tickets and GitHub Issues into autonomous Claude Code sessions and keeps them
         running around the clock. It paces them so the whole weekly allowance goes to the work
         that matters, with <code>fable</code> held for what is critical. Add a Codex or Google
         subscription and it spreads the queue across all of them, each paced against its own
@@ -123,7 +123,7 @@ powerqueue run          <span class="c-comment"># or a systemd unit</span></code
       </div>
       <div class="install-card">
         <h3>nothing else</h3>
-        <p class="install-desc">One static binary, SQLite, a Markdown rules file. No orchestration platform, no cloud account, no agents-as-a-service. Linear is optional: <code>powerqueue add</code> queues work by hand.</p>
+        <p class="install-desc">One static binary, SQLite, a Markdown rules file. No orchestration platform, no cloud account, no agents-as-a-service. Use Linear, GitHub Issues, or both. <code>powerqueue add</code> also queues work by hand.</p>
         <div class="code-block"><pre><code>$ powerqueue budget show
 period  43% used, day 3.1 of 7
 window  12% of the 5h window
@@ -144,7 +144,7 @@ fable   8% of 25% share, 12 tasks ok</code></pre></div>
       </div>
       <svg class="pipeline" viewBox="0 0 1120 460" role="img" aria-labelledby="pipeline-title pipeline-description">
         <title id="pipeline-title">Tasks flow through a VPS running powerqueue</title>
-        <desc id="pipeline-description">Linear issues and manual tasks enter the queue. Inside your VPS, powerqueue scores tasks and checks the budget, then fills three independent session slots. Each session has its own git worktree and tmux window. Completed branches are pushed, worktrees cleaned up, and Linear issues moved to In Review. The daemon watches usage and resumes crashed sessions.</desc>
+        <desc id="pipeline-description">Linear tickets, GitHub Issues and manual tasks enter the queue. Inside your VPS, powerqueue scores tasks and checks the budget, then fills three independent session slots. Each session has its own git worktree and tmux window. Completed branches are pushed, worktrees cleaned up, and the source issue updated with the configured state, labels and comments. The daemon watches usage and resumes crashed sessions.</desc>
         <defs>
           <pattern id="pipeline-grid" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" fill="#253044"/></pattern>
         </defs>
@@ -156,9 +156,9 @@ fable   8% of 25% share, 12 tasks ok</code></pre></div>
         <g class="pipeline-queue" transform="translate(24 112)">
           <rect class="pipeline-panel" width="200" height="212" rx="10"/>
           <text class="pipeline-heading" x="18" y="30">Incoming tasks</text>
-          <text class="pipeline-micro" x="18" y="51">Linear + manual</text>
+          <text class="pipeline-micro" x="18" y="51">Linear + GitHub + manual</text>
           <g class="pipeline-ticket" data-ticket="0" transform="translate(16 70)"><rect width="168" height="34" rx="5"/><circle cx="14" cy="17" r="3" fill="#c792ea"/><text x="27" y="22">ENG-412</text><text class="pipeline-ticket-priority" x="152" y="22">P0</text></g>
-          <g class="pipeline-ticket" data-ticket="1" transform="translate(16 112)"><rect width="168" height="34" rx="5"/><circle cx="14" cy="17" r="3" fill="#79c0ff"/><text x="27" y="22">ENG-398</text><text class="pipeline-ticket-priority" x="152" y="22">P2</text></g>
+          <g class="pipeline-ticket" data-ticket="1" transform="translate(16 112)"><rect width="168" height="34" rx="5"/><circle cx="14" cy="17" r="3" fill="#79c0ff"/><text x="27" y="22">api/app#398</text><text class="pipeline-ticket-priority" x="152" y="22">P2</text></g>
           <g class="pipeline-ticket" data-ticket="2" transform="translate(16 154)"><rect width="168" height="34" rx="5"/><circle cx="14" cy="17" r="3" fill="#ffa657"/><text x="27" y="22">ENG-401</text><text class="pipeline-ticket-priority" x="152" y="22">P1</text></g>
         </g>
         <g class="pipeline-vps" transform="translate(294 40)">
@@ -194,7 +194,7 @@ fable   8% of 25% share, 12 tasks ok</code></pre></div>
             <rect class="pipeline-slot-fill" width="152" height="142" rx="8" opacity="0.07"/>
             <text class="pipeline-micro" x="14" y="23">SESSION 02</text>
             <circle class="pipeline-slot-led" cx="132" cy="19" r="3"/>
-            <text class="pipeline-slot-state" x="14" y="51">ENG-398</text>
+            <text class="pipeline-slot-state" x="14" y="51">api/app#398</text>
             <text class="pipeline-slot-model" x="14" y="74">sonnet</text>
             <text class="pipeline-micro" x="14" y="99">worktree + tmux</text>
             <rect class="pipeline-track" x="14" y="116" width="124" height="4" rx="2"/>
@@ -237,7 +237,7 @@ fable   8% of 25% share, 12 tasks ok</code></pre></div>
       <div class="flow-step"><strong>3. pick a model</strong>The budget policy chooses the best tier the period and the 5-hour window can afford.</div>
       <div class="flow-step"><strong>4. run</strong>A fresh worktree, a tmux window, an interactive Claude Code session you can attach to at any time.</div>
       <div class="flow-step"><strong>5. watch</strong>Hooks report turns, prompts and failures. Transcripts give tokens. A dead pane means a resumed retry.</div>
-      <div class="flow-step"><strong>6. finish</strong>Claude runs <code>powerqueue task complete</code>; the branch is pushed, the worktree removed, Linear updated.</div>
+      <div class="flow-step"><strong>6. finish</strong>Claude runs <code>powerqueue task complete</code>; the branch is pushed, the worktree removed, the source issue updated.</div>
     </div>
   </div>
 </section>
@@ -248,7 +248,7 @@ fable   8% of 25% share, 12 tasks ok</code></pre></div>
     <div class="feature-grid">
       <div class="feature">
         <div class="feature-icon"><pre>ENG-412 ─▶ @3
-ENG-398 ─▶ @4
+api/app#398 ─▶ @4
 ENG-401 ─▶ @5</pre></div>
         <h3>One window per task</h3>
         <p>Each task gets its own git worktree and tmux window. <code>powerqueue attach ENG-412</code> drops you into the live session.</p>
@@ -317,16 +317,29 @@ gemini  period  3%</pre></div>
       <div class="install-card">
         <h3>pinned</h3>
         <p class="install-desc">Pin a release or pick the install directory with environment variables.</p>
-        <div class="code-block"><pre><code>POWERQUEUE_VERSION=v0.3.0 \
+        <div class="code-block"><pre><code>POWERQUEUE_VERSION=v0.9.0 \
 POWERQUEUE_INSTALL_DIR=~/bin \
   sh -c "$(curl -fsSL https://raw.githubusercontent.com/aleandros/powerqueue/main/install.sh)"</code></pre></div>
       </div>
     </div>
 
     <div class="usage-preview">
-      <h3>then use it</h3>
+      <h3>GitHub Issues setup</h3>
+      <p class="install-desc">Use the repository that matches your local checkout. Add the <code>powerqueue</code> label to issues you want the agent to pick up. Automatic closing defaults to off.</p>
+      <div class="code-block"><pre><code>powerqueue init --no-linear
+powerqueue secrets set github       <span class="c-comment"># prompts for your GitHub token</span>
+powerqueue config set github.repository '"owner/repo"'
+powerqueue config set github.enabled true
+powerqueue github test
+powerqueue github sync              <span class="c-comment"># preview intake</span>
+powerqueue run</code></pre></div>
+      <p class="install-desc">Already using Linear? Keep it enabled and add the GitHub settings. <a href="https://github.com/aleandros/powerqueue#github">GitHub configuration and token permissions →</a></p>
+    </div>
+
+    <div class="usage-preview">
+      <h3>Linear setup and daily use</h3>
       <div class="code-block">
-        <pre><code><span class="c-comment"># guided setup: Linear key → keychain, team, states, permission mode, PRIORITY.md</span>
+        <pre><code><span class="c-comment"># Linear setup: key → keychain, team, states, permission mode, PRIORITY.md</span>
 powerqueue init
 
 <span class="c-comment"># check tools, keys, state and the algorithm</span>
@@ -410,7 +423,7 @@ relax_after_fraction = 0.3</code></pre></div>
       </p>
     </blockquote>
     <div class="scope-note">
-      <strong>Scope.</strong> Sessions are interactive so you can always attach, which means a permission prompt waits for you (the task goes to <code>needs_attention</code>). For a VPS that nobody watches pick the <code>auto</code> permission mode in <code>init</code> (or <code>bypassPermissions</code>), or pre-approve commands in <code>claude.allowed_tools</code>; change it later with <code>powerqueue config set claude.permission_mode auto</code>. Linear is the only tracker today — <a href="https://github.com/aleandros/powerqueue/pulls">PRs welcome</a>.
+      <strong>Scope.</strong> Sessions are interactive so you can always attach, which means a permission prompt waits for you (the task goes to <code>needs_attention</code>). For a VPS that nobody watches pick the <code>auto</code> permission mode in <code>init</code> (or <code>bypassPermissions</code>), or pre-approve commands in <code>claude.allowed_tools</code>; change it later with <code>powerqueue config set claude.permission_mode auto</code>. Linear and GitHub Issues are supported independently, including in the same queue. GitHub intake uses repository, label and assignee filters; issue closing is opt-in.
     </div>
   </div>
 </section>

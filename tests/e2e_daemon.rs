@@ -696,7 +696,7 @@ impl wiremock::Respond for GitHubFixture {
     }
 }
 
-async fn github_lifecycle_e2e(close_on_complete: bool) {
+async fn github_lifecycle_e2e(close_on_complete: bool, with_review: bool) {
     use serde_json::json;
     use wiremock::{Mock, MockServer};
     // Construct Env before the server so prerequisites still skip cleanly.
@@ -721,6 +721,15 @@ async fn github_lifecycle_e2e(close_on_complete: bool) {
     git(&repo, &["push", "-u", "origin", "main"]);
     let config_path = env.home().join("config/config.toml");
     let mut cfg = powerqueue::config::Config::from_toml(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    let gh_state = env.root.path().join("fakestate");
+    std::fs::create_dir_all(&gh_state).unwrap();
+    env.vars.push(("FAKE_GH_DIR".into(), gh_state.display().to_string()));
+    cfg.scheduler.gh_binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-gh.sh").display().to_string();
+    cfg.scheduler.pr_poll_secs = 1;
+    if with_review {
+        std::fs::write(gh_state.join("pr-list.json"), r#"[{"url":"https://github.com/acme/app/pull/9"}]"#).unwrap();
+        std::fs::write(gh_state.join("pr-9.json"), gh_pr(9, "OPEN", "MERGEABLE")).unwrap();
+    }
     cfg.repo.default_branch = Some("main".into());
     cfg.cleanup.push_branch = true;
     cfg.github.enabled = true;
@@ -741,32 +750,38 @@ async fn github_lifecycle_e2e(close_on_complete: bool) {
 
     // No `add` or `sync --apply`: daemon polling itself must create and launch it.
     env.start_daemon();
+    if with_review {
+        assert_eq!(env.wait_for_state("acme/app#1", "in_review", Duration::from_secs(60)), "in_review", "{}", env.daemon_log());
+        let held = env.wait_for_show("acme/app#1", |v| has_event(v, "session.released"));
+        assert!(has_event(&held, "session.released"));
+        assert_eq!(remote_state.0.lock().unwrap().issue["state"], "open", "do not close before merge");
+        std::fs::write(gh_state.join("pr-9.json"), gh_pr(9, "MERGED", "UNKNOWN")).unwrap();
+    }
     assert_eq!(env.wait_for_state("acme/app#1", "completed", Duration::from_secs(60)), "completed", "{}", env.daemon_log());
     let show = env.wait_for_show("acme/app#1", |v| {
         v["usage"]["output_tokens"].as_u64().unwrap_or(0) >= 1400
             && has_event(v, "cleanup.done")
             && v["events"].as_array().unwrap().iter().filter(|e| e["kind"] == "github.comment").count() == 2
     });
-    for expected in [
-        "task.created",
-        "worktree.ready",
-        "session.launched",
-        "task.completed",
-        "cleanup.pushed",
-        "cleanup.done",
-        "github.label",
-        "github.comment",
-    ] {
+    for expected in
+        ["task.created", "worktree.ready", "session.launched", "cleanup.pushed", "cleanup.done", "github.label", "github.comment"]
+    {
         assert!(has_event(&show, expected), "missing {expected}: {show}; log: {}", env.daemon_log());
     }
+    assert!(if with_review { has_event(&show, "review.merged") } else { completed_event(&event_kinds(&show)) });
     assert_eq!(has_event(&show, "github.closed"), close_on_complete);
     assert!(!has_event(&show, "github.update_failed"), "{show}");
     assert!(!has_event(&show, "github.update_skipped"), "{show}");
     assert!(show["usage"]["output_tokens"].as_u64().unwrap_or(0) >= 1400, "{show}");
     let cleanup = show["events"].as_array().unwrap().iter().find(|e| e["kind"] == "cleanup.done").unwrap();
-    for field in ["pushed", "worktree_removed", "window_closed"] {
+    for field in ["pushed", "worktree_removed"] {
         assert_eq!(cleanup["data"][field], true, "{cleanup}");
     }
+    // Review hand-off kills the window before cleanup; check the actual pane,
+    // rather than requiring cleanup itself to have killed it a second time.
+    let session = &show["sessions"][0]["session"];
+    let tmux = powerqueue::tmux::Tmux::new("tmux", Some(env.socket.clone()));
+    assert!(tmux.find_pane(session["tmux_session"].as_str().unwrap(), session["pane_id"].as_str().unwrap()).unwrap().is_none());
     assert_eq!(show["task"]["source"]["kind"], "github");
     assert_eq!(show["task"]["attempts"], 1);
     let worktree = show["events"].as_array().unwrap().iter().find(|e| e["kind"] == "worktree.ready").unwrap()["data"]["path"]
@@ -806,10 +821,15 @@ async fn github_lifecycle_e2e(close_on_complete: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn github_issue_runs_to_completion_and_closes() {
-    github_lifecycle_e2e(true).await;
+    github_lifecycle_e2e(true, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn github_issue_runs_to_completion_and_stays_open_for_review() {
-    github_lifecycle_e2e(false).await;
+    github_lifecycle_e2e(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn github_issue_waits_for_pr_merge_before_closing() {
+    github_lifecycle_e2e(true, true).await;
 }

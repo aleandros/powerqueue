@@ -1,15 +1,15 @@
 [package]
 name = "powerqueue"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Get the most out of your Claude subscription: an autonomous work queue that turns Linear tickets into Claude Code sessions on a cheap VPS or your laptop, with budget pacing, crash recovery and usage learning"
+description = "Get the most out of your Claude subscription: an autonomous work queue that turns Linear tickets and GitHub Issues into Claude Code sessions on a cheap VPS or your laptop, with budget pacing, crash recovery and usage learning"
 license = "MIT"
 repository = "https://github.com/aleandros/powerqueue"
 homepage = "https://aleandros.github.io/powerqueue/"
 documentation = "https://github.com/aleandros/powerqueue#readme"
 readme = "README.md"
-keywords = ["claude", "linear", "tmux", "agent", "cli"]
+keywords = ["claude", "linear", "github", "agent", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = [".github/", ".claude/", "docs/reference/", "justfile"]
 

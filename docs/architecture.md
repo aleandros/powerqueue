@@ -17,6 +17,7 @@ src/
   logging.rs         tracing: stderr + rotating JSON file
   store/             SQLite (rusqlite, WAL); schema.sql; all queries
   linear/            GraphQL client; issue → task sync
+  github/            REST issue client; GitHub intake and synchronization
   priority/          PRIORITY.md parser/evaluator; file watcher
   jev.rs             Jev "score" client (optional)
 github.rs          `gh api graphql` PR status (state, mergeability, checks, threads)
@@ -37,7 +38,7 @@ github.rs          `gh api graphql` PR status (state, mergeability, checks, thre
 ```
 
 Dependency direction: `cli` and `scheduler` orchestrate; `budget`, `priority`,
-`linear`, `session` depend on `domain`, `config`, `store`; `domain` depends on
+`linear`, `github`, `session` depend on `domain`, `config`, `store`; `domain` depends on
 nothing in the crate. `tmux.rs` and `worktree.rs` know nothing about tasks.
 
 ## Data flow
@@ -66,7 +67,7 @@ nothing in the crate. `tmux.rs` and `worktree.rs` know nothing about tasks.
           state transitions ─▶ events table ─▶ task show / dashboard / logs --events
                                      │
                                      ▼ completed
-                      cleanup_task: push, remove worktree, kill window, Linear update
+                      cleanup_task: push, remove worktree, kill window, source issue update
 ```
 
 ## Storage
@@ -198,6 +199,22 @@ errors, last assistant message) and `parse_transcript_line` (usage records).
 The daemon turns the side state into hook rows (`StopFailure`, or a `Stop` for
 polled DONE / BLOCKED markers) that the hook phase handles on the next tick.
 
+## Issue sources
+
+Linear and GitHub Issues are independently configured and polled before rules
+are evaluated. GitHub's REST client lives under `github/client.rs`; the existing
+`github.rs` retains the `gh` CLI client for PR watching. Issue intake requires
+an API token but not `gh`. Each daemon works in one configured checkout.
+
+GitHub tasks use `TaskSource::GitHub` and keys `owner/repo#number`. The source
+metadata is stored in the existing JSON column. Sync computes a preview before
+applying it, skips pull requests and terminal local tasks, and cancels inactive
+tasks only after a confirmed issue closure. API errors abort the preview; 404
+is not interpreted as closure. Polling uses independent backoff and rate-limit
+reset headers. Lifecycle effects route to the task's tracker; GitHub completion
+labels/closing run on ordinary completion or after a watched PR merges. GitHub
+questions can be posted, but only Linear has incoming-comment reply relay.
+
 ## The daemon tick
 
 `Daemon::run` acquires `<state>/daemon.lock` (fd-lock), writes `daemon.pid`,
@@ -211,15 +228,15 @@ still runs):
 
 1. write the heartbeat; drain `commands` (pause, resume, cancel, retry, set
    model, sync now, reload, shutdown);
-2. reload `PRIORITY.md` if the watcher flagged a change (parse errors keep the
-   previous rules); re-score open tasks that have no live session, applying
-   `skip` overrides as `paused`;
-3. poll Linear when `poll_interval_secs` has elapsed (exponential backoff up
-   to 10 minutes after failures); `sync_issues` creates, updates and cancels
-   tasks (running tasks are never cancelled by sync);
+2. poll enabled Linear and GitHub issue sources on their own intervals and
+   backoff schedules; synchronization creates, updates and cancels tasks
+   (running tasks are never cancelled by sync);
+3. reload `PRIORITY.md` if the watcher flagged a change (parse errors keep the
+   previous rules); re-score open tasks that have no live session, including
+   newly imported tasks, applying `skip` overrides as `paused`;
 4. drain `hook_events`; `interpret_hook` maps each payload to an outcome and
    `transitions::on_hook_outcome` to state changes plus effects (cleanup,
-   Linear update, rate-limit cooldown);
+   source issue update, rate-limit cooldown);
 5. discover the provider session id and transcript of Codex / agy sessions
    (`session.discovered`), then read new transcript lines for live sessions
    (and those ended within the last 5 minutes) into `usage`; throttling
@@ -233,7 +250,7 @@ still runs):
    session stayed alive goes back to `running`;
 7. release sessions of tasks that became terminal outside the hook path
    (`task complete` on the CLI, cancelled by sync): `cleanup_task`, then the
-   Linear update and comment; a task handed off `in_review` gets its window
+   source issue update and comment; a task handed off `in_review` gets its window
    killed and `cleanup_task(.., for_review)` (branch kept, Linear untouched);
 7b. every `pr_poll_secs`, for each `in_review` task without a live session:
    `Gh::pr_status`, then `review::on_pr_status` (merged ⇒ completed + local
@@ -250,7 +267,7 @@ still runs):
 9. while live sessions `< max_concurrent`: `pick_next`, `Estimator::predict`,
    `Policy::decide` (throttle or start), `git fetch`, create the worktree,
    run `repo.setup`, `Launcher::prepare` + `launch`, move the Linear issue to
-   `in_progress_state`.
+   `in_progress_state` or apply the configured GitHub in-progress label.
 
 Every transition goes through `store.log_event` so `task show` replays the
 story.
