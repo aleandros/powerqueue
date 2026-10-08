@@ -90,13 +90,23 @@ POWERQUEUE_AGY_HOME = "{agy_home}"
     }
 
     fn with_provider(mode: &str, extra_scheduler: &str, provider_config: impl Fn(&Path) -> String) -> Option<Self> {
+        Self::with_opts(Opts { mode, extra_scheduler, ..Opts::default() }, provider_config)
+    }
+
+    /// The general form; see [`Opts`].
+    fn with_opts(opts: Opts<'_>, provider_config: impl Fn(&Path) -> String) -> Option<Self> {
         for tool in ["tmux", "git", "python3"] {
             if which::which(tool).is_err() {
                 eprintln!("skipping e2e test: {tool} not on PATH");
                 return None;
             }
         }
-        let root = tempfile::tempdir().unwrap();
+        // A physical path: the container tests mount the root at the same
+        // path inside the container, where macOS's `/var` → `/private/var`
+        // symlink does not exist, and Claude Code derives the transcript
+        // path from the physical working directory.
+        let temp_base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = tempfile::tempdir_in(temp_base).unwrap();
         let socket = format!("pq-e2e-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -108,15 +118,23 @@ POWERQUEUE_AGY_HOME = "{agy_home}"
         let home = root.path().join("home");
         std::fs::create_dir_all(home.join("config")).unwrap();
         let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-claude.sh");
+        let claude_binary = opts.claude_binary.clone().unwrap_or_else(|| fake.display().to_string());
+        let powerqueue_bin = if opts.launcher_sets_powerqueue_bin {
+            String::new()
+        } else {
+            format!("POWERQUEUE_BIN = \"{}\"", cargo_bin("powerqueue").display())
+        };
         let config = format!(
             r#"[repo]
 path = "{repo}"
+{extra_repo}
 [linear]
 enabled = false
 [claude]
-binary = "{fake}"
+binary = "{claude_binary}"
+{extra_claude}
 [claude.env]
-POWERQUEUE_BIN = "{bin}"
+{powerqueue_bin}
 FAKE_CLAUDE_MODE = "{mode}"
 FAKE_CLAUDE_STATE_DIR = "{state}"
 CLAUDE_CONFIG_DIR = "{claude_home}"
@@ -128,12 +146,16 @@ restart_backoff_secs = [1]
 {extra_scheduler}
 [cleanup]
 push_branch = false
+{extra_cleanup}
 {provider_config}
 "#,
             provider_config = provider_config(root.path()),
             repo = repo.display(),
-            fake = fake.display(),
-            bin = cargo_bin("powerqueue").display(),
+            extra_repo = opts.extra_repo,
+            extra_claude = opts.extra_claude,
+            extra_cleanup = opts.extra_cleanup,
+            mode = opts.mode,
+            extra_scheduler = opts.extra_scheduler,
             state = root.path().join("fakestate").display(),
             claude_home = root.path().join("claude").display(),
         );
@@ -277,6 +299,234 @@ fn add_task(env: &Env, title: &str, extra: &[&str]) -> String {
     let out = env.run_ok(&args);
     let v: serde_json::Value = serde_json::from_str(&out).expect("add json");
     v["key"].as_str().expect("key").to_string()
+}
+
+/// How [`Env::with_opts`] writes `config.toml`.
+#[derive(Default)]
+struct Opts<'a> {
+    /// `FAKE_CLAUDE_MODE`.
+    mode: &'a str,
+    /// Extra lines in `[scheduler]`.
+    extra_scheduler: &'a str,
+    /// `[claude] binary`; the fixture when `None`.
+    claude_binary: Option<String>,
+    /// Extra lines in `[claude]` (e.g. `shim = true`).
+    extra_claude: &'a str,
+    /// Leave `POWERQUEUE_BIN` to the launcher (the shim, or the binary)
+    /// instead of pointing the fixture at this build's binary.
+    launcher_sets_powerqueue_bin: bool,
+    /// Extra lines in `[repo]` (e.g. `setup = [...]`).
+    extra_repo: String,
+    /// Extra lines in `[cleanup]` (e.g. `run = [...]`).
+    extra_cleanup: String,
+}
+
+/// Where the generated shim and inbox of task `key` live under the test home.
+fn shim_and_inbox(env: &Env, key: &str) -> (PathBuf, PathBuf) {
+    let show = env.run_ok(&["--json", "task", "show", key]);
+    let v: serde_json::Value = serde_json::from_str(&show).expect("task show json");
+    let id = v["task"]["id"].as_str().expect("task id");
+    let task_dir = env.home().join("state/tasks").join(id);
+    (task_dir.join("bin/powerqueue"), task_dir.join("inbox"))
+}
+
+/// The fixture finds the generated shim on PATH (`POWERQUEUE_BIN` is the
+/// shim), its hooks call the shim by absolute path, and everything reaches
+/// the daemon through `<task dir>/inbox` instead of the binary.
+#[test]
+fn shim_routes_hooks_and_completion_through_the_inbox() {
+    let opts = Opts { mode: "complete", extra_claude: "shim = true", launcher_sets_powerqueue_bin: true, ..Opts::default() };
+    let Some(mut env) = Env::with_opts(opts, |_| String::new()) else { return };
+    let key = add_task(&env, "Say hello through the shim", &[]);
+    env.start_daemon();
+    let st = env.wait_for_state(&key, "completed", Duration::from_secs(60));
+    assert_eq!(st, "completed", "daemon log:\n{}", env.daemon_log());
+    let v = env.wait_for_show(&key, |v| output_tokens(v) >= 1400 && has_event(v, "cleanup.done"));
+    assert_eq!(v["task"]["summary"].as_str(), Some("fake-claude finished"));
+    let kinds = event_kinds(&v);
+    // `task complete` arrived as an inbox message, the hooks as hook rows.
+    for expected in ["inbox.complete", "hook.sessionstart", "hook.stop", "session.started", "cleanup.done"] {
+        assert!(kinds.iter().any(|k| k == expected), "missing event {expected} in {kinds:?}");
+    }
+    assert!(!kinds.iter().any(|k| k == "inbox.rejected" || k == "inbox.error"), "{kinds:?}");
+    assert!(output_tokens(&v) >= 1400, "usage came from the transcript: {}", v["usage"]);
+    let (shim, inbox) = shim_and_inbox(&env, &key);
+    assert!(shim.is_file(), "shim at {}", shim.display());
+    let left: Vec<PathBuf> = walk(&inbox).into_iter().filter(|p| p.extension().is_some_and(|e| e == "msg")).collect();
+    assert!(left.is_empty(), "the inbox was drained: {left:?}");
+    assert!(!inbox.join("rejected").exists(), "nothing was rejected");
+    let settings = std::fs::read_to_string(shim.parent().unwrap().parent().unwrap().join("settings.json")).unwrap();
+    assert!(settings.contains(&format!("{} hook --task", shim.display())), "{settings}");
+}
+
+/// Name of the image the container tests use; built from the fixtures when
+/// `POWERQUEUE_E2E_DOCKER` is set and `docker` works, else `None` (skip).
+fn docker_image() -> Option<String> {
+    if std::env::var_os("POWERQUEUE_E2E_DOCKER").is_none() {
+        eprintln!("skipping container test: set POWERQUEUE_E2E_DOCKER=1 to run it");
+        return None;
+    }
+    let ok = Command::new("docker").arg("info").stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success());
+    if !matches!(ok, Ok(true)) {
+        eprintln!("skipping container test: docker is not available");
+        return None;
+    }
+    let image = "powerqueue-e2e-fakes".to_string();
+    let ctx = tempfile::tempdir().unwrap();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    for f in ["fake-claude.sh", "fake-codex.sh"] {
+        std::fs::copy(fixtures.join(f), ctx.path().join(f)).unwrap();
+    }
+    std::fs::write(
+        ctx.path().join("Dockerfile"),
+        "FROM alpine:3.20\n\
+         RUN apk add --no-cache bash git python3 coreutils\n\
+         COPY fake-claude.sh /usr/local/bin/fake-claude\n\
+         COPY fake-codex.sh /usr/local/bin/fake-codex\n\
+         RUN chmod +x /usr/local/bin/fake-claude /usr/local/bin/fake-codex\n",
+    )
+    .unwrap();
+    let out = Command::new("docker").args(["build", "-q", "-t", &image]).arg(ctx.path()).output().unwrap();
+    assert!(out.status.success(), "docker build failed: {}", String::from_utf8_lossy(&out.stderr));
+    Some(image)
+}
+
+/// `repo.setup` / `cleanup.run` lines that start and remove a per-task
+/// container with the whole test root mounted at the same path (worktree,
+/// main checkout, state dir, the CLI's config dir and the fixture state).
+fn container_setup_and_cleanup(image: &str) -> (String, String) {
+    let setup = format!(
+        "setup = ['''root=$(dirname \"$(dirname \"$POWERQUEUE_STATE_DIR\")\"); \
+         docker rm -f pq-$POWERQUEUE_TASK_SLUG >/dev/null 2>&1; \
+         docker run -d --name pq-$POWERQUEUE_TASK_SLUG -v \"$root:$root\" \
+         -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+         {image} sleep infinity >/dev/null''']"
+    );
+    let cleanup = "run = ['''docker rm -f pq-$POWERQUEUE_TASK_SLUG >/dev/null''']".to_string();
+    (setup, cleanup)
+}
+
+/// Removes the task's container even when a test fails half-way.
+struct ContainerGuard(String);
+
+impl ContainerGuard {
+    fn running(&self) -> bool {
+        let out = Command::new("docker").args(["ps", "-q", "--filter", &format!("name=^{}$", self.0)]).output().unwrap();
+        !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+    }
+}
+
+impl Drop for ContainerGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("docker").args(["rm", "-f", &self.0]).output();
+    }
+}
+
+/// A Claude session runs inside a container: `claude.binary` is a
+/// `docker exec` template, the shim carries hooks and `task complete` out,
+/// the transcript is read from the mounted config dir, and cleanup removes
+/// the container.
+#[test]
+fn container_claude_session_completes_through_docker_exec() {
+    let Some(image) = docker_image() else { return };
+    let (setup, cleanup) = container_setup_and_cleanup(&image);
+    let opts = Opts {
+        mode: "complete",
+        claude_binary: Some("docker exec -i -t --env-file {task_dir}/env -w {worktree} pq-{slug} fake-claude".into()),
+        extra_claude: "shim = true",
+        launcher_sets_powerqueue_bin: true,
+        extra_repo: setup,
+        extra_cleanup: cleanup,
+        ..Opts::default()
+    };
+    let Some(mut env) = Env::with_opts(opts, |_| String::new()) else { return };
+    let key = add_task(&env, "Say hello from a container", &[]);
+    let guard = ContainerGuard(format!("pq-{}", key.to_lowercase()));
+    env.start_daemon();
+    let st = env.wait_for_state(&key, "completed", Duration::from_secs(120));
+    assert_eq!(st, "completed", "daemon log:\n{}", env.daemon_log());
+    let v = env.wait_for_show(&key, |v| output_tokens(v) >= 1400 && has_event(v, "cleanup.done"));
+    assert_eq!(v["task"]["summary"].as_str(), Some("fake-claude finished"));
+    let kinds = event_kinds(&v);
+    for expected in [
+        "worktree.setup",
+        "session.launched",
+        "session.started",
+        "inbox.complete",
+        "hook.stop",
+        "cleanup.commands",
+        "cleanup.done",
+    ] {
+        assert!(kinds.iter().any(|k| k == expected), "missing event {expected} in {kinds:?}");
+    }
+    assert!(!kinds.iter().any(|k| k == "inbox.rejected" || k == "inbox.error"), "{kinds:?}");
+    assert!(output_tokens(&v) >= 1400, "usage from the transcript written inside the container: {}", v["usage"]);
+    // The fixture committed inside the container, on the host's worktree.
+    let repo = env.root.path().join("repo");
+    let log = Command::new("git").args(["log", "--oneline", &format!("pq/{key}")]).current_dir(&repo).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&log.stdout).contains("fake-claude: work on task"),
+        "{}",
+        String::from_utf8_lossy(&log.stdout)
+    );
+    assert!(!guard.running(), "cleanup.run removed the container");
+    let (shim, inbox) = shim_and_inbox(&env, &key);
+    assert!(shim.is_file());
+    assert!(walk(&inbox).into_iter().all(|p| p.extension().is_none_or(|e| e != "msg")), "inbox drained");
+}
+
+/// Same through Codex: `notify` and `task complete` go through the shim,
+/// the rollout is discovered in the mounted `CODEX_HOME`.
+#[test]
+fn container_codex_session_completes_through_docker_exec() {
+    let Some(image) = docker_image() else { return };
+    let (setup, cleanup) = container_setup_and_cleanup(&image);
+    let opts = Opts { mode: "complete", extra_repo: setup, extra_cleanup: cleanup, ..Opts::default() };
+    let Some(mut env) = Env::with_opts(opts, |root| {
+        format!(
+            r#"[budget]
+default_model = "gpt-6-astra"
+low_model = "gpt-6-luna"
+[budget.providers.claude]
+enabled = false
+[budget.providers.codex]
+enabled = true
+[budget.providers.codex.models.gpt-6-astra]
+min_criticality = "normal"
+[codex]
+binary = "docker exec -i -t --env-file {{task_dir}}/env -w {{worktree}} pq-{{slug}} fake-codex"
+shim = true
+[codex.env]
+FAKE_CODEX_MODE = "complete"
+FAKE_CODEX_STATE_DIR = "{state}"
+CODEX_HOME = "{codex_home}"
+"#,
+            state = root.join("fakestate").display(),
+            codex_home = root.join("codex").display(),
+        )
+    }) else {
+        return;
+    };
+    let codex_home = env.root.path().join("codex").display().to_string();
+    env.vars.push(("CODEX_HOME".into(), codex_home));
+    let key = add_task(&env, "Codex in a container", &[]);
+    let guard = ContainerGuard(format!("pq-{}", key.to_lowercase()));
+    env.start_daemon();
+    if !launched_or_skip(&env, &key) {
+        return;
+    }
+    let st = env.wait_for_state(&key, "completed", Duration::from_secs(120));
+    assert_eq!(st, "completed", "daemon log:\n{}", env.daemon_log());
+    let v = env.wait_for_show(&key, |v| has_event(v, "cleanup.done") && output_tokens(v) > 0);
+    assert_eq!(v["task"]["summary"].as_str(), Some("fake-codex finished"));
+    let kinds = event_kinds(&v);
+    for expected in ["session.launched", "session.discovered", "inbox.complete", "hook.stop", "cleanup.commands", "cleanup.done"]
+    {
+        assert!(kinds.iter().any(|k| k == expected), "missing event {expected} in {kinds:?}");
+    }
+    assert!(!kinds.iter().any(|k| k == "inbox.rejected" || k == "inbox.error"), "{kinds:?}");
+    assert!(output_tokens(&v) > 0, "usage from the rollout in the mounted CODEX_HOME: {}", v["usage"]);
+    assert!(!guard.running(), "cleanup.run removed the container");
 }
 
 #[test]

@@ -324,6 +324,10 @@ impl Daemon {
         self.rt.force_sync = false;
         let r = self.refresh_rules(now).await;
         self.report_phase("rules", r);
+        // Inbox before hooks: a shim-delivered hook becomes a hook row that
+        // the hook phase handles on this same tick.
+        let r = self.process_inbox(now).await;
+        self.report_phase("inbox", r);
         let r = self.process_hooks(now).await;
         self.report_phase("hooks", r);
         let r = self.relay_comments(now).await;
@@ -1692,6 +1696,65 @@ impl Daemon {
         Ok(())
     }
 
+    // ---------------------------------------------------------------- inbox
+
+    /// Drain the task inboxes written by the session shim
+    /// ([`crate::session::inbox`]) when a provider has `shim = true`: hook
+    /// messages become `hook_events` rows (handled by [`Self::process_hooks`]
+    /// right after), `task complete|block` messages are applied exactly as
+    /// the CLI would apply them. Unparsable files move to `inbox/rejected/`
+    /// (logged as `inbox.rejected`, reported by `doctor`); a message that
+    /// cannot be applied is logged as `inbox.error` and dropped.
+    async fn process_inbox(&mut self, now: DateTime<Utc>) -> Result<()> {
+        use crate::session::inbox;
+        if !self.cfg.shim_enabled() {
+            return Ok(());
+        }
+        let tasks = self.store.list_tasks()?;
+        for task in tasks.iter().filter(|t| !t.state.is_terminal()) {
+            let inbox_dir = inbox::inbox_dir(&self.paths.task_dir(&task.id.to_string()));
+            if !inbox_dir.is_dir() {
+                continue;
+            }
+            for (path, parsed) in inbox::drain(&inbox_dir)? {
+                let file = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                match parsed {
+                    Ok(msg) => {
+                        let kind = msg.header.kind();
+                        tracing::debug!(task = %task.key, kind, file = %file, "inbox message");
+                        if let Err(e) = self.apply_inbox_message(task, &msg, now) {
+                            tracing::warn!(task = %task.key, kind, error = %format!("{e:#}"), "inbox message could not be applied");
+                            self.log(
+                                Some(task.id),
+                                msg.header.session(),
+                                EventLevel::Error,
+                                "inbox.error",
+                                &format!("{kind} message from the session shim: {e:#}"),
+                                serde_json::json!({ "kind": kind, "file": file }),
+                            );
+                        }
+                        if let Err(e) = std::fs::remove_file(&path) {
+                            tracing::warn!(file = %path.display(), error = %e, "cannot remove a drained inbox message");
+                        }
+                    }
+                    Err(e) => {
+                        let moved = inbox::reject(&path);
+                        tracing::warn!(task = %task.key, file = %file, error = %format!("{e:#}"), "rejected an inbox message");
+                        self.log(
+                            Some(task.id),
+                            None,
+                            EventLevel::Warn,
+                            "inbox.rejected",
+                            &format!("unreadable message from the session shim ({file}): {e:#}"),
+                            serde_json::json!({ "file": file, "moved_to": moved.ok().map(|p| p.display().to_string()) }),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn github_failure(&mut self, error: &anyhow::Error) {
         let base = Duration::seconds(self.cfg.github.poll_interval_secs.clamp(5, 3600) as i64);
         self.rt.github.backoff =
@@ -1786,6 +1849,62 @@ impl Daemon {
             return false;
         }
         true
+    }
+
+    /// Apply one shim message. `task` owns the inbox the message sat in;
+    /// the message itself names the task the way `powerqueue task` accepts
+    /// it (id, key or prefix), which must resolve to that same task.
+    fn apply_inbox_message(&self, task: &Task, msg: &crate::session::inbox::InboxMessage, now: DateTime<Utc>) -> Result<()> {
+        use crate::cli::commands::task::{block_task, complete_task, hand_off_for_review, record_agent_block};
+        use crate::session::inbox::InboxHeader;
+        let mut target =
+            self.store.find_task(msg.header.task())?.ok_or_else(|| anyhow::anyhow!("no task matches `{}`", msg.header.task()))?;
+        if target.id != task.id {
+            bail!("the message names {} but sat in the inbox of {}", target.key, task.key);
+        }
+        let session = msg.header.session();
+        let body = msg.body.trim();
+        match &msg.header {
+            InboxHeader::Hook { provider, event, .. } => {
+                if *provider == Provider::Claude
+                    && event.trim().eq_ignore_ascii_case(crate::budget::probes::claude::STATUS_LINE_EVENT)
+                {
+                    crate::hook::handle_status_line(Some(&self.store), &mut msg.body.as_bytes(), now);
+                    return Ok(());
+                }
+                crate::hook::handle_provider(&self.store, *provider, target.id, session, event, &msg.body)?;
+            }
+            InboxHeader::Complete { pr, .. } => {
+                let summary = (!body.is_empty()).then_some(body);
+                match pr.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+                    Some(url) => hand_off_for_review(&self.store, &mut target, summary, url)?,
+                    None => complete_task(&self.store, &mut target, summary)?,
+                }
+                self.log(
+                    Some(target.id),
+                    session,
+                    EventLevel::Debug,
+                    "inbox.complete",
+                    "task complete received from the session shim",
+                    serde_json::json!({ "pr": pr, "summary": summary }),
+                );
+            }
+            InboxHeader::Block { .. } => {
+                let reason = (!body.is_empty()).then_some(body);
+                block_task(&self.store, &mut target, reason)?;
+                let session_s = session.map(|s| s.to_string());
+                record_agent_block(&self.store, &target, Some(&target.id.to_string()), session_s.as_deref())?;
+                self.log(
+                    Some(target.id),
+                    session,
+                    EventLevel::Debug,
+                    "inbox.block",
+                    "task block received from the session shim",
+                    serde_json::json!({ "reason": reason }),
+                );
+            }
+        }
+        Ok(())
     }
 
     // ---------------------------------------------------------------- hooks
@@ -2024,7 +2143,7 @@ impl Daemon {
                 None => {
                     let Some(task) = self.store.get_task(session.task_id)? else { continue };
                     let Some(wt) = &task.worktree_path else { continue };
-                    let guess = transcript_path_for(&claude_home(), Path::new(wt), session.id);
+                    let guess = transcript_path_for(&claude_home(&self.cfg), Path::new(wt), session.id);
                     if !guess.exists() {
                         continue;
                     }
@@ -2914,8 +3033,12 @@ impl Daemon {
             let env = vec![
                 ("POWERQUEUE_TASK_ID".to_string(), task.id.to_string()),
                 ("POWERQUEUE_TASK_KEY".to_string(), task.key.clone()),
+                ("POWERQUEUE_TASK_SLUG".to_string(), task.slug()),
+                ("POWERQUEUE_TASK_DIR".to_string(), self.paths.task_dir(&task.id.to_string()).display().to_string()),
                 ("POWERQUEUE_BRANCH".to_string(), branch.to_string()),
                 ("POWERQUEUE_WORKTREE".to_string(), worktree.display().to_string()),
+                ("POWERQUEUE_DATA_DIR".to_string(), self.paths.data_dir.display().to_string()),
+                ("POWERQUEUE_STATE_DIR".to_string(), self.paths.state_dir.display().to_string()),
             ];
             let output = run_commands(worktree, &self.cfg.repo.setup, &env).context("repo.setup commands")?;
             self.log(Some(task.id), None, EventLevel::Debug, "worktree.setup", "setup commands finished", serde_json::json!({ "output": output.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect::<String>() }));

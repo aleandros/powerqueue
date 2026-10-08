@@ -11,7 +11,7 @@
 //! can feed the same [`ObservedUsage`].
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::time::{Duration as StdDuration, Instant};
 
@@ -66,7 +66,7 @@ impl UsageProbe for CodexProbe {
     /// answers with an error before replying, or takes longer than
     /// `timeout`; `Ok(None)` when the reply carries no usable bucket.
     fn probe(&self) -> Result<Option<ObservedUsage>> {
-        let mut child = Command::new(&self.binary)
+        let mut child = crate::session::binary::host_command(&self.binary)?
             .args(["-s", "read-only", "-a", "never", "app-server"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

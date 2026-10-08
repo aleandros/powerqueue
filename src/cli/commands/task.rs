@@ -706,11 +706,16 @@ pub fn preview_prompt(cfg: &Config, paths: &crate::paths::Paths, task: &Task) ->
         preview.worktree_path =
             Some(crate::scheduler::worktree_dir(&cfg.worktree_root(paths), task).to_string_lossy().to_string());
     }
+    let shim = cfg
+        .launch_settings(model.provider())
+        .shim
+        .then(|| crate::session::inbox::shim_path(&paths.task_dir(&task.id.to_string())));
     let ctx = crate::session::PromptContext {
         provider: model.provider(),
         model: Some(&model),
         attempt: task.attempts.saturating_add(1),
         previous_error: task.last_error.as_deref(),
+        powerqueue: shim.as_deref(),
     };
     crate::session::render_prompt(&preview, cfg, &ctx)
 }

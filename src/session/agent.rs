@@ -163,12 +163,23 @@ pub fn prompt_arg(prompt_path: &Path) -> String {
 
 /// Environment exported to a session: the provider's `env` table plus
 /// powerqueue's own variables (so `powerqueue task complete` inside the
-/// session finds the same home as the daemon).
-pub fn session_env(provider_env: &BTreeMap<String, String>, task: &Task, session_id: uuid::Uuid) -> Vec<(String, String)> {
+/// session finds the same home as the daemon). `POWERQUEUE_BIN` names the
+/// `powerqueue` command the session should run (`powerqueue_bin`: the host
+/// binary, or the task's shim with `<provider>.shim`) unless the provider's
+/// `env` sets it.
+pub fn session_env(
+    provider_env: &BTreeMap<String, String>,
+    task: &Task,
+    session_id: uuid::Uuid,
+    powerqueue_bin: &Path,
+) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = provider_env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     env.push(("POWERQUEUE_TASK_ID".to_string(), task.id.to_string()));
     env.push(("POWERQUEUE_TASK_KEY".to_string(), task.key.clone()));
     env.push(("POWERQUEUE_SESSION_ID".to_string(), session_id.to_string()));
+    if !provider_env.contains_key("POWERQUEUE_BIN") {
+        env.push(("POWERQUEUE_BIN".to_string(), powerqueue_bin.to_string_lossy().to_string()));
+    }
     if let Some(home) = std::env::var_os("POWERQUEUE_HOME") {
         env.push(("POWERQUEUE_HOME".to_string(), home.to_string_lossy().to_string()));
     }
@@ -246,10 +257,16 @@ mod tests {
         let mut base = BTreeMap::new();
         base.insert("A".to_string(), "1".to_string());
         let sid = uuid::Uuid::new_v4();
-        let env = session_env(&base, &t, sid);
+        let env = session_env(&base, &t, sid, Path::new("/opt/pq/bin/powerqueue"));
         assert_eq!(env[0], ("A".to_string(), "1".to_string()));
         assert!(env.contains(&("POWERQUEUE_SESSION_ID".to_string(), sid.to_string())));
         assert!(env.contains(&("POWERQUEUE_TASK_KEY".to_string(), "ENG-1".to_string())));
+        assert!(env.contains(&("POWERQUEUE_BIN".to_string(), "/opt/pq/bin/powerqueue".to_string())));
+        // The provider env wins over the default.
+        base.insert("POWERQUEUE_BIN".to_string(), "fake".to_string());
+        let env = session_env(&base, &t, sid, Path::new("/opt/pq/bin/powerqueue"));
+        assert_eq!(env.iter().filter(|(k, _)| k == "POWERQUEUE_BIN").count(), 1);
+        assert!(env.contains(&("POWERQUEUE_BIN".to_string(), "fake".to_string())));
     }
 
     #[test]

@@ -12,9 +12,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-/// Location of Claude Code's global state file.
-pub fn claude_json_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+/// Location of Claude Code's global state file: `<claude.env.CLAUDE_CONFIG_DIR>/.claude.json`
+/// when the sessions get a config dir of their own (see
+/// [`crate::session::transcript::claude_home`]), else the daemon's
+/// `$CLAUDE_CONFIG_DIR/.claude.json`, else `~/.claude.json`.
+pub fn claude_json_path(cfg: &crate::config::Config) -> PathBuf {
+    if let Some(dir) = cfg.claude.env.get("CLAUDE_CONFIG_DIR").filter(|d| !d.trim().is_empty()) {
+        return crate::paths::expand_tilde(dir).join(".claude.json");
+    }
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
         return PathBuf::from(dir).join(".claude.json");
     }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));

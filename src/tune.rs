@@ -656,10 +656,15 @@ pub const ALLOWED_TOOLS: [&str; 8] = [
     "Bash(powerqueue config validate*)",
 ];
 
-/// The `claude -p` command line for a tuning session.
+/// The `claude -p` command line for a tuning session. `binary` is
+/// `claude.binary`: its program and leading arguments come first (a
+/// per-task template cannot be used here; the caller checks).
 pub fn claude_argv(binary: &str, model: &str, extra_args: &[String]) -> Vec<String> {
-    let mut argv = vec![
-        binary.to_string(),
+    let mut argv: Vec<String> = crate::session::BinaryTemplate::parse(binary)
+        .ok()
+        .and_then(|t| t.host_argv().map(|w| w.to_vec()))
+        .unwrap_or_else(|| vec![binary.to_string()]);
+    argv.extend([
         "-p".to_string(),
         "--model".to_string(),
         model.to_string(),
@@ -670,7 +675,7 @@ pub fn claude_argv(binary: &str, model: &str, extra_args: &[String]) -> Vec<Stri
         "--allowedTools".to_string(),
         ALLOWED_TOOLS.join(","),
         "--no-session-persistence".to_string(),
-    ];
+    ]);
     argv.extend(extra_args.iter().cloned());
     argv
 }

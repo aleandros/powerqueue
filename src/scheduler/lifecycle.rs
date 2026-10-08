@@ -324,6 +324,7 @@ fn cleanup_env(task: &Task, succeeded: bool) -> Vec<(String, String)> {
     vec![
         ("POWERQUEUE_TASK_ID".to_string(), task.id.to_string()),
         ("POWERQUEUE_TASK_KEY".to_string(), task.key.clone()),
+        ("POWERQUEUE_TASK_SLUG".to_string(), task.slug()),
         ("POWERQUEUE_BRANCH".to_string(), task.branch.clone().unwrap_or_default()),
         ("POWERQUEUE_WORKTREE".to_string(), task.worktree_path.clone().unwrap_or_default()),
         ("POWERQUEUE_SUCCEEDED".to_string(), if succeeded { "1" } else { "0" }.to_string()),

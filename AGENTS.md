@@ -33,7 +33,7 @@ src/
   worktree.rs        git worktree ops (shell out to git)
   tmux.rs            tmux ops (shell out to tmux)
   service.rs         `powerqueue service`: systemd user unit / launchd agent rendering, parsing, systemctl/launchctl ops
-  session/           agent.rs (AgentCli trait, agent_for, shared helpers), claude.rs, codex.rs, gemini.rs (one per CLI), launcher (prompt, launch.sh), transcript tailing, probes
+  session/           agent.rs (AgentCli trait, agent_for, shared helpers), claude.rs, codex.rs, gemini.rs (one per CLI), binary.rs (`<provider>.binary` command templates), inbox.rs (container shim + inbox for `<provider>.shim`), launcher (prompt, launch.sh), transcript tailing, probes
   scheduler/         daemon loop (daemon.rs), pure transitions (transitions.rs), pick_next + cleanup (lifecycle.rs), PR watcher decisions (review.rs)
   hook.rs            `powerqueue hook` (called by Claude Code hooks)
   dashboard/         ratatui TUI

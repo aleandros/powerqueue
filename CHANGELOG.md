@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Sessions can run inside containers (or anywhere the daemon's `powerqueue`
+binary cannot run); see docs/containers.md.
+
+### Added
+
+- `claude.binary`, `codex.binary` and `gemini.binary` are command templates:
+  a command line split like a shell would, with per-task placeholders
+  (`{key}`, `{slug}`, `{task_id}`, `{session_id}`, `{worktree}`,
+  `{task_dir}`, `{repo}`, `{attempt}`, `{model}`), e.g. `docker exec -it
+  --env-file {task_dir}/env -w {worktree} pq-{slug} claude`. A plain
+  program still works as before. `config validate` reports unbalanced
+  quotes and unknown placeholders; `doctor`, `service status` and the
+  usage probes use the template's program, and skip the login check with a
+  note when the command is per-task.
+- `<provider>.shim = true`: the launcher writes a POSIX shell shim to
+  `<task dir>/bin/powerqueue` and points the hooks, Claude Code's status
+  line, Codex's `notify` and the prompt's completion protocol at it. The
+  shim writes one file per call into `<task dir>/inbox/`; the daemon drains
+  it every tick (new `inbox` phase before the hooks) and applies the
+  messages as `powerqueue hook` / `task complete` / `task block` would
+  (events `inbox.complete`, `inbox.block`, `inbox.error`, `inbox.rejected`;
+  `doctor` reports parked unreadable messages). Claude sessions get
+  `Bash(<shim> task *)` in `--allowedTools`; prompt templates can use
+  `{{powerqueue}}`.
+- `POWERQUEUE_BIN` in the session environment names the `powerqueue`
+  command the session should run (the host binary, or the shim) unless the
+  provider's `env` sets it.
+- `repo.setup` gets `POWERQUEUE_TASK_SLUG`, `POWERQUEUE_TASK_DIR`,
+  `POWERQUEUE_DATA_DIR` and `POWERQUEUE_STATE_DIR`; `cleanup.run` gets
+  `POWERQUEUE_TASK_SLUG`.
+- `claude.env.CLAUDE_CONFIG_DIR` is also where the daemon reads transcripts
+  and seeds workspace trust (like `codex.env.CODEX_HOME` for rollouts), so a
+  config directory mounted into a container at the same path works on both
+  sides.
+- docs/containers.md, docs/examples/Dockerfile.agent (Claude Code + Codex
+  on Node 22) and docs/examples/agent-container.sh (`up` / `down` / `exec`
+  for a per-task container); end-to-end tests of the shim on the host and,
+  with `POWERQUEUE_E2E_DOCKER=1`, of Claude and Codex sessions through
+  `docker exec`.
+
 ## [0.9.0] - 2026-10-08
 
 ### Added
@@ -22,7 +62,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Document both Linear and GitHub Issues in the README, troubleshooting guide,
   architecture notes and project landing page, with a GitHub setup example.
-
 
 ## [0.8.1] - 2026-10-07
 

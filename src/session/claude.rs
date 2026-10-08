@@ -28,25 +28,17 @@ impl AgentCli for ClaudeCli {
         let mut settings = hook_settings(ctx.self_bin, ctx.task.id, ctx.session_id, &ctx.cfg.claude);
         settings["statusLine"] = crate::budget::probes::claude::status_line_setting(ctx.self_bin, ctx.task.id, ctx.session_id);
         let settings_text = serde_json::to_string_pretty(&settings).context("serialise settings.json")? + "\n";
-        let argv = Launcher::claude_command(
-            ctx.cfg,
-            ctx.model,
-            ctx.session_id,
-            &settings_path,
-            ctx.prompt_path,
-            ctx.resume.is_some(),
-            &ctx.task.key,
-        );
+        let argv = Launcher::claude_command(ctx, &settings_path)?;
         // Claude Code encodes its *physical* cwd, so resolve symlinks (e.g. /tmp → /private/tmp).
         let physical = std::fs::canonicalize(ctx.worktree).unwrap_or_else(|_| ctx.worktree.to_path_buf());
         let transcript = crate::session::transcript::transcript_path_for(
-            &crate::session::transcript::claude_home(),
+            &crate::session::transcript::claude_home(ctx.cfg),
             &physical,
             ctx.session_id,
         );
         Ok(AgentLaunch {
             files: vec![(settings_path, settings_text, 0o644)],
-            env: session_env(&ctx.cfg.claude.env, ctx.task, ctx.session_id),
+            env: session_env(&ctx.cfg.claude.env, ctx.task, ctx.session_id, ctx.self_bin),
             argv,
             transcript_path: Some(transcript),
             poll_transcript_for_completion: false,
@@ -60,7 +52,7 @@ impl AgentCli for ClaudeCli {
         if !cfg.claude.trust_workspace {
             return Ok(());
         }
-        let file = crate::session::trust::claude_json_path();
+        let file = crate::session::trust::claude_json_path(cfg);
         let targets = crate::session::trust::trust_targets(repo, worktree);
         let refs: Vec<&Path> = targets.iter().map(|p| p.as_path()).collect();
         match crate::session::trust::ensure_trusted(&file, &refs) {

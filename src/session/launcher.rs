@@ -88,7 +88,7 @@ const HOOK_TIMEOUT_SECS: u64 = 10;
 /// log. `cfg.claude.append_system_prompt` is deliberately *not* included
 /// here; it goes to `--append-system-prompt`.
 pub fn build_prompt(task: &Task, cfg: &Config, provider: Provider, attempt: u32, previous_error: Option<&str>) -> String {
-    let rendered = render_prompt(task, cfg, &PromptContext { provider, model: None, attempt, previous_error });
+    let rendered = render_prompt(task, cfg, &PromptContext { provider, model: None, attempt, previous_error, powerqueue: None });
     for w in &rendered.warnings {
         tracing::warn!(task = %task.key, "{w}");
     }
@@ -103,6 +103,10 @@ pub struct PromptContext<'a> {
     pub model: Option<&'a ModelTier>,
     pub attempt: u32,
     pub previous_error: Option<&'a str>,
+    /// The `powerqueue` command the session should run for the completion
+    /// protocol (`{{powerqueue}}`): the task's shim when `<provider>.shim`
+    /// is on, else `None` for plain `powerqueue` on PATH.
+    pub powerqueue: Option<&'a Path>,
 }
 
 /// Result of [`render_prompt`].
@@ -117,7 +121,8 @@ pub struct RenderedPrompt {
 }
 
 /// Placeholder names a prompt template may use (`{{name}}`).
-pub const PROMPT_PLACEHOLDERS: [&str; 25] = [
+pub const PROMPT_PLACEHOLDERS: [&str; 26] = [
+    "powerqueue",
     "key",
     "title",
     "description",
@@ -199,10 +204,11 @@ pub fn prompt_variables(task: &Task, cfg: &Config, ctx: &PromptContext<'_>) -> B
          {commit_rule}\
          - Do not push unless asked; powerqueue pushes on completion.\n"
     );
+    let powerqueue = ctx.powerqueue.map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "powerqueue".to_string());
     let completion_protocol = format!(
         "## Completion protocol\n\n\
-         When the task is fully done, run `powerqueue task complete {id} --summary \"...\"` and then print `{DONE_MARKER}` as the last line of your final message.\n\
-         If you are blocked and need a human, run `powerqueue task block {id} --reason \"...\"` and print `{BLOCKED_MARKER}`.\n",
+         When the task is fully done, run `{powerqueue} task complete {id} --summary \"...\"` and then print `{DONE_MARKER}` as the last line of your final message.\n\
+         If you are blocked and need a human, run `{powerqueue} task block {id} --reason \"...\"` and print `{BLOCKED_MARKER}`.\n",
         id = task.id,
     );
     let previous_error = ctx.previous_error.map(str::trim).filter(|e| !e.is_empty()).unwrap_or_default().to_string();
@@ -242,6 +248,7 @@ pub fn prompt_variables(task: &Task, cfg: &Config, ctx: &PromptContext<'_>) -> B
     }
 
     let mut vars = BTreeMap::new();
+    vars.insert("powerqueue", powerqueue);
     vars.insert("key", task.key.clone());
     vars.insert("title", task.title.trim().to_string());
     vars.insert("description", description);
@@ -404,9 +411,32 @@ impl Launcher {
         let env_path = task_dir.join("env");
         let script_path = task_dir.join("launch.sh");
 
+        // With `<provider>.shim` the session cannot run this binary: it gets
+        // a shell shim that writes to the task inbox instead, and every
+        // command line that would name the binary names the shim.
+        let shim = cfg.launch_settings(provider).shim.then(|| {
+            let shim = crate::session::inbox::shim_path(&task_dir);
+            (shim, crate::session::inbox::inbox_dir(&task_dir))
+        });
+        if let Some((shim_bin, inbox)) = &shim {
+            write_executable(shim_bin, &crate::session::inbox::shim_script(&task.key, inbox))?;
+            std::fs::create_dir_all(inbox).with_context(|| format!("cannot create {}", inbox.display()))?;
+        }
+        let powerqueue_bin: &Path = shim.as_ref().map(|(s, _)| s.as_path()).unwrap_or(&self.self_bin);
+
         let prompt = match prompt_override {
             Some(text) => RenderedPrompt { text: format!("{}\n", text.trim_end()), template: None, warnings: Vec::new() },
-            None => render_prompt(task, cfg, &PromptContext { provider, model: Some(model), attempt, previous_error }),
+            None => render_prompt(
+                task,
+                cfg,
+                &PromptContext {
+                    provider,
+                    model: Some(model),
+                    attempt,
+                    previous_error,
+                    powerqueue: shim.as_ref().map(|(s, _)| s.as_path()),
+                },
+            ),
         };
         for w in &prompt.warnings {
             tracing::warn!(task = %task.key, session = %session_id, "{w}");
@@ -426,7 +456,7 @@ impl Launcher {
             task_dir: &task_dir,
             prompt_path: &prompt_path,
             worktree,
-            self_bin: &self.self_bin,
+            self_bin: powerqueue_bin,
         };
         let launch = agent.prepare(&ctx).with_context(|| format!("prepare {provider} launch for {}", task.key))?;
         for (path, contents, mode) in &launch.files {
@@ -453,7 +483,18 @@ impl Launcher {
             .with_context(|| format!("cannot write {}", env_path.display()))?;
 
         let argv = launch.argv;
-        let script = launch_script(task, attempt, worktree, &env, &argv, &self.self_bin);
+        // PATH for the session: the shim's directory first when there is
+        // one (so a host-run CLI reaches the inbox too), then this binary's.
+        let mut path_dirs: Vec<PathBuf> = Vec::new();
+        if let Some((shim_bin, _)) = &shim
+            && let Some(dir) = shim_bin.parent()
+        {
+            path_dirs.push(dir.to_path_buf());
+        }
+        if let Some(dir) = self.self_bin.parent() {
+            path_dirs.push(dir.to_path_buf());
+        }
+        let script = launch_script(task, attempt, worktree, &env, &argv, &path_dirs);
         // The script exports `claude.env`, which may hold secrets: owner-only.
         crate::config::write_private(&script_path, script.as_bytes())
             .with_context(|| format!("cannot write {}", script_path.display()))?;
@@ -464,7 +505,7 @@ impl Launcher {
                 .with_context(|| format!("cannot chmod {}", script_path.display()))?;
         }
 
-        tracing::info!(task = %task.key, session = %session_id, attempt, resume, model = %model, provider = %provider, dir = %task_dir.display(), "prepared launch files");
+        tracing::info!(task = %task.key, session = %session_id, attempt, resume, model = %model, provider = %provider, shim = shim.is_some(), dir = %task_dir.display(), "prepared launch files");
         Ok(LaunchPlan {
             shell_command: format!("sh {}", shell_quote(&script_path.to_string_lossy())),
             task_dir,
@@ -536,26 +577,21 @@ impl Launcher {
 
     /// Full command line (for `task show` and debugging).
     ///
-    /// The last element is the prompt, expressed as the shell snippet
+    /// `claude.binary` is rendered first (program plus leading arguments,
+    /// per-task placeholders filled; see [`crate::session::binary`]). The
+    /// last element is the prompt, expressed as the shell snippet
     /// `$(cat '<prompt_path>')` so the script (and a human re-running it)
-    /// reads the prompt from disk. Everything before it is a literal argument.
-    pub fn claude_command(
-        cfg: &Config,
-        model: &ModelTier,
-        session_id: uuid::Uuid,
-        settings_path: &Path,
-        prompt_path: &Path,
-        resume: bool,
-        name: &str,
-    ) -> Vec<String> {
-        let c = &cfg.claude;
-        let mut argv = vec![c.binary.clone()];
-        argv.push(if resume { "--resume" } else { "--session-id" }.to_string());
-        argv.push(session_id.to_string());
-        argv.extend(["--model".to_string(), model.alias().to_string()]);
+    /// reads the prompt from disk. Everything in between is a literal
+    /// argument. Fails when `claude.binary` does not parse.
+    pub fn claude_command(ctx: &LaunchContext<'_>, settings_path: &Path) -> Result<Vec<String>> {
+        let c = &ctx.cfg.claude;
+        let mut argv = crate::session::binary::launch_argv(&c.binary, ctx).context("claude.binary")?;
+        argv.push(if ctx.resume.is_some() { "--resume" } else { "--session-id" }.to_string());
+        argv.push(ctx.resume.unwrap_or(&ctx.session_id.to_string()).to_string());
+        argv.extend(["--model".to_string(), ctx.model.alias().to_string()]);
         argv.extend(["--permission-mode".to_string(), c.permission_mode.clone()]);
         argv.extend(["--settings".to_string(), settings_path.to_string_lossy().to_string()]);
-        argv.extend(["--name".to_string(), name.to_string()]);
+        argv.extend(["--name".to_string(), ctx.task.key.clone()]);
         if let Some(effort) = c.effort.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
             argv.extend(["--effort".to_string(), effort.to_string()]);
         }
@@ -563,9 +599,10 @@ impl Launcher {
             argv.extend(["--fallback-model".to_string(), c.fallback_models.join(",")]);
         }
         let mut allowed: Vec<String> = c.allowed_tools.clone();
-        for always in ALWAYS_ALLOWED_TOOLS {
-            if !allowed.iter().any(|a| a == always) {
-                allowed.push(always.to_string());
+        let shim = c.shim.then(|| ctx.self_bin.to_string_lossy().to_string());
+        for always in always_allowed_tools(shim.as_deref()) {
+            if !allowed.contains(&always) {
+                allowed.push(always);
             }
         }
         argv.extend(["--allowedTools".to_string(), allowed.join(",")]);
@@ -577,9 +614,35 @@ impl Launcher {
         // variadic: without the separator the prompt is read as one more tool
         // rule and the session starts empty, waiting for input.
         argv.push("--".to_string());
-        argv.push(prompt_arg(prompt_path));
-        argv
+        argv.push(prompt_arg(ctx.prompt_path));
+        Ok(argv)
     }
+}
+
+/// The tool rules every Claude session gets: [`ALWAYS_ALLOWED_TOOLS`], plus
+/// the same rule for the task's shim when the session runs through one
+/// (the prompt then names the shim by its absolute path).
+pub fn always_allowed_tools(shim: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = ALWAYS_ALLOWED_TOOLS.iter().map(|s| s.to_string()).collect();
+    if let Some(shim) = shim.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push(format!("Bash({shim} task *)"));
+    }
+    out
+}
+
+/// Write `contents` to `path` (parents created) and make it executable.
+fn write_executable(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    std::fs::write(path, contents).with_context(|| format!("cannot write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("cannot chmod {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn worktree_of(task: &Task) -> Result<&Path> {
@@ -589,14 +652,14 @@ fn worktree_of(task: &Task) -> Result<&Path> {
     }
 }
 
-/// Render `launch.sh`.
+/// Render `launch.sh`. `path_dirs` go in front of `PATH`, first entry first.
 fn launch_script(
     task: &Task,
     attempt: u32,
     worktree: &Path,
     env: &[(String, String)],
     argv: &[String],
-    self_bin: &Path,
+    path_dirs: &[PathBuf],
 ) -> String {
     let mut s = String::new();
     s.push_str("#!/bin/sh\n");
@@ -605,7 +668,7 @@ fn launch_script(
     let _ = writeln!(s, "cd {} || exit 1", shell_quote(&worktree.to_string_lossy()));
     // `powerqueue task complete` must work inside the session even when the
     // binary is not on the user's PATH (e.g. a cargo build in a checkout).
-    if let Some(dir) = self_bin.parent() {
+    for dir in path_dirs.iter().rev() {
         let _ = writeln!(s, "export PATH={}:\"$PATH\"", shell_quote(&dir.to_string_lossy()));
     }
     for (k, v) in env {
@@ -717,6 +780,32 @@ mod tests {
         assert!(v.get("env").is_none());
     }
 
+    /// A launch context for `claude_command` tests: task `ENG-123` in
+    /// `/work/wt/eng-123`, task dir `/s`, prompt `/s/prompt.md`.
+    fn launch_ctx<'a>(
+        cfg: &'a Config,
+        task: &'a Task,
+        model: &'a ModelTier,
+        sid: uuid::Uuid,
+        resume: Option<&'a str>,
+        paths: &'a Paths,
+        self_bin: &'a Path,
+    ) -> LaunchContext<'a> {
+        LaunchContext {
+            cfg,
+            paths,
+            task,
+            session_id: sid,
+            model,
+            attempt: 1,
+            resume,
+            task_dir: Path::new("/s"),
+            prompt_path: Path::new("/s/prompt.md"),
+            worktree: Path::new("/work/wt/eng-123"),
+            self_bin,
+        }
+    }
+
     #[test]
     fn claude_command_ordering() {
         let mut cfg = config();
@@ -726,15 +815,11 @@ mod tests {
         cfg.claude.append_system_prompt = Some("Be terse.".into());
         cfg.claude.extra_args = vec!["--add-dir".into(), "/shared".into()];
         let sid = uuid::Uuid::new_v4();
-        let argv = Launcher::claude_command(
-            &cfg,
-            &ModelTier::opus(),
-            sid,
-            Path::new("/s/settings.json"),
-            Path::new("/s/prompt.md"),
-            false,
-            "ENG-123",
-        );
+        let t = task();
+        let paths = Paths::rooted(Path::new("/pq"));
+        let opus = ModelTier::opus();
+        let ctx = launch_ctx(&cfg, &t, &opus, sid, None, &paths, Path::new("/bin/powerqueue"));
+        let argv = Launcher::claude_command(&ctx, Path::new("/s/settings.json")).unwrap();
         let sid_s = sid.to_string();
         let expected = vec![
             "claude",
@@ -764,15 +849,9 @@ mod tests {
         assert_eq!(argv, expected);
 
         let cfg = config();
-        let argv = Launcher::claude_command(
-            &cfg,
-            &ModelTier::sonnet(),
-            sid,
-            Path::new("/s/settings.json"),
-            Path::new("/s/prompt.md"),
-            true,
-            "x",
-        );
+        let sonnet = ModelTier::sonnet();
+        let ctx = launch_ctx(&cfg, &t, &sonnet, sid, Some(&sid_s), &paths, Path::new("/bin/powerqueue"));
+        let argv = Launcher::claude_command(&ctx, Path::new("/s/settings.json")).unwrap();
         assert_eq!(argv[1], "--resume");
         assert_eq!(argv[2], sid.to_string());
         assert_eq!(argv.len(), 15, "{argv:?}");
@@ -782,6 +861,75 @@ mod tests {
         // The variadic `--allowedTools` must not swallow the prompt.
         assert_eq!(argv[allowed + 2], "--", "{argv:?}");
         assert_eq!(argv.last().unwrap(), "$(cat /s/prompt.md)");
+    }
+
+    #[test]
+    fn claude_command_renders_the_binary_template_and_shim_rule() {
+        let mut cfg = config();
+        cfg.claude.binary = "docker exec -it --env-file {task_dir}/env -w {worktree} pq-{slug} claude".into();
+        cfg.claude.shim = true;
+        let sid = uuid::Uuid::new_v4();
+        let t = task();
+        let paths = Paths::rooted(Path::new("/pq"));
+        let opus = ModelTier::opus();
+        let ctx = launch_ctx(&cfg, &t, &opus, sid, None, &paths, Path::new("/s/bin/powerqueue"));
+        let argv = Launcher::claude_command(&ctx, Path::new("/s/settings.json")).unwrap();
+        assert_eq!(
+            &argv[..9],
+            &["docker", "exec", "-it", "--env-file", "/s/env", "-w", "/work/wt/eng-123", "pq-eng-123", "claude"]
+        );
+        assert_eq!(argv[9], "--session-id");
+        let allowed = argv.iter().position(|a| a == "--allowedTools").unwrap();
+        assert_eq!(argv[allowed + 1], "Bash(powerqueue task *),Bash(/s/bin/powerqueue task *)");
+
+        cfg.claude.binary = "claude 'oops".into();
+        let ctx = launch_ctx(&cfg, &t, &opus, sid, None, &paths, Path::new("/s/bin/powerqueue"));
+        let err = format!("{:#}", Launcher::claude_command(&ctx, Path::new("/s/settings.json")).unwrap_err());
+        assert!(err.contains("claude.binary") && err.contains("unbalanced"), "{err}");
+        assert_eq!(always_allowed_tools(None), vec!["Bash(powerqueue task *)".to_string()]);
+        assert_eq!(always_allowed_tools(Some(" ")), vec!["Bash(powerqueue task *)".to_string()]);
+    }
+
+    #[test]
+    fn prepare_with_shim_writes_the_shim_and_routes_hooks_through_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        let launcher = Launcher { paths, tmux: Tmux::new("tmux", None), self_bin: PathBuf::from("/usr/local/bin/powerqueue") };
+        let mut cfg = config();
+        cfg.claude.shim = true;
+        let mut t = task();
+        t.worktree_path = Some(dir.path().join("wt").to_string_lossy().to_string());
+        let sid = uuid::Uuid::new_v4();
+        let plan = launcher.prepare(&cfg, &t, sid, &ModelTier::sonnet(), 1, false, None).unwrap();
+        let shim = crate::session::inbox::shim_path(&plan.task_dir);
+        assert!(shim.is_file(), "shim written at {}", shim.display());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&shim).unwrap().permissions().mode() & 0o111, 0o111, "shim is executable");
+        }
+        assert!(crate::session::inbox::inbox_dir(&plan.task_dir).is_dir());
+        let shim_s = shim.to_string_lossy().to_string();
+        let settings = std::fs::read_to_string(&plan.settings_path).unwrap();
+        assert!(settings.contains(&format!("{shim_s} hook --task")), "hooks call the shim: {settings}");
+        assert!(!settings.contains("/usr/local/bin/powerqueue"), "{settings}");
+        let prompt = std::fs::read_to_string(&plan.prompt_path).unwrap();
+        assert!(prompt.contains(&format!("run `{shim_s} task complete {} --summary", t.id)), "{prompt}");
+        let script = std::fs::read_to_string(&plan.script_path).unwrap();
+        let shim_dir = shell_quote(&shim.parent().unwrap().to_string_lossy());
+        let bin_dir = shell_quote("/usr/local/bin");
+        let shim_line = script.lines().position(|l| l == format!("export PATH={shim_dir}:\"$PATH\"")).expect("shim dir on PATH");
+        let bin_line = script.lines().position(|l| l == format!("export PATH={bin_dir}:\"$PATH\"")).expect("binary dir on PATH");
+        assert!(shim_line > bin_line, "the shim directory is prepended last, so it comes first on PATH:\n{script}");
+        let allowed = script.lines().last().unwrap();
+        assert!(allowed.contains(&format!("Bash({shim_s} task *)")), "{allowed}");
+
+        // Without the shim nothing of this exists and hooks call the binary.
+        cfg.claude.shim = false;
+        let plan = launcher.prepare(&cfg, &t, uuid::Uuid::new_v4(), &ModelTier::sonnet(), 1, false, None).unwrap();
+        let settings = std::fs::read_to_string(&plan.settings_path).unwrap();
+        assert!(settings.contains("/usr/local/bin/powerqueue hook --task"), "{settings}");
+        assert!(std::fs::read_to_string(&plan.prompt_path).unwrap().contains("run `powerqueue task complete"));
     }
 
     #[test]
@@ -913,8 +1061,18 @@ mod tests {
         let t = task();
         let cfg = config();
         let opus = ModelTier::opus();
-        let ctx = PromptContext { provider: Provider::Claude, model: Some(&opus), attempt: 1, previous_error: None };
+        let ctx =
+            PromptContext { provider: Provider::Claude, model: Some(&opus), attempt: 1, previous_error: None, powerqueue: None };
         let vars = prompt_variables(&t, &cfg, &ctx);
+        assert_eq!(vars["powerqueue"], "powerqueue");
+        let shim_ctx = PromptContext { powerqueue: Some(Path::new("/s/bin/powerqueue")), ..ctx };
+        let shim_vars = prompt_variables(&t, &cfg, &shim_ctx);
+        assert_eq!(shim_vars["powerqueue"], "/s/bin/powerqueue");
+        assert!(
+            shim_vars["completion_protocol"].contains("run `/s/bin/powerqueue task complete"),
+            "{}",
+            shim_vars["completion_protocol"]
+        );
         let expected = format!(
             "# ENG-123: Fix the flaky login test\n\nThe test fails every third run.\n\nSee CI logs.\n\n\
              Source: ENG-123 <https://linear.app/acme/issue/ENG-123>\n\n{}\n{}",
@@ -1008,7 +1166,13 @@ mod tests {
         cfg.prompt.template = Some("prompt.md".into());
         cfg.prompt.base_dir = Some(dir.path().to_path_buf());
         let sonnet = ModelTier::sonnet();
-        let ctx = PromptContext { provider: Provider::Claude, model: Some(&sonnet), attempt: 1, previous_error: None };
+        let ctx = PromptContext {
+            provider: Provider::Claude,
+            model: Some(&sonnet),
+            attempt: 1,
+            previous_error: None,
+            powerqueue: None,
+        };
         let r = render_prompt(&t, &cfg, &ctx);
         assert_eq!(r.template.as_deref(), Some(tpl.as_path()));
         assert!(r.text.starts_with("Hello ENG-123 on pq/eng-123 (claude/sonnet)\n\n## Completion protocol\n"), "{}", r.text);
