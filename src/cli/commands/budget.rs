@@ -22,6 +22,7 @@ use crate::cli::{BudgetCommand, Context};
 use crate::config::Config;
 use crate::domain::{Criticality, ModelTier, Provider, Task, TaskSource};
 use crate::priority::PriorityRules;
+use crate::scheduler::{Candidate, LaunchContext, LaunchPlanner};
 
 pub fn run(ctx: &mut Context, cmd: BudgetCommand) -> Result<i32> {
     match cmd {
@@ -278,13 +279,6 @@ fn decision_why(d: &crate::budget::Decision) -> String {
     }
 }
 
-/// A waiting task with the rules' preference and the policy's answer.
-struct QueuedDecision {
-    task: Task,
-    preferred: Vec<ModelTier>,
-    decision: crate::budget::Decision,
-}
-
 /// The policy's answer for every schedulable open task (queued, throttled,
 /// crashed), in the order the daemon's next pass would take them
 /// (`pick_next`: score, criticality, age; a started task's predicted cost
@@ -301,34 +295,13 @@ fn queued_decisions(
     limits: &RateLimitState,
     estimator: &Estimator,
     now: DateTime<Utc>,
-) -> Result<Vec<QueuedDecision>> {
-    use crate::scheduler::pick_next;
+) -> Result<Vec<Candidate>> {
     let rules = PriorityRules::from_source(&cfg.rules_source(paths))?.unwrap_or_default();
     let tasks: Vec<Task> = store.list_open_tasks()?.into_iter().filter(|t| t.state.is_schedulable()).collect();
-    let mut ledgers = ledgers.clone();
-    let mut out = Vec::new();
-    let mut considered: std::collections::HashSet<crate::domain::TaskId> = std::collections::HashSet::new();
-    let decide = |task: Task, ledgers: &mut Ledgers| {
-        let evaluated = rules.evaluate(&task, now, None, 0.0, 0.0).models;
-        let preferred = if evaluated.is_empty() { rules.model_for(task.criticality).to_vec() } else { evaluated };
-        let decision = Policy::new(&cfg.budget, ledgers, limits).decide(&task, estimator.predict(&task), &preferred);
-        if let Some(model) = &decision.model
-            && let Some(ledger) = ledgers.for_model_mut(model)
-        {
-            ledger.add_spend(model, decision.prediction.weighted_tokens * tier_weight(&cfg.budget, model));
-        }
-        QueuedDecision { task, preferred, decision }
-    };
-    loop {
-        let candidates: Vec<Task> = tasks.iter().filter(|t| !considered.contains(&t.id)).cloned().collect();
-        let Some(task) = pick_next(&candidates, now).cloned() else { break };
-        considered.insert(task.id);
-        out.push(decide(task, &mut ledgers));
-    }
-    for task in tasks.into_iter().filter(|t| !considered.contains(&t.id)) {
-        out.push(decide(task, &mut ledgers));
-    }
-    Ok(out)
+    // The daemon's planner with no slot limit: what the queue would get if
+    // every task could start.
+    let planner = LaunchPlanner::new(estimator.clone(), ledgers.clone(), tasks, u32::MAX);
+    Ok(planner.plan_all(LaunchContext { budget: &cfg.budget, rules: &rules, rate_limits: limits }, now))
 }
 
 /// Print one provider's section of `budget show`.

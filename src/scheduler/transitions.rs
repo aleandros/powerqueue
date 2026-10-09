@@ -10,8 +10,12 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, SchedulerConfig};
-use crate::domain::{EventLevel, HookEvent, ModelTier, Provider, Session, SessionState, Task, TaskState};
+use crate::domain::{EventLevel, HookEvent, LinkedIssue, ModelTier, Provider, Session, SessionState, Task, TaskState};
+use crate::priority::Evaluation;
 use crate::session::{HookOutcome, SessionProbe};
+
+/// `last_error` marker for tasks paused by a PRIORITY.md `skip` override.
+pub const SKIP_REASON: &str = "skipped by PRIORITY.md";
 
 /// What Claude is told when a session sits idle without a completion signal.
 pub const NUDGE_TEXT: &str = "If the task is complete, run the completion command and print the done marker; otherwise continue.";
@@ -59,10 +63,17 @@ pub enum Effect {
     /// (blocked marker, question), the daemon posts it only if the agent
     /// itself ran `task block` (`RelayState::agent_blocked`).
     Question { text: String, reason: Option<String>, confirmed: bool },
+    /// Post a routine progress comment on the source issue (started,
+    /// resumed): only with `linear.post_comments = true`.
+    ProgressComment { body: String },
+    /// Forget a reply relayed from Linear that was waiting for the next
+    /// launch (a retry starts over).
+    ForgetAnswer,
 }
 
 impl Effect {
-    fn log(level: EventLevel, kind: &str, message: impl Into<String>, data: serde_json::Value) -> Self {
+    /// A [`Effect::Log`] event.
+    pub fn log(level: EventLevel, kind: &str, message: impl Into<String>, data: serde_json::Value) -> Self {
         Effect::Log { level, kind: kind.to_string(), message: message.into(), data }
     }
 }
@@ -743,6 +754,192 @@ pub fn on_dependencies(task: &mut Task) -> Vec<Effect> {
     }
 }
 
+/// Apply a PRIORITY.md evaluation to a task that has no live session:
+/// criticality, score (moves of more than half a point), the preferred
+/// model line of the reasons trail, a `skip` override (⇒ `paused`, marked
+/// with [`SKIP_REASON`]; lifted when the skip goes away) and the dependency
+/// state ([`on_dependencies`]). The reasons trail is replaced only when
+/// something else changed, so a task is not rewritten on every tick. The
+/// caller persists the task when it differs from before.
+pub fn on_evaluation(task: &mut Task, eval: &Evaluation) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    let mut changed = false;
+    if task.criticality != eval.criticality {
+        task.criticality = eval.criticality;
+        changed = true;
+    }
+    if (task.score - eval.score).abs() > 0.5 {
+        task.score = eval.score;
+        changed = true;
+    }
+    // A new label or `## Models` row can change the preferred models
+    // without moving criticality or score; keep the stored trail honest.
+    let model_line = |reasons: &[String]| reasons.iter().find(|r| r.starts_with("model ")).cloned();
+    let (old_model, new_model) = (model_line(&task.score_reasons), model_line(&eval.reasons));
+    if old_model != new_model {
+        changed = true;
+        effects.push(Effect::log(
+            EventLevel::Info,
+            "task.models_changed",
+            new_model.clone().unwrap_or_else(|| "no preferred model from PRIORITY.md".to_string()),
+            serde_json::json!({ "models": eval.models, "source": eval.model_source, "previous": old_model }),
+        ));
+    }
+    if changed {
+        task.score_reasons = eval.reasons.clone();
+    }
+    if eval.skip && task.state != TaskState::Paused && !task.state.is_handed_off() {
+        task.state = TaskState::Paused;
+        task.last_error = Some(SKIP_REASON.to_string());
+        task.not_before = None;
+        effects.push(Effect::log(EventLevel::Info, "task.skipped", SKIP_REASON, serde_json::json!({})));
+    } else if !eval.skip && task.state == TaskState::Paused && task.last_error.as_deref() == Some(SKIP_REASON) {
+        task.state = TaskState::Queued;
+        task.last_error = None;
+        effects.push(Effect::log(EventLevel::Info, "task.unskipped", "no longer skipped by PRIORITY.md", serde_json::json!({})));
+    }
+    effects.extend(on_dependencies(task));
+    effects
+}
+
+/// A container task (a parent issue) whose sub-issues are all done: it is
+/// completed with the final list of children and its resources released
+/// when it ever had any. A task that ran before it got sub-issues may be
+/// paused or crashed here; terminal tasks are left alone.
+pub fn on_container_closed(task: &mut Task, children: &[LinkedIssue], now: DateTime<Utc>) -> Vec<Effect> {
+    if task.state.is_terminal() {
+        return Vec::new();
+    }
+    let keys: Vec<&str> = children.iter().map(|c| c.key.as_str()).collect();
+    let previous = task.state;
+    task.state = TaskState::Completed;
+    task.children = children.to_vec();
+    task.summary = Some(format!("container closed: all sub-issues done ({})", keys.join(", ")));
+    task.completed_at = Some(now);
+    task.not_before = None;
+    let mut effects = vec![Effect::log(
+        EventLevel::Info,
+        "task.completed",
+        "container completed: every sub-issue is done",
+        serde_json::json!({ "previous_state": previous.as_str(), "children": keys }),
+    )];
+    if task.worktree_path.is_some() || task.branch.is_some() {
+        effects.push(Effect::Cleanup { succeeded: true });
+    }
+    effects
+}
+
+/// A reply from Linear was typed into the session of a `needs_attention`
+/// task: the task and session are running again, and the issue leaves
+/// `linear.blocked_state` when one is configured (a relaunch does the same
+/// when it starts the session). `ids` are the relayed comment ids.
+pub fn on_answer_sent(
+    task: &mut Task,
+    session: &mut Session,
+    text: &str,
+    ids: &[String],
+    cfg: &Config,
+    now: DateTime<Utc>,
+) -> Vec<Effect> {
+    task.state = TaskState::Running;
+    task.last_error = None;
+    session.state = SessionState::Running;
+    session.last_activity_at = now;
+    let mut effects = vec![Effect::log(
+        EventLevel::Info,
+        "relay.answer_sent",
+        "relayed the Linear reply to the session; task running again",
+        serde_json::json!({ "comments": ids, "text": text }),
+    )];
+    if cfg.linear.blocked_state.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+        effects.push(Effect::Linear { target: LinearTarget::InProgress, comment: None });
+    }
+    effects
+}
+
+/// A reply from Linear arrived for a task whose session is gone: re-queue
+/// it so the next launch resumes the session with the pending answer (the
+/// answer wins over a pending review round and over a parked watch). A
+/// task that cannot go back to `queued` is left alone.
+pub fn on_answer_queued(task: &mut Task, ids: &[String], now: DateTime<Utc>) -> Vec<Effect> {
+    let from = task.state;
+    if task.state != TaskState::Queued && !task.state.can_transition_to(TaskState::Queued) {
+        return Vec::new();
+    }
+    task.state = TaskState::Queued;
+    task.not_before = None;
+    task.last_error = None;
+    if let Some(watch) = task.review.as_mut() {
+        watch.parked = false;
+        watch.last_change_at = now;
+    }
+    vec![Effect::log(
+        EventLevel::Info,
+        "relay.answer_queued",
+        format!("Linear reply received while {from}; re-queued to resume the session with it"),
+        serde_json::json!({ "comments": ids, "from": from }),
+    )]
+}
+
+/// A task finished outside the hook path (`powerqueue task complete`,
+/// cancelled by sync, a merged PR) while its session is still live: close
+/// the session row and release its resources. A task handed off
+/// `in_review` gives up its window, slot and worktree but keeps its branch;
+/// a terminal one is cleaned up and its issue updated. Any other state
+/// leaves the session untouched and returns nothing.
+pub fn release_session(task: &Task, session: &mut Session, now: DateTime<Utc>) -> Vec<Effect> {
+    if task.state == TaskState::InReview {
+        session.state = SessionState::Exited;
+        session.ended_at = Some(now);
+        return release_for_review(task);
+    }
+    if !task.state.is_terminal() {
+        return Vec::new();
+    }
+    session.state = SessionState::Exited;
+    session.ended_at = Some(now);
+    let mut effects = vec![
+        Effect::log(
+            EventLevel::Info,
+            "session.finalized",
+            format!("task is {}; releasing its session", task.state),
+            serde_json::json!({}),
+        ),
+        Effect::Cleanup { succeeded: task.state == TaskState::Completed },
+    ];
+    match task.state {
+        TaskState::Completed => effects.push(Effect::Linear {
+            target: LinearTarget::Done,
+            comment: Some(format!(
+                "powerqueue completed this task on branch `{}`.\n\n{}",
+                task.branch.as_deref().unwrap_or("?"),
+                task.summary.as_deref().unwrap_or("No summary was provided.")
+            )),
+        }),
+        TaskState::Failed => effects.push(Effect::Linear {
+            target: LinearTarget::Blocked,
+            comment: Some(format!("powerqueue failed this task: {}", task.last_error.as_deref().unwrap_or("unknown error"))),
+        }),
+        _ => {}
+    }
+    effects
+}
+
+/// A live session whose task no longer exists: close its row as killed.
+pub fn orphan_session(session: &mut Session, now: DateTime<Utc>) {
+    session.state = SessionState::Killed;
+    session.ended_at = Some(now);
+}
+
+/// New transcript lines of a live session: bump its activity to `newest`
+/// (never backwards) and treat a `launching` session as running.
+pub fn on_transcript_activity(session: &mut Session, newest: DateTime<Utc>) {
+    session.last_activity_at = session.last_activity_at.max(newest);
+    if session.state == SessionState::Launching {
+        session.state = SessionState::Running;
+    }
+}
+
 fn list_or_none<S: AsRef<str>>(items: &[S]) -> String {
     if items.is_empty() { "none".to_string() } else { items.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(", ") }
 }
@@ -943,6 +1140,8 @@ mod tests {
                 Effect::LinearComment { .. } => "linear_comment".into(),
                 Effect::DeleteBranch => "delete_branch".into(),
                 Effect::Question { .. } => "question".into(),
+                Effect::ProgressComment { .. } => "progress_comment".into(),
+                Effect::ForgetAnswer => "forget_answer".into(),
             })
             .collect()
     }
@@ -1585,5 +1784,187 @@ mod tests {
     fn preview_flattens_and_truncates() {
         assert_eq!(preview("a\n\n b   c", 10), "a b c");
         assert_eq!(preview("abcdefghij", 5), "abcde…");
+    }
+
+    fn evaluation(criticality: crate::domain::Criticality, score: f64, skip: bool, reasons: &[&str]) -> Evaluation {
+        Evaluation {
+            criticality,
+            score,
+            model: None,
+            models: Vec::new(),
+            model_source: None,
+            skip,
+            reasons: reasons.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn evaluation_updates_criticality_score_and_the_model_line() {
+        use crate::domain::Criticality;
+        let mut t = task(TaskState::Queued, 0);
+        let before = t.clone();
+        let same = evaluation(t.criticality, t.score + 0.2, false, &["age +0.2"]);
+        assert!(on_evaluation(&mut t, &same).is_empty());
+        assert_eq!(t, before, "a score move under half a point is not a change");
+
+        let eval = evaluation(Criticality::High, 500.0, false, &["label urgent", "model fable (## Models)"]);
+        let effects = on_evaluation(&mut t, &eval);
+        assert_eq!(kinds(&effects), ["task.models_changed"]);
+        assert_eq!((t.criticality, t.score), (Criticality::High, 500.0));
+        assert_eq!(t.score_reasons, eval.reasons, "the trail is replaced when something changed");
+
+        // Only the model line changes: still logged and persisted.
+        let eval = evaluation(Criticality::High, 500.0, false, &["label urgent"]);
+        let effects = on_evaluation(&mut t, &eval);
+        assert!(
+            matches!(&effects[..], [Effect::Log { message, .. }] if message == "no preferred model from PRIORITY.md"),
+            "{effects:?}"
+        );
+        assert_eq!(t.score_reasons, vec!["label urgent".to_string()]);
+    }
+
+    #[test]
+    fn evaluation_skips_and_unskips_through_paused() {
+        let keep = |t: &Task, skip: bool| evaluation(t.criticality, t.score, skip, &[]);
+        let mut t = task(TaskState::Queued, 0);
+        t.not_before = Some(now());
+        let eval = keep(&t, true);
+        let effects = on_evaluation(&mut t, &eval);
+        assert_eq!(kinds(&effects), ["task.skipped"]);
+        assert_eq!((t.state, t.last_error.as_deref(), t.not_before), (TaskState::Paused, Some(SKIP_REASON), None));
+        assert!(on_evaluation(&mut t, &eval).is_empty(), "stays paused quietly");
+
+        let eval = keep(&t, false);
+        let effects = on_evaluation(&mut t, &eval);
+        assert_eq!(kinds(&effects), ["task.unskipped"]);
+        assert_eq!((t.state, t.last_error), (TaskState::Queued, None));
+
+        // A task paused by the user is not unpaused by the rules, and a
+        // handed-off task is never skipped.
+        let mut t = task(TaskState::Paused, 0);
+        let eval = keep(&t, false);
+        assert!(on_evaluation(&mut t, &eval).is_empty());
+        assert_eq!(t.state, TaskState::Paused);
+        let mut t = task(TaskState::InReview, 1);
+        let eval = keep(&t, true);
+        assert!(on_evaluation(&mut t, &eval).is_empty());
+        assert_eq!(t.state, TaskState::InReview);
+    }
+
+    #[test]
+    fn evaluation_applies_dependencies_too() {
+        let mut t = task(TaskState::Queued, 0);
+        t.blocked_by = vec![linked("ENG-9", "started")];
+        let eval = evaluation(t.criticality, t.score, false, &[]);
+        let effects = on_evaluation(&mut t, &eval);
+        assert_eq!(kinds(&effects), ["task.blocked"]);
+        assert_eq!(t.state, TaskState::Blocked);
+    }
+
+    #[test]
+    fn a_closed_container_completes_and_releases_what_it_had() {
+        let children = [linked("ENG-2", "completed"), linked("ENG-3", "completed")];
+        let mut t = task(TaskState::Crashed, 1);
+        let effects = on_container_closed(&mut t, &children, now());
+        assert_eq!(kinds(&effects), ["task.completed", "cleanup(true)"]);
+        assert_eq!(t.state, TaskState::Completed);
+        assert_eq!(t.children, children.to_vec());
+        assert_eq!(t.completed_at, Some(now()));
+        assert!(t.summary.as_deref().unwrap().contains("ENG-2, ENG-3"));
+        assert!(matches!(&effects[0], Effect::Log { data, .. } if data["previous_state"] == "crashed"));
+
+        let mut t = task(TaskState::Blocked, 0);
+        t.branch = None;
+        let effects = on_container_closed(&mut t, &children, now());
+        assert_eq!(kinds(&effects), ["task.completed"], "never ran: nothing to clean up");
+
+        let mut t = task(TaskState::Completed, 0);
+        assert!(on_container_closed(&mut t, &children, now()).is_empty());
+    }
+
+    #[test]
+    fn a_relayed_answer_resumes_the_session_and_unblocks_the_issue() {
+        let mut t = task(TaskState::NeedsAttention, 1);
+        t.last_error = Some("blocked: which table?".into());
+        let mut s = session(SessionState::Idle, 1);
+        let ids = ["c-1".to_string()];
+        let effects = on_answer_sent(&mut t, &mut s, "the users table", &ids, &cfg(), now());
+        assert_eq!(kinds(&effects), ["relay.answer_sent"], "no blocked_state configured: the issue stays");
+        assert_eq!((t.state, t.last_error.clone()), (TaskState::Running, None));
+        assert_eq!((s.state, s.last_activity_at), (SessionState::Running, now()));
+
+        let mut cfg = cfg();
+        cfg.linear.blocked_state = Some("Blocked".into());
+        let effects = on_answer_sent(&mut t, &mut s, "x", &ids, &cfg, now());
+        assert_eq!(kinds(&effects), ["relay.answer_sent", "linear(InProgress)"]);
+    }
+
+    #[test]
+    fn a_relayed_answer_without_a_session_requeues_the_task() {
+        let mut t = task(TaskState::NeedsAttention, 1);
+        t.last_error = Some("blocked".into());
+        let mut watch = crate::domain::ReviewWatch::armed(now() - Duration::hours(2), None);
+        watch.parked = true;
+        t.review = Some(watch);
+        let effects = on_answer_queued(&mut t, &["c-1".to_string()], now());
+        assert!(
+            matches!(&effects[..], [Effect::Log { kind, message, .. }] if kind == "relay.answer_queued" && message.contains("while needs_attention"))
+        );
+        assert_eq!((t.state, t.last_error), (TaskState::Queued, None));
+        let watch = t.review.unwrap();
+        assert!(!watch.parked && watch.last_change_at == now(), "the answer wins over a parked watch");
+
+        let mut t = task(TaskState::Running, 1);
+        assert!(on_answer_queued(&mut t, &[], now()).is_empty());
+        assert_eq!(t.state, TaskState::Running);
+    }
+
+    #[test]
+    fn releasing_a_session_depends_on_where_the_task_went() {
+        let mut t = task(TaskState::Completed, 1);
+        t.summary = Some("done".into());
+        let mut s = session(SessionState::Running, 1);
+        let effects = release_session(&t, &mut s, now());
+        assert_eq!(kinds(&effects), ["session.finalized", "cleanup(true)", "linear(Done)"]);
+        assert_eq!((s.state, s.ended_at), (SessionState::Exited, Some(now())));
+        assert!(matches!(&effects[2], Effect::Linear { comment: Some(c), .. } if c.contains("pq/eng-1") && c.contains("done")));
+
+        let mut t = task(TaskState::Failed, 1);
+        t.last_error = Some("boom".into());
+        let mut s = session(SessionState::Idle, 1);
+        let effects = release_session(&t, &mut s, now());
+        assert_eq!(kinds(&effects), ["session.finalized", "cleanup(false)", "linear(Blocked)"]);
+
+        let t = task(TaskState::Cancelled, 1);
+        let mut s = session(SessionState::Running, 1);
+        assert_eq!(kinds(&release_session(&t, &mut s, now())), ["session.finalized", "cleanup(false)"]);
+
+        let mut t = task(TaskState::InReview, 1);
+        t.pr_url = Some("https://github.com/o/r/pull/1".into());
+        let mut s = session(SessionState::Running, 1);
+        assert_eq!(kinds(&release_session(&t, &mut s, now())), ["session.released", "release_for_review"]);
+        assert_eq!(s.state, SessionState::Exited);
+
+        let t = task(TaskState::Running, 1);
+        let mut s = session(SessionState::Running, 1);
+        assert!(release_session(&t, &mut s, now()).is_empty());
+        assert_eq!(s.state, SessionState::Running, "a live task keeps its session");
+    }
+
+    #[test]
+    fn transcript_activity_moves_forward_only_and_starts_a_launching_session() {
+        let mut s = session(SessionState::Launching, 1);
+        let seen = s.last_activity_at;
+        on_transcript_activity(&mut s, seen - Duration::minutes(5));
+        assert_eq!((s.state, s.last_activity_at), (SessionState::Running, seen));
+        on_transcript_activity(&mut s, now());
+        assert_eq!(s.last_activity_at, now());
+        let mut s = session(SessionState::Idle, 1);
+        on_transcript_activity(&mut s, now());
+        assert_eq!(s.state, SessionState::Idle, "only launching is promoted");
+
+        let mut s = session(SessionState::Running, 1);
+        orphan_session(&mut s, now());
+        assert_eq!((s.state, s.ended_at), (SessionState::Killed, Some(now())));
     }
 }

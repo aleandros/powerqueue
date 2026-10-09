@@ -29,12 +29,16 @@ src/
   jev.rs             TypeSafe Jev "score" client (optional scoring)
   github.rs          `gh api graphql` PR status for the PR watcher
   github/            REST issue client, intake and sync
-  budget/            period clock, ledger (one per provider: Ledgers), probe.rs (observed usage + UsageProbe), cost estimator, model policy
+  budget/            pure: period clock, ledger (Ledger::build over plain rows; one per provider: Ledgers), probe.rs (observed usage + UsageProbe),
+                     cost estimator, model policy; io.rs is the only budget module that reads/writes the store (Ledger::load, observations)
   worktree.rs        git worktree ops (shell out to git)
   tmux.rs            tmux ops (shell out to tmux)
   service.rs         `powerqueue service`: systemd user unit / launchd agent rendering, parsing, systemctl/launchctl ops
   session/           agent.rs (AgentCli trait, agent_for, shared helpers), claude.rs, codex.rs, gemini.rs (one per CLI), binary.rs (`<provider>.binary` command templates), inbox.rs (container shim + inbox for `<provider>.shim`), launcher (prompt, launch.sh), transcript tailing, probes
-  scheduler/         daemon loop (daemon.rs), pure transitions (transitions.rs), pick_next + cleanup (lifecycle.rs), PR watcher decisions (review.rs)
+  scheduler/         daemon loop (daemon.rs: store, tmux, git, Linear, GitHub; applies Effects) around a pure core:
+                     transitions.rs (hooks, probes, crashes, rescoring, finalize), commands.rs (pause/resume/cancel/retry/model),
+                     launch.rs (LaunchPlanner, on_starting/on_launched, resume plan + prompt), review.rs (PR watcher),
+                     lifecycle.rs (pick_next, cleanup_plan; cleanup_task is the git/tmux half)
   hook.rs            `powerqueue hook` (called by Claude Code hooks)
   dashboard/         ratatui TUI
   doctor.rs          diagnostics + tuning advice
@@ -67,6 +71,12 @@ docs/                user docs (priority grammar, budget algorithm, troubleshoot
 - Config: every field has a default; `deny_unknown_fields`; `Config::validate` reports problems in plain language.
 - No `unwrap()` outside tests; `expect()` only for invariants with a message.
 - Public functions get a doc comment stating behaviour and failure modes.
+- Functional core, imperative shell: every task/session state change is made by a pure function in
+  `scheduler/{transitions,commands,launch,review}.rs` that returns `Effect`s; `daemon.rs` only loads rows,
+  calls those functions, persists what changed (`Daemon::commit`) and carries out the effects. Never set
+  `task.state` / `session.state` in the daemon; add a transition (with a unit test) and, if the outside world
+  must do something new, an `Effect` variant. The budget core (`period`, `ledger`, `probe`, `estimator`,
+  `policy`) takes plain data; store access lives in `budget/io.rs`.
 - Tests: unit tests next to the code; integration tests in `tests/` using `POWERQUEUE_HOME` + `POWERQUEUE_SECRETS=file` in a tempdir. Network via `wiremock`. tmux/git tests skip themselves with `which::which(...)` when the tool is not on PATH and use a private tmux socket (`-L powerqueue-test-<pid>-<random>`); see CONTRIBUTING.md.
 - UX: output goes through `cli::output` helpers; colours respect `--no-color`/`NO_COLOR`; `--json` prints machine-readable output for status/task/budget/doctor.
 - Keep the CLI surface in `cli/mod.rs` in sync with `docs/commands.md`; keep README.md focused on the overview and quick start.
@@ -79,7 +89,7 @@ Module ownership is coarse so agents can work on branches without conflicts:
 |------|-------|
 | linear + priority + jev | `src/linear/**`, `src/priority/**`, `src/jev.rs`, `src/cli/commands/{linear,priority}.rs` |
 | runtime | `src/tmux.rs`, `src/worktree.rs`, `src/service.rs`, `src/session/**` (incl. `session/{agent,claude,codex,gemini}.rs`, the provider trait and its CLIs), `src/cli/commands/{attach,service}.rs` |
-| budget + scheduler | `src/budget/**` (incl. `budget/probe.rs`, observed usage), `src/scheduler/**`, `src/github.rs`, `src/hook.rs`, `src/cli/commands/{run,budget,hook}.rs` |
+| budget + scheduler | `src/budget/**` (incl. `budget/probe.rs`, observed usage, `budget/io.rs`), `src/scheduler/**` (pure core + daemon), `src/github.rs`, `src/hook.rs`, `src/cli/commands/{run,budget,hook}.rs` |
 | ux | `src/dashboard/**`, `src/doctor.rs`, `src/tune.rs`, `src/cli/commands/{init,status,add,task,logs,config,secrets,doctor,tune}.rs` |
 
 Shared files (`domain.rs`, `config.rs`, `store/**`, `cli/mod.rs`, `Cargo.toml`) may be

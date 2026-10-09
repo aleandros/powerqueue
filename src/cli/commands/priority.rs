@@ -524,7 +524,7 @@ pub fn simulate_with(
                     && slots > 0
                 {
                     let cost = decision.prediction.weighted_tokens * tier_weight(&cfg.budget, m);
-                    reserve(&mut input.ledgers, m, cost);
+                    crate::scheduler::reserve(&mut input.ledgers, m, cost);
                 }
                 (decision.model, reason)
             }
@@ -607,14 +607,6 @@ fn load_policy_input(cfg: &Config, store: &Store, now: DateTime<Utc>) -> Result<
     limits.clear_expired(now);
     let estimator = Estimator::from_summaries(&store.task_usage_summaries()?);
     Ok(PolicyInput { ledgers, limits, estimator })
-}
-
-/// Mirror of the daemon's reservation: count a planned start against the
-/// ledgers so the next row sees a slightly fuller budget.
-fn reserve(ledgers: &mut Ledgers, tier: &ModelTier, weighted_cost: f64) {
-    if let Some(ledger) = ledgers.for_model_mut(tier) {
-        ledger.add_spend(tier, weighted_cost);
-    }
 }
 
 /// Queued Linear issues that have no task yet, as unsaved tasks.

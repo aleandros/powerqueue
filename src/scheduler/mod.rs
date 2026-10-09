@@ -20,12 +20,17 @@
 //! The decisions themselves live in [`transitions`] as pure functions; the
 //! [`daemon`] applies the [`transitions::Effect`]s they return.
 
+pub mod commands;
 pub mod daemon;
+pub mod launch;
 pub mod lifecycle;
 pub mod relay;
 pub mod review;
 pub mod transitions;
 
-pub use daemon::{Daemon, DaemonHandle, SKIP_REASON};
+pub use daemon::{Daemon, DaemonHandle};
+pub use launch::{Candidate, LaunchContext, LaunchPlanner, preferred_models, reserve};
 pub use lifecycle::{CleanupPlan, cleanup_plan, cleanup_task, pick_next, worktree_dir};
-pub use transitions::{CRASH_TAIL_LINES, Effect, LinearTarget, NUDGE_TEXT, ProbeContext, on_crash, on_hook_outcome, on_probe};
+pub use transitions::{
+    CRASH_TAIL_LINES, Effect, LinearTarget, NUDGE_TEXT, ProbeContext, SKIP_REASON, on_crash, on_hook_outcome, on_probe,
+};

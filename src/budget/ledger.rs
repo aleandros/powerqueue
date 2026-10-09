@@ -1,15 +1,14 @@
 use std::collections::BTreeMap;
 
-use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::config::BudgetConfig;
+use crate::config::{BudgetConfig, ProviderBudget};
 use crate::domain::{ModelTier, Provider, TokenUsage};
-use crate::store::Store;
+use crate::store::TierUsage;
 
 use super::period::{AnchorSource, Period, PeriodClock};
-use super::probe::{ObservationSample, ObservedUsage, apply_observed, load_observations, load_observed};
+use super::probe::{ObservationSample, ObservedUsage, apply_observed};
 
 /// kv key of the pre-0.7 Claude calibration (an additive offset). No longer
 /// read: the ledger learns a rate from the observation history instead.
@@ -230,66 +229,69 @@ pub fn tier_share(cfg: &BudgetConfig, tier: &ModelTier) -> f64 {
     cfg.model_budget(tier).filter(|m| m.enabled).map(|m| m.share.max(0.0)).unwrap_or(0.0)
 }
 
-/// Tier-weighted tokens of `provider`'s models recorded in `[since, until)`.
-fn weighted_between(
-    store: &Store,
-    cfg: &BudgetConfig,
-    provider: Provider,
-    since: DateTime<Utc>,
-    until: DateTime<Utc>,
-) -> anyhow::Result<f64> {
-    if until <= since {
-        return Ok(0.0);
+/// Tier-weighted tokens of `provider`'s models in a set of usage rows.
+fn weighted_sum(cfg: &BudgetConfig, provider: Provider, rows: &[TierUsage]) -> f64 {
+    rows.iter().filter(|r| r.tier.provider() == provider).map(|r| r.usage.weighted() * tier_weight(cfg, &r.tier)).sum()
+}
+
+/// Where a provider's period and window sit: the configured anchor, unless
+/// the latest observation reports a `period_resets_at` still ahead of
+/// `now`, which wins ([`super::io`] loads the observation; the dashboard and
+/// simulations may pass their own).
+pub fn resolve_clock(budget: &ProviderBudget, observed: Option<&ObservedUsage>, now: DateTime<Utc>) -> PeriodClock {
+    let clock = PeriodClock::from_provider(budget, now);
+    match observed.and_then(|o| o.period_resets_at).filter(|reset| *reset > now) {
+        Some(reset) => clock.with_observed_anchor(reset),
+        None => clock,
     }
-    Ok(store
-        .usage_by_tier(since, until)
-        .context("read usage")?
-        .into_iter()
-        .filter(|r| r.tier.provider() == provider)
-        .map(|r| r.usage.weighted() * tier_weight(cfg, &r.tier))
-        .sum())
+}
+
+/// Everything [`Ledger::build`] needs from storage, as plain rows. The usage
+/// rows must cover the period and window of the clock the ledger is built
+/// with (see [`super::io`] for how they are read); rows of other providers'
+/// models are ignored.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LedgerSource {
+    /// The provider's latest self-reported usage, if a probe stored one.
+    pub observed: Option<ObservedUsage>,
+    /// Observation history, oldest first (readings outside the period are ignored).
+    pub history: Vec<ObservationSample>,
+    /// Usage per tier over the current period.
+    pub period_rows: Vec<TierUsage>,
+    /// Usage per tier over the current window.
+    pub window_rows: Vec<TierUsage>,
+    /// Usage per tier and minute over the current period (rate learning).
+    pub minute_rows: Vec<(DateTime<Utc>, TierUsage)>,
+    /// Usage per tier recorded at or after `observed.observed_at` up to the
+    /// period end; empty without an observation.
+    pub since_observation_rows: Vec<TierUsage>,
 }
 
 impl Ledger {
-    /// Aggregate usage rows into a ledger for one provider.
+    /// Build one provider's ledger from plain rows: no I/O, cannot fail.
     ///
-    /// Builds the period clock from `cfg.providers.<provider>` (an observed
-    /// `period_resets_at` in kv `budget.observed.<provider>` overrides the
-    /// configured anchor), reads `usage` rows of the provider's models for
-    /// the current period and the rolling window, learns the exchange rates
-    /// from kv `budget.observations.<provider>` ([`learn_rate`]: the
+    /// `clock` places the period and window (see [`resolve_clock`]); the
+    /// rows in `source` must have been read for those ranges. Learns the
+    /// exchange rates from the observation history ([`learn_rate`]: the
     /// effective budgets are the learned ones when available), applies the
     /// per-model cost weights and shares, and folds in the latest
-    /// observation ([`apply_observed`]). Fails only when the database cannot
-    /// be read.
-    pub fn load(store: &Store, cfg: &BudgetConfig, provider: Provider, now: DateTime<Utc>) -> anyhow::Result<Ledger> {
+    /// observation ([`apply_observed`]).
+    pub fn build(
+        cfg: &BudgetConfig,
+        provider: Provider,
+        now: DateTime<Utc>,
+        clock: &PeriodClock,
+        source: LedgerSource,
+    ) -> Ledger {
         let budget = cfg.provider(provider);
-        let observed = load_observed(store, provider)?;
-        let mut clock = PeriodClock::from_provider(budget, now);
-        if let Some(reset) = observed.as_ref().and_then(|o| o.period_resets_at)
-            && reset > now
-        {
-            clock = clock.with_observed_anchor(reset);
-        }
         let period = clock.current_period(now);
         let window = clock.current_window(now);
-        let period_rows: Vec<_> = store
-            .usage_by_tier(period.start, period.end)
-            .context("read period usage")?
-            .into_iter()
-            .filter(|r| r.tier.provider() == provider)
-            .collect();
-        let window_rows: Vec<_> = store
-            .usage_by_tier(window.start, window.end)
-            .context("read window usage")?
-            .into_iter()
-            .filter(|r| r.tier.provider() == provider)
-            .collect();
+        let LedgerSource { observed, history, period_rows, window_rows, minute_rows, since_observation_rows } = source;
+        let period_rows: Vec<TierUsage> = period_rows.into_iter().filter(|r| r.tier.provider() == provider).collect();
+        let window_rows: Vec<TierUsage> = window_rows.into_iter().filter(|r| r.tier.provider() == provider).collect();
 
-        let history: Vec<ObservationSample> =
-            load_observations(store, provider)?.into_iter().filter(|s| period.contains(s.at) && s.at <= now).collect();
-        let series =
-            SpendSeries::new(cfg, provider, &store.usage_by_minute(period.start, period.end).context("read usage per minute")?);
+        let history: Vec<ObservationSample> = history.into_iter().filter(|s| period.contains(s.at) && s.at <= now).collect();
+        let series = SpendSeries::new(cfg, provider, &minute_rows);
         let measured = |from, to| series.between(from, to);
         let learned = LearnedRate {
             period: learn_rate(&history, |s| s.period_used, None, measured),
@@ -325,8 +327,8 @@ impl Ledger {
             .collect();
 
         let spent_since_observation = match &observed {
-            Some(obs) => weighted_between(store, cfg, provider, obs.observed_at, period.end)?,
-            None => 0.0,
+            Some(obs) if period.end > obs.observed_at => weighted_sum(cfg, provider, &since_observation_rows),
+            _ => 0.0,
         };
         let mut ledger = Ledger {
             provider,
@@ -349,7 +351,7 @@ impl Ledger {
         if let Some(obs) = &observed {
             apply_observed(&mut ledger, obs);
         }
-        Ok(ledger)
+        ledger
     }
 
     /// An empty ledger with the given clock (tests and simulations): no
@@ -484,17 +486,6 @@ pub struct Ledgers {
 }
 
 impl Ledgers {
-    /// Load a ledger for every enabled provider. Fails when any of them
-    /// cannot be read from the database.
-    pub fn load(store: &Store, cfg: &BudgetConfig, now: DateTime<Utc>) -> anyhow::Result<Ledgers> {
-        let mut by_provider = BTreeMap::new();
-        for provider in cfg.providers.enabled() {
-            let ledger = Ledger::load(store, cfg, provider, now).with_context(|| format!("load {provider} ledger"))?;
-            by_provider.insert(provider, ledger);
-        }
-        Ok(Ledgers { by_provider })
-    }
-
     /// A set holding just one ledger (tests, single-provider call sites).
     pub fn single(ledger: Ledger) -> Ledgers {
         let mut by_provider = BTreeMap::new();
@@ -552,8 +543,9 @@ mod tests {
     use chrono::Duration;
 
     use super::*;
-    use crate::budget::probe::save_observed;
+    use crate::budget::io::save_observed;
     use crate::domain::{Task, TaskId, TaskSource, UsageRecord};
+    use crate::store::Store;
 
     fn at(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)

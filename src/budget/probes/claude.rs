@@ -11,7 +11,8 @@ use std::path::Path;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
-use crate::budget::probe::{ObservedUsage, UsageProbe, load_observed};
+use crate::budget::io::load_observed;
+use crate::budget::probe::{ObservedUsage, UsageProbe};
 use crate::domain::{ModelTier, Provider, TaskId};
 use crate::store::Store;
 
@@ -118,7 +119,7 @@ pub fn status_line_text(payload: &serde_json::Value, observed: Option<&ObservedU
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::budget::probe::save_observed;
+    use crate::budget::io::save_observed;
 
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-10-01T12:00:00Z").unwrap().with_timezone(&Utc)

@@ -13,15 +13,15 @@
 //! provider, or one whose window is fully used, is on cooldown until the
 //! matching reset ([`ObservedUsage::cooldown_until`]).
 //!
-//! This module holds the types, the trait and the kv helpers. The real
-//! probes live with their provider CLIs; [`NoProbe`] is the stand-in.
+//! This module holds the types, the trait and the pure history rules; the
+//! kv reads and writes live in [`super::io`]. The real probes live with
+//! their provider CLIs; [`NoProbe`] is the stand-in.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::Provider;
-use crate::store::Store;
 
 use super::ledger::Ledger;
 
@@ -38,6 +38,11 @@ impl ObservationSample {
     pub fn of(obs: &ObservedUsage) -> Self {
         Self { at: obs.observed_at, period_used: obs.period_used, window_used: obs.window_used }
     }
+
+    /// Neither a period nor a window reading: nothing to record.
+    pub fn is_empty(&self) -> bool {
+        self.period_used.is_none() && self.window_used.is_none()
+    }
 }
 
 /// Samples younger than this are kept at most one per [`SAMPLE_SPACING_RECENT`];
@@ -53,50 +58,38 @@ pub fn observations_key(provider: Provider) -> String {
     format!("budget.observations.{provider}")
 }
 
-/// The stored observation history of a provider, oldest first. A pre-0.7
-/// calibration (kv `budget.calibration.<p>`: `observed_fraction` at `at`)
-/// is folded in as one more reading when the history has none at that
-/// instant, so an upgrade keeps the reading it had. Fails only when the
-/// database cannot be read or the stored JSON is unreadable.
-pub fn load_observations(store: &Store, provider: Provider) -> Result<Vec<ObservationSample>> {
-    let mut samples = store
-        .kv_get::<Vec<ObservationSample>>(&observations_key(provider))
-        .with_context(|| format!("read observation history of {provider}"))?
-        .unwrap_or_default();
-    #[derive(Deserialize)]
-    struct Legacy {
-        observed_fraction: f64,
-        at: DateTime<Utc>,
-    }
-    if let Ok(Some(legacy)) = store.kv_get::<Legacy>(&super::ledger::calibration_key(provider))
+/// Fold a pre-0.7 calibration reading (`legacy`, see
+/// [`super::io::load_observations`]) into a history when no sample already
+/// sits at that instant. Output oldest first.
+pub fn fold_legacy_calibration(mut samples: Vec<ObservationSample>, legacy: Option<ObservationSample>) -> Vec<ObservationSample> {
+    if let Some(legacy) = legacy
         && !samples.iter().any(|s| (s.at - legacy.at).num_seconds().abs() < 1)
     {
-        samples.push(ObservationSample { at: legacy.at, period_used: Some(legacy.observed_fraction), window_used: None });
+        samples.push(legacy);
         samples.sort_by_key(|s| s.at);
     }
-    Ok(samples)
+    samples
 }
 
-/// Append a sample to the history and thin it ([`thin_samples`]). A sample
-/// that only repeats the newest reading within [`SAMPLE_SPACING_RECENT`]
-/// is not stored (the status line fires after every response).
-pub fn record_observation(store: &Store, provider: Provider, obs: &ObservedUsage) -> Result<()> {
+/// The history after appending `obs` and thinning it ([`thin_samples`]), or
+/// `None` when there is nothing to store: a reading that knows nothing, or
+/// one that only repeats the newest reading within [`SAMPLE_SPACING_RECENT`]
+/// (the status line fires after every response). Input oldest first.
+pub fn append_observation(mut samples: Vec<ObservationSample>, obs: &ObservedUsage) -> Option<Vec<ObservationSample>> {
     let sample = ObservationSample::of(obs);
-    if sample.period_used.is_none() && sample.window_used.is_none() {
-        return Ok(());
+    if sample.is_empty() {
+        return None;
     }
-    let mut samples = load_observations(store, provider)?;
     if let Some(last) = samples.last()
         && sample.at - last.at < SAMPLE_SPACING_RECENT
         && last.period_used == sample.period_used
         && last.window_used == sample.window_used
     {
-        return Ok(());
+        return None;
     }
     samples.push(sample);
     samples.sort_by_key(|s| s.at);
-    let thinned = thin_samples(&samples, sample.at);
-    store.kv_set(&observations_key(provider), &thinned).with_context(|| format!("store observation history of {provider}"))
+    Some(thin_samples(&samples, sample.at))
 }
 
 /// Keep the newest sample, at most one per minute for the last two hours,
@@ -187,19 +180,6 @@ pub fn observed_key(provider: Provider) -> String {
     format!("budget.observed.{provider}")
 }
 
-/// The latest observation for a provider, if any. Fails only when the
-/// database cannot be read or the stored JSON is unreadable.
-pub fn load_observed(store: &Store, provider: Provider) -> Result<Option<ObservedUsage>> {
-    store.kv_get(&observed_key(provider)).with_context(|| format!("read observed usage of {provider}"))
-}
-
-/// Store a provider's observation (latest wins) and append it to the
-/// history ([`record_observation`]).
-pub fn save_observed(store: &Store, provider: Provider, observed: &ObservedUsage) -> Result<()> {
-    store.kv_set(&observed_key(provider), observed).with_context(|| format!("store observed usage of {provider}"))?;
-    record_observation(store, provider, observed)
-}
-
 /// Fold an observation into a ledger that was loaded for the same provider.
 ///
 /// * `period_resets_at` moves the period so it ends at that instant when the
@@ -248,70 +228,46 @@ mod tests {
     }
 
     #[test]
-    fn kv_round_trip() {
-        let store = Store::open_in_memory().unwrap();
-        assert!(load_observed(&store, Provider::Codex).unwrap().is_none());
-        let obs = ObservedUsage { period_used: Some(0.3), ..ObservedUsage::empty(at("2026-10-01T12:00:00Z")) };
-        save_observed(&store, Provider::Codex, &obs).unwrap();
-        assert_eq!(load_observed(&store, Provider::Codex).unwrap(), Some(obs.clone()));
-        assert_eq!(load_observations(&store, Provider::Codex).unwrap(), vec![ObservationSample::of(&obs)]);
-        assert!(load_observed(&store, Provider::Claude).unwrap().is_none());
-        assert!(load_observations(&store, Provider::Claude).unwrap().is_empty());
-        assert_eq!(observed_key(Provider::Gemini), "budget.observed.gemini");
-        assert_eq!(observations_key(Provider::Gemini), "budget.observations.gemini");
-        assert!(NoProbe(Provider::Gemini).probe().unwrap().is_none());
-        assert_eq!(NoProbe(Provider::Gemini).provider(), Provider::Gemini);
-    }
-
-    #[test]
-    fn history_skips_repeats_and_empty_readings_and_stays_sorted() {
-        let store = Store::open_in_memory().unwrap();
+    fn appending_skips_repeats_and_empty_readings_and_stays_sorted() {
         let t0 = at("2026-10-01T12:00:00Z");
         let base = ObservedUsage { period_used: Some(0.3), window_used: Some(0.1), ..ObservedUsage::empty(t0) };
-        save_observed(&store, Provider::Claude, &base).unwrap();
+        let h = append_observation(Vec::new(), &base).expect("first reading stored");
+        assert_eq!(h, vec![ObservationSample::of(&base)]);
         // Same reading 20s later: not stored. Same reading 2 min later: stored.
-        save_observed(&store, Provider::Claude, &ObservedUsage { observed_at: t0 + Duration::seconds(20), ..base.clone() })
-            .unwrap();
-        assert_eq!(load_observations(&store, Provider::Claude).unwrap().len(), 1);
-        save_observed(&store, Provider::Claude, &ObservedUsage { observed_at: t0 + Duration::minutes(2), ..base.clone() })
-            .unwrap();
-        assert_eq!(load_observations(&store, Provider::Claude).unwrap().len(), 2);
+        assert!(
+            append_observation(h.clone(), &ObservedUsage { observed_at: t0 + Duration::seconds(20), ..base.clone() }).is_none()
+        );
+        let h = append_observation(h, &ObservedUsage { observed_at: t0 + Duration::minutes(2), ..base.clone() }).unwrap();
+        assert_eq!(h.len(), 2);
         // A changed reading 10s later replaces the one just before it (one per minute is kept).
         let changed = ObservedUsage {
             period_used: Some(0.31),
             observed_at: t0 + Duration::minutes(2) + Duration::seconds(10),
             ..base.clone()
         };
-        save_observed(&store, Provider::Claude, &changed).unwrap();
-        let h = load_observations(&store, Provider::Claude).unwrap();
+        let h = append_observation(h, &changed).unwrap();
         assert_eq!(h.len(), 2);
         assert_eq!(h.last().map(|s| s.period_used), Some(Some(0.31)));
         // Nothing to learn from: not stored.
-        save_observed(&store, Provider::Claude, &ObservedUsage::empty(t0 + Duration::minutes(5))).unwrap();
-        let h = load_observations(&store, Provider::Claude).unwrap();
-        assert_eq!(h.len(), 2);
+        assert!(append_observation(h.clone(), &ObservedUsage::empty(t0 + Duration::minutes(5))).is_none());
+        assert!(h.windows(2).all(|w| w[0].at <= w[1].at));
+        // Out-of-order input is sorted.
+        let older = ObservedUsage { period_used: Some(0.2), ..ObservedUsage::empty(t0 - Duration::hours(1)) };
+        let h = append_observation(h, &older).unwrap();
         assert!(h.windows(2).all(|w| w[0].at <= w[1].at));
     }
 
     #[test]
-    fn a_pre_0_7_calibration_counts_as_a_reading() {
-        let store = Store::open_in_memory().unwrap();
+    fn a_legacy_calibration_is_folded_in_once() {
         let t0 = at("2026-10-01T12:00:00Z");
-        store
-            .kv_set(
-                &super::super::ledger::calibration_key(Provider::Claude),
-                &serde_json::json!({ "observed_fraction": 0.43, "at": t0, "measured_fraction": 0.57 }),
-            )
-            .unwrap();
-        let h = load_observations(&store, Provider::Claude).unwrap();
-        assert_eq!(h, vec![ObservationSample { at: t0, period_used: Some(0.43), window_used: None }]);
-        // Later readings come after it; the legacy one is not duplicated.
-        let obs = ObservedUsage { period_used: Some(0.5), ..ObservedUsage::empty(t0 + Duration::hours(1)) };
-        save_observed(&store, Provider::Claude, &obs).unwrap();
-        let h = load_observations(&store, Provider::Claude).unwrap();
-        assert_eq!(h.len(), 2);
-        assert_eq!(h[0].at, t0);
-        assert_eq!(h[1].period_used, Some(0.5));
+        let legacy = ObservationSample { at: t0, period_used: Some(0.43), window_used: None };
+        assert_eq!(fold_legacy_calibration(Vec::new(), Some(legacy)), vec![legacy]);
+        assert!(fold_legacy_calibration(Vec::new(), None).is_empty());
+        let later = sample(t0 + Duration::hours(1), 0.5);
+        let h = fold_legacy_calibration(vec![later], Some(legacy));
+        assert_eq!(h, vec![legacy, later], "sorted, oldest first");
+        let h = fold_legacy_calibration(vec![legacy, later], Some(legacy));
+        assert_eq!(h.len(), 2, "not duplicated");
     }
 
     #[test]

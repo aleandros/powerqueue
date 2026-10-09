@@ -1161,6 +1161,12 @@ impl Store {
         opt_ts(v)
     }
 
+    /// The daemon-wide scheduling pause (`powerqueue pause`), if one is
+    /// set. Fails only when the database cannot be read.
+    pub fn scheduling_pause(&self) -> Result<Option<SchedulingPause>> {
+        self.kv_get(SCHEDULING_PAUSE_KEY)
+    }
+
     pub fn kv_delete(&self, key: &str) -> Result<()> {
         let conn = self.lock();
         conn.execute("DELETE FROM kv WHERE key = ?1", params![key])?;

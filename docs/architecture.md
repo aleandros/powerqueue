@@ -21,7 +21,8 @@ src/
   priority/          PRIORITY.md parser/evaluator; file watcher
   jev.rs             Jev "score" client (optional)
 github.rs          `gh api graphql` PR status (state, mergeability, checks, threads)
-  budget/            period clock, ledger, estimator, policy
+  budget/            period clock, ledger, estimator, policy (pure, plain data in and out);
+                     io.rs reads the usage rows and observations from the store
   worktree.rs        git worktree ops (shell out to git)
   tmux.rs            tmux ops (shell out to tmux)
   session/           agent.rs (AgentCli trait, agent_for, shared helpers) with one
@@ -30,8 +31,13 @@ github.rs          `gh api graphql` PR status (state, mergeability, checks, thre
                      placeholders), inbox.rs (the container shim + inbox transport for
                      `<provider>.shim`), launcher (prompt, launch.sh), hook interpretation,
                      transcript tailing, liveness + resource probes
-  scheduler/         daemon.rs (Daemon, tick loop, effects), transitions.rs (pure
-                     state logic → Effect list), lifecycle.rs (pick_next, cleanup_task)
+  scheduler/         daemon.rs (Daemon, tick loop, applies Effects against the store,
+                     tmux, git, Linear and GitHub) around a pure core: transitions.rs
+                     (hook outcomes, probes, crashes, re-scoring, finalize → Effect
+                     list), commands.rs (pause/resume/cancel/retry/model), launch.rs
+                     (LaunchPlanner, on_starting/on_launched, resume plan and prompt),
+                     review.rs (PR watcher), lifecycle.rs (pick_next, cleanup_plan;
+                     cleanup_task is the git/tmux half)
   hook.rs            `powerqueue hook` entry (Claude Code hooks, Codex notify, agy hooks;
                      payloads normalised to the Claude shape via AgentCli::normalize_hook)
   dashboard/         ratatui TUI: Snapshot (data) / ui (render)
@@ -39,9 +45,37 @@ github.rs          `gh api graphql` PR status (state, mergeability, checks, thre
   cli/               clap definitions (mod.rs), Context, output helpers, one file per command
 ```
 
-Dependency direction: `cli` and `scheduler` orchestrate; `budget`, `priority`,
+Dependency direction: `cli` and `scheduler::daemon` orchestrate; `budget`, `priority`,
 `linear`, `github`, `session` depend on `domain`, `config`, `store`; `domain` depends on
 nothing in the crate. `tmux.rs` and `worktree.rs` know nothing about tasks.
+
+## Functional core, imperative shell
+
+Every change to a task or session state is made by a pure function and
+described by the `Effect`s it returns; the daemon is the shell that loads
+rows, calls the function, persists what changed and carries out the effects.
+
+| decides (pure, unit-tested without a database) | carries out (daemon) |
+|---|---|
+| `transitions::on_hook_outcome`, `on_probe`, `on_crash`, `on_progress`, `on_evaluation`, `on_dependencies`, `on_container_closed`, `on_answer_sent`, `on_answer_queued`, `release_session` | `Daemon::process_hook`, `probe_sessions`, `refresh_rules`, `close_finished_parents`, `relay_comments`, `finalize_terminal` |
+| `commands::on_pause`, `on_resume`, `on_cancel`, `on_retry`, `on_set_model` | `Daemon::apply_command` |
+| `launch::LaunchPlanner` (`next` / `started`), `on_throttled`, `on_starting`, `claim`, `resume_plan`, `resume_prompt`, `on_launched` | `Daemon::launch_tasks` / `start_task` (git, launcher, tmux) |
+| `review::on_pr_status`, `request_round`, `on_unusable_pr`, `on_watch_error` | `Daemon::watch_reviews` (`gh`) |
+| `lifecycle::pick_next`, `cleanup_plan` | `lifecycle::cleanup_task` (git, tmux) |
+| `budget::Ledger::build`, `resolve_clock`, `Policy::decide`, `Estimator`, `probe::append_observation` | `budget::io` (`Ledger::load`, observations in kv) |
+
+`Daemon::commit` persists a task only when the transition changed it
+(`Task: PartialEq`) and again after the effects ran, since cleanup may
+change it further. `Effect` is `Serialize`, so a run can be replayed or
+checked against a model from the event log. The budget core takes
+`LedgerSource` (plain usage rows and the observation history) and never
+sees the store, which is what lets `budget plan` and `priority simulate`
+share `LaunchPlanner` with the daemon (`budget plan` runs `plan_all`). The
+planner owns the estimator and a copy of the ledgers (reservations within a
+pass) and borrows the budget config, rules and rate limits per step through
+`LaunchContext`, so a rate limit marked by a failed start is seen by the next
+candidate of the same pass. `task pause|resume|cancel|retry` applied offline by
+the CLI (no daemon) call the same `commands::*` transitions.
 
 ## Data flow
 
@@ -266,10 +300,12 @@ still runs):
    Linear instead of moving the issue;
 8. sample CPU/RSS every `resource_sample_secs`; prune samples older than 7
    days once an hour;
-9. while live sessions `< max_concurrent`: `pick_next`, `Estimator::predict`,
-   `Policy::decide` (throttle or start), `git fetch`, create the worktree,
-   run `repo.setup`, `Launcher::prepare` + `launch`, move the Linear issue to
-   `in_progress_state` or apply the configured GitHub in-progress label.
+9. while live sessions `< max_concurrent`: `launch::LaunchPlanner::next`
+   (`pick_next`, `Estimator::predict`, `Policy::decide`: throttle or start),
+   `git fetch`, create the worktree, run `repo.setup`, `Launcher::prepare` +
+   `launch`, then `LaunchPlanner::started` reserves the predicted cost for
+   the rest of the pass; `on_launched` moves the Linear issue to
+   `in_progress_state` or applies the configured GitHub in-progress label.
 
 Every transition goes through `store.log_event` so `task show` replays the
 story.
