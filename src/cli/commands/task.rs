@@ -15,7 +15,8 @@ use crate::cli::output::{self, human_bytes, human_f64, model_with_provider};
 use crate::cli::{Context, TaskCommand, TaskRef};
 use crate::config::Config;
 use crate::domain::{BRANCH_CREATED_EVENT, DaemonCommand, Event, EventLevel, ModelTier, Session, Task, TaskState};
-use crate::github::PrRef;
+use crate::scheduler::commands;
+use crate::scheduler::transitions::Effect;
 use crate::store::Store;
 use crate::tmux::Tmux;
 
@@ -26,85 +27,44 @@ pub fn find_task(store: &Store, needle: &str) -> Result<Task> {
     store.find_task(needle)?.ok_or_else(|| anyhow!("no task matches `{needle}` (try `powerqueue status --all`)"))
 }
 
-/// Mark a task completed directly in the store (no daemon required).
+/// Mark a task completed directly in the store (no daemon required):
+/// [`commands::on_complete`] persisted, with its events logged. Fails with
+/// the transition's message when it does not apply (already completed,
+/// still being launched, not completable from its state).
 pub fn complete_task(store: &Store, task: &mut Task, summary: Option<&str>) -> Result<()> {
-    if task.state == TaskState::Completed {
-        bail!("{} is already completed", task.key);
-    }
-    if !task.state.can_transition_to(TaskState::Completed) {
-        bail!("cannot complete {} while it is {} (cancel it instead)", task.key, task.state);
-    }
-    task.state = TaskState::Completed;
-    task.completed_at = Some(Utc::now());
-    if let Some(s) = summary.map(str::trim).filter(|s| !s.is_empty()) {
-        task.summary = Some(s.to_string());
-    }
-    task.last_error = None;
-    store.update_task(task)?;
-    store.log_event(
-        Some(task.id),
-        None,
-        EventLevel::Info,
-        "task.completed_by_command",
-        "marked completed via `powerqueue task complete`",
-        serde_json::json!({ "summary": task.summary }),
-    )?;
-    Ok(())
+    let effects = commands::on_complete(task, summary, Utc::now())?;
+    persist(store, task, effects)
 }
 
-/// Hand a task off for review (`task complete --pr <url>`): it moves to
-/// `in_review` with the PR recorded, so the daemon releases its session,
-/// slot and worktree (keeping the branch) and watches the PR. Calling it
-/// again while in review re-arms the watch (e.g. after a review round).
-/// Fails for a URL that is not a GitHub pull request or a task that is not
-/// running (queued, finished, ...).
+/// Hand a task off for review (`task complete --pr <url>`):
+/// [`commands::on_hand_off`] persisted, with its events logged. Fails for a
+/// URL that is not a GitHub pull request, a task still being launched, or
+/// one that is not running (queued, finished, ...).
 pub fn hand_off_for_review(store: &Store, task: &mut Task, summary: Option<&str>, pr_url: &str) -> Result<()> {
-    let pr: PrRef = pr_url.parse().map_err(|e: String| anyhow!(e))?;
-    if task.state != TaskState::InReview && !task.state.can_transition_to(TaskState::InReview) {
-        bail!("cannot hand {} off for review while it is {} (only a running task opens a PR)", task.key, task.state);
-    }
-    let from = task.state;
-    task.hand_off_for_review(pr_url, Utc::now());
-    if let Some(s) = summary.map(str::trim).filter(|s| !s.is_empty()) {
-        task.summary = Some(s.to_string());
-    }
-    store.update_task(task)?;
-    let rounds = task.review.as_ref().map_or(0, |r| r.rounds);
-    store.log_event(
-        Some(task.id),
-        None,
-        EventLevel::Info,
-        "task.in_review",
-        &format!(
-            "handed off for review: {pr} (merge armed{})",
-            if rounds > 0 { format!(", after {rounds} review round(s)") } else { String::new() }
-        ),
-        serde_json::json!({ "pr": task.pr_url, "from": from, "rounds": rounds, "summary": task.summary }),
-    )?;
-    Ok(())
+    let effects = commands::on_hand_off(task, pr_url, summary, Utc::now())?;
+    persist(store, task, effects)
 }
 
-/// Mark a task as needing a human directly in the store.
+/// Mark a task as needing a human directly in the store:
+/// [`commands::on_block`] persisted, with its events logged.
 pub fn block_task(store: &Store, task: &mut Task, reason: Option<&str>) -> Result<()> {
-    if task.state.is_terminal() {
-        bail!("cannot block {}: it is already {}", task.key, task.state);
-    }
-    if !task.state.can_transition_to(TaskState::NeedsAttention) {
-        bail!("cannot block {} while it is {}", task.key, task.state);
-    }
-    task.state = TaskState::NeedsAttention;
-    if let Some(r) = reason.map(str::trim).filter(|r| !r.is_empty()) {
-        task.last_error = Some(r.to_string());
-    }
+    let effects = commands::on_block(task, reason)?;
+    persist(store, task, effects)
+}
+
+/// Write a direct transition's result: the task row, then its log effects
+/// (the only kind these transitions return; anything else is the daemon's
+/// job and is reported at warn level).
+fn persist(store: &Store, task: &Task, effects: Vec<Effect>) -> Result<()> {
     store.update_task(task)?;
-    store.log_event(
-        Some(task.id),
-        None,
-        EventLevel::Warn,
-        "task.blocked_by_command",
-        &format!("blocked via `powerqueue task block`: {}", task.last_error.as_deref().unwrap_or("no reason given")),
-        serde_json::json!({ "reason": task.last_error }),
-    )?;
+    for effect in effects {
+        match effect {
+            Effect::Log { level, kind, message, data } => {
+                store.log_event(Some(task.id), None, level, &kind, &message, data)?;
+            }
+            other => tracing::warn!(task = %task.key, effect = ?other, "effect ignored by a direct command"),
+        }
+    }
     Ok(())
 }
 
@@ -139,8 +99,6 @@ pub fn offline_target(cmd: &DaemonCommand) -> Option<TaskState> {
 /// Apply a control command directly (used when no daemon is running).
 /// Returns `Ok(false)` when the transition is not allowed from the current state.
 pub fn apply_offline(store: &Store, task: &mut Task, cmd: &DaemonCommand) -> Result<bool> {
-    use crate::scheduler::commands;
-    use crate::scheduler::transitions::Effect;
     let Some(target) = offline_target(cmd) else { return Ok(false) };
     let now = Utc::now();
     let before = task.clone();

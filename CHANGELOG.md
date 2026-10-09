@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Testing: the pure core is checked by property-based tests (`proptest`)
+  besides the example tests. Shared generators in `src/strategies.rs`
+  produce tasks, sessions, configs, ledgers, hook outcomes and PR statuses
+  the daemon could hold; every pure module in `scheduler` and `budget` has
+  properties (legal moves, inert terminal states, idempotent commands,
+  justified effects, backoff arithmetic, review rounds, planner passes,
+  policy eligibility, period arithmetic, observation history), and a
+  stateful model test runs random sequences of the daemon's calls against
+  one task, checking the cross-cutting invariants after each step.
+  `TaskState::can_transition_to` now lists every move the daemon makes
+  (a `starting` task may land in any session state; paused and throttled
+  tasks keep their session and may complete, crash or ask for a human; a
+  crashed or failed task completes when the done marker of its last
+  attempt arrives after the probe; a paused task unskipped while waiting
+  on a blocker goes `blocked`).
+- `task complete`, `task complete --pr` and `task block` are pure
+  transitions (`scheduler::commands::{on_complete, on_hand_off, on_block}`)
+  that the CLI persists, so the stateful model runs the real ones. They
+  refuse a `starting` task: the daemon is launching it and would persist
+  `running` over the change. The daemon also re-reads the row after a
+  launch and keeps whatever was written to it meanwhile (a command applied
+  offline during a long `repo.setup`), logging `launch.superseded`.
+
+### Fixed
+
+Found by the new property tests:
+
+- A reply relayed from Linear to a completed, failed or cancelled task no
+  longer re-queues it; only `task retry` revives a finished task.
+- A `Stop` with the done marker or a `SessionEnd` drained after the
+  session was already closed no longer completes a cancelled task or one
+  re-queued since, nor counts a second crash against a re-queued one. A
+  done marker drained after the probe already crashed or failed the
+  session still completes the task (the pane died right after printing
+  it), instead of relaunching the finished work or leaving it failed.
+- A throttled task whose agent then reports a blocker, hits a permission
+  prompt or an authentication failure, or finishes, no longer keeps the
+  stale retry time; neither does a task that starts out of a throttle or
+  is completed by `task complete` or blocked by `task block`.
+- A throttled or paused task whose agent is still in its session (waiting
+  for a usage reset, finishing its turn) is no longer re-scored, so an
+  unsatisfied blocker cannot move it to `blocked` under the live session,
+  where nothing would probe the window.
+- A task parked because its PR URL is unusable is marked parked on its
+  watch (created when the row had none), so `task resume` watches the PR
+  again instead of running a pending review round or re-queuing it.
+- `Policy::eligibility` agrees with `decide` for a provider disabled in
+  config that still has a ledger: its models are not eligible.
+
 ## [0.12.0] - 2026-10-09
 
 The scheduler is now a functional core with an imperative shell, the

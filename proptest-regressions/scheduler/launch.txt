@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 52012f76cf3085f5595aada1e689bf2c713808e25a35aef78bbd478deb859a5b # shrinks to task = Task { id: TaskId(00000000-0000-0000-0000-000000000000), key: "ENG-a", title: "t", description: "", source: Manual, state: Queued, criticality: Critical, score: 0.0, labels: [], linear_priority: None, estimate: None, project: None, cycle: None, cycle_number: None, blocked_by: [], children: [], parent: None, model_override: None, model: None, worktree_path: None, branch: None, attempts: 0, max_attempts: None, not_before: Some(2026-10-01T12:00:01Z), last_error: None, summary: None, score_reasons: [], created_at: 2026-10-01T11:59:59Z, updated_at: 2026-10-01T11:59:59Z, started_at: None, completed_at: None, pr_url: None, review: None }, model = ModelTier("fable"), decision = Decision { model: None, retry_at: None, prediction: Prediction { weighted_tokens: 1.0, wall_secs: 1.0, confidence: 0.0, basis: "prop" }, reasons: ["prop"] }, resuming = false

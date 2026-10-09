@@ -126,6 +126,33 @@ pub fn on_hook_outcome(
     {
         return effects;
     }
+    // Late signals from a session the daemon already closed (a crash seen
+    // by the probe, a kill by a cancel or retry): its end must not crash
+    // the task again, which could fail a task re-queued since; its done
+    // marker must not revive a finished or cancelled task, nor one that was
+    // re-queued since (a retry starts over). It does complete a task the
+    // probe crashed or failed in the meantime: the pane died right after
+    // the marker was printed, and the work was done.
+    if !session.state.is_live() {
+        let late = match outcome {
+            HookOutcome::SessionEnded { reason } => Some(format!("session ended ({reason}); already {}", session.state)),
+            HookOutcome::Completed { .. }
+                if task.state == TaskState::Completed || !task.state.can_transition_to(TaskState::Completed) =>
+            {
+                Some(format!("completion ignored: the session already ended and the task is {}", task.state))
+            }
+            _ => None,
+        };
+        if let Some(message) = late {
+            effects.push(Effect::log(
+                EventLevel::Debug,
+                "hook.duplicate",
+                message,
+                serde_json::json!({ "state": task.state, "session_state": session.state }),
+            ));
+            return effects;
+        }
+    }
     session.last_activity_at = now;
     match outcome {
         HookOutcome::Started { transcript_path, source } => {
@@ -169,15 +196,6 @@ pub fn on_hook_outcome(
                 // `task complete --pr` already handed the task to the PR
                 // watcher; the done marker only ends the session.
                 effects.extend(end_review_session(session, "the agent printed the done marker", now));
-                return effects;
-            }
-            if !session.state.is_live() && task.state == TaskState::Completed {
-                effects.push(Effect::log(
-                    EventLevel::Debug,
-                    "hook.duplicate",
-                    "completion already processed",
-                    serde_json::json!({}),
-                ));
                 return effects;
             }
             let summary = summary.trim();
@@ -358,6 +376,13 @@ pub fn on_hook_outcome(
                 serde_json::json!({}),
             ));
         }
+    }
+    // A retry time only means something while the task is crashed or
+    // throttled: a hook that moves a throttled task on (the agent waited
+    // in-session for its limit, then reported a blocker, finished, ...)
+    // must not leave one behind.
+    if !matches!(task.state, TaskState::Crashed | TaskState::Throttled) {
+        task.not_before = None;
     }
     effects
 }
@@ -860,10 +885,12 @@ pub fn on_answer_sent(
 /// A reply from Linear arrived for a task whose session is gone: re-queue
 /// it so the next launch resumes the session with the pending answer (the
 /// answer wins over a pending review round and over a parked watch). A
-/// task that cannot go back to `queued` is left alone.
+/// task that cannot go back to `queued` is left alone, and so is a finished
+/// one: only `task retry` revives a completed, failed or cancelled task
+/// (a late comment on its issue must not).
 pub fn on_answer_queued(task: &mut Task, ids: &[String], now: DateTime<Utc>) -> Vec<Effect> {
     let from = task.state;
-    if task.state != TaskState::Queued && !task.state.can_transition_to(TaskState::Queued) {
+    if task.state.is_terminal() || (task.state != TaskState::Queued && !task.state.can_transition_to(TaskState::Queued)) {
         return Vec::new();
     }
     task.state = TaskState::Queued;
@@ -1966,5 +1993,419 @@ mod tests {
         let mut s = session(SessionState::Running, 1);
         orphan_session(&mut s, now());
         assert_eq!((s.state, s.ended_at), (SessionState::Killed, Some(now())));
+    }
+}
+
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::domain::ReviewWatch;
+    use crate::priority::Evaluation;
+    use crate::strategies::*;
+
+    /// A live session row of `task`'s current attempt, started at the origin.
+    fn session_stub(task: &Task) -> Session {
+        Session {
+            id: uuid::Uuid::from_u128(7),
+            task_id: task.id,
+            attempt: task.attempts,
+            model: ModelTier::sonnet(),
+            state: SessionState::Running,
+            tmux_session: "powerqueue".into(),
+            tmux_window: "@1".into(),
+            pane_id: Some("%1".into()),
+            pid: Some(42),
+            transcript_path: None,
+            exit_code: None,
+            started_at: origin(),
+            ended_at: None,
+            last_activity_at: origin(),
+            error: None,
+            agent_session_id: None,
+            waiting_since: None,
+            waited_secs: 0,
+        }
+    }
+
+    fn logs_are_well_formed(effects: &[Effect]) -> bool {
+        effects.iter().all(|e| !matches!(e, Effect::Log { kind, message, .. } if kind.is_empty() || message.is_empty()))
+    }
+
+    fn has<F: Fn(&Effect) -> bool>(effects: &[Effect], f: F) -> bool {
+        effects.iter().any(f)
+    }
+
+    fn evaluation() -> impl Strategy<Value = Evaluation> {
+        (criticality(), 0.0f64..2000.0, any::<bool>()).prop_map(|(criticality, score, skip)| Evaluation {
+            criticality,
+            score,
+            model: None,
+            models: Vec::new(),
+            model_source: None,
+            skip,
+            reasons: Vec::new(),
+        })
+    }
+
+    fn probe_context() -> impl Strategy<Value = ProbeContext> {
+        (any::<bool>(), pane_tail(), prop::option::of(instant_between(600, 3600))).prop_map(
+            |(nudged, pane_tail, provider_cooldown_until)| ProbeContext {
+                now: origin(),
+                nudged,
+                pane_tail,
+                provider_cooldown_until,
+            },
+        )
+    }
+
+    proptest! {
+        /// A crash either schedules a retry (`crashed`, with one of the
+        /// configured backoffs) or gives up (`failed`, cleaned up, issue
+        /// marked blocked); the session (when there is one) is closed as
+        /// crashed. When to give up is [`crash_gives_up_exactly_at_max_attempts`].
+        #[test]
+        fn crash_backs_off_or_gives_up(
+            (task, session) in task_with_session_among(&[TaskState::Starting, TaskState::Running, TaskState::Idle, TaskState::NeedsAttention, TaskState::Crashed]),
+            with_session in any::<bool>(),
+            cfg in scheduler_config(),
+            exit_status in prop::option::of(0i32..=130),
+            tail in pane_tail(),
+        ) {
+            let now = origin();
+            let mut t = task.clone();
+            let mut s = session.clone();
+            let effects = on_crash(&mut t, with_session.then_some(&mut s), "boom", exit_status, &cfg, now, tail.as_deref());
+            prop_assert!(logs_are_well_formed(&effects));
+            prop_assert!(task.state.can_transition_to(t.state), "{:?} -> {:?}", task.state, t.state);
+            prop_assert_eq!(t.last_error.as_deref(), Some("boom"));
+            if with_session {
+                prop_assert_eq!((s.state, s.ended_at, s.exit_code, s.error.as_deref()), (SessionState::Crashed, Some(now), exit_status, Some("boom")));
+            } else {
+                prop_assert_eq!(&s, &session);
+            }
+            match t.state {
+                TaskState::Failed => {
+                    prop_assert_eq!((t.completed_at, t.not_before), (Some(now), None));
+                    prop_assert!(has(&effects, |e| matches!(e, Effect::Cleanup { succeeded: false })), "{:?}", effects);
+                    prop_assert!(has(&effects, |e| matches!(e, Effect::Linear { target: LinearTarget::Blocked, .. })), "{:?}", effects);
+                }
+                TaskState::Crashed => {
+                    let configured: Vec<u64> = if cfg.restart_backoff_secs.is_empty() { vec![60] } else { cfg.restart_backoff_secs.clone() };
+                    let backoff = t.not_before.map(|at| (at - now).num_seconds());
+                    prop_assert!(
+                        backoff.is_some_and(|b| configured.contains(&(b as u64))),
+                        "backoff {backoff:?} is not one of {configured:?}"
+                    );
+                    prop_assert!(!has(&effects, |e| matches!(e, Effect::Cleanup { .. })), "{:?}", effects);
+                }
+                other => prop_assert!(false, "a crash left the task {other:?}"),
+            }
+        }
+
+        /// A task fails on exactly its `max_attempts`-th crash since it
+        /// started over (never earlier, never later), with the backoff of
+        /// the n-th crash being the n-th configured one (the last one
+        /// repeats). A review round starts the count again at its
+        /// `attempt_base`, so a relaunch never eats into the attempts.
+        #[test]
+        fn crash_gives_up_exactly_at_max_attempts(
+            task in task_in(TaskState::Queued),
+            cfg in scheduler_config(),
+            max in prop::option::of(1u32..=4),
+            review_round in prop::option::of((review_watch(), review_relaunch(), 0u32..=3)),
+        ) {
+            let now = origin();
+            let mut t = task.clone();
+            t.max_attempts = max;
+            let max = max.unwrap_or(cfg.max_attempts).max(1);
+            // Attempts used before this run: none for a fresh task, the
+            // round's base for a review relaunch.
+            let base = match review_round {
+                Some((watch, relaunch, base)) => {
+                    t.review = Some(ReviewWatch { attempt_base: base, relaunch: Some(relaunch), ..watch });
+                    base
+                }
+                None => {
+                    t.review = None;
+                    0
+                }
+            };
+            t.attempts = base;
+            for n in 1..=max {
+                // The claim of the n-th attempt of this run.
+                t.attempts += 1;
+                let mut s = Session { attempt: t.attempts, ..session_stub(&t) };
+                t.state = TaskState::Running;
+                let effects = on_crash(&mut t, Some(&mut s), "boom", None, &cfg, now, None);
+                if n < max {
+                    prop_assert_eq!(t.state, TaskState::Crashed, "crash {} of {} gave up", n, max);
+                    let expected = Duration::seconds(cfg.backoff_for_attempt(n) as i64);
+                    prop_assert_eq!(t.not_before, Some(now + expected), "backoff of crash {}", n);
+                    let cleaned = has(&effects, |e| matches!(e, Effect::Cleanup { .. }));
+                    prop_assert!(!cleaned, "crash {} of {} cleaned up", n, max);
+                } else {
+                    prop_assert_eq!(t.state, TaskState::Failed, "crash {} of {} did not give up", n, max);
+                    let cleaned = has(&effects, |e| matches!(e, Effect::Cleanup { succeeded: false }));
+                    prop_assert!(cleaned, "giving up did not clean up");
+                }
+            }
+        }
+
+        /// Hook outcomes make legal moves, never revive handed-off or paused
+        /// work, ignore a dead session (except the three outcomes that may
+        /// close it), and account rate limits once per outcome.
+        #[test]
+        fn hook_outcomes_make_legal_moves((task, session) in task_with_session(), outcome in hook_outcome()) {
+            let now = origin();
+            let period_end = now + Duration::days(3);
+            let cfg = Config::default();
+            let mut t = task.clone();
+            let mut s = session.clone();
+            let effects = on_hook_outcome(&mut t, &mut s, &outcome, &cfg, now, period_end);
+            prop_assert!(logs_are_well_formed(&effects));
+            prop_assert!(task.state.can_transition_to(t.state), "{:?}: {:?} -> {:?}", outcome, task.state, t.state);
+            let closing = matches!(outcome, HookOutcome::Started { .. } | HookOutcome::Completed { .. } | HookOutcome::SessionEnded { .. });
+            if task.state.is_handed_off() || task.state == TaskState::Paused {
+                prop_assert!(
+                    !matches!(t.state, TaskState::Running | TaskState::Idle | TaskState::NeedsAttention | TaskState::Throttled),
+                    "{:?} revived {:?} -> {:?}", outcome, task.state, t.state
+                );
+            }
+            if !session.state.is_live() && !closing {
+                prop_assert_eq!(&t, &task);
+                prop_assert_eq!(&s, &session);
+                prop_assert!(effects.is_empty());
+            }
+            // A late end of a session that is already closed is a duplicate.
+            if !session.state.is_live() && matches!(outcome, HookOutcome::SessionEnded { .. }) {
+                prop_assert_eq!(&t, &task);
+                prop_assert_eq!(&s, &session);
+                prop_assert!(matches!(&effects[..], [Effect::Log { kind, .. }] if kind == "hook.duplicate"), "{:?}", effects);
+            }
+            let applies = session.state.is_live() && !task.state.is_handed_off() && task.state != TaskState::Paused;
+            match &outcome {
+                HookOutcome::RateLimited { error_type, .. } if applies => {
+                    prop_assert_eq!(t.state, TaskState::Throttled);
+                    let until = t.not_before.expect("a retry time");
+                    prop_assert!(until >= now + Duration::minutes(1) && until <= period_end, "{until}");
+                    let provider_wide = has(&effects, |e| matches!(e, Effect::RateLimitProvider { .. }));
+                    let tier_only = has(&effects, |e| matches!(e, Effect::RateLimit { .. }));
+                    prop_assert_eq!((provider_wide, tier_only), (error_type != "overloaded", error_type == "overloaded"));
+                }
+                HookOutcome::Completed { .. } if applies && !task.state.is_terminal() => {
+                    prop_assert_eq!((t.state, t.completed_at), (TaskState::Completed, Some(now)));
+                    prop_assert!(has(&effects, |e| matches!(e, Effect::Cleanup { succeeded: true })), "{:?}", effects);
+                    prop_assert_eq!((s.state, s.ended_at), (SessionState::Exited, Some(now)));
+                }
+                // A late done marker of a closed session completes the task
+                // where the table lets a task complete (including one the
+                // probe crashed or failed in the meantime: the work was
+                // done); elsewhere (re-queued, finished, cancelled) it is a
+                // duplicate.
+                HookOutcome::Completed { .. } if !session.state.is_live() && (task.state == TaskState::Completed || !task.state.can_transition_to(TaskState::Completed)) => {
+                    prop_assert_eq!(&t, &task);
+                    prop_assert_eq!(&s, &session);
+                    prop_assert!(matches!(&effects[..], [Effect::Log { kind, .. }] if kind == "hook.duplicate"), "{:?}", effects);
+                }
+                HookOutcome::Completed { .. } if !session.state.is_live() && task.state != TaskState::InReview => {
+                    prop_assert_eq!((t.state, t.completed_at, t.not_before), (TaskState::Completed, Some(now), None));
+                    prop_assert!(has(&effects, |e| matches!(e, Effect::Cleanup { succeeded: true })), "{:?}", effects);
+                }
+                _ => {}
+            }
+        }
+
+        /// A liveness probe: a dead session is never touched; a dead pane
+        /// crashes the attempt (unless the task is done, paused or in
+        /// review); nudges and kills are justified by what was observed.
+        #[test]
+        fn probes_make_legal_moves(
+            (task, session) in task_with_session_among(&[
+                TaskState::Starting, TaskState::Running, TaskState::Idle, TaskState::NeedsAttention, TaskState::Throttled,
+                TaskState::Paused, TaskState::InReview, TaskState::Completed, TaskState::Failed, TaskState::Cancelled,
+            ]),
+            session_state in prop::sample::select(vec![SessionState::Launching, SessionState::Running, SessionState::Idle, SessionState::Exited, SessionState::Crashed]),
+            probe in session_probe(),
+            cfg in scheduler_config(),
+            ctx in probe_context(),
+        ) {
+            let now = origin();
+            let session = Session { state: session_state, ..session };
+            let mut t = task.clone();
+            let mut s = session.clone();
+            let effects = on_probe(&mut t, &mut s, &probe, &cfg, &ctx);
+            prop_assert!(logs_are_well_formed(&effects));
+            prop_assert!(task.state.can_transition_to(t.state), "{:?} -> {:?}", task.state, t.state);
+            if !session.state.is_live() {
+                prop_assert_eq!(&t, &task);
+                prop_assert_eq!(&s, &session);
+                prop_assert!(effects.is_empty());
+                return Ok(());
+            }
+            if !probe.is_alive() {
+                if task.state.is_handed_off() || task.state == TaskState::Paused {
+                    prop_assert_eq!(t.state, task.state);
+                    prop_assert!(!has(&effects, |e| matches!(e, Effect::Cleanup { .. })), "{:?}", effects);
+                } else {
+                    prop_assert!(matches!(t.state, TaskState::Crashed | TaskState::Failed), "{:?}", t.state);
+                    prop_assert_eq!((s.state, s.ended_at), (SessionState::Crashed, Some(now)));
+                }
+                return Ok(());
+            }
+            let nudged = has(&effects, |e| matches!(e, Effect::Nudge { .. }));
+            if nudged {
+                prop_assert_eq!(task.state, TaskState::Idle);
+                prop_assert!(!ctx.nudged);
+                prop_assert!(cfg.idle_timeout_secs > 0);
+                prop_assert!(now - session.last_activity_at > Duration::seconds(cfg.idle_timeout_secs as i64));
+                prop_assert_eq!(s.last_activity_at, now);
+            }
+            let killed = has(&effects, |e| matches!(e, Effect::KillWindow));
+            let stale_or_timeout = has(&effects, |e| matches!(e, Effect::Log { kind, .. } if kind == "session.stale" || kind == "session.timeout"));
+            prop_assert_eq!(killed, stale_or_timeout, "{:?}", effects);
+            if killed {
+                prop_assert!(matches!(t.state, TaskState::Crashed | TaskState::Failed));
+            }
+        }
+
+        /// Dependencies move only `queued`/`throttled` to `blocked` and only
+        /// `blocked` back to `queued`; a second look changes nothing.
+        #[test]
+        fn dependencies_block_and_unblock_only_what_they_may(task in task()) {
+            let mut t = task.clone();
+            let effects = on_dependencies(&mut t);
+            prop_assert!(logs_are_well_formed(&effects));
+            prop_assert!(task.state.can_transition_to(t.state), "{:?} -> {:?}", task.state, t.state);
+            let waiting = task.is_waiting();
+            match task.state {
+                TaskState::Queued | TaskState::Throttled if waiting => {
+                    prop_assert_eq!((t.state, t.not_before), (TaskState::Blocked, None));
+                }
+                TaskState::Blocked if !waiting => prop_assert_eq!(t.state, TaskState::Queued),
+                _ => {
+                    prop_assert_eq!(&t, &task);
+                    prop_assert!(effects.is_empty());
+                }
+            }
+            let again = t.clone();
+            prop_assert!(on_dependencies(&mut t).is_empty());
+            prop_assert_eq!(&t, &again);
+        }
+
+        /// A PRIORITY.md skip pauses open work and lifts only what it
+        /// paused; the same evaluation applied twice is a no-op.
+        #[test]
+        fn evaluation_skips_and_unskips(task in task(), eval in evaluation()) {
+            let mut t = task.clone();
+            let effects = on_evaluation(&mut t, &eval);
+            prop_assert!(logs_are_well_formed(&effects));
+            prop_assert!(task.state.can_transition_to(t.state), "{:?} -> {:?}", task.state, t.state);
+            prop_assert_eq!(t.criticality, eval.criticality);
+            if eval.skip && task.state != TaskState::Paused && !task.state.is_handed_off() {
+                prop_assert_eq!((t.state, t.last_error.as_deref(), t.not_before), (TaskState::Paused, Some(SKIP_REASON), None));
+            } else if !eval.skip && task.state == TaskState::Paused && task.last_error.as_deref() == Some(SKIP_REASON) {
+                prop_assert_eq!(t.last_error.as_deref(), None);
+                prop_assert!(matches!(t.state, TaskState::Queued | TaskState::Blocked), "{:?}", t.state);
+            }
+            let again = t.clone();
+            prop_assert!(on_evaluation(&mut t, &eval).is_empty());
+            prop_assert_eq!(&t, &again);
+        }
+
+        /// Closing a container completes any open task and releases its
+        /// resources only when it ever had any. This is the one move the
+        /// transition table does not list (a container is normally
+        /// `blocked`, but one that ran before it got sub-issues may be
+        /// queued, crashed or paused), so the table is not checked here.
+        #[test]
+        fn closing_a_container_completes_open_tasks(task in task(), children in prop::collection::vec(linked_issue(), 0..3)) {
+            let now = origin();
+            let mut t = task.clone();
+            let effects = on_container_closed(&mut t, &children, now);
+            if task.state.is_terminal() {
+                prop_assert_eq!(&t, &task);
+                prop_assert!(effects.is_empty());
+            } else {
+                prop_assert_eq!((t.state, t.completed_at, t.not_before), (TaskState::Completed, Some(now), None));
+                let had_resources = task.worktree_path.is_some() || task.branch.is_some();
+                prop_assert_eq!(has(&effects, |e| matches!(e, Effect::Cleanup { succeeded: true })), had_resources);
+            }
+        }
+
+        /// A reply that arrives without a session re-queues the task iff the
+        /// table allows it and the task is not finished (the table's
+        /// terminal → queued row is `task retry`'s, not a late comment's),
+        /// and forgets the parking.
+        #[test]
+        fn queued_answers_requeue_when_allowed(task in task(), ids in prop::collection::vec(word(), 0..3)) {
+            let now = origin();
+            let mut t = task.clone();
+            let effects = on_answer_queued(&mut t, &ids, now);
+            if !task.state.is_terminal() && (task.state == TaskState::Queued || task.state.can_transition_to(TaskState::Queued)) {
+                prop_assert_eq!((t.state, t.not_before, t.last_error.clone()), (TaskState::Queued, None, None));
+                prop_assert!(t.review.as_ref().is_none_or(|w| !w.parked));
+                prop_assert_eq!(effects.len(), 1);
+            } else {
+                prop_assert_eq!(&t, &task);
+                prop_assert!(effects.is_empty());
+            }
+        }
+
+        /// Releasing a session only applies to tasks that are handed off.
+        #[test]
+        fn release_only_handed_off_sessions((task, session) in task_with_session()) {
+            let now = origin();
+            let mut s = session.clone();
+            let effects = release_session(&task, &mut s, now);
+            prop_assert!(logs_are_well_formed(&effects));
+            let review = has(&effects, |e| matches!(e, Effect::ReleaseForReview));
+            prop_assert_eq!(review, task.state == TaskState::InReview);
+            let cleanup = effects.iter().find_map(|e| match e { Effect::Cleanup { succeeded } => Some(*succeeded), _ => None });
+            prop_assert_eq!(cleanup, task.state.is_terminal().then_some(task.state == TaskState::Completed));
+            if task.state.is_handed_off() {
+                prop_assert_eq!((s.state, s.ended_at), (SessionState::Exited, Some(now)));
+            } else {
+                prop_assert_eq!(&s, &session);
+                prop_assert!(effects.is_empty());
+            }
+        }
+
+        /// Waiting time never counts as working time; noting a wait twice
+        /// is noting it once; a waiting task never times out.
+        #[test]
+        fn waiting_is_not_working((task, session) in task_with_session(), cfg in scheduler_config(), ahead in 0i64..7200) {
+            let now = origin() + Duration::seconds(ahead);
+            let mut s = session.clone();
+            note_waiting(&task, &mut s, now);
+            let once = s.clone();
+            note_waiting(&task, &mut s, now);
+            prop_assert_eq!(&s, &once);
+            prop_assert!(s.working_time(now) <= now - s.started_at);
+            if matches!(task.state, TaskState::NeedsAttention | TaskState::Paused | TaskState::Throttled) {
+                prop_assert!(!session_timed_out(&task, &s, &cfg, now));
+                prop_assert!(s.waiting_since.is_some());
+            } else {
+                prop_assert_eq!(s.waiting_since, None);
+            }
+            if task.state.is_handed_off() {
+                prop_assert!(!session_timed_out(&task, &s, &cfg, now));
+            }
+        }
+
+        /// `preview` and the usage-reset detector never panic and keep to
+        /// their contracts.
+        #[test]
+        fn preview_and_reset_detector_are_total(text in "[\\s\\S]{0,120}", max in 0usize..50, tail in pane_tail()) {
+            let p = preview(&text, max);
+            prop_assert!(!p.contains('\n'));
+            prop_assert!(p.chars().count() <= max + 1);
+            if let Some(tail) = tail {
+                let waits = pane_waits_for_usage_reset(&tail);
+                let lower = tail.to_lowercase();
+                prop_assert!(!waits || WAITING_FOR_RESET_SIGNATURES.iter().any(|s| lower.contains(s)));
+            }
+        }
     }
 }

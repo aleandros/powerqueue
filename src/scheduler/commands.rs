@@ -1,18 +1,131 @@
-//! Pure transitions for user commands (`task pause|resume|cancel|retry|model`).
+//! Pure transitions for user commands (`task pause|resume|cancel|retry|model`)
+//! and the direct writes (`task complete`, `task complete --pr`, `task block`).
 //!
 //! Each function mutates the in-memory [`Task`] (and the live [`Session`],
 //! when one is handed in) and returns the [`Effect`]s the daemon must carry
 //! out: events to log, a window to kill, a cleanup, a relayed answer to
 //! forget. A command that does not apply to the task's state leaves it
 //! untouched and returns at most a log effect; the daemon persists a task
-//! only when it changed.
+//! only when it changed. A direct write that does not apply is [`Refused`]
+//! with the message the CLI shows.
 
 use chrono::{DateTime, Utc};
 
 use crate::domain::{EventLevel, ModelTier, Session, SessionState, Task, TaskState};
+use crate::github::PrRef;
 
 use super::review;
 use super::transitions::{Effect, SKIP_REASON};
+
+/// Why a direct write (`task complete`, `task block`) does not apply to the
+/// task; shown to the user as is.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct Refused(pub String);
+
+/// `task complete` without a PR, written straight into the store by the
+/// agent from inside its session or by a human: the task goes `completed`
+/// with `summary` and the daemon releases its session, if still live, on
+/// its next tick ([`super::transitions::release_session`]). Refused for a
+/// task that is already completed or that the table does not let complete
+/// ([`TaskState::can_transition_to`]), and for a `starting` one: the daemon
+/// is launching it and persists `running` when the launch ends, which would
+/// lose the completion.
+pub fn on_complete(task: &mut Task, summary: Option<&str>, now: DateTime<Utc>) -> Result<Vec<Effect>, Refused> {
+    if task.state == TaskState::Completed {
+        return Err(Refused(format!("{} is already completed", task.key)));
+    }
+    refuse_while_starting(task, "complete")?;
+    if !task.state.can_transition_to(TaskState::Completed) {
+        return Err(Refused(format!("cannot complete {} while it is {} (cancel it instead)", task.key, task.state)));
+    }
+    task.state = TaskState::Completed;
+    task.completed_at = Some(now);
+    task.not_before = None;
+    if let Some(s) = non_empty(summary) {
+        task.summary = Some(s.to_string());
+    }
+    task.last_error = None;
+    Ok(vec![Effect::log(
+        EventLevel::Info,
+        "task.completed_by_command",
+        "marked completed via `powerqueue task complete`",
+        serde_json::json!({ "summary": task.summary }),
+    )])
+}
+
+/// `task complete --pr <url>`: the task moves to `in_review` with the PR
+/// recorded ([`Task::hand_off_for_review`]), so the daemon releases its
+/// session, slot and worktree (keeping the branch) and watches the PR.
+/// Calling it again while in review re-arms the watch (e.g. after a review
+/// round). Refused for a URL that is not a GitHub pull request, a task that
+/// is not running (queued, finished, ...) and a `starting` one (see
+/// [`on_complete`]).
+pub fn on_hand_off(task: &mut Task, pr_url: &str, summary: Option<&str>, now: DateTime<Utc>) -> Result<Vec<Effect>, Refused> {
+    let pr: PrRef = pr_url.parse().map_err(Refused)?;
+    refuse_while_starting(task, "hand off for review")?;
+    if task.state != TaskState::InReview && !task.state.can_transition_to(TaskState::InReview) {
+        return Err(Refused(format!(
+            "cannot hand {} off for review while it is {} (only a running task opens a PR)",
+            task.key, task.state
+        )));
+    }
+    let from = task.state;
+    task.hand_off_for_review(pr_url, now);
+    if let Some(s) = non_empty(summary) {
+        task.summary = Some(s.to_string());
+    }
+    let rounds = task.review.as_ref().map_or(0, |r| r.rounds);
+    Ok(vec![Effect::log(
+        EventLevel::Info,
+        "task.in_review",
+        format!(
+            "handed off for review: {pr} (merge armed{})",
+            if rounds > 0 { format!(", after {rounds} review round(s)") } else { String::new() }
+        ),
+        serde_json::json!({ "pr": task.pr_url, "from": from, "rounds": rounds, "summary": task.summary }),
+    )])
+}
+
+/// `task block`: the task needs a human (`needs_attention`) for `reason`;
+/// a live session keeps running (the agent is waiting for the answer).
+/// Refused for a finished task, one the table does not let block, and a
+/// `starting` one (see [`on_complete`]).
+pub fn on_block(task: &mut Task, reason: Option<&str>) -> Result<Vec<Effect>, Refused> {
+    if task.state.is_terminal() {
+        return Err(Refused(format!("cannot block {}: it is already {}", task.key, task.state)));
+    }
+    refuse_while_starting(task, "block")?;
+    if !task.state.can_transition_to(TaskState::NeedsAttention) {
+        return Err(Refused(format!("cannot block {} while it is {}", task.key, task.state)));
+    }
+    task.state = TaskState::NeedsAttention;
+    // A throttled task's retry time is over: a human decides when it runs.
+    task.not_before = None;
+    if let Some(r) = non_empty(reason) {
+        task.last_error = Some(r.to_string());
+    }
+    Ok(vec![Effect::log(
+        EventLevel::Warn,
+        "task.blocked_by_command",
+        format!("blocked via `powerqueue task block`: {}", task.last_error.as_deref().unwrap_or("no reason given")),
+        serde_json::json!({ "reason": task.last_error }),
+    )])
+}
+
+fn refuse_while_starting(task: &Task, verb: &str) -> Result<(), Refused> {
+    if task.state == TaskState::Starting {
+        return Err(Refused(format!(
+            "cannot {verb} {} while the daemon is launching it; try again once it is running",
+            task.key
+        )));
+    }
+    Ok(())
+}
+
+fn non_empty(text: Option<&str>) -> Option<&str> {
+    text.map(str::trim).filter(|s| !s.is_empty())
+}
 
 /// `task pause`. `live` says whether the task has a live session (it
 /// finishes its turn and is not relaunched). Terminal and already paused
@@ -322,5 +435,155 @@ mod tests {
         let effects = on_set_model(&mut t, None);
         assert!(matches!(&effects[..], [Effect::Log { message, .. }] if message == "model override cleared"));
         assert_eq!(t.model_override, None);
+    }
+}
+
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::scheduler::review::pr_number_of;
+    use crate::strategies::*;
+
+    fn logs_are_well_formed(effects: &[Effect]) -> bool {
+        effects.iter().all(|e| !matches!(e, Effect::Log { kind, message, .. } if kind.is_empty() || message.is_empty()))
+    }
+
+    fn has_kill(effects: &[Effect]) -> bool {
+        effects.iter().any(|e| matches!(e, Effect::KillWindow))
+    }
+
+    proptest! {
+        /// Every command makes a move the transition table allows.
+        #[test]
+        fn commands_make_legal_moves((task, session) in task_with_session(), live in any::<bool>(), model in prop::option::of(claude_model())) {
+            let now = origin();
+            for cmd in 0..5u8 {
+                let before = task.clone();
+                let mut t = task.clone();
+                let mut s = session.clone();
+                let effects = match cmd {
+                    0 => on_pause(&mut t, live),
+                    1 => on_resume(&mut t, live, now),
+                    2 => on_cancel(&mut t, Some(&mut s), now),
+                    3 => on_retry(&mut t, Some(&mut s), now),
+                    _ => on_set_model(&mut t, model.clone()),
+                };
+                prop_assert!(before.state.can_transition_to(t.state), "cmd {cmd}: {:?} -> {:?}", before.state, t.state);
+                prop_assert!(logs_are_well_formed(&effects));
+            }
+        }
+
+        /// Terminal tasks are inert for pause and cancel; only retry leaves a
+        /// terminal state, and then the task starts over.
+        #[test]
+        fn terminal_tasks_only_leave_through_retry(
+            (task, session) in task_with_session_among(&[TaskState::Completed, TaskState::Failed, TaskState::Cancelled]),
+            live in any::<bool>(),
+        ) {
+            let now = origin();
+            let mut t = task.clone();
+            prop_assert!(on_pause(&mut t, live).is_empty());
+            prop_assert_eq!(&t, &task);
+            let mut s = session.clone();
+            prop_assert!(on_cancel(&mut t, Some(&mut s), now).is_empty());
+            prop_assert_eq!(&t, &task);
+            prop_assert_eq!(&s, &session);
+            let mut t = task.clone();
+            let mut s = session.clone();
+            let effects = on_retry(&mut t, Some(&mut s), now);
+            prop_assert_eq!(t.state, TaskState::Queued);
+            prop_assert_eq!(t.attempts, 0);
+            prop_assert_eq!((t.last_error.clone(), t.summary.clone(), t.completed_at, t.started_at, t.not_before), (None, None, None, None, None));
+            prop_assert!(effects.iter().any(|e| matches!(e, Effect::ForgetAnswer)));
+            prop_assert!(!has_kill(&effects), "a terminal task's session is already dead");
+        }
+
+        /// A second pause changes nothing and says nothing; resuming a task
+        /// that is neither paused nor waiting for a human changes nothing.
+        /// (A task that was already paused is left alone, retry time
+        /// included: the generator may give it one, the daemon never does.)
+        #[test]
+        fn pause_and_resume_are_idempotent((task, _) in task_with_session(), live in any::<bool>()) {
+            let now = origin();
+            let mut t = task.clone();
+            on_pause(&mut t, live);
+            let paused = t.clone();
+            prop_assert!(on_pause(&mut t, live).is_empty());
+            prop_assert_eq!(&t, &paused);
+            if !task.state.is_terminal() && task.state != TaskState::Paused {
+                prop_assert_eq!((paused.state, paused.not_before), (TaskState::Paused, None));
+            }
+            let mut t = task.clone();
+            if !matches!(task.state, TaskState::Paused | TaskState::NeedsAttention) {
+                prop_assert!(on_resume(&mut t, live, now).is_empty());
+                prop_assert_eq!(&t, &task);
+            } else {
+                on_resume(&mut t, live, now);
+                prop_assert_eq!(t.not_before, None);
+                prop_assert!(matches!(t.state, TaskState::Running | TaskState::InReview | TaskState::Queued));
+                prop_assert_eq!(t.state == TaskState::Running, live);
+            }
+        }
+
+        /// Effects are justified: a window is killed iff the session handed
+        /// in was live (and it is then closed); cleanup only for a task that
+        /// ended; a relayed answer is forgotten only by a re-queue.
+        #[test]
+        fn cancel_and_retry_effects_are_justified((task, session) in task_with_session()) {
+            let now = origin();
+            let was_live = session.state.is_live();
+            // Cancel.
+            let mut t = task.clone();
+            let mut s = session.clone();
+            let effects = on_cancel(&mut t, Some(&mut s), now);
+            if task.state.is_terminal() {
+                prop_assert!(effects.is_empty());
+            } else {
+                prop_assert_eq!(has_kill(&effects), was_live);
+                prop_assert_eq!((t.state, t.completed_at, t.not_before), (TaskState::Cancelled, Some(now), None));
+                prop_assert!(effects.iter().any(|e| matches!(e, Effect::Cleanup { succeeded: false })), "no failed cleanup: {:?}", effects);
+            }
+            if was_live && !task.state.is_terminal() {
+                prop_assert_eq!((s.state, s.ended_at), (SessionState::Killed, Some(now)));
+            } else {
+                prop_assert_eq!(&s, &session);
+            }
+            // Retry.
+            let mut t = task.clone();
+            let mut s = session.clone();
+            let effects = on_retry(&mut t, Some(&mut s), now);
+            let applies = task.state.is_terminal()
+                || matches!(task.state, TaskState::Crashed | TaskState::Throttled | TaskState::Paused | TaskState::NeedsAttention)
+                || (task.state == TaskState::InReview && task.pr_url.as_deref().and_then(pr_number_of).is_some());
+            prop_assert_eq!(has_kill(&effects), applies && was_live);
+            prop_assert!(!effects.iter().any(|e| matches!(e, Effect::Cleanup { .. })), "retry never cleans up: {:?}", effects);
+            let forgot = effects.iter().any(|e| matches!(e, Effect::ForgetAnswer));
+            prop_assert_eq!(forgot, applies && task.state != TaskState::InReview);
+            if applies {
+                prop_assert_eq!((t.state, t.not_before), (TaskState::Queued, None));
+            } else {
+                prop_assert_eq!(&t, &task);
+                prop_assert!(matches!(&effects[..], [Effect::Log { kind, .. }] if kind == "task.retry_ignored"), "{effects:?}");
+            }
+            if task.state == TaskState::InReview && applies {
+                let watch = t.review.as_ref().expect("a watch");
+                prop_assert_eq!(watch.relaunch.as_ref().map(|r| r.reason.as_str()), Some("requested"));
+                prop_assert_eq!(watch.rounds, task.review.as_ref().map_or(0, |w| w.rounds));
+                prop_assert!(!watch.parked);
+            }
+        }
+
+        /// `task model` only records the override and logs it.
+        #[test]
+        fn set_model_only_changes_the_override((task, _) in task_with_session(), model in prop::option::of(model())) {
+            let mut t = task.clone();
+            let effects = on_set_model(&mut t, model.clone());
+            prop_assert_eq!(t.model_override, model);
+            t.model_override = task.model_override.clone();
+            prop_assert_eq!(&t, &task);
+            prop_assert!(matches!(&effects[..], [Effect::Log { kind, .. }] if kind == "task.model_override"), "{:?}", effects);
+        }
     }
 }

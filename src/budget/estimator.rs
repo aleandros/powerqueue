@@ -388,3 +388,111 @@ mod tests {
         assert_eq!(median([f64::NAN, 5.0].into_iter()), 5.0);
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use crate::domain::{TaskId, TokenUsage};
+    use crate::strategies::{criticality, task, task_state, word};
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+
+    fn estimate() -> impl Strategy<Value = Option<f64>> {
+        prop::option::of(prop::sample::select(vec![1.0, 2.0, 3.0, 5.0, 8.0]))
+    }
+
+    fn summary() -> impl Strategy<Value = TaskUsageSummary> {
+        (criticality(), estimate(), vec(word(), 0..2), task_state(), 1u32..=3, 0.0f64..5_000_000.0, -10i64..20_000).prop_map(
+            |(criticality, estimate, labels, state, attempts, weighted, wall_secs)| TaskUsageSummary {
+                task_id: TaskId::new(),
+                criticality,
+                estimate,
+                labels,
+                state,
+                attempts,
+                usage: TokenUsage::default(),
+                weighted,
+                wall_secs,
+                tier: None,
+            },
+        )
+    }
+
+    fn effective_tokens(s: &Sample) -> f64 {
+        if s.completed { s.weighted_tokens } else { s.weighted_tokens * Estimator::FAILED_PENALTY }
+    }
+
+    proptest! {
+        /// Only completed and failed tasks with usage become samples; a
+        /// prediction is always positive, finite, with a confidence in
+        /// `[0, 1]`, a non-negative wall time and a named basis. With no
+        /// usable history it is the default guess.
+        #[test]
+        fn predictions_are_well_formed(rows in vec(summary(), 0..=12), task in task()) {
+            let est = Estimator::from_summaries(&rows);
+            let usable = rows.iter().filter(|r| r.weighted > 0.0 && matches!(r.state, TaskState::Completed | TaskState::Failed)).count();
+            prop_assert_eq!(est.sample_count(), usable);
+            prop_assert!(est.samples.iter().all(|s| s.weighted_tokens > 0.0 && s.wall_secs >= 0.0));
+            let p = est.predict(&task);
+            prop_assert!(p.weighted_tokens > 0.0 && p.weighted_tokens.is_finite(), "{:?}", p);
+            prop_assert!(p.wall_secs >= 0.0 && p.wall_secs.is_finite());
+            prop_assert!((0.0..=1.0).contains(&p.confidence));
+            prop_assert!(!p.basis.is_empty());
+            if usable == 0 {
+                prop_assert_eq!(&p, &Prediction::default_guess());
+            } else {
+                let lo = est.samples.iter().map(effective_tokens).fold(f64::INFINITY, f64::min);
+                let hi = est.samples.iter().map(effective_tokens).fold(0.0, f64::max);
+                prop_assert!(p.weighted_tokens >= lo - 1e-6 && p.weighted_tokens <= hi + 1e-6, "{} outside [{lo}, {hi}]", p.weighted_tokens);
+            }
+            prop_assert_eq!(&est.predict(&task), &p, "deterministic");
+        }
+
+        /// Accuracy needs four completed samples and is a non-negative error
+        /// fraction; identical histories predict themselves exactly.
+        #[test]
+        fn accuracy_needs_history(rows in vec(summary(), 0..=12)) {
+            let est = Estimator::from_summaries(&rows);
+            let completed = est.samples.iter().filter(|s| s.completed).count();
+            match est.accuracy() {
+                None => prop_assert!(completed < 4, "{completed} completed samples but no accuracy"),
+                Some(x) => {
+                    prop_assert!(completed >= 4);
+                    prop_assert!(x >= 0.0 && x.is_finite(), "{x}");
+                }
+            }
+        }
+
+        /// A bucket with at least `TRUST_N` tasks of the same estimate is
+        /// trusted as is: the prediction is that bucket's median of effective
+        /// tokens, with confidence `n / 10` capped at 1.
+        #[test]
+        fn a_full_estimate_bucket_is_its_median(
+            others in vec(summary(), 0..=8),
+            matching in vec(summary(), Estimator::TRUST_N..=8),
+            e in prop::sample::select(vec![1.0, 2.0, 3.0, 5.0, 8.0]),
+            mut task in task(),
+        ) {
+            task.estimate = Some(e);
+            // The matching rows all count as samples of the `estimate=e` bucket.
+            let matching: Vec<TaskUsageSummary> = matching
+                .into_iter()
+                .enumerate()
+                .map(|(i, mut r)| {
+                    r.estimate = Some(e);
+                    r.state = if i % 2 == 0 { TaskState::Completed } else { TaskState::Failed };
+                    r.weighted = r.weighted.max(1.0);
+                    r
+                })
+                .collect();
+            let rows: Vec<TaskUsageSummary> = others.into_iter().filter(|r| r.estimate != Some(e)).chain(matching).collect();
+            let est = Estimator::from_summaries(&rows);
+            let bucket: Vec<f64> = est.samples.iter().filter(|s| s.estimate == Some(e)).map(effective_tokens).collect();
+            prop_assert!(bucket.len() >= Estimator::TRUST_N);
+            let p = est.predict(&task);
+            prop_assert!((p.weighted_tokens - median(bucket.iter().copied())).abs() < 1e-6, "{:?} vs {:?}", p, bucket);
+            prop_assert!((p.confidence - (bucket.len() as f64 / 10.0).min(1.0)).abs() < 1e-9);
+            prop_assert_eq!(p.basis, format!("estimate={e} (n={})", bucket.len()));
+        }
+    }
+}

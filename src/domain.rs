@@ -516,11 +516,37 @@ impl TaskState {
         matches!(self, TaskState::Starting | TaskState::Running | TaskState::Idle | TaskState::NeedsAttention)
     }
 
+    /// True while a live session may still exist: the states that expect
+    /// one ([`Self::has_live_session`]) plus `paused` (the session finishes
+    /// its turn and is not relaunched) and `throttled` (the agent waits
+    /// in-session for its usage limit to reset). Whether one does exist is
+    /// the session row's business; the daemon never re-scores or relaunches
+    /// a task under a live session.
+    pub fn may_keep_session(&self) -> bool {
+        self.has_live_session() || matches!(self, TaskState::Paused | TaskState::Throttled)
+    }
+
     /// True if the scheduler may pick this task up (possibly after backoff).
     pub fn is_schedulable(&self) -> bool {
         matches!(self, TaskState::Queued | TaskState::Crashed | TaskState::Throttled)
     }
 
+    /// The moves the daemon and the CLI make. `Starting` is an early
+    /// `Running`, so every hook outcome may land on it; `throttled` and
+    /// `paused` tasks keep their session (waiting for a usage reset, or for
+    /// the turn to end), so they can still complete, and a throttled one
+    /// can still crash or ask for a human (blocker, permission prompt,
+    /// authentication failure). A done marker drained after the probe
+    /// already crashed or failed the session completes the task: the work
+    /// was done (`crashed` / `failed` → `completed`). A container (parent
+    /// issue) is the one exception the table does not list: it is closed
+    /// from whatever open state it is in once its sub-issues are done.
+    ///
+    /// The CLI's direct writes (`task complete`, `task block`; see
+    /// [`crate::scheduler::commands::on_complete`]) refuse `starting` on top
+    /// of this table: the daemon is launching the task and persists
+    /// `running` when the launch ends. Checked by the scheduler's property
+    /// tests and the stateful model.
     pub fn can_transition_to(&self, next: TaskState) -> bool {
         use TaskState::*;
         if *self == next {
@@ -528,20 +554,43 @@ impl TaskState {
         }
         match self {
             Queued => matches!(next, Starting | Paused | Cancelled | Throttled | Blocked),
-            Starting => matches!(next, Running | Crashed | Failed | Cancelled | Queued),
+            Starting => matches!(
+                next,
+                Running
+                    | Idle
+                    | Crashed
+                    | Throttled
+                    | NeedsAttention
+                    | InReview
+                    | Completed
+                    | Failed
+                    | Cancelled
+                    | Queued
+                    | Paused
+            ),
             Running => {
                 matches!(next, Idle | Crashed | Throttled | NeedsAttention | InReview | Completed | Failed | Cancelled | Paused)
             }
-            Idle => matches!(next, Running | Crashed | NeedsAttention | InReview | Completed | Failed | Cancelled | Paused),
-            Crashed => matches!(next, Starting | Queued | Failed | Cancelled | Paused | Throttled),
-            Throttled => matches!(next, Queued | Starting | Running | Cancelled | Paused | Blocked),
-            Paused => matches!(next, Queued | InReview | Cancelled),
+            Idle => {
+                matches!(
+                    next,
+                    Running | Crashed | Throttled | NeedsAttention | InReview | Completed | Failed | Cancelled | Paused
+                )
+            }
+            Crashed => matches!(next, Starting | Queued | Failed | Cancelled | Paused | Throttled | Completed),
+            Throttled => matches!(
+                next,
+                Queued | Starting | Running | NeedsAttention | Crashed | Failed | Cancelled | Paused | Blocked | Completed
+            ),
+            // Unskipped by PRIORITY.md while waiting on a blocker: `blocked`.
+            Paused => matches!(next, Queued | Running | InReview | Cancelled | Completed | Blocked),
             Blocked => matches!(next, Queued | Paused | Cancelled | Completed),
             NeedsAttention => {
-                matches!(next, Queued | Running | Idle | InReview | Completed | Failed | Cancelled | Paused | Crashed)
+                matches!(next, Queued | Running | Idle | Throttled | InReview | Completed | Failed | Cancelled | Paused | Crashed)
             }
             InReview => matches!(next, Queued | NeedsAttention | Completed | Cancelled | Paused),
-            Completed | Failed | Cancelled => matches!(next, Queued),
+            Failed => matches!(next, Queued | Completed),
+            Completed | Cancelled => matches!(next, Queued),
         }
     }
 }
@@ -1392,7 +1441,14 @@ mod tests {
         assert!(Crashed.can_transition_to(Starting));
         assert!(!Completed.can_transition_to(Running));
         assert!(Completed.can_transition_to(Queued)); // retry
-        assert!(!Paused.can_transition_to(Running));
+        assert!(Paused.can_transition_to(Running)); // resume with a live session
+        assert!(!Paused.can_transition_to(Idle));
+        assert!(Crashed.can_transition_to(Completed)); // done marker drained after the probe crashed it
+        assert!(Failed.can_transition_to(Completed));
+        assert!(!Cancelled.can_transition_to(Completed));
+        for st in TaskState::ALL {
+            assert_eq!(st.may_keep_session(), st.has_live_session() || matches!(st, Paused | Throttled));
+        }
         for st in TaskState::ALL {
             assert_eq!(st.as_str().parse::<TaskState>().unwrap(), st);
         }

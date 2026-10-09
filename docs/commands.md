@@ -44,8 +44,8 @@ Global flags work on every command.
 | `add "title" [-d DESC\|-] [-c CRIT] [-m MODEL] [-k KEY] [-l LABEL]... [--paused]` | enqueue a manual task; `-d -` reads stdin |
 | `task show <task>` | details and timeline |
 | `task list [-a]` | same as `status` |
-| `task complete <task> [-s SUMMARY] [--pr URL]` | mark completed (Claude calls this from inside the session); with `--pr` hand it off for review instead: `in_review`, slot and worktree released, the daemon watches the PR (see [Review](task-lifecycle.md#review-pull-requests)) |
-| `task block <task> [-r REASON]` | mark blocked / needs a human |
+| `task complete <task> [-s SUMMARY] [--pr URL]` | mark completed (Claude calls this from inside the session); with `--pr` hand it off for review instead: `in_review`, slot and worktree released, the daemon watches the PR (see [Review](task-lifecycle.md#review-pull-requests)). Refused while the task is `starting` (the daemon is launching it; try again once it is running) |
+| `task block <task> [-r REASON]` | mark blocked / needs a human; refused while the task is `starting` |
 | `task cancel <task>` | cancel and release resources |
 | `task pause <task>` | do not schedule; a running session stops after its turn |
 | `task resume <task>` | resume a paused or needs-attention task; one the PR watcher parked goes back to `in_review` |

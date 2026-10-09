@@ -207,6 +207,8 @@ pub fn on_starting(
     }
     task.state = TaskState::Starting;
     task.model = Some(model.clone());
+    // The backoff or retry time that held the task is over.
+    task.not_before = None;
     let branch = task.branch.clone().unwrap_or_else(|| branch_name(&cfg.repo.branch_template, &task.slug(), &task.id.short()));
     let worktree = task
         .worktree_path
@@ -380,6 +382,30 @@ pub fn on_launched(task: &mut Task, session: &Session, launched: &Launched<'_>, 
         }),
     }
     effects
+}
+
+/// The task row changed while the launch ran: `fresh` is the row as it is
+/// now (a cancel or pause the CLI applied offline during a long
+/// `repo.setup`, with the heartbeat gone stale), `claimed` the copy the
+/// launch worked on. The claim is carried over (attempt, branch, worktree,
+/// model) so the session row stays consistent with the task, and the new
+/// state is kept: the launched session is released by the finalize or
+/// probe phase like any session of a task that moved on. Logged as
+/// `launch.superseded`.
+pub fn on_launch_superseded(fresh: &mut Task, claimed: &Task, session: &Session) -> Vec<Effect> {
+    fresh.attempts = claimed.attempts;
+    fresh.branch = claimed.branch.clone();
+    fresh.worktree_path = claimed.worktree_path.clone();
+    fresh.model = claimed.model.clone();
+    vec![Effect::log(
+        EventLevel::Warn,
+        "launch.superseded",
+        format!(
+            "the task became {} while attempt {} was being launched; the launched session will be released",
+            fresh.state, session.attempt
+        ),
+        serde_json::json!({ "state": fresh.state, "attempt": session.attempt, "window": session.tmux_window }),
+    )]
 }
 
 #[cfg(test)]
@@ -690,5 +716,330 @@ mod tests {
         assert!(
             matches!(&effects[1], Effect::ProgressComment { body } if body == "powerqueue resumed the session for PR #9: ci_failed (lint). Prompt: `fix lint`")
         );
+    }
+}
+
+#[cfg(test)]
+mod properties {
+    use std::collections::HashSet;
+
+    use chrono::Duration;
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::domain::Provider;
+    use crate::strategies::*;
+
+    /// Distinct tasks (the generator's ids are random, but make sure).
+    fn candidates() -> impl Strategy<Value = Vec<Task>> {
+        prop::collection::vec(task(), 0..8).prop_map(|mut tasks| {
+            let mut seen = HashSet::new();
+            tasks.retain(|t| seen.insert(t.id));
+            tasks
+        })
+    }
+
+    struct Fixed {
+        cfg: Config,
+        rules: PriorityRules,
+        limits: RateLimitState,
+    }
+
+    impl Fixed {
+        fn new() -> Self {
+            Self { cfg: Config::default(), rules: PriorityRules::default(), limits: RateLimitState::default() }
+        }
+        fn ctx(&self) -> LaunchContext<'_> {
+            LaunchContext { budget: &self.cfg.budget, rules: &self.rules, rate_limits: &self.limits }
+        }
+    }
+
+    /// Run a whole pass with `next` + `started`, returning the candidates
+    /// in the order they were handed out.
+    fn run_pass(planner: &mut LaunchPlanner, f: &Fixed, now: DateTime<Utc>) -> Vec<Candidate> {
+        let mut out = Vec::new();
+        while let Some(c) = planner.next(f.ctx(), now) {
+            planner.started(&f.cfg.budget, &c);
+            out.push(c);
+        }
+        out
+    }
+
+    proptest! {
+        /// A launch whose row changed underneath keeps the row's state and
+        /// bookkeeping, takes the claim (attempt, branch, worktree, model)
+        /// and only logs.
+        #[test]
+        fn superseded_launch_keeps_the_new_state_and_the_claim(fresh in task(), (claimed, session) in task_with_session()) {
+            let mut t = fresh.clone();
+            let effects = on_launch_superseded(&mut t, &claimed, &session);
+            prop_assert_eq!(effect_kinds(&effects), vec!["launch.superseded".to_string()]);
+            prop_assert_eq!(
+                (t.attempts, &t.branch, &t.worktree_path, &t.model),
+                (claimed.attempts, &claimed.branch, &claimed.worktree_path, &claimed.model)
+            );
+            let expected = Task {
+                attempts: claimed.attempts,
+                branch: claimed.branch.clone(),
+                worktree_path: claimed.worktree_path.clone(),
+                model: claimed.model.clone(),
+                ..fresh.clone()
+            };
+            prop_assert_eq!(&t, &expected);
+        }
+
+        /// Starting is two-phase: `on_starting` settles the attempt without
+        /// touching the task's bookkeeping (only the state, the model, the
+        /// retry time that is now over and, when resuming, the parking
+        /// flag); `claim` puts it on the task.
+        #[test]
+        fn starting_settles_then_claims(
+            task in task_among(&[TaskState::Queued, TaskState::Crashed, TaskState::Throttled]),
+            model in claude_model(),
+            decision in decision(),
+            resuming in any::<bool>(),
+        ) {
+            let cfg = Config::default();
+            let root = Path::new("/wt");
+            let mut t = task.clone();
+            let start = on_starting(&mut t, &model, &decision, &cfg, root, resuming);
+            prop_assert_eq!((t.state, t.model.clone()), (TaskState::Starting, Some(model.clone())));
+            prop_assert_eq!(start.attempt, task.attempts + 1);
+            if let Some(branch) = &task.branch {
+                prop_assert_eq!(&start.branch, branch);
+            }
+            let expected_wt = task.worktree_path.clone().or_else(|| task.review.as_ref().and_then(|r| r.worktree_path.clone()));
+            if let Some(wt) = expected_wt {
+                prop_assert_eq!(start.worktree.display().to_string(), wt);
+            } else {
+                prop_assert!(start.worktree.starts_with(root));
+            }
+            // Only state, model and the parking flag may differ.
+            prop_assert_eq!(t.not_before, None, "the backoff or retry time that held the task is over");
+            let mut normalised = t.clone();
+            normalised.state = task.state;
+            normalised.model = task.model.clone();
+            normalised.not_before = task.not_before;
+            if let (Some(w), Some(before)) = (normalised.review.as_mut(), task.review.as_ref()) {
+                prop_assert!(!w.parked || !resuming, "resuming un-parks the watch");
+                prop_assert!(w.parked == before.parked || resuming, "the parking flag only moves when resuming");
+                w.parked = before.parked;
+            }
+            prop_assert_eq!(&normalised, &task);
+            prop_assert!(matches!(&start.effects[..], [Effect::Log { kind, .. }] if kind == "task.starting"), "{:?}", start.effects);
+            claim(&mut t, &start);
+            prop_assert_eq!(t.attempts, task.attempts + 1);
+            prop_assert_eq!(t.branch.as_deref(), Some(start.branch.as_str()));
+            prop_assert_eq!(t.worktree_path.clone(), Some(start.worktree.display().to_string()));
+        }
+
+        /// Throttling sets the retry time from the decision and logs once.
+        #[test]
+        fn throttling_is_quiet_the_second_time(task in task(), decision in decision()) {
+            let now = origin();
+            let mut t = task.clone();
+            let effects = on_throttled(&mut t, &decision, now);
+            let retry_at = decision.retry_at.unwrap_or(now + WINDOW_RECHECK);
+            prop_assert_eq!((t.state, t.not_before), (TaskState::Throttled, Some(retry_at)));
+            prop_assert!(retry_at > now);
+            prop_assert_eq!(effects.len(), usize::from(task.state != TaskState::Throttled));
+            let again = t.clone();
+            prop_assert!(on_throttled(&mut t, &decision, now).is_empty());
+            prop_assert_eq!(&t, &again);
+        }
+
+        /// A pass hands out each schedulable task at most once, in
+        /// `pick_next` order, uses at most `slots` starts, and reserves
+        /// exactly the predicted cost on exactly one ledger per start.
+        #[test]
+        fn a_pass_hands_out_tasks_once_in_order(tasks in candidates(), slots in 0u32..=4, ledgers in ledgers()) {
+            let now = origin();
+            let f = Fixed::new();
+            let mut p = LaunchPlanner::new(Estimator::from_summaries(&[]), ledgers.clone(), tasks.clone(), slots);
+            let mut handed: Vec<TaskId> = Vec::new();
+            let mut starts = 0u32;
+            let mut before = ledgers.clone();
+            let mut expected_order: Vec<TaskId> = Vec::new();
+            let mut remaining = tasks.clone();
+            while let Some(c) = p.next(f.ctx(), now) {
+                prop_assert!(starts < slots, "handed out after the slots were used");
+                prop_assert!(!handed.contains(&c.task.id), "handed out twice");
+                handed.push(c.task.id);
+                // pick_next over what was not considered yet.
+                let pick = pick_next(&remaining, now).map(|t| t.id).expect("something schedulable");
+                prop_assert_eq!(pick, c.task.id);
+                expected_order.push(pick);
+                remaining.retain(|t| t.id != c.task.id);
+                prop_assert!(c.task.state.is_schedulable() && !c.task.is_waiting());
+                prop_assert!(c.task.not_before.is_none_or(|nb| nb <= now));
+                // A throttled candidate consumes nothing.
+                if c.decision.model.is_none() {
+                    let snapshot = p.ledgers().clone();
+                    p.started(&f.cfg.budget, &c);
+                    prop_assert_eq!(p.ledgers(), &snapshot);
+                    continue;
+                }
+                p.started(&f.cfg.budget, &c);
+                starts += 1;
+                let model = c.decision.model.clone().expect("a model");
+                let cost = c.weighted_cost(&f.cfg.budget);
+                for (provider, after) in p.ledgers().iter() {
+                    let was = before.get(provider).expect("same providers");
+                    if provider == model.provider() {
+                        prop_assert!((after.total_period_weighted - was.total_period_weighted - cost).abs() < 1e-6 * cost.max(1.0));
+                        prop_assert!((after.total_window_weighted - was.total_window_weighted - cost).abs() < 1e-6 * cost.max(1.0));
+                    } else {
+                        prop_assert_eq!(after, was);
+                    }
+                }
+                before = p.ledgers().clone();
+            }
+            prop_assert!(starts <= slots);
+            prop_assert_eq!(&handed, &expected_order);
+            // Nothing left unconsidered that could start when slots remain.
+            if starts < slots {
+                prop_assert!(pick_next(&remaining, now).is_none());
+            }
+        }
+
+        /// `plan_all` lists every schedulable candidate exactly once, the
+        /// pass first, and nothing else.
+        #[test]
+        fn plan_all_covers_every_schedulable_task_once(tasks in candidates(), slots in 0u32..=4, ledgers in ledgers()) {
+            let now = origin();
+            let f = Fixed::new();
+            let planner = LaunchPlanner::new(Estimator::from_summaries(&[]), ledgers.clone(), tasks.clone(), slots);
+            let mut pass = LaunchPlanner::new(Estimator::from_summaries(&[]), ledgers, tasks.clone(), slots);
+            let pass_ids: Vec<TaskId> = run_pass(&mut pass, &f, now).iter().map(|c| c.task.id).collect();
+            let all = planner.plan_all(f.ctx(), now);
+            let ids: Vec<TaskId> = all.iter().map(|c| c.task.id).collect();
+            prop_assert!(ids.starts_with(&pass_ids), "{ids:?} vs {pass_ids:?}");
+            let unique: HashSet<TaskId> = ids.iter().copied().collect();
+            prop_assert_eq!(unique.len(), ids.len(), "a task listed twice");
+            let schedulable: HashSet<TaskId> = tasks.iter().filter(|t| t.state.is_schedulable()).map(|t| t.id).collect();
+            prop_assert_eq!(unique, schedulable);
+        }
+
+        /// A provider marked rate-limited between two steps of a pass is not
+        /// handed to the next candidate.
+        #[test]
+        fn rate_limits_marked_between_steps_are_seen(ledgers in ledgers(), provider in prop::sample::select(Provider::ALL.to_vec())) {
+            let now = origin();
+            let mut f = Fixed::new();
+            f.cfg.budget.providers.codex.enabled = true;
+            f.cfg.budget.providers.gemini.enabled = true;
+            let tasks = vec![
+                { let mut t = Task::new("ENG-a", "a", TaskSource::Manual); t.score = 2.0; t },
+                { let mut t = Task::new("ENG-b", "b", TaskSource::Manual); t.score = 1.0; t },
+            ];
+            let mut p = LaunchPlanner::new(Estimator::from_summaries(&[]), ledgers, tasks, 2);
+            let first = p.next(f.ctx(), now).expect("a candidate");
+            let blocked = first.decision.model.as_ref().map_or(provider, |m| m.provider());
+            f.limits.mark_provider(&f.cfg.budget, blocked, now + Duration::minutes(10));
+            let second = p.next(f.ctx(), now).expect("a second candidate");
+            prop_assert_ne!(second.decision.model.as_ref().map(|m| m.provider()), Some(blocked), "{:?}", second.decision.reasons);
+        }
+
+        /// A session is resumed only with a transcript, on the same provider,
+        /// and only a crashed one (or, for a review round, whatever ended).
+        #[test]
+        fn resume_plan_never_crosses_providers(
+            (task, session) in task_with_session(),
+            with_previous in any::<bool>(),
+            model in model(),
+            transcript_present in any::<bool>(),
+            review in any::<bool>(),
+        ) {
+            let _ = task;
+            let previous = with_previous.then_some(&session);
+            let (id, resume, agent_id) = resume_plan(previous, &model, transcript_present, review);
+            if resume {
+                let p = previous.expect("a previous session");
+                prop_assert!(transcript_present);
+                prop_assert_eq!(p.model.provider(), model.provider());
+                prop_assert!(p.state == SessionState::Crashed || review);
+                prop_assert_eq!(id, p.id);
+                let needs_agent_id = !agent_for(model.provider()).accepts_session_id();
+                prop_assert_eq!(agent_id.is_some(), needs_agent_id);
+                if needs_agent_id {
+                    prop_assert_eq!(agent_id, p.agent_session_id.clone());
+                }
+            } else {
+                prop_assert!(previous.is_none_or(|p| p.id != id), "a fresh start gets a fresh id");
+                prop_assert_eq!(agent_id, None);
+            }
+        }
+
+        /// What a resumed or restarted session is told is composed totally
+        /// and consistently with whether it is resumed.
+        #[test]
+        fn resume_prompt_is_consistent(
+            review_prompt in prop::option::of(line()),
+            answer in prop::option::of(line()),
+            resume in any::<bool>(),
+            pr_url in prop::option::of(pr_url()),
+            last_error in prop::option::of(line()),
+        ) {
+            let p = resume_prompt(review_prompt.as_deref(), answer.as_deref(), resume, pr_url.as_deref(), last_error.as_deref());
+            prop_assert_eq!(p.resume_prompt.is_some(), review_prompt.is_some() || answer.is_some());
+            prop_assert_eq!(p.prompt_override.is_some(), resume && p.resume_prompt.is_some());
+            if p.prompt_override.is_some() {
+                prop_assert_eq!(&p.prompt_override, &p.resume_prompt);
+            }
+            if let Some(url) = &pr_url {
+                let mentions = p.previous_error.as_deref().is_some_and(|e| e.contains(url.as_str()));
+                prop_assert_eq!(mentions, !resume && review_prompt.is_some());
+            }
+            if review_prompt.is_none() && answer.is_none() {
+                prop_assert_eq!(p.previous_error, last_error);
+            }
+            if let (Some(r), Some(a)) = (&review_prompt, &answer) {
+                prop_assert_eq!(p.resume_prompt.clone(), Some(format!("{r}\n\n{a}")));
+            }
+        }
+
+        /// A launched session runs the task and tells the issue exactly one
+        /// thing: a move to in-progress on a first attempt (or whenever a
+        /// blocked state is configured), else a comment.
+        #[test]
+        fn launched_tells_the_issue_one_thing(
+            (task, session) in task_with_session_among(&[TaskState::Starting]),
+            model in model(),
+            attempt in 1u32..=5,
+            resume in any::<bool>(),
+            relaunch in prop::option::of(review_relaunch()),
+            review_prompt in prop::option::of(line()),
+            answered in any::<bool>(),
+            blocked_state in prop::option::of(Just("Blocked".to_string())),
+        ) {
+            let now = origin();
+            let mut cfg = Config::default();
+            cfg.linear.blocked_state = blocked_state.clone();
+            let launched = Launched {
+                model: &model,
+                attempt,
+                resume,
+                relaunch: relaunch.as_ref(),
+                review_prompt: review_prompt.as_deref(),
+                resume_prompt: review_prompt.as_deref(),
+                branch: "pq/x",
+                worktree: Path::new("/wt/x"),
+                answered,
+            };
+            let mut t = task.clone();
+            let effects = on_launched(&mut t, &session, &launched, &cfg, now);
+            prop_assert_eq!((t.state, t.not_before), (TaskState::Running, None));
+            prop_assert_eq!(t.started_at, task.started_at.or(Some(now)));
+            prop_assert!(task.state.can_transition_to(t.state));
+            let forgot = effects.iter().any(|e| matches!(e, Effect::ForgetAnswer));
+            prop_assert_eq!(forgot, answered);
+            let progress = effects.iter().filter(|e| matches!(e, Effect::ProgressComment { .. })).count();
+            let moved = effects.iter().filter(|e| matches!(e, Effect::Linear { target: LinearTarget::InProgress, .. })).count();
+            prop_assert_eq!(progress + moved, 1, "{:?}", effects);
+            let round = relaunch.is_some() && review_prompt.is_some();
+            let blocked_configured = blocked_state.is_some();
+            prop_assert_eq!(moved == 1, !round && (attempt == 1 || blocked_configured));
+            prop_assert!(effects.iter().any(|e| matches!(e, Effect::Log { kind, .. } if kind == "session.launched")), "{:?}", effects);
+        }
     }
 }

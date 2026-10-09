@@ -915,3 +915,174 @@ mod tests {
         assert_eq!(tier_share(&BudgetConfig::default(), &ModelTier::fable()), 0.25);
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use crate::budget::period::PeriodClock;
+    use crate::domain::TokenUsage;
+    use crate::scheduler::reserve;
+    use crate::strategies::{known_models, ledgers, model, origin};
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+
+    fn token_usage() -> impl Strategy<Value = TokenUsage> {
+        (0u64..1_000_000, 0u64..1_000_000, 0u64..1_000_000, 0u64..1_000_000).prop_map(
+            |(input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens)| TokenUsage {
+                input_tokens,
+                output_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+            },
+        )
+    }
+
+    /// Usage rows as the store returns them: one row per tier.
+    fn tier_rows() -> impl Strategy<Value = Vec<TierUsage>> {
+        vec((model(), token_usage(), 0u64..50), 0..6).prop_map(|rows| {
+            let mut out: Vec<TierUsage> = Vec::new();
+            for (tier, usage, messages) in rows {
+                match out.iter_mut().find(|r| r.tier == tier) {
+                    Some(r) => {
+                        r.usage.add(&usage);
+                        r.messages += messages;
+                    }
+                    None => out.push(TierUsage { tier, usage, messages }),
+                }
+            }
+            out
+        })
+    }
+
+    /// `rows` with `extra` folded in, keeping one row per tier.
+    fn merged(rows: &[TierUsage], extra: &[TierUsage]) -> Vec<TierUsage> {
+        let mut out = rows.to_vec();
+        for e in extra {
+            match out.iter_mut().find(|r| r.tier == e.tier) {
+                Some(r) => {
+                    r.usage.add(&e.usage);
+                    r.messages += e.messages;
+                }
+                None => out.push(e.clone()),
+            }
+        }
+        out
+    }
+
+    fn cfg() -> BudgetConfig {
+        let mut cfg = BudgetConfig::default();
+        for p in Provider::ALL {
+            cfg.providers.get_mut(p).period_anchor = Some("2026-09-28T00:00:00Z".into());
+        }
+        cfg
+    }
+
+    fn build(cfg: &BudgetConfig, provider: Provider, period_rows: Vec<TierUsage>, window_rows: Vec<TierUsage>) -> Ledger {
+        let clock = PeriodClock::from_provider(cfg.provider(provider), origin());
+        let source = LedgerSource { period_rows, window_rows, ..LedgerSource::default() };
+        Ledger::build(cfg, provider, origin(), &clock, source)
+    }
+
+    fn weighted_sum_of(cfg: &BudgetConfig, provider: Provider, rows: &[TierUsage]) -> f64 {
+        rows.iter().filter(|r| r.tier.provider() == provider).map(|r| r.usage.weighted() * tier_weight(cfg, &r.tier)).sum()
+    }
+
+    proptest! {
+        /// A reservation lands on exactly one provider's ledger (the model's),
+        /// raises its period and window totals and the tier's own counters by
+        /// exactly the cost, and leaves every other ledger untouched. A model
+        /// whose provider has no ledger changes nothing.
+        #[test]
+        fn reserve_charges_exactly_one_provider(before in ledgers(), tier in model(), cost in 0.0f64..1.0e8) {
+            let mut after = before.clone();
+            reserve(&mut after, &tier, cost);
+            let provider = tier.provider();
+            for (p, l) in before.iter() {
+                let changed = after.get(p).expect("same providers");
+                if p == provider {
+                    prop_assert!((changed.total_period_weighted - (l.total_period_weighted + cost)).abs() < 1e-6);
+                    prop_assert!((changed.total_window_weighted - (l.total_window_weighted + cost)).abs() < 1e-6);
+                    prop_assert!((changed.spent_since_observation - (l.spent_since_observation + cost)).abs() < 1e-6);
+                    prop_assert!((changed.tier(&tier).period_weighted - (l.tier(&tier).period_weighted + cost)).abs() < 1e-6);
+                    prop_assert!((changed.tier(&tier).window_weighted - (l.tier(&tier).window_weighted + cost)).abs() < 1e-6);
+                    prop_assert!(changed.total_period_weighted >= 0.0 && changed.total_window_weighted >= 0.0);
+                    prop_assert!(changed.tiers.iter().all(|t| t.period_weighted >= 0.0 && t.window_weighted >= 0.0));
+                    // Only the charged tier moved.
+                    for t in &l.tiers {
+                        if t.tier != tier {
+                            prop_assert_eq!(&changed.tier(&t.tier), t);
+                        }
+                    }
+                } else {
+                    prop_assert_eq!(changed, l, "{} must not change for a {} model", p, provider);
+                }
+            }
+            prop_assert_eq!(after.by_provider.len(), before.by_provider.len());
+            if before.get(provider).is_none() {
+                prop_assert_eq!(after, before, "no ledger for {}: nothing to charge", provider);
+            }
+        }
+
+        /// Every shipped model has a positive cost weight; unknown models cost
+        /// as much as Sonnet (1.0) and have no share.
+        #[test]
+        fn weights_are_positive(name in "[a-z]{3,8}") {
+            let cfg = BudgetConfig::default();
+            for m in known_models() {
+                prop_assert!(tier_weight(&cfg, &m) > 0.0, "{}", m);
+                prop_assert!(tier_share(&cfg, &m) >= 0.0, "{}", m);
+            }
+            let unknown = ModelTier::new(&format!("codex:{name}"));
+            prop_assert_eq!(tier_weight(&cfg, &unknown), 1.0);
+            prop_assert_eq!(tier_share(&cfg, &unknown), 0.0);
+        }
+
+        /// The ledger's totals are the tier-weighted sum of the provider's
+        /// rows, rows of other providers are ignored, and adding usage never
+        /// lowers a spend fraction. Without an observation the fractions are
+        /// `measured`; `period_fraction` is clamped to `[0, 2]`, the measured
+        /// window fraction is only bounded below (the policy compares it
+        /// against the margin, so a value above 2 is as blocking as 2).
+        #[test]
+        fn build_is_monotone_in_usage(
+            provider in prop::sample::select(Provider::ALL.to_vec()),
+            period_rows in tier_rows(),
+            window_rows in tier_rows(),
+            more_period in tier_rows(),
+            more_window in tier_rows(),
+        ) {
+            let cfg = cfg();
+            let base = build(&cfg, provider, period_rows.clone(), window_rows.clone());
+            prop_assert_eq!(base.provider, provider);
+            prop_assert!(base.period.contains(origin()));
+            let expected = weighted_sum_of(&cfg, provider, &period_rows);
+            prop_assert!((base.total_period_weighted - expected).abs() < 1e-6 * expected.max(1.0), "{} vs {}", base.total_period_weighted, expected);
+            let expected_window = weighted_sum_of(&cfg, provider, &window_rows);
+            prop_assert!((base.total_window_weighted - expected_window).abs() < 1e-6 * expected_window.max(1.0));
+            prop_assert!(base.tiers.iter().all(|t| t.tier.provider() == provider), "{:?}", base.tiers);
+            for m in cfg.models_for(provider) {
+                prop_assert!(base.tiers.iter().any(|t| t.tier == m), "configured model {} always has a tier", m);
+            }
+            prop_assert_eq!(base.period_fraction_source(), "measured");
+            prop_assert_eq!(base.window_fraction_source(), "measured");
+            prop_assert!((0.0..=2.0).contains(&base.period_fraction()));
+            prop_assert!(base.window_fraction() >= 0.0);
+            prop_assert_eq!(base.period_budget, base.configured_period_budget, "nothing learned from an empty history");
+
+            let more = build(&cfg, provider, merged(&period_rows, &more_period), merged(&window_rows, &more_window));
+            prop_assert!(more.total_period_weighted >= base.total_period_weighted - 1e-6);
+            prop_assert!(more.total_window_weighted >= base.total_window_weighted - 1e-6);
+            prop_assert!(more.period_fraction() >= base.period_fraction() - 1e-9, "{} < {}", more.period_fraction(), base.period_fraction());
+            prop_assert!(more.window_fraction() >= base.window_fraction() - 1e-9, "{} < {}", more.window_fraction(), base.window_fraction());
+            prop_assert_eq!(more.period, base.period);
+            prop_assert_eq!(more.window, base.window);
+
+            // Rows of other providers never show up.
+            let own: Vec<TierUsage> = period_rows.iter().filter(|r| r.tier.provider() == provider).cloned().collect();
+            let foreign: Vec<TierUsage> = period_rows.iter().filter(|r| r.tier.provider() != provider).cloned().collect();
+            let without = build(&cfg, provider, own.clone(), Vec::new());
+            let with = build(&cfg, provider, merged(&own, &foreign), Vec::new());
+            prop_assert_eq!(with, without);
+        }
+    }
+}
