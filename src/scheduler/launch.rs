@@ -743,7 +743,9 @@ mod properties {
 
     proptest! {
         /// Starting is two-phase: `on_starting` settles the attempt without
-        /// touching the task's bookkeeping; `claim` puts it on the task.
+        /// touching the task's bookkeeping (only the state, the model, the
+        /// retry time that is now over and, when resuming, the parking
+        /// flag); `claim` puts it on the task.
         #[test]
         fn starting_settles_then_claims(
             task in task_among(&[TaskState::Queued, TaskState::Crashed, TaskState::Throttled]),
@@ -767,9 +769,11 @@ mod properties {
                 prop_assert!(start.worktree.starts_with(root));
             }
             // Only state, model and the parking flag may differ.
+            prop_assert_eq!(t.not_before, None, "the backoff or retry time that held the task is over");
             let mut normalised = t.clone();
             normalised.state = task.state;
             normalised.model = task.model.clone();
+            normalised.not_before = task.not_before;
             if let (Some(w), Some(before)) = (normalised.review.as_mut(), task.review.as_ref()) {
                 prop_assert!(!w.parked || !resuming, "resuming un-parks the watch");
                 prop_assert!(w.parked == before.parked || resuming, "the parking flag only moves when resuming");

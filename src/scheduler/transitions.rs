@@ -2251,13 +2251,15 @@ mod properties {
         }
 
         /// A reply that arrives without a session re-queues the task iff the
-        /// table allows it, and forgets the parking.
+        /// table allows it and the task is not finished (the table's
+        /// terminal → queued row is `task retry`'s, not a late comment's),
+        /// and forgets the parking.
         #[test]
         fn queued_answers_requeue_when_allowed(task in task(), ids in prop::collection::vec(word(), 0..3)) {
             let now = origin();
             let mut t = task.clone();
             let effects = on_answer_queued(&mut t, &ids, now);
-            if task.state == TaskState::Queued || task.state.can_transition_to(TaskState::Queued) {
+            if !task.state.is_terminal() && (task.state == TaskState::Queued || task.state.can_transition_to(TaskState::Queued)) {
                 prop_assert_eq!((t.state, t.not_before, t.last_error.clone()), (TaskState::Queued, None, None));
                 prop_assert!(t.review.as_ref().is_none_or(|w| !w.parked));
                 prop_assert_eq!(effects.len(), 1);

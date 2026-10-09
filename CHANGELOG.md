@@ -18,6 +18,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   policy eligibility, period arithmetic, observation history), and a
   stateful model test runs random sequences of the daemon's calls against
   one task, checking the cross-cutting invariants after each step.
+  `TaskState::can_transition_to` now lists every move the daemon makes
+  (a `starting` task may land in any session state; paused and throttled
+  tasks keep their session and may complete, crash or ask for a human).
+
+### Fixed
+
+Found by the new property tests:
+
+- A reply relayed from Linear to a completed, failed or cancelled task no
+  longer re-queues it; only `task retry` revives a finished task.
+- A `Stop` with the done marker or a `SessionEnd` drained after the
+  session was already closed no longer completes a cancelled or failed
+  task, nor counts a second crash against a re-queued one.
+- A throttled task whose agent then reports a blocker, hits a permission
+  prompt or an authentication failure, or finishes, no longer keeps the
+  stale retry time; neither does a task that starts out of a throttle or
+  is completed by `task complete`.
+- A task parked because its PR URL is unusable is marked parked on its
+  watch, so `task resume` watches the PR again instead of running a
+  pending review round.
+- `Policy::eligibility` agrees with `decide` for a provider disabled in
+  config that still has a ledger: its models are not eligible.
 
 ## [0.12.0] - 2026-10-09
 

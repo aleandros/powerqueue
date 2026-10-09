@@ -525,7 +525,8 @@ impl TaskState {
     /// `Running`, so every hook outcome may land on it; `throttled` and
     /// `paused` tasks keep their session (waiting for a usage reset, or for
     /// the turn to end), so they can still complete, and a throttled one
-    /// can still crash. A container (parent issue) is the one exception
+    /// can still crash or ask for a human (blocker, permission prompt,
+    /// authentication failure). A container (parent issue) is the one exception
     /// the table does not list: it is closed from whatever open state it is
     /// in once its sub-issues are done. Checked by the scheduler's property
     /// tests.
@@ -560,9 +561,10 @@ impl TaskState {
                 )
             }
             Crashed => matches!(next, Starting | Queued | Failed | Cancelled | Paused | Throttled),
-            Throttled => {
-                matches!(next, Queued | Starting | Running | Crashed | Failed | Cancelled | Paused | Blocked | Completed)
-            }
+            Throttled => matches!(
+                next,
+                Queued | Starting | Running | NeedsAttention | Crashed | Failed | Cancelled | Paused | Blocked | Completed
+            ),
             Paused => matches!(next, Queued | Running | InReview | Cancelled | Completed),
             Blocked => matches!(next, Queued | Paused | Cancelled | Completed),
             NeedsAttention => {

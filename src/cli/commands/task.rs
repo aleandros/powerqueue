@@ -36,6 +36,7 @@ pub fn complete_task(store: &Store, task: &mut Task, summary: Option<&str>) -> R
     }
     task.state = TaskState::Completed;
     task.completed_at = Some(Utc::now());
+    task.not_before = None;
     if let Some(s) = summary.map(str::trim).filter(|s| !s.is_empty()) {
         task.summary = Some(s.to_string());
     }

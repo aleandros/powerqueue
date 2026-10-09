@@ -260,6 +260,7 @@ impl World {
                 }
                 self.task.state = TaskState::Completed;
                 self.task.completed_at = Some(now);
+                self.task.not_before = None;
                 if let Some(s) = summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                     self.task.summary = Some(s.to_string());
                 }
@@ -362,8 +363,12 @@ fn check(step: usize, op: &Op, before: &World, after: &World, effects: &[Effect]
         )
     };
 
-    // Legal moves.
-    prop_assert!(b.state.can_transition_to(a.state), "{}", ctx("move not in TaskState::can_transition_to"));
+    // Legal moves. Closing a container (a parent issue whose sub-issues are
+    // done) is the one move the table does not list: it happens from any
+    // open state and must not open `task complete` to queued tasks.
+    if !matches!(op, Op::ContainerClosed) {
+        prop_assert!(b.state.can_transition_to(a.state), "{}", ctx("move not in TaskState::can_transition_to"));
+    }
 
     // Session / task agreement.
     if let Some(s) = &after.session {
@@ -458,8 +463,7 @@ proptest! {
     /// effect trace consistent (see the module doc for the invariants).
     #[test]
     fn a_task_survives_any_sequence_of_daemon_calls(task in fresh_task(), cfg in scheduler_config(), ops in vec(op(), 1..40)) {
-        let mut config = Config::default();
-        config.scheduler = cfg;
+        let config = Config { scheduler: cfg, ..Config::default() };
         let mut world = World::new(config, task);
         for (step, op) in ops.iter().enumerate() {
             let before = World {
