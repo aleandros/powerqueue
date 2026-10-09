@@ -301,6 +301,26 @@ fn logs_without_files_and_events() {
 }
 
 #[test]
+fn priority_simulate_json_is_one_document_without_a_rules_file() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    write_minimal_config(home.path(), repo.path());
+    let _ = std::fs::remove_file(home.path().join("config").join("PRIORITY.md"));
+    pq(home.path()).args(["add", "Something", "-k", "X-1"]).assert().success();
+    let out = pq(home.path()).args(["--json", "priority", "simulate", "--no-budget"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("exactly one JSON document on stdout");
+    assert_eq!(v["rules_missing"], true);
+    assert_eq!(v["rows"][0]["key"], "X-1");
+    // Without tasks the short form carries the flag too.
+    pq(home.path()).args(["task", "cancel", "X-1"]).assert().success();
+    let out = pq(home.path()).args(["--json", "priority", "simulate", "--no-budget"]).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one document");
+    assert_eq!(v["rules_missing"], true);
+    assert_eq!(v["rows"].as_array().map(Vec::len), Some(0));
+}
+
+#[test]
 fn priority_simulate_ranks_without_writing() {
     let home = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();

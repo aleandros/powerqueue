@@ -62,14 +62,23 @@ enum Parsed {
 }
 
 /// Read and parse `source`, printing problems (and the missing-file hint).
-fn parse_source(ctx: &mut Context, source: &RulesSource) -> Result<Parsed> {
+/// A command whose JSON output is one document of its own (`simulate`)
+/// passes `json_missing = false` and reports a missing file in that
+/// document instead.
+fn parse_source(ctx: &mut Context, source: &RulesSource, json_missing: bool) -> Result<Parsed> {
     let path = source.path();
     let Some(text) = source.read()? else {
         if ctx.json {
-            println!(
-                "{}",
-                serde_json::json!({ "ok": false, "path": path, "rev": source.rev(), "error": "missing", "hint": "run `powerqueue init`" })
-            );
+            if json_missing {
+                let hint = match source.rev() {
+                    Some(rev) => format!("commit the file on {rev}; the daemon reads the rules from that branch"),
+                    None => "run `powerqueue init`".to_string(),
+                };
+                println!(
+                    "{}",
+                    serde_json::json!({ "ok": false, "path": path, "rev": source.rev(), "error": "missing", "hint": hint })
+                );
+            }
         } else {
             println!(
                 "{} {}",
@@ -112,7 +121,7 @@ fn print_problems(problems: &[RuleError], level: &str) {
 
 fn show(ctx: &mut Context) -> Result<i32> {
     let source = live_source(ctx)?;
-    let rules = match parse_source(ctx, &source)? {
+    let rules = match parse_source(ctx, &source, true)? {
         Parsed::Rules(r) => *r,
         Parsed::Missing => return Ok(0),
         Parsed::Invalid => return Ok(1),
@@ -141,7 +150,7 @@ fn check(ctx: &mut Context, args: &CheckArgs) -> Result<i32> {
         }
         None => live_source(ctx)?,
     };
-    let Parsed::Rules(rules) = parse_source(ctx, &source)? else {
+    let Parsed::Rules(rules) = parse_source(ctx, &source, true)? else {
         return Ok(1);
     };
     let rules = *rules;
@@ -266,13 +275,8 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let cfg = full_cfg.priority.clone();
     let store = ctx.store()?.clone();
     let task = store.find_task(&task_ref.task)?.ok_or_else(|| anyhow!("no task matches `{}`", task_ref.task))?;
-    let rules = match source.read()? {
-        Some(text) => PriorityRules::parse(&text).map_err(|errors| {
-            anyhow!(
-                "{source} has errors:\n  - {}",
-                errors.iter().map(|e| format!("line {}: {}", e.line, e.message)).collect::<Vec<_>>().join("\n  - ")
-            )
-        })?,
+    let rules = match PriorityRules::from_source(&source)? {
+        Some(rules) => rules,
         None => {
             println!(
                 "{} {}",
@@ -363,6 +367,9 @@ pub struct SimRow {
 pub struct Simulation {
     /// The rules file that was used.
     pub rules: PathBuf,
+    /// True when that file does not exist and the built-in defaults ranked
+    /// the queue (every task at the default criticality).
+    pub rules_missing: bool,
     pub warnings: Vec<RuleError>,
     pub max_concurrent: u32,
     /// True when a draft rules file or a draft config was used (the daemon
@@ -396,19 +403,20 @@ fn simulate(ctx: &mut Context, args: SimulateArgs) -> Result<i32> {
     if args.file.is_some() && !path.exists() {
         bail!("{} does not exist", path.display());
     }
-    let rules = match parse_source(ctx, &source)? {
-        Parsed::Rules(r) => *r,
+    let (rules, rules_missing) = match parse_source(ctx, &source, false)? {
+        Parsed::Rules(r) => (*r, false),
         Parsed::Invalid => return Ok(1),
-        Parsed::Missing => PriorityRules::default(),
+        Parsed::Missing => (PriorityRules::default(), true),
     };
     if !ctx.json {
         print_problems(&rules.warnings, "warning");
     }
 
-    let sim = simulate_with(ctx, &args, &cfg, &rules, &path)?;
+    let mut sim = simulate_with(ctx, &args, &cfg, &rules, &path)?;
+    sim.rules_missing = rules_missing;
     if sim.rows.is_empty() {
         if ctx.json {
-            println!("{}", serde_json::json!({ "rules": path, "rows": [] }));
+            println!("{}", serde_json::json!({ "rules": path, "rules_missing": rules_missing, "rows": [] }));
         } else {
             println!(
                 "{}",
@@ -452,6 +460,7 @@ pub fn simulate_with(
     if tasks.is_empty() {
         return Ok(Simulation {
             rules: path.to_path_buf(),
+            rules_missing: false,
             warnings: rules.warnings.clone(),
             max_concurrent: cfg.scheduler.max_concurrent,
             draft,
@@ -553,6 +562,7 @@ pub fn simulate_with(
     }
     Ok(Simulation {
         rules: path.to_path_buf(),
+        rules_missing: false,
         warnings: rules.warnings.clone(),
         max_concurrent: cfg.scheduler.max_concurrent,
         draft,
