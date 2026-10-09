@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-09
+
+The scheduler is now a functional core with an imperative shell, the
+groundwork for stronger testing of the queue's decisions, and the
+default-branch policy reading introduced in 0.11.0 no longer locks the
+CLI out or stalls the daemon when the branch cannot be read.
+
 ### Changed
 
 - The scheduler is a functional core with an imperative shell: every task
@@ -791,7 +798,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.12.0
 [0.11.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.11.0
 [0.10.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.10.0
 [0.9.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.9.0
