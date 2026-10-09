@@ -52,6 +52,18 @@ const LINEAR_MAX_BACKOFF: Duration = Duration::minutes(10);
 /// How often `.powerqueue.toml` (and committed rules) are fingerprinted for
 /// an automatic reload.
 const OVERRIDES_CHECK_SECS: i64 = 10;
+/// How long a tick waits for the periodic `git fetch` before letting it
+/// finish in the background.
+const FETCH_GRACE_SECS: u64 = 2;
+
+/// Log the outcome of a periodic fetch run on a blocking thread.
+fn report_fetch(result: std::result::Result<Result<()>, tokio::task::JoinError>) {
+    match result {
+        Ok(Ok(())) => tracing::debug!("periodic fetch done"),
+        Ok(Err(e)) => tracing::warn!(error = %format!("{e:#}"), "periodic fetch failed; repository overrides stay as last read"),
+        Err(e) => tracing::warn!(error = %e, "periodic fetch panicked; repository overrides stay as last read"),
+    }
+}
 /// How long resource samples are kept.
 const RESOURCE_RETENTION: Duration = Duration::days(7);
 /// Ended sessions keep having their transcript tailed for this long.
@@ -162,8 +174,17 @@ struct RuntimeState {
     /// check; a change reloads without a `Reload` command.
     overrides_fingerprint: Option<OverridesFingerprint>,
     last_overrides_check: Option<DateTime<Utc>>,
-    /// Last periodic `git fetch` (`repo.fetch_interval_secs`).
+    /// Last periodic `git fetch` (`repo.fetch_interval_secs`); a fetch
+    /// before a task start counts too.
     last_fetch: Option<DateTime<Utc>>,
+    /// The periodic fetch running on a blocking thread, so an unreachable
+    /// remote never stalls the tick; its result is read on the next check.
+    periodic_fetch: Option<tokio::task::JoinHandle<Result<()>>>,
+    /// A git failure while fingerprinting is reported once, not every check.
+    fingerprint_error_logged: bool,
+    /// The fingerprint whose reload failed and was reported; the reload is
+    /// retried silently every check until it succeeds or the file changes.
+    reload_failed_for: Option<OverridesFingerprint>,
     /// Usage probes running on a blocking thread (they record their own results).
     usage_probe: Option<tokio::task::JoinHandle<()>>,
     last_usage_probe: Option<DateTime<Utc>>,
@@ -225,6 +246,9 @@ impl Daemon {
             overrides_fingerprint: None,
             last_overrides_check: None,
             last_fetch: None,
+            periodic_fetch: None,
+            fingerprint_error_logged: false,
+            reload_failed_for: None,
             usage_probe: None,
             last_usage_probe: None,
             system: sysinfo::System::new(),
@@ -334,7 +358,7 @@ impl Daemon {
         // Issue sources first, rules second: a ticket created this tick gets its
         // criticality, score and preferred model before `launch_tasks` sees
         // it (otherwise an urgent ticket is first scheduled as `normal`).
-        let r = self.refresh_overrides(now);
+        let r = self.refresh_overrides(now).await;
         self.report_phase("config", r);
         let force_sync = self.rt.force_sync;
         let r = self.poll_linear(now).await;
@@ -705,6 +729,16 @@ impl Daemon {
         self.rt.watcher = None;
         self.rt.watcher_failed = false;
         self.cfg = cfg;
+        // What was just loaded is the new baseline, whichever way the reload
+        // was requested; `refresh_overrides` must not apply it a second time.
+        self.rt.overrides_fingerprint = match self.overrides_fingerprint() {
+            Ok(fp) => Some(fp),
+            Err(e) => {
+                tracing::debug!(error = %format!("{e:#}"), "cannot fingerprint the overrides after a reload");
+                None
+            }
+        };
+        self.rt.reload_failed_for = None;
         Ok(())
     }
 
@@ -866,12 +900,16 @@ impl Daemon {
     /// [`OVERRIDES_CHECK_SECS`] the file is fingerprinted (working tree:
     /// mtime and size; default branch: the blob ids of the file and of the
     /// committed rules, after a periodic `git fetch` every
-    /// `repo.fetch_interval_secs`). A change reloads the configuration
-    /// (event `daemon.reloaded`), or only the rules when nothing but the
-    /// committed rules changed. A file that no longer loads keeps the
-    /// previous configuration (event `daemon.reload_failed`) until it
-    /// changes again.
-    fn refresh_overrides(&mut self, now: DateTime<Utc>) -> Result<()> {
+    /// `repo.fetch_interval_secs`, run on a blocking thread so an
+    /// unreachable remote never stalls the tick). A change reloads the
+    /// configuration (event `daemon.reloaded`), or only the rules when
+    /// nothing but the committed rules changed. A file that does not load
+    /// keeps the previous configuration (event `daemon.reload_failed`, once
+    /// per change) and the reload is retried every check, so a transient
+    /// failure (a git lock, a half-written `config.toml`) heals on its own.
+    /// A git failure while fingerprinting is logged once and the last good
+    /// fingerprint kept, so it never counts as a change.
+    async fn refresh_overrides(&mut self, now: DateTime<Utc>) -> Result<()> {
         if self.rt.last_overrides_check.is_some_and(|t| now - t < Duration::seconds(OVERRIDES_CHECK_SECS)) {
             return Ok(());
         }
@@ -883,20 +921,53 @@ impl Daemon {
         // *before* the first fetch: a change merged while the daemon was
         // down must count as a change, not as the starting point.
         if self.rt.overrides_fingerprint.is_none() {
-            self.rt.overrides_fingerprint = Some(self.overrides_fingerprint());
-        }
-        let from_branch = self.cfg.repo.overrides_from == OverridesSource::DefaultBranch;
-        if from_branch && self.cfg.repo.fetch_interval_secs > 0 && !self.offline {
-            let interval = Duration::seconds(self.cfg.repo.fetch_interval_secs.min(i64::MAX as u64) as i64);
-            if self.rt.last_fetch.is_none_or(|t| now - t >= interval) {
-                self.rt.last_fetch = Some(now);
-                if let Err(e) = self.rt.repo.fetch() {
-                    tracing::warn!(error = %format!("{e:#}"), "periodic fetch failed; repository overrides stay as last read");
+            match self.overrides_fingerprint() {
+                Ok(fp) => self.rt.overrides_fingerprint = Some(fp),
+                Err(e) => {
+                    self.fingerprint_error_once(&e);
+                    return Ok(());
                 }
             }
         }
-        let current = self.overrides_fingerprint();
-        let Some(previous) = self.rt.overrides_fingerprint.replace(current.clone()) else {
+        if let Some(handle) = self.rt.periodic_fetch.take() {
+            // A fetch started on an earlier check: compare after it landed,
+            // never against half-updated refs.
+            if !handle.is_finished() {
+                self.rt.periodic_fetch = Some(handle);
+                return Ok(());
+            }
+            report_fetch(handle.await);
+        }
+        let from_branch = self.cfg.repo.overrides_from == OverridesSource::DefaultBranch;
+        if from_branch && self.cfg.repo.fetch_interval_secs > 0 && !self.offline {
+            let interval =
+                Duration::try_seconds(self.cfg.repo.fetch_interval_secs.min(i64::MAX as u64) as i64).unwrap_or(Duration::MAX);
+            if self.rt.last_fetch.is_none_or(|t| now - t >= interval) {
+                self.rt.last_fetch = Some(now);
+                let repo = self.rt.repo.clone();
+                let mut handle = tokio::task::spawn_blocking(move || repo.fetch());
+                // A reachable remote answers within the grace period and the
+                // comparison happens right away; a hanging one keeps running
+                // on its thread while the tick goes on.
+                match tokio::time::timeout(std::time::Duration::from_secs(FETCH_GRACE_SECS), &mut handle).await {
+                    Ok(result) => report_fetch(result),
+                    Err(_) => {
+                        tracing::debug!("periodic fetch still running; checking overrides after it finishes");
+                        self.rt.periodic_fetch = Some(handle);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let current = match self.overrides_fingerprint() {
+            Ok(fp) => fp,
+            Err(e) => {
+                self.fingerprint_error_once(&e);
+                return Ok(());
+            }
+        };
+        self.rt.fingerprint_error_logged = false;
+        let Some(previous) = self.rt.overrides_fingerprint.clone() else {
             return Ok(());
         };
         if previous == current {
@@ -905,6 +976,7 @@ impl Daemon {
         let file = self.cfg.repo_path().join(REPO_CONFIG_FILE);
         if previous.overrides == current.overrides {
             // Only the committed rules moved: no need to rebuild clients.
+            self.rt.overrides_fingerprint = Some(current);
             self.rt.rules_loaded = false;
             return Ok(());
         }
@@ -921,53 +993,68 @@ impl Daemon {
                     serde_json::json!({ "reason": "repo_overrides", "file": file, "rev": ov.rev, "keys": ov.keys }),
                 );
             }
-            Err(e) => self.log(
-                None,
-                None,
-                EventLevel::Warn,
-                "daemon.reload_failed",
-                &format!("{} changed but cannot be applied; keeping the previous configuration: {e:#}", file.display()),
-                serde_json::json!({ "reason": "repo_overrides", "file": file, "error": format!("{e:#}") }),
-            ),
+            Err(e) if self.rt.reload_failed_for.as_ref() == Some(&current) => {
+                // Already reported for this very change; keep retrying quietly.
+                tracing::debug!(error = %format!("{e:#}"), "reload still failing; previous configuration kept");
+            }
+            Err(e) => {
+                self.rt.reload_failed_for = Some(current);
+                self.log(
+                    None,
+                    None,
+                    EventLevel::Warn,
+                    "daemon.reload_failed",
+                    &format!("{} changed but cannot be applied; keeping the previous configuration: {e:#}", file.display()),
+                    serde_json::json!({ "reason": "repo_overrides", "file": file, "error": format!("{e:#}") }),
+                );
+            }
         }
         Ok(())
     }
 
+    fn fingerprint_error_once(&mut self, e: &anyhow::Error) {
+        if self.rt.fingerprint_error_logged {
+            tracing::debug!(error = %format!("{e:#}"), "overrides fingerprint still failing");
+            return;
+        }
+        self.rt.fingerprint_error_logged = true;
+        self.log(
+            None,
+            None,
+            EventLevel::Warn,
+            "daemon.overrides_check_failed",
+            &format!("cannot check {} for changes; keeping the last known state: {e:#}", REPO_CONFIG_FILE),
+            serde_json::json!({ "error": format!("{e:#}") }),
+        );
+    }
+
     /// What `.powerqueue.toml` and the committed rules currently look like.
-    /// A git failure is part of the fingerprint, so it is reported once (as
-    /// a failed reload) rather than every check.
-    fn overrides_fingerprint(&self) -> OverridesFingerprint {
+    /// Fails when git cannot read the branch; the caller keeps the previous
+    /// fingerprint then, so a transient failure is neither a change nor a
+    /// reason to reload.
+    fn overrides_fingerprint(&self) -> Result<OverridesFingerprint> {
         let repo = self.cfg.repo_path();
         match self.cfg.repo.overrides_from {
             OverridesSource::WorkingTree => {
                 let overrides =
                     std::fs::metadata(repo.join(REPO_CONFIG_FILE)).ok().map(|m| format!("{:?}:{}", m.modified().ok(), m.len()));
-                OverridesFingerprint { overrides, rules: None }
+                Ok(OverridesFingerprint { overrides, rules: None })
             }
             OverridesSource::DefaultBranch => {
                 let rules_path = self.cfg.overrides.priority_file_in_repo.clone();
                 // The commit the loader read (recorded even when the file was
                 // absent): the merged config's `default_branch` may be the
                 // repo's own override and must not move the watch.
-                let rev = match &self.cfg.overrides.rev {
-                    Some(rev) => Ok(rev.clone()),
-                    None => self.cfg.overrides_rev(&self.rt.repo),
-                };
-                let ids = rev.and_then(|rev| {
-                    let mut paths = vec![REPO_CONFIG_FILE];
-                    if let Some(p) = &rules_path {
-                        paths.push(p);
-                    }
-                    let ids = self.rt.repo.blob_ids(&rev, &paths)?;
-                    Ok((rev, ids))
-                });
-                match ids {
-                    Ok((rev, ids)) => OverridesFingerprint {
-                        overrides: ids.get(REPO_CONFIG_FILE).map(|sha| format!("{rev}:{sha}")),
-                        rules: rules_path.and_then(|p| ids.get(&p).cloned()),
-                    },
-                    Err(e) => OverridesFingerprint { overrides: Some(format!("error: {e:#}")), rules: None },
+                let rev = self.cfg.overrides_rev(&self.rt.repo)?;
+                let mut paths = vec![REPO_CONFIG_FILE];
+                if let Some(p) = &rules_path {
+                    paths.push(p);
                 }
+                let ids = self.rt.repo.blob_ids(&rev, &paths)?;
+                Ok(OverridesFingerprint {
+                    overrides: ids.get(REPO_CONFIG_FILE).map(|sha| format!("{rev}:{sha}")),
+                    rules: rules_path.and_then(|p| ids.get(&p).cloned()),
+                })
             }
         }
     }
@@ -2930,7 +3017,12 @@ impl Daemon {
         task.worktree_path = Some(worktree.display().to_string());
         task.attempts = attempt;
 
-        if let Err(e) = self.prepare_worktree(&task, &root, &worktree, &branch) {
+        let prepared = self.prepare_worktree(&task, &root, &worktree, &branch);
+        if let Ok(true) = prepared {
+            // The periodic fetch has nothing to add right after this one.
+            self.rt.last_fetch = Some(now);
+        }
+        if let Err(e) = prepared {
             let effects = transitions::on_crash(
                 &mut task,
                 None,
@@ -3155,11 +3247,12 @@ impl Daemon {
     /// to `origin/<branch>` after a successful fetch (commits pushed to the
     /// PR on GitHub since the hand-off); a branch with local commits the
     /// remote lacks is left as is.
-    fn prepare_worktree(&self, task: &Task, root: &Path, worktree: &Path, branch: &str) -> Result<()> {
+    fn prepare_worktree(&self, task: &Task, root: &Path, worktree: &Path, branch: &str) -> Result<bool> {
         std::fs::create_dir_all(root).with_context(|| format!("create worktree root {}", root.display()))?;
         let new_branch = !self.rt.repo.branch_exists(branch).with_context(|| format!("look up branch {branch}"))?;
         let fetch_error =
             if self.cfg.repo.fetch_before_start { self.rt.repo.fetch().err().map(|e| format!("{e:#}")) } else { None };
+        let fetched = self.cfg.repo.fetch_before_start && fetch_error.is_none();
         if let (Some(e), false) = (&fetch_error, new_branch) {
             self.log(
                 Some(task.id),
@@ -3262,7 +3355,7 @@ impl Daemon {
                 "stale_base": new_branch && fetch_error.is_some(),
             }),
         );
-        Ok(())
+        Ok(fetched)
     }
 }
 
@@ -4339,7 +4432,7 @@ mod tests {
         // Merged upstream while the daemon was down: the first check's fetch
         // brings it, and it counts as a change from what was loaded.
         upstream(&[(REPO_CONFIG_FILE, "priority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 4\n")], "while down");
-        daemon.refresh_overrides(now).unwrap();
+        daemon.refresh_overrides(now).await.unwrap();
         assert_eq!(daemon.cfg.scheduler.max_concurrent, 4, "the first check compares against what was loaded");
         assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 1);
         daemon.refresh_rules(now).await.unwrap();
@@ -4349,10 +4442,10 @@ mod tests {
 
         // Only the rules change upstream: the rules reload, the config does not.
         upstream(&[("docs/PRIORITY.md", "## High\n- source: manual\n## Low\n- label: chore\n")], "rules");
-        daemon.refresh_overrides(now).unwrap();
+        daemon.refresh_overrides(now).await.unwrap();
         assert!(daemon.rt.rules_loaded, "throttled: nothing is checked within OVERRIDES_CHECK_SECS");
         now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
-        daemon.refresh_overrides(now).unwrap();
+        daemon.refresh_overrides(now).await.unwrap();
         assert!(!daemon.rt.rules_loaded);
         daemon.refresh_rules(now).await.unwrap();
         assert_eq!(daemon.rt.rules.rule_count(), 2);
@@ -4361,7 +4454,7 @@ mod tests {
         // The config changes upstream: full reload with the keys named.
         upstream(&[(REPO_CONFIG_FILE, "priority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 5\n")], "concurrency");
         now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
-        daemon.refresh_overrides(now).unwrap();
+        daemon.refresh_overrides(now).await.unwrap();
         assert_eq!(daemon.cfg.scheduler.max_concurrent, 5);
         assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 2);
         let events = store.recent_events(5).unwrap();
@@ -4369,14 +4462,33 @@ mod tests {
         assert_eq!(reloaded.data["rev"], "origin/main");
         assert_eq!(reloaded.data["keys"], serde_json::json!(["priority.file", "scheduler.max_concurrent"]));
 
+        // A transient failure (config.toml half-written while the change
+        // lands) is reported once and retried: the change is not lost.
+        let config_file = daemon.paths.config_file();
+        let good_config = std::fs::read_to_string(&config_file).unwrap();
+        std::fs::write(&config_file, "[scheduler\n").unwrap();
+        upstream(&[(REPO_CONFIG_FILE, "priority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 6\n")], "racing");
+        now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
+        daemon.refresh_overrides(now).await.unwrap();
+        assert_eq!(daemon.cfg.scheduler.max_concurrent, 5);
+        assert_eq!(store.count_events_of_kind("daemon.reload_failed", since).unwrap(), 1);
+        now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
+        daemon.refresh_overrides(now).await.unwrap();
+        assert_eq!(store.count_events_of_kind("daemon.reload_failed", since).unwrap(), 1, "retried quietly");
+        std::fs::write(&config_file, good_config).unwrap();
+        now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
+        daemon.refresh_overrides(now).await.unwrap();
+        assert_eq!(daemon.cfg.scheduler.max_concurrent, 6, "the retry applied the change nothing else touched");
+        assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 3);
+
         // A broken file keeps the previous configuration, reported once.
         upstream(&[(REPO_CONFIG_FILE, "[scheduler]\nmax_concurrent = 0\n")], "broken");
         now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
-        daemon.refresh_overrides(now).unwrap();
+        daemon.refresh_overrides(now).await.unwrap();
         now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
-        daemon.refresh_overrides(now).unwrap();
-        assert_eq!(daemon.cfg.scheduler.max_concurrent, 5);
-        assert_eq!(store.count_events_of_kind("daemon.reload_failed", since).unwrap(), 1);
+        daemon.refresh_overrides(now).await.unwrap();
+        assert_eq!(daemon.cfg.scheduler.max_concurrent, 6);
+        assert_eq!(store.count_events_of_kind("daemon.reload_failed", since).unwrap(), 2);
 
         // The main checkout never matters: a local branch with other values,
         // checked out there, is invisible.
@@ -4384,9 +4496,9 @@ mod tests {
         std::fs::write(repo.join(REPO_CONFIG_FILE), "[scheduler]\nmax_concurrent = 9\n").unwrap();
         git_in(&repo, &["commit", "-qam", "feature"]);
         now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
-        daemon.refresh_overrides(now).unwrap();
-        assert_eq!(daemon.cfg.scheduler.max_concurrent, 5);
-        assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 2);
+        daemon.refresh_overrides(now).await.unwrap();
+        assert_eq!(daemon.cfg.scheduler.max_concurrent, 6);
+        assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 3);
 
         // The repo's own `default_branch` does not move the watch: the
         // fingerprint follows the commit the loader read (origin/main).
@@ -4398,10 +4510,11 @@ mod tests {
             "override default branch",
         );
         now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
-        daemon.refresh_overrides(now).unwrap();
+        daemon.refresh_overrides(now).await.unwrap();
         assert_eq!(daemon.cfg.scheduler.max_concurrent, 6);
         assert_eq!(daemon.cfg.repo.default_branch.as_deref(), Some("feature"));
         assert_eq!(daemon.cfg.overrides.rev.as_deref(), Some("origin/main"));
+        assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 4);
         upstream(
             &[(
                 REPO_CONFIG_FILE,
@@ -4410,8 +4523,72 @@ mod tests {
             "still on main",
         );
         now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
-        daemon.refresh_overrides(now).unwrap();
+        daemon.refresh_overrides(now).await.unwrap();
         assert_eq!(daemon.cfg.scheduler.max_concurrent, 7, "a change on origin/main is still seen");
+    }
+
+    #[tokio::test]
+    async fn a_git_failure_while_checking_overrides_is_reported_once_and_is_not_a_change() {
+        use crate::secrets::FileBackend;
+        if which::which("git").is_err() {
+            eprintln!("git not available; skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_in(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "[scheduler]\nmax_concurrent = 3\n").unwrap();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-qm", "config"]);
+        let mut cfg = Config::default();
+        cfg.repo.path = repo.display().to_string();
+        cfg.repo.overrides_from = OverridesSource::DefaultBranch;
+        cfg.repo.fetch_interval_secs = 0;
+        cfg.save(&paths).unwrap();
+        cfg.apply_repo_overrides(&repo).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let secrets = Secrets::with_backend(Box::new(FileBackend::new(paths.secrets_file())));
+        let mut daemon = Daemon::new(cfg, paths, store.clone(), secrets).unwrap();
+        let since = Utc::now() - Duration::minutes(1);
+        let mut now = Utc::now();
+        daemon.refresh_overrides(now).await.unwrap();
+        assert!(daemon.rt.overrides_fingerprint.is_some());
+
+        // git breaks (the repository is no longer one): no reload, no
+        // fingerprint change, one event.
+        std::fs::rename(repo.join(".git"), repo.join(".git-away")).unwrap();
+        for _ in 0..3 {
+            now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
+            daemon.refresh_overrides(now).await.unwrap();
+        }
+        assert_eq!(store.count_events_of_kind("daemon.overrides_check_failed", since).unwrap(), 1);
+        assert_eq!(store.count_events_of_kind("daemon.reload", since).unwrap(), 0);
+        assert_eq!(daemon.cfg.scheduler.max_concurrent, 3);
+
+        // git is back: nothing changed, so nothing reloads; the next real
+        // change still does.
+        std::fs::rename(repo.join(".git-away"), repo.join(".git")).unwrap();
+        now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
+        daemon.refresh_overrides(now).await.unwrap();
+        assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 0);
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "[scheduler]\nmax_concurrent = 4\n").unwrap();
+        git_in(&repo, &["commit", "-qam", "more"]);
+        now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
+        daemon.refresh_overrides(now).await.unwrap();
+        assert_eq!(daemon.cfg.scheduler.max_concurrent, 4);
+        assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 1);
+
+        // A reload asked for by a command moves the baseline: the same
+        // change is not applied a second time by the next check.
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "[scheduler]\nmax_concurrent = 5\n").unwrap();
+        git_in(&repo, &["commit", "-qam", "again"]);
+        daemon.reload_config().unwrap();
+        assert_eq!(daemon.cfg.scheduler.max_concurrent, 5);
+        now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
+        daemon.refresh_overrides(now).await.unwrap();
+        assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 1, "no duplicate reload");
     }
 
     #[tokio::test]
@@ -4430,13 +4607,13 @@ mod tests {
         let mut daemon = Daemon::new(cfg, paths, store.clone(), secrets).unwrap();
         let since = Utc::now() - Duration::minutes(1);
         let mut now = Utc::now();
-        daemon.refresh_overrides(now).unwrap();
+        daemon.refresh_overrides(now).await.unwrap();
         assert_eq!(daemon.cfg.scheduler.max_concurrent, 2);
 
         std::fs::write(repo.join(REPO_CONFIG_FILE), "[scheduler]\nmax_concurrent = 4\n[linear]\nexcluded_labels = ['x']\n")
             .unwrap();
         now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
-        daemon.refresh_overrides(now).unwrap();
+        daemon.refresh_overrides(now).await.unwrap();
         assert_eq!(daemon.cfg.scheduler.max_concurrent, 4);
         assert_eq!(daemon.cfg.linear.excluded_labels, vec!["x".to_string()]);
         assert_eq!(daemon.cfg.overrides.rev, None);
@@ -4445,7 +4622,7 @@ mod tests {
         // Removing the file restores the global values.
         std::fs::remove_file(repo.join(REPO_CONFIG_FILE)).unwrap();
         now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
-        daemon.refresh_overrides(now).unwrap();
+        daemon.refresh_overrides(now).await.unwrap();
         assert_eq!(daemon.cfg.scheduler.max_concurrent, 2);
         assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 2);
     }
