@@ -521,6 +521,14 @@ impl TaskState {
         matches!(self, TaskState::Queued | TaskState::Crashed | TaskState::Throttled)
     }
 
+    /// The moves the daemon and the CLI make. `Starting` is an early
+    /// `Running`, so every hook outcome may land on it; `throttled` and
+    /// `paused` tasks keep their session (waiting for a usage reset, or for
+    /// the turn to end), so they can still complete, and a throttled one
+    /// can still crash. A container (parent issue) is the one exception
+    /// the table does not list: it is closed from whatever open state it is
+    /// in once its sub-issues are done. Checked by the scheduler's property
+    /// tests.
     pub fn can_transition_to(&self, next: TaskState) -> bool {
         use TaskState::*;
         if *self == next {
@@ -528,17 +536,37 @@ impl TaskState {
         }
         match self {
             Queued => matches!(next, Starting | Paused | Cancelled | Throttled | Blocked),
-            Starting => matches!(next, Running | Crashed | Failed | Cancelled | Queued),
+            Starting => matches!(
+                next,
+                Running
+                    | Idle
+                    | Crashed
+                    | Throttled
+                    | NeedsAttention
+                    | InReview
+                    | Completed
+                    | Failed
+                    | Cancelled
+                    | Queued
+                    | Paused
+            ),
             Running => {
                 matches!(next, Idle | Crashed | Throttled | NeedsAttention | InReview | Completed | Failed | Cancelled | Paused)
             }
-            Idle => matches!(next, Running | Crashed | NeedsAttention | InReview | Completed | Failed | Cancelled | Paused),
+            Idle => {
+                matches!(
+                    next,
+                    Running | Crashed | Throttled | NeedsAttention | InReview | Completed | Failed | Cancelled | Paused
+                )
+            }
             Crashed => matches!(next, Starting | Queued | Failed | Cancelled | Paused | Throttled),
-            Throttled => matches!(next, Queued | Starting | Running | Cancelled | Paused | Blocked),
-            Paused => matches!(next, Queued | InReview | Cancelled),
+            Throttled => {
+                matches!(next, Queued | Starting | Running | Crashed | Failed | Cancelled | Paused | Blocked | Completed)
+            }
+            Paused => matches!(next, Queued | Running | InReview | Cancelled | Completed),
             Blocked => matches!(next, Queued | Paused | Cancelled | Completed),
             NeedsAttention => {
-                matches!(next, Queued | Running | Idle | InReview | Completed | Failed | Cancelled | Paused | Crashed)
+                matches!(next, Queued | Running | Idle | Throttled | InReview | Completed | Failed | Cancelled | Paused | Crashed)
             }
             InReview => matches!(next, Queued | NeedsAttention | Completed | Cancelled | Paused),
             Completed | Failed | Cancelled => matches!(next, Queued),
@@ -1392,7 +1420,8 @@ mod tests {
         assert!(Crashed.can_transition_to(Starting));
         assert!(!Completed.can_transition_to(Running));
         assert!(Completed.can_transition_to(Queued)); // retry
-        assert!(!Paused.can_transition_to(Running));
+        assert!(Paused.can_transition_to(Running)); // resume with a live session
+        assert!(!Paused.can_transition_to(Idle));
         for st in TaskState::ALL {
             assert_eq!(st.as_str().parse::<TaskState>().unwrap(), st);
         }

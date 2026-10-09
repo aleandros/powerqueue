@@ -324,3 +324,153 @@ mod tests {
         assert_eq!(t.model_override, None);
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::scheduler::review::pr_number_of;
+    use crate::strategies::*;
+
+    fn logs_are_well_formed(effects: &[Effect]) -> bool {
+        effects.iter().all(|e| !matches!(e, Effect::Log { kind, message, .. } if kind.is_empty() || message.is_empty()))
+    }
+
+    fn has_kill(effects: &[Effect]) -> bool {
+        effects.iter().any(|e| matches!(e, Effect::KillWindow))
+    }
+
+    proptest! {
+        /// Every command makes a move the transition table allows.
+        #[test]
+        fn commands_make_legal_moves((task, session) in task_with_session(), live in any::<bool>(), model in prop::option::of(claude_model())) {
+            let now = origin();
+            for cmd in 0..5u8 {
+                let before = task.clone();
+                let mut t = task.clone();
+                let mut s = session.clone();
+                let effects = match cmd {
+                    0 => on_pause(&mut t, live),
+                    1 => on_resume(&mut t, live, now),
+                    2 => on_cancel(&mut t, Some(&mut s), now),
+                    3 => on_retry(&mut t, Some(&mut s), now),
+                    _ => on_set_model(&mut t, model.clone()),
+                };
+                prop_assert!(before.state.can_transition_to(t.state), "cmd {cmd}: {:?} -> {:?}", before.state, t.state);
+                prop_assert!(logs_are_well_formed(&effects));
+            }
+        }
+
+        /// Terminal tasks are inert for pause and cancel; only retry leaves a
+        /// terminal state, and then the task starts over.
+        #[test]
+        fn terminal_tasks_only_leave_through_retry(
+            (task, session) in task_with_session_among(&[TaskState::Completed, TaskState::Failed, TaskState::Cancelled]),
+            live in any::<bool>(),
+        ) {
+            let now = origin();
+            let mut t = task.clone();
+            prop_assert!(on_pause(&mut t, live).is_empty());
+            prop_assert_eq!(&t, &task);
+            let mut s = session.clone();
+            prop_assert!(on_cancel(&mut t, Some(&mut s), now).is_empty());
+            prop_assert_eq!(&t, &task);
+            prop_assert_eq!(&s, &session);
+            let mut t = task.clone();
+            let mut s = session.clone();
+            let effects = on_retry(&mut t, Some(&mut s), now);
+            prop_assert_eq!(t.state, TaskState::Queued);
+            prop_assert_eq!(t.attempts, 0);
+            prop_assert_eq!((t.last_error.clone(), t.summary.clone(), t.completed_at, t.started_at, t.not_before), (None, None, None, None, None));
+            prop_assert!(effects.iter().any(|e| matches!(e, Effect::ForgetAnswer)));
+            prop_assert!(!has_kill(&effects), "a terminal task's session is already dead");
+        }
+
+        /// A second pause changes nothing and says nothing; resuming a task
+        /// that is neither paused nor waiting for a human changes nothing.
+        /// (A task that was already paused is left alone, retry time
+        /// included: the generator may give it one, the daemon never does.)
+        #[test]
+        fn pause_and_resume_are_idempotent((task, _) in task_with_session(), live in any::<bool>()) {
+            let now = origin();
+            let mut t = task.clone();
+            on_pause(&mut t, live);
+            let paused = t.clone();
+            prop_assert!(on_pause(&mut t, live).is_empty());
+            prop_assert_eq!(&t, &paused);
+            if !task.state.is_terminal() && task.state != TaskState::Paused {
+                prop_assert_eq!((paused.state, paused.not_before), (TaskState::Paused, None));
+            }
+            let mut t = task.clone();
+            if !matches!(task.state, TaskState::Paused | TaskState::NeedsAttention) {
+                prop_assert!(on_resume(&mut t, live, now).is_empty());
+                prop_assert_eq!(&t, &task);
+            } else {
+                on_resume(&mut t, live, now);
+                prop_assert_eq!(t.not_before, None);
+                prop_assert!(matches!(t.state, TaskState::Running | TaskState::InReview | TaskState::Queued));
+                prop_assert_eq!(t.state == TaskState::Running, live);
+            }
+        }
+
+        /// Effects are justified: a window is killed iff the session handed
+        /// in was live (and it is then closed); cleanup only for a task that
+        /// ended; a relayed answer is forgotten only by a re-queue.
+        #[test]
+        fn cancel_and_retry_effects_are_justified((task, session) in task_with_session()) {
+            let now = origin();
+            let was_live = session.state.is_live();
+            // Cancel.
+            let mut t = task.clone();
+            let mut s = session.clone();
+            let effects = on_cancel(&mut t, Some(&mut s), now);
+            if task.state.is_terminal() {
+                prop_assert!(effects.is_empty());
+            } else {
+                prop_assert_eq!(has_kill(&effects), was_live);
+                prop_assert_eq!((t.state, t.completed_at, t.not_before), (TaskState::Cancelled, Some(now), None));
+                prop_assert!(effects.iter().any(|e| matches!(e, Effect::Cleanup { succeeded: false })), "no failed cleanup: {:?}", effects);
+            }
+            if was_live && !task.state.is_terminal() {
+                prop_assert_eq!((s.state, s.ended_at), (SessionState::Killed, Some(now)));
+            } else {
+                prop_assert_eq!(&s, &session);
+            }
+            // Retry.
+            let mut t = task.clone();
+            let mut s = session.clone();
+            let effects = on_retry(&mut t, Some(&mut s), now);
+            let applies = task.state.is_terminal()
+                || matches!(task.state, TaskState::Crashed | TaskState::Throttled | TaskState::Paused | TaskState::NeedsAttention)
+                || (task.state == TaskState::InReview && task.pr_url.as_deref().and_then(pr_number_of).is_some());
+            prop_assert_eq!(has_kill(&effects), applies && was_live);
+            prop_assert!(!effects.iter().any(|e| matches!(e, Effect::Cleanup { .. })), "retry never cleans up: {:?}", effects);
+            let forgot = effects.iter().any(|e| matches!(e, Effect::ForgetAnswer));
+            prop_assert_eq!(forgot, applies && task.state != TaskState::InReview);
+            if applies {
+                prop_assert_eq!((t.state, t.not_before), (TaskState::Queued, None));
+            } else {
+                prop_assert_eq!(&t, &task);
+                prop_assert!(matches!(&effects[..], [Effect::Log { kind, .. }] if kind == "task.retry_ignored"), "{effects:?}");
+            }
+            if task.state == TaskState::InReview && applies {
+                let watch = t.review.as_ref().expect("a watch");
+                prop_assert_eq!(watch.relaunch.as_ref().map(|r| r.reason.as_str()), Some("requested"));
+                prop_assert_eq!(watch.rounds, task.review.as_ref().map_or(0, |w| w.rounds));
+                prop_assert!(!watch.parked);
+            }
+        }
+
+        /// `task model` only records the override and logs it.
+        #[test]
+        fn set_model_only_changes_the_override((task, _) in task_with_session(), model in prop::option::of(model())) {
+            let mut t = task.clone();
+            let effects = on_set_model(&mut t, model.clone());
+            prop_assert_eq!(t.model_override, model);
+            t.model_override = task.model_override.clone();
+            prop_assert_eq!(&t, &task);
+            prop_assert!(matches!(&effects[..], [Effect::Log { kind, .. }] if kind == "task.model_override"), "{:?}", effects);
+        }
+    }
+}

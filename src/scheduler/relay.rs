@@ -339,3 +339,109 @@ mod tests {
         assert_eq!(truncate_chars("ñandú", 3), "ñan…");
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::strategies::*;
+
+    /// Text with paragraphs, blank lines, markers and odd whitespace.
+    fn message() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![
+                line(),
+                Just(String::new()),
+                Just("   ".to_string()),
+                Just(BLOCKED_MARKER.to_string()),
+                Just(DONE_MARKER.to_string()),
+                (line(), line()).prop_map(|(a, b)| format!("{a}\n{b}")),
+            ],
+            0..5,
+        )
+        .prop_map(|parts| parts.join("\n\n"))
+    }
+
+    fn comment() -> impl Strategy<Value = IssueComment> {
+        (word(), message(), past_instant(), prop::option::of(word())).prop_map(|(id, body, created_at, author)| IssueComment {
+            id,
+            body,
+            created_at,
+            author,
+        })
+    }
+
+    proptest! {
+        /// The last paragraph is a non-empty paragraph of the message (with
+        /// the markers removed) whenever one exists, else empty.
+        #[test]
+        fn last_paragraph_is_a_paragraph_of_the_message(msg in message()) {
+            let last = last_paragraph(&msg);
+            let cleaned = msg.replace(BLOCKED_MARKER, "").replace(DONE_MARKER, "");
+            let has_text = cleaned.split("\n\n").any(|p| !p.trim().is_empty());
+            prop_assert_eq!(!last.is_empty(), has_text);
+            if has_text {
+                for line in last.lines() {
+                    prop_assert_eq!(line.trim(), line, "lines are trimmed");
+                    prop_assert!(cleaned.contains(line), "{line:?} not in {cleaned:?}");
+                }
+                prop_assert!(!last.starts_with('\n') && !last.ends_with('\n'));
+            }
+        }
+
+        /// A question is relayed iff the message or the reason says
+        /// something; it never exceeds the excerpt limit.
+        #[test]
+        fn question_text_needs_some_text(msg in message(), reason in prop::option::of(line())) {
+            let text = question_text(&msg, reason.as_deref());
+            let paragraph = last_paragraph(&msg);
+            let expected = !paragraph.is_empty() || reason.as_deref().is_some_and(|r| !r.trim().is_empty());
+            prop_assert_eq!(text.is_some(), expected);
+            if let Some(text) = &text {
+                prop_assert!(text.chars().count() <= QUESTION_MAX_CHARS + 1);
+                prop_assert_eq!(text.trim(), text.as_str());
+                let body = question_body(text, reason.as_deref());
+                prop_assert!(body.ends_with(QUESTION_MARKER));
+                prop_assert!(body.contains(MARKER_PREFIX));
+                prop_assert_eq!(tag_own(&body), body.clone(), "a tagged body is not tagged twice");
+            }
+        }
+
+        /// Relayed answers and hints are single lines naming every author
+        /// once; comments are recognised as powerqueue's own iff tagged or
+        /// remembered.
+        #[test]
+        fn relayed_text_is_one_line(comments in prop::collection::vec(comment(), 0..4), remembered in prop::option::of(word())) {
+            let refs: Vec<&IssueComment> = comments.iter().collect();
+            for text in [answer_text(&refs), hint_text(&refs)] {
+                prop_assert!(!text.contains('\n'));
+                for c in &comments {
+                    let author = c.author.as_deref().unwrap_or("a human");
+                    prop_assert!(text.contains(author));
+                    prop_assert!(text.contains(&one_line(&c.body)));
+                }
+            }
+            let mut state = RelayState::default();
+            if let Some(id) = &remembered {
+                state.record_posted(id);
+            }
+            for c in &comments {
+                let own = c.body.contains(MARKER_PREFIX) || remembered.as_deref() == Some(c.id.as_str());
+                prop_assert_eq!(state.is_own(c), own);
+                let tagged = IssueComment { body: tag_own(&c.body), ..c.clone() };
+                prop_assert!(state.is_own(&tagged), "tagging marks a comment as powerqueue's own");
+                prop_assert!(tagged.body.ends_with(OWN_MARKER) || c.body.contains(MARKER_PREFIX));
+            }
+        }
+
+        /// `one_line` collapses all whitespace and keeps every word.
+        #[test]
+        fn one_line_keeps_the_words(text in "[\\s\\S]{0,80}") {
+            let flat = one_line(&text);
+            prop_assert!(!flat.contains('\n') && !flat.contains('\t'));
+            prop_assert!(!flat.contains("  "));
+            prop_assert_eq!(flat.split(' ').filter(|w| !w.is_empty()).collect::<Vec<_>>(), text.split_whitespace().collect::<Vec<_>>());
+        }
+    }
+}

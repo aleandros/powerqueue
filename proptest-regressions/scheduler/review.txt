@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f3ee395ab9be04bdec328ce02601c362a7a55ef494672287b3c832ece3795096 # shrinks to task = Task { id: TaskId(00000000-0000-0000-0000-000000000000), key: "ENG-a", title: "t", description: "", source: Manual, state: InReview, criticality: Critical, score: 0.0, labels: [], linear_priority: None, estimate: None, project: None, cycle: None, cycle_number: None, blocked_by: [], children: [], parent: None, model_override: None, model: Some(ModelTier("sonnet")), worktree_path: Some("/wt/eng-a"), branch: Some("pq/eng-a"), attempts: 1, max_attempts: None, not_before: None, last_error: None, summary: None, score_reasons: [], created_at: 2026-10-01T11:59:59Z, updated_at: 2026-10-01T11:59:59Z, started_at: Some(2026-10-01T11:59:59Z), completed_at: None, pr_url: Some("https://github.com/o/r/pull/1"), review: Some(ReviewWatch { armed_at: 2026-10-01T11:59:59Z, rounds: 0, last_polled_at: None, last_change_at: 2026-10-01T11:59:59Z, fingerprint: None, waiting_manual_merge: false, attempt_base: 0, worktree_path: None, relaunch: Some(ReviewRelaunch { pr_number: 1, reason: "conflict", detail: "", requested_at: 2026-10-01T11:59:59Z }), parked: false }) }, error = "", second = ""

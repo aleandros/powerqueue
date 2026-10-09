@@ -289,11 +289,16 @@ pub fn pr_number_of(url: &str) -> Option<u64> {
     url.parse::<crate::github::PrRef>().ok().map(|pr| pr.number)
 }
 
-/// Hand the task to a human: `needs_attention` with `reason`.
+/// Hand the task to a human: `needs_attention` with `reason`. The watch is
+/// marked parked so `task resume` watches the PR again instead of running a
+/// relaunch that may be pending ([`Task::parked_in_review`]).
 fn park(task: &mut Task, reason: String) {
     task.state = TaskState::NeedsAttention;
     task.last_error = Some(reason);
     task.not_before = None;
+    if let Some(watch) = task.review.as_mut() {
+        watch.parked = true;
+    }
 }
 
 fn log(level: EventLevel, kind: &str, message: String) -> Effect {
@@ -553,5 +558,151 @@ mod tests {
         t.review = None;
         on_watch_error(&mut t, "o/r#7", "x", now());
         assert!(t.review.is_some());
+    }
+}
+
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::strategies::*;
+
+    /// A task in review with its PR number and a sequence of what `gh` says.
+    fn review_run() -> impl Strategy<Value = (Task, Vec<PrStatus>)> {
+        task_in(TaskState::InReview).prop_flat_map(|t| {
+            let n = t.pr_url.as_deref().and_then(pr_number_of).expect("the generator gives a parseable PR URL");
+            let statuses = prop::collection::vec(pr_status(n), 1..6);
+            (Just(t), statuses)
+        })
+    }
+
+    proptest! {
+        /// Over any sequence of PR polls: rounds are capped, parking is
+        /// exactly `needs_attention`, merging completes once, the fingerprint
+        /// tracks the status and a status event is logged iff it changed.
+        #[test]
+        fn review_rounds_are_capped_and_parking_is_consistent((task, statuses) in review_run(), cfg in scheduler_config(), step_secs in 0i64..7200) {
+            let rounds_before = task.review.as_ref().map_or(0, |w| w.rounds);
+            let mut t = task.clone();
+            let mut now = origin();
+            let mut rounds = rounds_before;
+            for status in &statuses {
+                if t.state != TaskState::InReview {
+                    // Any other state is left alone.
+                    let frozen = t.clone();
+                    prop_assert!(on_pr_status(&mut t, status, &cfg, now).is_empty());
+                    prop_assert_eq!(&t, &frozen);
+                    break;
+                }
+                let before = t.clone();
+                let effects = on_pr_status(&mut t, status, &cfg, now);
+                prop_assert!(before.state.can_transition_to(t.state), "{:?} -> {:?}", before.state, t.state);
+                prop_assert!(matches!(t.state, TaskState::InReview | TaskState::Queued | TaskState::NeedsAttention | TaskState::Completed), "{:?}", t.state);
+                let watch = t.review.as_ref().expect("a watch after a poll");
+                prop_assert!(watch.rounds <= rounds_before.max(cfg.review_rounds_max), "rounds {} > max {}", watch.rounds, cfg.review_rounds_max);
+                prop_assert!(watch.rounds >= rounds && watch.rounds <= rounds + 1);
+                rounds = watch.rounds;
+                prop_assert_eq!(watch.parked, t.state == TaskState::NeedsAttention);
+                prop_assert_eq!(watch.last_polled_at, Some(now));
+                let print = fingerprint(status, watch.armed_at);
+                prop_assert_eq!(watch.fingerprint.as_deref(), Some(print.as_str()));
+                let changed = before.review.as_ref().and_then(|w| w.fingerprint.as_deref()) != Some(print.as_str());
+                let logged = effects.iter().any(|e| matches!(e, Effect::Log { kind, .. } if kind == "review.status"));
+                prop_assert_eq!(logged, changed);
+                if changed {
+                    prop_assert_eq!(watch.last_change_at, now);
+                }
+                match t.state {
+                    TaskState::Completed => {
+                        prop_assert_eq!(status.state.as_str(), "MERGED");
+                        prop_assert_eq!(t.completed_at, Some(now));
+                        prop_assert!(effects.iter().any(|e| matches!(e, Effect::DeleteBranch)), "{:?}", effects);
+                    }
+                    TaskState::Queued => {
+                        prop_assert!(watch.relaunch.is_some());
+                        prop_assert_eq!((t.not_before, t.last_error.as_deref()), (None, None));
+                        prop_assert_eq!(watch.rounds, before.review.as_ref().map_or(0, |w| w.rounds) + 1);
+                        prop_assert_eq!(watch.attempt_base, t.attempts);
+                    }
+                    TaskState::NeedsAttention => {
+                        prop_assert!(t.last_error.is_some());
+                        prop_assert_eq!(t.not_before, None);
+                    }
+                    _ => {}
+                }
+                if status.state == "MERGED" {
+                    prop_assert_eq!(t.state, TaskState::Completed);
+                }
+                now += Duration::seconds(step_secs);
+            }
+        }
+
+        /// A user-requested round applies iff the task is in review with a
+        /// usable PR, never counts against the rounds, and un-parks.
+        #[test]
+        fn requested_rounds_apply_only_in_review(task in task(), url in any_pr_url()) {
+            let now = origin();
+            let mut t = task.clone();
+            t.pr_url = Some(url.clone());
+            let before = t.clone();
+            let effect = request_round(&mut t, now);
+            let applies = before.state == TaskState::InReview && pr_number_of(&url).is_some();
+            prop_assert_eq!(effect.is_some(), applies);
+            if applies {
+                prop_assert_eq!((t.state, t.not_before, t.last_error.as_deref()), (TaskState::Queued, None, None));
+                let watch = t.review.as_ref().expect("a watch");
+                prop_assert_eq!(watch.rounds, before.review.as_ref().map_or(0, |w| w.rounds));
+                prop_assert!(!watch.parked && !watch.waiting_manual_merge);
+                prop_assert_eq!(watch.relaunch.as_ref().map(|r| (r.reason.as_str(), r.pr_number)), Some(("requested", pr_number_of(&url).expect("usable"))));
+                prop_assert!(matches!(&effect, Some(Effect::Log { kind, .. }) if kind == "review.relaunch"), "{:?}", effect);
+            } else {
+                prop_assert_eq!(&t, &before);
+            }
+        }
+
+        /// Watcher errors never move the task; a parked task has no retry
+        /// time; recovery clears only the watcher's own note.
+        #[test]
+        fn watcher_errors_are_noted_not_acted_on(task in task_in(TaskState::InReview), error in line(), second in line()) {
+            let now = origin();
+            let mut t = task.clone();
+            let effects = on_watch_error(&mut t, "o/r#1", &error, now);
+            prop_assert_eq!(t.state, task.state);
+            prop_assert_eq!(t.review.as_ref().and_then(|w| w.last_polled_at), Some(now));
+            let message = format!("{WATCHER_ERROR_PREFIX} cannot read o/r#1: {error}");
+            prop_assert_eq!(t.last_error.as_deref(), Some(message.as_str()));
+            prop_assert_eq!(effects.len(), usize::from(task.last_error.as_deref() != Some(message.as_str())));
+            let again = on_watch_error(&mut t, "o/r#1", &error, now + Duration::minutes(1));
+            prop_assert!(again.is_empty(), "the same message is silent");
+            let changed = on_watch_error(&mut t, "o/r#1", &second, now + Duration::minutes(2));
+            prop_assert_eq!(changed.len(), usize::from(second != error));
+            on_watch_recovered(&mut t);
+            prop_assert_eq!(t.last_error, None);
+            // Only watcher notes are cleared.
+            let mut t = task.clone();
+            t.last_error = Some(error.clone());
+            on_watch_recovered(&mut t);
+            prop_assert_eq!(t.last_error.as_deref().is_none(), error.starts_with(WATCHER_ERROR_PREFIX));
+            // An unusable PR parks the task without a retry time.
+            let mut t = task.clone();
+            on_unusable_pr(&mut t, &error);
+            prop_assert_eq!((t.state, t.not_before), (TaskState::NeedsAttention, None));
+            prop_assert!(t.last_error.as_deref().is_some_and(|e| e.ends_with(&error)));
+            prop_assert!(t.parked_in_review() || t.review.is_none());
+        }
+
+        /// The default review prompt renders every placeholder.
+        #[test]
+        fn default_review_prompt_renders_every_placeholder(relaunch in review_relaunch(), url in pr_url()) {
+            let cfg = SchedulerConfig::default();
+            let rendered = review_prompt(&cfg.review_prompt, &relaunch, &url);
+            for placeholder in ["{pr}", "{url}", "{reason}", "{detail}"] {
+                prop_assert!(!rendered.contains(placeholder), "{rendered}");
+            }
+            prop_assert!(rendered.contains(&relaunch.pr_number.to_string()));
+            prop_assert!(rendered.contains(&relaunch.reason));
+            prop_assert_eq!(rendered.trim(), rendered.as_str());
+        }
     }
 }
