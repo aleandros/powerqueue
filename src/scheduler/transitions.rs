@@ -373,6 +373,13 @@ pub fn on_hook_outcome(
             ));
         }
     }
+    // A retry time only means something while the task is crashed or
+    // throttled: a hook that moves a throttled task on (the agent waited
+    // in-session for its limit, then reported a blocker, finished, ...)
+    // must not leave one behind.
+    if !matches!(task.state, TaskState::Crashed | TaskState::Throttled) {
+        task.not_before = None;
+    }
     effects
 }
 
@@ -874,10 +881,12 @@ pub fn on_answer_sent(
 /// A reply from Linear arrived for a task whose session is gone: re-queue
 /// it so the next launch resumes the session with the pending answer (the
 /// answer wins over a pending review round and over a parked watch). A
-/// task that cannot go back to `queued` is left alone.
+/// task that cannot go back to `queued` is left alone, and so is a finished
+/// one: only `task retry` revives a completed, failed or cancelled task
+/// (a late comment on its issue must not).
 pub fn on_answer_queued(task: &mut Task, ids: &[String], now: DateTime<Utc>) -> Vec<Effect> {
     let from = task.state;
-    if task.state != TaskState::Queued && !task.state.can_transition_to(TaskState::Queued) {
+    if task.state.is_terminal() || (task.state != TaskState::Queued && !task.state.can_transition_to(TaskState::Queued)) {
         return Vec::new();
     }
     task.state = TaskState::Queued;

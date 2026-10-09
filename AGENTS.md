@@ -77,7 +77,9 @@ docs/                user docs (priority grammar, budget algorithm, troubleshoot
   `task.state` / `session.state` in the daemon; add a transition (with a unit test) and, if the outside world
   must do something new, an `Effect` variant. The budget core (`period`, `ledger`, `probe`, `estimator`,
   `policy`) takes plain data; store access lives in `budget/io.rs`.
-- Tests: unit tests next to the code; integration tests in `tests/` using `POWERQUEUE_HOME` + `POWERQUEUE_SECRETS=file` in a tempdir. Network via `wiremock`. tmux/git tests skip themselves with `which::which(...)` when the tool is not on PATH and use a private tmux socket (`-L powerqueue-test-<pid>-<random>`); see CONTRIBUTING.md.
+- Tests: unit tests next to the code; properties (`proptest`) next to them in `mod properties`,
+  drawing from `src/strategies.rs`, plus the stateful model test in `scheduler/model.rs`;
+  a failing property's seed under `proptest-regressions/` is committed with the fix; integration tests in `tests/` using `POWERQUEUE_HOME` + `POWERQUEUE_SECRETS=file` in a tempdir. Network via `wiremock`. tmux/git tests skip themselves with `which::which(...)` when the tool is not on PATH and use a private tmux socket (`-L powerqueue-test-<pid>-<random>`); see CONTRIBUTING.md.
 - UX: output goes through `cli::output` helpers; colours respect `--no-color`/`NO_COLOR`; `--json` prints machine-readable output for status/task/budget/doctor.
 - Keep the CLI surface in `cli/mod.rs` in sync with `docs/commands.md`; keep README.md focused on the overview and quick start.
 
@@ -102,4 +104,6 @@ signature another area depends on, say so in your PR/report.
 - [ ] New config keys documented in `docs/configuration.md` and have defaults
 - [ ] New CLI flags documented in `docs/commands.md`
 - [ ] Events logged for new state transitions
+- [ ] A new or changed transition has a property (`mod properties` in its module) or an op in
+      `scheduler/model.rs`, not only an example test; generators live in `src/strategies.rs`
 - [ ] `doctor` knows about any new failure mode you introduced

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Testing: the pure core is checked by property-based tests (`proptest`)
+  besides the example tests. Shared generators in `src/strategies.rs`
+  produce tasks, sessions, configs, ledgers, hook outcomes and PR statuses
+  the daemon could hold; every pure module in `scheduler` and `budget` has
+  properties (legal moves, inert terminal states, idempotent commands,
+  justified effects, backoff arithmetic, review rounds, planner passes,
+  policy eligibility, period arithmetic, observation history), and a
+  stateful model test runs random sequences of the daemon's calls against
+  one task, checking the cross-cutting invariants after each step.
+
 ## [0.12.0] - 2026-10-09
 
 The scheduler is now a functional core with an imperative shell, the

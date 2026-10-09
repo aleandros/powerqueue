@@ -24,6 +24,8 @@ pub mod commands;
 pub mod daemon;
 pub mod launch;
 pub mod lifecycle;
+#[cfg(test)]
+mod model;
 pub mod relay;
 pub mod review;
 pub mod transitions;

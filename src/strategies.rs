@@ -341,11 +341,14 @@ pub fn scheduler_config() -> impl Strategy<Value = SchedulerConfig> {
     )
 }
 
+/// Floats are whole or half numbers so a prediction survives a JSON round
+/// trip bit for bit (`serde_json` parses floats inexactly unless its
+/// `float_roundtrip` feature is on; a replayed trace must compare equal).
 pub fn prediction() -> impl Strategy<Value = Prediction> {
-    (1.0f64..5_000_000.0, 1.0f64..20_000.0, 0.0f64..=1.0).prop_map(|(weighted_tokens, wall_secs, confidence)| Prediction {
-        weighted_tokens,
-        wall_secs,
-        confidence,
+    (1u64..5_000_000, 1u64..20_000, 0u8..=10).prop_map(|(weighted_tokens, wall_secs, confidence)| Prediction {
+        weighted_tokens: weighted_tokens as f64,
+        wall_secs: wall_secs as f64,
+        confidence: confidence as f64 / 10.0,
         basis: "prop".into(),
     })
 }

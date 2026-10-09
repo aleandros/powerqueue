@@ -57,6 +57,15 @@ just test
 - Git tests create a throwaway repo in the temp dir with one commit and, where
   pushing matters, a local bare `origin`. They skip when `git` is missing.
 - Prefer table-driven tests for parsers and the state machine.
+- The pure core is also checked by properties (`proptest`). Generators for
+  tasks, sessions, configs, ledgers, hook outcomes and PR statuses live in
+  `src/strategies.rs` (tests only); each pure module has a `properties`
+  test module, and `src/scheduler/model.rs` runs random sequences of the
+  daemon's calls against one task and checks the cross-cutting invariants
+  after every step. A failing property writes its seed under
+  `proptest-regressions/`; commit that file with the fix so the case is
+  replayed first from then on. A new transition needs a property (or an op
+  in the model) besides its example test.
 
 Run one test with `cargo test name_of_test -- --nocapture`. Set
 `RUST_LOG=powerqueue=debug` for stderr logging in tests.

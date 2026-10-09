@@ -207,6 +207,8 @@ pub fn on_starting(
     }
     task.state = TaskState::Starting;
     task.model = Some(model.clone());
+    // The backoff or retry time that held the task is over.
+    task.not_before = None;
     let branch = task.branch.clone().unwrap_or_else(|| branch_name(&cfg.repo.branch_template, &task.slug(), &task.id.short()));
     let worktree = task
         .worktree_path
