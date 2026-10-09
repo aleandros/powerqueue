@@ -233,6 +233,9 @@ pub fn validation_problems(cfg: &Config) -> (Config, Vec<String>) {
 /// One line saying what `.powerqueue.toml` contributed, for `config show`
 /// and `config validate`.
 pub fn overrides_summary(cfg: &Config) -> String {
+    if let Some(error) = &cfg.overrides.error {
+        return format!("repository overrides NOT applied: {error}");
+    }
     match &cfg.overrides.file {
         Some(file) if cfg.overrides.keys.is_empty() => {
             format!("repository overrides from {} ({}): no keys set", file.display(), cfg.overrides.origin())
@@ -254,62 +257,44 @@ pub fn overrides_summary(cfg: &Config) -> String {
     }
 }
 
-/// Mark every `key = value` line of a pretty-printed config that came from
-/// `.powerqueue.toml` with a trailing comment. Table headers (`[linear]`)
-/// set the prefix. A multi-line value (an array, or a `"""` / `\'\'\'`
-/// string) gets the comment on the line *before* the key instead, where it
-/// cannot land inside the value, and the lines inside a multi-line string
-/// are never mistaken for keys.
+/// Mark every value of a pretty-printed config that came from
+/// `.powerqueue.toml` with a `# .powerqueue.toml` comment. The text is
+/// parsed as TOML, so the mark lands on the right item whatever shape the
+/// value has: a one-line value gets it as a trailing comment, a value that
+/// spans lines (an array, a `"""` string) gets it on the line before its key,
+/// where it cannot end up inside the value. A key the text does not contain
+/// is ignored; text that is not TOML is returned unchanged.
 pub fn annotate_overrides(toml: &str, keys: &[String]) -> String {
     const MARK: &str = "# .powerqueue.toml";
-    let mut table = String::new();
-    // The delimiter that closes the multi-line string we are inside, if any.
-    let mut in_string: Option<&str> = None;
-    let mut out = String::with_capacity(toml.len() + keys.len() * 24);
-    for line in toml.lines() {
-        if let Some(delim) = in_string {
-            if line.contains(delim) {
-                in_string = None;
-            }
-            out.push_str(line);
-            out.push('\n');
-            continue;
-        }
-        let trimmed = line.trim();
-        if let Some(name) = trimmed.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
-            table = name.trim_matches('[').trim_matches(']').to_string();
-            out.push_str(line);
-        } else if let Some((key, value)) = trimmed.split_once('=')
-            && !trimmed.starts_with('#')
-            && key.trim().chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '"')
-        {
-            let key = key.trim().trim_matches('"');
-            let full = if table.is_empty() { key.to_string() } else { format!("{table}.{key}") };
-            let value = value.trim();
-            if let Some(delim) = ["\"\"\"", "\'\'\'"].into_iter().find(|d| value.starts_with(d))
-                && !value[delim.len()..].contains(delim)
-            {
-                in_string = Some(delim);
-            }
-            let multi_line = in_string.is_some() || (value.starts_with('[') && !value.contains(']'));
-            let marked = keys.iter().any(|k| k == &full);
-            if marked && multi_line {
-                out.push_str(MARK);
-                out.push('\n');
-                out.push_str(line);
-            } else {
-                out.push_str(line);
-                if marked {
-                    out.push_str("  ");
-                    out.push_str(MARK);
-                }
-            }
-        } else {
-            out.push_str(line);
-        }
-        out.push('\n');
+    if keys.is_empty() {
+        return toml.to_string();
     }
-    out
+    let Ok(mut doc) = toml.parse::<DocumentMut>() else { return toml.to_string() };
+    for key in keys {
+        let mut parts: Vec<&str> = key.split('.').collect();
+        let Some(leaf) = parts.pop() else { continue };
+        let Some(table) = table_at(doc.as_table_mut(), &parts) else { continue };
+        let Some((mut key_mut, item)) = table.get_key_value_mut(leaf) else { continue };
+        let Some(value) = item.as_value_mut() else { continue };
+        if value.to_string().contains('\n') {
+            let decor = key_mut.leaf_decor_mut();
+            let prefix = decor.prefix().and_then(|p| p.as_str()).unwrap_or_default().to_string();
+            decor.set_prefix(format!("{prefix}{MARK}\n"));
+        } else {
+            let decor = value.decor_mut();
+            let suffix = decor.suffix().and_then(|p| p.as_str()).unwrap_or_default().trim_end().to_string();
+            decor.set_suffix(format!("{suffix}  {MARK}"));
+        }
+    }
+    doc.to_string()
+}
+
+/// The sub-table at `parts` (`["budget", "providers"]`), if every step is a table.
+fn table_at<'a>(table: &'a mut Table, parts: &[&str]) -> Option<&'a mut Table> {
+    match parts.split_first() {
+        None => Some(table),
+        Some((head, rest)) => table_at(table.get_mut(head)?.as_table_mut()?, rest),
+    }
 }
 
 /// The editor command from `$VISUAL`, then `$EDITOR`, falling back to `vi`.
@@ -380,6 +365,7 @@ pub fn run(ctx: &mut Context, cmd: ConfigCommand) -> Result<i32> {
                             "source": cfg.repo.overrides_from,
                             "rev": cfg.overrides.rev,
                             "keys": cfg.overrides.keys,
+                            "error": cfg.overrides.error,
                         }),
                     );
                 }
@@ -661,6 +647,25 @@ mod tests {
         let back = Config::from_toml(&out).unwrap();
         assert_eq!(back.claude.append_system_prompt, cfg.claude.append_system_prompt);
         assert_eq!(back.claude.permission_mode, "plan");
+
+        // Shapes a line scanner would get wrong: a multi-line array element
+        // containing the string delimiter, an inline table, a value with an
+        // existing trailing comment, and a key that is not in the text.
+        let toml = "[repo]\nsetup = [\n    \"echo \\\"\\\"\\\"\",\n    \"make\",\n]\nbranch_template = \"pq/{key}\" # mine\n\n[claude]\nenv = { A = \"1\" }\n";
+        let keys = vec![
+            "repo.setup".to_string(),
+            "repo.branch_template".to_string(),
+            "claude.env".to_string(),
+            "claude.nope".to_string(),
+            "nope.nope".to_string(),
+        ];
+        let out = annotate_overrides(toml, &keys);
+        assert!(out.contains("# .powerqueue.toml\nsetup = [\n"), "{out}");
+        assert!(out.contains("branch_template = \"pq/{key}\" # mine  # .powerqueue.toml\n"), "{out}");
+        assert!(out.contains("env = { A = \"1\" }  # .powerqueue.toml\n"), "{out}");
+        assert_eq!(out.matches("# .powerqueue.toml").count(), 3);
+        assert_eq!(out.parse::<DocumentMut>().unwrap().to_string(), out, "still valid TOML");
+        assert_eq!(annotate_overrides("not = = toml", &keys), "not = = toml", "unparseable text is left alone");
     }
 
     #[test]

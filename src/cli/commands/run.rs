@@ -13,6 +13,12 @@ use crate::secrets::Secrets;
 /// Start the scheduler in the foreground (one tick with `--once`).
 pub fn run(ctx: &mut Context, args: RunArgs) -> Result<i32> {
     let cfg = ctx.config_cloned()?;
+    if let Some(error) = &cfg.overrides.error {
+        anyhow::bail!(
+            "cannot start: {error} (the daemon never runs without the repository's {} when it is configured; fix it, or set repo.overrides_from = \"working-tree\")",
+            crate::config::REPO_CONFIG_FILE
+        );
+    }
     cfg.ensure_valid()?;
     let store = ctx.store()?.clone();
     let paths = ctx.paths.clone();

@@ -84,17 +84,9 @@ fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
     // What the daemon reads (the committed copy when the repo owns the rules).
     let priority_text = cfg.read_rules_text(&paths)?;
     let config_text = std::fs::read_to_string(&live_config).with_context(|| format!("read {}", live_config.display()))?;
-    let rules = match &priority_text {
-        Some(text) => match PriorityRules::parse(text) {
-            Ok(r) => r,
-            Err(errors) => bail!(
-                "{} has errors; fix them first (`powerqueue priority check`):\n  - {}",
-                live_priority.display(),
-                errors.iter().map(|e| format!("line {}: {}", e.line, e.message)).collect::<Vec<_>>().join("\n  - ")
-            ),
-        },
-        None => PriorityRules::default(),
-    };
+    let rules = PriorityRules::from_source(&cfg.rules_source(&paths))
+        .context("fix the rules first (`powerqueue priority check`)")?
+        .unwrap_or_default();
 
     // Current state for the prompt.
     let sim_args = SimulateArgs { reasons: true, no_budget: args.no_budget, ..SimulateArgs::default() };
@@ -725,6 +717,7 @@ mod tests {
         t.description = "line one\n\nline two".into();
         let sim = Simulation {
             rules: "/x/PRIORITY.md".into(),
+            rules_missing: false,
             warnings: vec![],
             max_concurrent: 2,
             draft: false,

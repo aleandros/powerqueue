@@ -25,7 +25,7 @@ use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::budget::{Estimator, Ledger, Ledgers, load_observations, load_observed, load_probe_status, tier_weight};
-use crate::cli::output::human_f64;
+use crate::cli::output::{ago, human_f64};
 use crate::config::{Config, OverridesSource, REPO_CONFIG_FILE, RepoOverrides};
 use crate::domain::{EventLevel, ModelTier, Provider, SessionState, Task, TaskState};
 use crate::jev::JevClient;
@@ -1154,6 +1154,41 @@ fn check_daemon(store: &Store) -> CheckResult {
     }
 }
 
+/// A `.powerqueue.toml` (or `config.toml`) change the running daemon could
+/// not apply: it keeps the configuration it had, which `config show` no
+/// longer describes, and nothing but the event log says so. Reported while
+/// the latest `daemon.reload_failed` is newer than the latest
+/// `daemon.reloaded` / `daemon.started`.
+fn check_config_reload(store: &Store) -> CheckResult {
+    const NAME: &str = "config reload";
+    let failed = match store.last_event_of_kind("daemon.reload_failed") {
+        Ok(Some(e)) => e,
+        Ok(None) => return CheckResult::ok(STATE, NAME, "no failed reload on record"),
+        Err(e) => return CheckResult::fail(STATE, NAME, format!("{e:#}"), "check the database"),
+    };
+    let recovered = ["daemon.reloaded", "daemon.started"]
+        .iter()
+        .filter_map(|k| store.last_event_of_kind(k).ok().flatten())
+        .any(|e| e.id > failed.id);
+    if recovered {
+        return CheckResult::ok(
+            STATE,
+            NAME,
+            format!("the last failed reload ({}) was followed by a successful one", ago(failed.timestamp)),
+        );
+    }
+    CheckResult::warn(
+        STATE,
+        NAME,
+        format!(
+            "the daemon still runs the configuration from before a change it could not apply ({}): {}",
+            ago(failed.timestamp),
+            failed.message
+        ),
+        "fix the file (`powerqueue config validate` names the problem); the daemon retries every check, and any `powerqueue config set` asks it to reload too",
+    )
+}
+
 /// The user service from `powerqueue service install`: running, and its unit
 /// still points at a binary and a PATH that work. Skipped when there is no
 /// service manager or no unit.
@@ -2027,6 +2062,7 @@ pub async fn run_all(
 
     results.push(check_db(store));
     results.push(check_daemon(store));
+    results.push(check_config_reload(store));
     results.push(check_service(cfg));
     results.push(check_scheduling_pause(store));
     results.push(check_stuck_tasks(cfg, store, fix));
@@ -2053,6 +2089,26 @@ pub fn exit_code(results: &[CheckResult]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_reload_is_reported_until_a_later_reload_or_start() {
+        let store = Store::open_in_memory().unwrap();
+        let log = |kind: &str| {
+            store.log_event(None, None, EventLevel::Info, kind, kind, serde_json::json!({})).unwrap();
+        };
+        assert_eq!(check_config_reload(&store).status, Status::Ok);
+        log("daemon.started");
+        log("daemon.reload_failed");
+        let r = check_config_reload(&store);
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("could not apply"), "{}", r.detail);
+        log("daemon.reloaded");
+        assert_eq!(check_config_reload(&store).status, Status::Ok);
+        log("daemon.reload_failed");
+        assert_eq!(check_config_reload(&store).status, Status::Warn);
+        log("daemon.started");
+        assert_eq!(check_config_reload(&store).status, Status::Ok, "a restart loads the file afresh");
+    }
 
     #[test]
     fn terminal_check_levels() {

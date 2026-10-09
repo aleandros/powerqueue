@@ -187,6 +187,7 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
         let out = serde_json::json!({
             "daemon": daemon,
             "scheduling_paused": pause,
+            "repo_overrides_error": cfg.overrides.error,
             "tmux_session": cfg.tmux.session_name,
             "counts": {
                 "queued": counts.queued, "running": counts.running, "idle": counts.idle,
@@ -223,6 +224,10 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
         None => String::new(),
     };
     println!("daemon {daemon_text}  ·  {}  ·  tmux session {}{pause_text}", counts_line(&counts), cfg.tmux.session_name);
+    if let Some(error) = &cfg.overrides.error {
+        let s = format!("warning: {error}; shown with config.toml alone (`powerqueue doctor` explains)");
+        println!("{}", if color { s.if_supports_color(Stream::Stdout, |t| t.yellow()).to_string() } else { s });
+    }
 
     if rows.is_empty() {
         println!(
