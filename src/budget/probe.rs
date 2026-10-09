@@ -349,3 +349,139 @@ mod tests {
         assert_eq!(l.period, before, "a reset in the past does not move the period");
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use crate::strategies::instant_between;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+
+    fn reading() -> impl Strategy<Value = Option<f64>> {
+        prop::option::of(prop::sample::select(vec![0.0, 0.1, 0.25, 0.5, 0.99, 1.0, 1.2]))
+    }
+
+    /// A history as stored: sorted oldest first, spanning up to twelve days.
+    fn history() -> impl Strategy<Value = Vec<ObservationSample>> {
+        vec((instant_between(12 * 86_400, 0), reading(), reading()), 0..12).prop_map(|rows| {
+            let mut out: Vec<ObservationSample> = rows
+                .into_iter()
+                .map(|(at, period_used, window_used)| ObservationSample { at, period_used, window_used })
+                .collect();
+            out.sort_by_key(|s| s.at);
+            out
+        })
+    }
+
+    fn observed() -> impl Strategy<Value = ObservedUsage> {
+        (
+            reading(),
+            prop::option::of(instant_between(86_400, 86_400)),
+            reading(),
+            prop::option::of(instant_between(86_400, 7 * 86_400)),
+            any::<bool>(),
+            instant_between(12 * 86_400, 600),
+        )
+            .prop_map(|(window_used, window_resets_at, period_used, period_resets_at, blocked, observed_at)| {
+                ObservedUsage { window_used, window_resets_at, period_used, period_resets_at, blocked, observed_at }
+            })
+    }
+
+    fn sorted(samples: &[ObservationSample]) -> bool {
+        samples.windows(2).all(|w| w[0].at <= w[1].at)
+    }
+
+    /// The thinning rule: the older sample of each kept pair sets the spacing.
+    fn spaced(samples: &[ObservationSample], now: DateTime<Utc>) -> bool {
+        samples.windows(2).all(|w| {
+            let spacing = if now - w[0].at <= SAMPLE_RECENT { SAMPLE_SPACING_RECENT } else { SAMPLE_SPACING_OLD };
+            w[1].at - w[0].at >= spacing
+        })
+    }
+
+    proptest! {
+        /// Thinning keeps a sorted subset of the input, never anything older
+        /// than `SAMPLE_MAX_AGE`, always the newest sample that is young
+        /// enough, with consecutive samples at least a minute apart in the
+        /// recent two hours and ten minutes apart before that.
+        #[test]
+        fn thinning_keeps_a_spaced_subset(samples in history(), now in instant_between(0, 86_400)) {
+            let kept = thin_samples(&samples, now);
+            prop_assert!(kept.len() <= samples.len());
+            prop_assert!(sorted(&kept));
+            prop_assert!(kept.iter().all(|k| samples.contains(k)), "only input samples are kept");
+            prop_assert!(kept.iter().all(|k| now - k.at <= SAMPLE_MAX_AGE));
+            prop_assert!(spaced(&kept, now), "{kept:?}");
+            if let Some(newest) = samples.last().filter(|s| now - s.at <= SAMPLE_MAX_AGE) {
+                prop_assert_eq!(kept.last(), Some(newest), "the newest sample is always kept");
+            }
+            prop_assert_eq!(&thin_samples(&kept, now), &kept, "thinning is idempotent");
+        }
+
+        /// A reading is stored unless it knows nothing or merely repeats the
+        /// newest stored reading within a minute. What is stored is the
+        /// thinned, sorted history including the new sample when it is the
+        /// newest (an out-of-order older reading may be thinned away).
+        #[test]
+        fn appending_stores_new_information_only(samples in history(), obs in observed()) {
+            let sample = ObservationSample::of(&obs);
+            let repeat = samples.last().is_some_and(|last| {
+                sample.at - last.at < SAMPLE_SPACING_RECENT
+                    && last.period_used == sample.period_used
+                    && last.window_used == sample.window_used
+            });
+            match append_observation(samples.clone(), &obs) {
+                None => prop_assert!(sample.is_empty() || repeat, "dropped a new reading {sample:?} after {:?}", samples.last()),
+                Some(stored) => {
+                    prop_assert!(!sample.is_empty() && !repeat);
+                    prop_assert!(sorted(&stored));
+                    prop_assert!(stored.len() <= samples.len() + 1);
+                    prop_assert!(spaced(&stored, sample.at), "{stored:?}");
+                    if samples.last().is_none_or(|last| last.at <= sample.at) {
+                        prop_assert_eq!(stored.last(), Some(&sample), "the newest reading is kept");
+                    }
+                    let mut all = samples.clone();
+                    all.push(sample);
+                    all.sort_by_key(|s| s.at);
+                    prop_assert_eq!(&stored, &thin_samples(&all, sample.at));
+                }
+            }
+        }
+
+        /// Folding the legacy calibration in is idempotent, keeps the history
+        /// sorted and adds the reading only when no sample sits at its instant.
+        #[test]
+        fn legacy_calibration_folds_in_once(samples in history(), legacy in prop::option::of((instant_between(12 * 86_400, 0), reading()))) {
+            let legacy = legacy.map(|(at, period_used)| ObservationSample { at, period_used, window_used: None });
+            let once = fold_legacy_calibration(samples.clone(), legacy);
+            prop_assert!(sorted(&once));
+            let present = legacy.is_some_and(|l| samples.iter().any(|s| (s.at - l.at).num_seconds().abs() < 1));
+            prop_assert_eq!(once.len(), samples.len() + usize::from(legacy.is_some() && !present));
+            prop_assert_eq!(&fold_legacy_calibration(once.clone(), legacy), &once, "idempotent");
+            prop_assert!(samples.iter().all(|s| once.contains(s)));
+        }
+
+        /// The cooldown is the earliest known reset of what is exhausted:
+        /// `blocked` looks at both resets, a full window at the window's, a
+        /// full period at the period's; nothing exhausted (or no reset known
+        /// for it) means no cooldown.
+        #[test]
+        fn cooldown_follows_the_exhausted_allowance(obs in observed()) {
+            let window_out = obs.window_used.is_some_and(|u| u >= 1.0);
+            let period_out = obs.period_used.is_some_and(|u| u >= 1.0);
+            let mut applicable = Vec::new();
+            if obs.blocked || window_out {
+                applicable.push(obs.window_resets_at);
+            }
+            if obs.blocked || period_out {
+                applicable.push(obs.period_resets_at);
+            }
+            let expected = applicable.into_iter().flatten().min();
+            prop_assert_eq!(obs.cooldown_until(), expected);
+            if !(obs.blocked || window_out || period_out) {
+                prop_assert_eq!(obs.cooldown_until(), None);
+            }
+            prop_assert_eq!(ObservationSample::of(&obs).is_empty(), obs.period_used.is_none() && obs.window_used.is_none());
+        }
+    }
+}

@@ -246,3 +246,111 @@ mod tests {
         assert_eq!(w.start, w.end, "no window: an empty range");
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use crate::domain::Provider;
+    use crate::strategies::instant_between;
+    use proptest::prelude::*;
+
+    const MONTH: i64 = 30 * 86_400;
+
+    /// A clock from a random provider budget: period 1..=400 h, window
+    /// 0..=24 h, anchor absent or an instant within a month of the origin.
+    fn clock() -> impl Strategy<Value = (PeriodClock, DateTime<Utc>)> {
+        (1u64..=400, 0u64..=24, prop::option::of(instant_between(MONTH, MONTH)), instant_between(MONTH, MONTH)).prop_map(
+            |(period_hours, window_hours, anchor, now)| {
+                let budget = ProviderBudget {
+                    period_hours,
+                    window_hours,
+                    period_anchor: anchor.map(|a| a.to_rfc3339()),
+                    ..ProviderBudget::defaults_for(Provider::Claude)
+                };
+                (PeriodClock::from_provider(&budget, now), now)
+            },
+        )
+    }
+
+    proptest! {
+        /// The current period contains `now`, is `period` long, and
+        /// consecutive periods tile the time line exactly.
+        #[test]
+        fn periods_contain_now_and_tile((clock, now) in clock()) {
+            let p = clock.current_period(now);
+            prop_assert!(p.contains(now), "{p:?} does not contain {now}");
+            prop_assert_eq!(p.len(), clock.period);
+            prop_assert!(!p.contains(p.end));
+            prop_assert_eq!(clock.current_period(p.end).start, p.end, "next period starts where this one ends");
+            prop_assert_eq!(clock.current_period(p.start - Duration::seconds(1)).end, p.start, "previous period ends here");
+            prop_assert_eq!(clock.current_period(p.start), p, "the start is inside its own period");
+        }
+
+        /// Elapsed fraction is within `[0, 1]`, remaining time is never
+        /// negative, and inside the period `elapsed + remaining == len`.
+        #[test]
+        fn fractions_and_remaining_are_consistent((clock, now) in clock(), probe in instant_between(2 * MONTH, 2 * MONTH)) {
+            let p = clock.current_period(now);
+            let f = p.elapsed_fraction(probe);
+            prop_assert!((0.0..=1.0).contains(&f), "{f}");
+            prop_assert!(p.remaining(probe) >= Duration::zero());
+            if p.contains(probe) {
+                prop_assert_eq!(p.remaining(probe) + (probe - p.start), p.len());
+                prop_assert!((f - (probe - p.start).num_seconds() as f64 / p.len().num_seconds() as f64).abs() < 1e-9);
+            } else if probe < p.start {
+                prop_assert_eq!(f, 0.0);
+                prop_assert_eq!(p.remaining(probe), p.end - probe);
+            } else {
+                prop_assert_eq!(f, 1.0);
+                prop_assert_eq!(p.remaining(probe), Duration::zero());
+            }
+        }
+
+        /// An observed anchor only moves the grid: the period length is kept,
+        /// the source becomes `Observed`, and the new grid is aligned on the
+        /// observed instant.
+        #[test]
+        fn observed_anchor_keeps_the_period_length((clock, now) in clock(), reset in instant_between(MONTH, MONTH)) {
+            let observed = clock.clone().with_observed_anchor(reset);
+            prop_assert_eq!(observed.period, clock.period);
+            prop_assert_eq!(observed.window, clock.window);
+            prop_assert_eq!(observed.anchor_source, AnchorSource::Observed);
+            prop_assert_eq!(observed.current_period(now).len(), clock.current_period(now).len());
+            prop_assert!(observed.current_period(now).contains(now));
+            prop_assert_eq!(observed.current_period(reset).start, reset, "the observed reset starts a period");
+        }
+
+        /// The rolling window ends at `now` and is `window` long; without a
+        /// window it is empty and `has_window` is false.
+        #[test]
+        fn window_ends_now((clock, now) in clock()) {
+            let w = clock.current_window(now);
+            prop_assert_eq!(w.end, now);
+            prop_assert_eq!(w.len(), clock.window);
+            prop_assert_eq!(clock.has_window(), clock.window > Duration::zero());
+            if !clock.has_window() {
+                prop_assert_eq!(w.start, w.end);
+                prop_assert!(!w.contains(now));
+            } else {
+                prop_assert!(!w.contains(now), "half-open: now itself is outside");
+                prop_assert!(w.contains(now - Duration::seconds(1)));
+            }
+        }
+
+        /// The anchor source reflects where the anchor came from, and the
+        /// Monday default is a Monday midnight on or before `now`.
+        #[test]
+        fn anchor_source_matches_the_budget((clock, now) in clock()) {
+            match clock.anchor_source {
+                AnchorSource::Config => {}
+                AnchorSource::Default => {
+                    prop_assert!(clock.anchor <= now);
+                    prop_assert_eq!(clock.anchor.weekday(), chrono::Weekday::Mon);
+                    prop_assert_eq!(clock.anchor.time(), chrono::NaiveTime::MIN);
+                    prop_assert!(now - clock.anchor < Duration::days(7));
+                }
+                AnchorSource::Observed => prop_assert!(false, "from_provider never reports an observed anchor"),
+            }
+        }
+    }
+}

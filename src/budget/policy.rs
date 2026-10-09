@@ -298,7 +298,9 @@ impl<'a> Policy<'a> {
 
     fn verdict(&self, task: &Task, tier: &ModelTier, predicted_weighted: f64) -> Verdict {
         let blocked = |reason: String, retry_at: Option<DateTime<Utc>>| Verdict { eligible: false, reason, retry_at };
-        let Some(ledger) = self.ledgers.for_model(tier) else {
+        // A stale ledger of a provider that was disabled since must not make
+        // its models eligible: `candidates()` never lists them either.
+        let Some(ledger) = self.ledgers.for_model(tier).filter(|_| self.cfg.provider(tier.provider()).enabled) else {
             return blocked(format!("provider {} is disabled", tier.provider()), None);
         };
         let now = ledger.now;
@@ -1144,5 +1146,128 @@ mod tests {
         assert_eq!(lower_by(Criticality::Low, 0), Criticality::Low);
         assert_eq!(fraction_of(Duration::hours(10), 0.5), Duration::hours(5));
         assert_eq!(fraction_of(Duration::hours(10), 2.0), Duration::hours(10));
+    }
+}
+
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use crate::strategies::{budget_config, instant_between, ledgers, model, origin, prediction, rate_limits, task};
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// The policy never picks what it cannot use: a chosen model is on an
+        /// enabled provider that has a ledger, is not rate limited, and is
+        /// eligible by the policy's own `eligibility`. A hard override is
+        /// only ever satisfied within its own provider's downgrade chain.
+        /// Without a model there is a retry time after `now` and a trail of
+        /// reasons. The decision is a pure function of its inputs.
+        #[test]
+        fn decide_never_picks_what_it_cannot_use(
+            cfg in budget_config(),
+            ledgers in ledgers(),
+            limits in rate_limits(),
+            task in task(),
+            prediction in prediction(),
+            preferred in vec(model(), 0..=2),
+        ) {
+            let policy = Policy::new(&cfg, &ledgers, &limits);
+            let d = policy.decide(&task, prediction.clone(), &preferred);
+            prop_assert_eq!(&d, &policy.decide(&task, prediction.clone(), &preferred), "deterministic");
+            prop_assert!(!d.reasons.is_empty());
+            prop_assert_eq!(&d.prediction, &prediction);
+            match &d.model {
+                Some(m) => {
+                    prop_assert!(d.retry_at.is_none());
+                    prop_assert!(cfg.provider(m.provider()).enabled, "{} is disabled", m.provider());
+                    prop_assert!(ledgers.for_model(m).is_some());
+                    prop_assert!(!limits.is_exhausted(m, origin()), "{} is rate limited", m);
+                    prop_assert!(policy.candidates().contains(m), "{} is not a candidate", m);
+                    let (ok, why) = policy.eligibility(&task, m, prediction.weighted_tokens);
+                    prop_assert!(ok, "{}: {}", m, why);
+                    if let Some(o) = &task.model_override {
+                        prop_assert_eq!(m.provider(), o.provider(), "an override never crosses providers");
+                        prop_assert!(cfg.downgrade_chain(o).contains(m), "{} is not below the override {}", m, o);
+                    }
+                }
+                None => {
+                    let at = d.retry_at.expect("a throttled decision says when to look again");
+                    prop_assert!(at > origin(), "retry {} is not after now", at);
+                    for m in policy.candidates() {
+                        let (ok, why) = policy.eligibility(&task, &m, prediction.weighted_tokens);
+                        let pinned = task.model_override.as_ref().is_some_and(|o| !cfg.downgrade_chain(o).contains(&m));
+                        prop_assert!(!ok || pinned, "{} was eligible ({}) but nothing was chosen: {:?}", m, why, d.reasons);
+                    }
+                }
+            }
+        }
+
+        /// The rules' first preference wins whenever it is eligible and no
+        /// CLI override is set.
+        #[test]
+        fn preference_is_honoured_when_eligible(
+            cfg in budget_config(),
+            ledgers in ledgers(),
+            limits in rate_limits(),
+            mut task in task(),
+            prediction in prediction(),
+            preferred in vec(model(), 1..=2),
+        ) {
+            task.model_override = None;
+            let policy = Policy::new(&cfg, &ledgers, &limits);
+            let first = &preferred[0];
+            let d = policy.decide(&task, prediction.clone(), &preferred);
+            let (ok, why) = policy.eligibility(&task, first, prediction.weighted_tokens);
+            if ok {
+                prop_assert_eq!(d.model.as_ref(), Some(first), "{}: {}; {:?}", first, why, d.reasons);
+            }
+        }
+
+        /// A rate-limit mark is exactly a cooldown: exhausted strictly before
+        /// `until`, clear from then on; `clear_expired` drops exactly the
+        /// marks that are over; the provider is blocked iff every enabled
+        /// model is marked, until the soonest of their cooldowns.
+        #[test]
+        fn rate_limit_marks_are_cooldowns(
+            cfg in budget_config(),
+            marks in vec((model(), instant_between(3600, 3600)), 0..6),
+            now in instant_between(7200, 7200),
+        ) {
+            let mut state = RateLimitState::default();
+            for (tier, until) in &marks {
+                state.mark(tier.clone(), *until);
+            }
+            // Later marks of the same model replace earlier ones.
+            let mut expected: std::collections::BTreeMap<ModelTier, DateTime<Utc>> = Default::default();
+            for (tier, until) in &marks {
+                expected.insert(tier.clone(), *until);
+            }
+            prop_assert_eq!(&state.exhausted_until, &expected);
+            for (tier, until) in &expected {
+                prop_assert_eq!(state.is_exhausted(tier, now), now < *until);
+                prop_assert_eq!(state.until(tier, now), (now < *until).then_some(*until));
+            }
+            prop_assert!(!state.is_exhausted(&ModelTier::new("codex:never-marked"), now));
+            for p in Provider::ALL {
+                let enabled = cfg.provider(p).enabled_models();
+                let blocked = state.provider_blocked_until(&cfg, p, now);
+                let all_marked = !enabled.is_empty() && enabled.iter().all(|m| state.is_exhausted(m, now));
+                prop_assert_eq!(blocked.is_some(), all_marked, "{}: {:?}", p, blocked);
+                if let Some(at) = blocked {
+                    let soonest = enabled.iter().filter_map(|m| state.until(m, now)).min();
+                    prop_assert_eq!(Some(at), soonest);
+                }
+                let provider_until = state.provider_until(p, now);
+                let any = expected.iter().filter(|(t, u)| t.provider() == p && **u > now).map(|(_, u)| *u).min();
+                prop_assert_eq!(provider_until, any);
+            }
+            let mut cleared = state.clone();
+            cleared.clear_expired(now);
+            let kept: std::collections::BTreeMap<ModelTier, DateTime<Utc>> =
+                expected.iter().filter(|(_, u)| **u > now).map(|(t, u)| (t.clone(), *u)).collect();
+            prop_assert_eq!(&cleared.exhausted_until, &kept);
+            prop_assert_eq!(cleared.is_empty(), kept.is_empty());
+        }
     }
 }
