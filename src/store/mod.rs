@@ -977,6 +977,17 @@ impl Store {
         Ok(rows.next().transpose()?)
     }
 
+    /// The most recent event of exactly `kind` across all tasks, if any.
+    pub fn last_event_of_kind(&self, kind: &str) -> Result<Option<Event>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, task_id, session_id, timestamp, level, kind, message, data FROM events
+             WHERE kind = ?1 ORDER BY id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![kind], Self::row_to_event)?;
+        Ok(rows.next().transpose()?)
+    }
+
     pub fn recent_events(&self, limit: usize) -> Result<Vec<Event>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(

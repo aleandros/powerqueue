@@ -92,6 +92,9 @@ impl Repo {
             .stdin(Stdio::null())
             // Never block on a credential prompt from a daemon.
             .env("GIT_TERMINAL_PROMPT", "0")
+            // Messages are read by the code in a few places (and by users in
+            // error text); keep git's output in its untranslated form.
+            .env("LC_ALL", "C")
             .output()
             .with_context(|| format!("cannot run `{}` in {} (is git installed?)", self.describe(args), cwd.display()))
     }
@@ -185,15 +188,12 @@ impl Repo {
             bail!("`{rev}` does not resolve to a commit in {}", self.path.display());
         }
         let spec = format!("{rev}:{path}");
-        let out = self.git_output(None, &["show", &spec])?;
-        if out.status.success() {
-            return Ok(Some(String::from_utf8_lossy(&out.stdout).to_string()));
-        }
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if stderr.contains("does not exist in") || stderr.contains("exists on disk, but not in") {
+        // Existence is a separate, exit-status-only probe: `git show`'s
+        // "does not exist" message is translated on localized hosts.
+        if !self.git_succeeds(None, &["cat-file", "-e", &spec])? {
             return Ok(None);
         }
-        bail!("`{}` failed ({}) in {}: {}", self.describe(&["show", &spec]), out.status, self.path.display(), stderr.trim());
+        Ok(Some(self.git(None, &["show", &spec])?))
     }
 
     /// Blob ids of `paths` (relative to the repository root) on `rev`, keyed

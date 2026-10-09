@@ -45,30 +45,40 @@ impl Context {
         Ok(())
     }
 
-    /// Config with repo overrides applied. Error if not initialised.
+    /// Config with repo overrides applied. Error if not initialised. A
+    /// `.powerqueue.toml` that cannot be read or parsed does not fail the
+    /// command: the global configuration is used, the problem is recorded in
+    /// `overrides.error` (shown by `status`, `doctor` and `config show`) and
+    /// warned about once on stderr, so the commands that diagnose or stop
+    /// the daemon keep working. `powerqueue run` checks the field and
+    /// refuses to start.
     pub fn config(&mut self) -> Result<&Config> {
         if self.config.is_none() {
-            let mut cfg = Config::load(&self.paths)?;
-            let repo = cfg.repo_path();
-            if repo.exists() {
-                cfg.apply_repo_overrides(&repo)?;
-            }
-            self.config = Some(cfg);
+            let cfg = Config::load(&self.paths)?;
+            self.config = Some(self.with_repo_overrides(cfg));
         }
         Ok(self.config.as_ref().expect("config just loaded"))
     }
 
-    /// Config, or defaults when no file exists yet.
+    /// Config, or defaults when no file exists yet. Repo overrides degrade
+    /// as in [`Context::config`].
     pub fn config_or_default(&mut self) -> Result<&Config> {
         if self.config.is_none() {
-            let mut cfg = Config::load_or_default(&self.paths)?;
-            let repo = cfg.repo_path();
-            if !cfg.repo.path.is_empty() && repo.exists() {
-                cfg.apply_repo_overrides(&repo)?;
-            }
-            self.config = Some(cfg);
+            let cfg = Config::load_or_default(&self.paths)?;
+            self.config = Some(self.with_repo_overrides(cfg));
         }
         Ok(self.config.as_ref().expect("config just loaded"))
+    }
+
+    fn with_repo_overrides(&self, mut cfg: Config) -> Config {
+        let repo = cfg.repo_path();
+        if !cfg.repo.path.trim().is_empty()
+            && repo.exists()
+            && let Some(error) = cfg.apply_repo_overrides_or_record(&repo)
+        {
+            eprintln!("warning: {error}; running with config.toml alone (see `powerqueue doctor`)");
+        }
+        cfg
     }
 
     pub fn config_cloned(&mut self) -> Result<Config> {

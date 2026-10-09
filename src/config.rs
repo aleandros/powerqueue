@@ -22,6 +22,30 @@ use crate::paths::{Paths, expand_tilde};
 /// Name of the per-repository override file.
 pub const REPO_CONFIG_FILE: &str = ".powerqueue.toml";
 
+/// Upper bound for `repo.fetch_interval_secs` (one week): larger values are
+/// a typo, and would not fit the daemon's interval arithmetic.
+pub const MAX_FETCH_INTERVAL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// A path from `.powerqueue.toml` that git must be able to read from a
+/// commit (`git show <rev>:<path>`): `./` and empty segments collapsed, no
+/// `..`, no leading `/`. Fails in plain language when the path leaves the
+/// repository, since the committed copy could never be found.
+pub fn normalize_repo_relative(raw: &str) -> Result<String> {
+    let mut parts = Vec::new();
+    let slashed = raw.replace('\\', "/");
+    for segment in slashed.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => bail!("priority_file = \"{raw}\" leaves the repository; use a path inside it or an absolute path"),
+            s => parts.push(s),
+        }
+    }
+    if parts.is_empty() {
+        bail!("priority_file = \"{raw}\" names no file");
+    }
+    Ok(parts.join("/"))
+}
+
 /// Top-level configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -142,6 +166,9 @@ pub struct AppliedOverrides {
     /// `priority_file` as written in the file when it is relative to the
     /// repository root (the rules then come from the same place as the file).
     pub priority_file_in_repo: Option<String>,
+    /// Why the file could not be applied, when a command chose to run with
+    /// the global configuration alone (see [`Config::apply_repo_overrides_or_record`]).
+    pub error: Option<String>,
 }
 
 impl AppliedOverrides {
@@ -1598,8 +1625,9 @@ impl Config {
     /// (`origin/<branch>` after a fetch, else the local branch). The result's
     /// `text` is `None` when there is no such file; an error when the branch
     /// cannot be read (the working tree is never used as a fallback, by
-    /// design). Call it on the *global* config: `.powerqueue.toml` may set
-    /// `default_branch` itself, and that must not change where it is read from.
+    /// design). On a config that already has overrides applied the commit
+    /// recorded in [`Config::overrides`] is read again (`.powerqueue.toml`
+    /// may set `default_branch` itself, and that must not move the read).
     pub fn read_repo_overrides(&self, repo_path: &Path) -> Result<LoadedOverrides> {
         let file = repo_path.join(REPO_CONFIG_FILE);
         match self.repo.overrides_from {
@@ -1626,11 +1654,15 @@ impl Config {
         }
     }
 
-    /// The commit `repo.overrides_from = "default-branch"` reads from:
-    /// `origin/<default_branch>` when that remote branch exists locally,
-    /// else the local default branch. Fails when git cannot run or no
-    /// default branch can be determined.
+    /// The commit `repo.overrides_from = "default-branch"` reads from: the
+    /// commit recorded in [`Config::overrides`] when this config already has
+    /// overrides applied, else `origin/<default_branch>` when that remote
+    /// branch exists locally, else the local default branch. Fails when git
+    /// cannot run or no default branch can be determined.
     pub fn overrides_rev(&self, repo: &crate::worktree::Repo) -> Result<String> {
+        if let Some(rev) = &self.overrides.rev {
+            return Ok(rev.clone());
+        }
         let branch = match self.repo.default_branch.as_deref().map(str::trim) {
             Some(b) if !b.is_empty() => b.to_string(),
             _ => repo.default_branch()?,
@@ -1642,7 +1674,8 @@ impl Config {
     /// `repo.overrides_from` says (see [`Config::read_repo_overrides`]).
     /// Records what was taken in [`Config::overrides`]. Returns the file's
     /// path in the checkout when something was applied. Fails when the file
-    /// cannot be read or parsed.
+    /// cannot be read or parsed, or names a `priority_file` outside the
+    /// repository; the config is then unchanged.
     pub fn apply_repo_overrides(&mut self, repo_path: &Path) -> Result<Option<PathBuf>> {
         let loaded = self.read_repo_overrides(repo_path)?;
         let Some(text) = &loaded.text else {
@@ -1662,14 +1695,38 @@ impl Config {
         if let Some(t) = ov.priority_file.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
             let raw = expand_tilde(t);
             if !raw.is_absolute() {
-                priority_file_in_repo = Some(t.trim_start_matches("./").to_string());
+                let inside = normalize_repo_relative(t).with_context(|| format!("invalid {}", loaded.describe()))?;
+                priority_file_in_repo = Some(inside);
             }
             ov.priority_file = Some(resolve(t).to_string_lossy().to_string());
         }
-        self.overrides =
-            AppliedOverrides { file: Some(loaded.file.clone()), rev: loaded.rev, keys: Vec::new(), priority_file_in_repo };
+        self.overrides = AppliedOverrides {
+            file: Some(loaded.file.clone()),
+            rev: loaded.rev,
+            keys: Vec::new(),
+            priority_file_in_repo,
+            error: None,
+        };
         self.merge_overrides(ov);
         Ok(Some(loaded.file))
+    }
+
+    /// [`Config::apply_repo_overrides`] for commands that must keep working
+    /// when the repository's `.powerqueue.toml` cannot be read (the default
+    /// branch is missing, git fails, the file does not parse): the error is
+    /// recorded in `overrides.error`, the global configuration stays as it
+    /// is, and the caller decides whether that is acceptable (`status` and
+    /// `doctor` report it; `run` refuses to start). Returns the error that
+    /// was recorded, if any.
+    pub fn apply_repo_overrides_or_record(&mut self, repo_path: &Path) -> Option<String> {
+        match self.apply_repo_overrides(repo_path) {
+            Ok(_) => None,
+            Err(e) => {
+                let error = format!("{e:#}");
+                self.overrides = AppliedOverrides { error: Some(error.clone()), ..AppliedOverrides::default() };
+                Some(error)
+            }
+        }
     }
 
     /// Fold `ov` into this config: scalars replace, lists replace,
@@ -1724,7 +1781,11 @@ impl Config {
                 Some(existing) => format!("{existing}\n\n{instr}"),
                 None => instr,
             });
-            keys.push("instructions".to_string());
+            // `instructions` lands in `claude.append_system_prompt`: record
+            // the key it changed so `config show` marks that value.
+            if !keys.iter().any(|k| k == "claude.append_system_prompt") {
+                keys.push("claude.append_system_prompt".to_string());
+            }
         }
         if let Some(t) = ov.prompt_template.filter(|t| !t.trim().is_empty()) {
             self.prompt.template = Some(t);
@@ -1916,6 +1977,11 @@ impl Config {
         }
         if !self.repo.branch_template.contains("{key}") && !self.repo.branch_template.contains("{id}") {
             problems.push("repo.branch_template must contain {key} or {id}".to_string());
+        }
+        if self.repo.fetch_interval_secs > MAX_FETCH_INTERVAL_SECS {
+            problems.push(format!(
+                "repo.fetch_interval_secs must be at most {MAX_FETCH_INTERVAL_SECS} seconds (a week); 0 disables the periodic fetch"
+            ));
         }
         if self.scheduler.max_concurrent == 0 {
             problems.push("scheduler.max_concurrent must be >= 1".to_string());
@@ -2288,6 +2354,75 @@ mod tests {
         assert_eq!(cfg.codex.approval, "yolo");
         assert_eq!(cfg.gemini.mode, "plan");
         assert_eq!(cfg.gemini.effort.as_deref(), Some("low"));
+        // `instructions` is recorded as the key it changed, once.
+        assert!(cfg.overrides.sets("claude.append_system_prompt"));
+        assert!(!cfg.overrides.keys.iter().any(|k| k == "instructions"));
+        assert_eq!(cfg.overrides.keys.iter().filter(|k| *k == "claude.append_system_prompt").count(), 1);
+        let mut both = Config::default();
+        let ov: RepoOverrides = toml::from_str("instructions = 'A'\n[claude]\nappend_system_prompt = 'B'\n").unwrap();
+        both.merge_overrides(ov);
+        assert_eq!(both.claude.append_system_prompt.as_deref(), Some("B\n\nA"));
+        assert_eq!(both.overrides.keys.iter().filter(|k| *k == "claude.append_system_prompt").count(), 1);
+    }
+
+    #[test]
+    fn repo_relative_paths_are_normalised_or_rejected() {
+        assert_eq!(normalize_repo_relative("docs/PRIORITY.md").unwrap(), "docs/PRIORITY.md");
+        assert_eq!(normalize_repo_relative("./docs/./PRIORITY.md").unwrap(), "docs/PRIORITY.md");
+        assert_eq!(normalize_repo_relative("docs//PRIORITY.md").unwrap(), "docs/PRIORITY.md");
+        assert_eq!(normalize_repo_relative("docs\\PRIORITY.md").unwrap(), "docs/PRIORITY.md");
+        let err = normalize_repo_relative("../shared/PRIORITY.md").unwrap_err().to_string();
+        assert!(err.contains("leaves the repository"), "{err}");
+        assert!(normalize_repo_relative("./").is_err());
+
+        // Through `.powerqueue.toml`: the committed copy is looked up by the
+        // normalised path, and a path outside the repository is rejected
+        // when the file is applied.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "priority_file = \"./docs//PRIORITY.md\"\n").unwrap();
+        let mut cfg = Config::default();
+        cfg.repo.path = repo.display().to_string();
+        cfg.apply_repo_overrides(&repo).unwrap();
+        assert_eq!(cfg.overrides.priority_file_in_repo.as_deref(), Some("docs/PRIORITY.md"));
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "priority_file = \"../queue/PRIORITY.md\"\n").unwrap();
+        let mut cfg = Config::default();
+        cfg.repo.path = repo.display().to_string();
+        let err = cfg.apply_repo_overrides(&repo).unwrap_err();
+        assert!(format!("{err:#}").contains("leaves the repository"), "{err:#}");
+        assert_eq!(cfg.overrides, AppliedOverrides::default(), "nothing applied");
+    }
+
+    #[test]
+    fn a_failed_override_read_can_be_recorded_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "nonsense = = =\n").unwrap();
+        let mut cfg = Config::default();
+        cfg.repo.path = repo.display().to_string();
+        cfg.scheduler.max_concurrent = 5;
+        let error = cfg.apply_repo_overrides_or_record(&repo).expect("the file does not parse");
+        assert!(error.contains("invalid"), "{error}");
+        assert_eq!(cfg.overrides.error.as_deref(), Some(error.as_str()));
+        assert_eq!(cfg.scheduler.max_concurrent, 5, "the global configuration stands");
+        assert!(cfg.overrides.keys.is_empty());
+        // A readable file clears it.
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "[scheduler]\nmax_concurrent = 3\n").unwrap();
+        assert_eq!(cfg.apply_repo_overrides_or_record(&repo), None);
+        assert_eq!(cfg.overrides.error, None);
+        assert_eq!(cfg.scheduler.max_concurrent, 3);
+    }
+
+    #[test]
+    fn fetch_interval_has_an_upper_bound() {
+        let mut cfg = Config::default();
+        cfg.repo.path = "/r".into();
+        cfg.repo.fetch_interval_secs = MAX_FETCH_INTERVAL_SECS;
+        assert!(cfg.validate().iter().all(|p| !p.contains("fetch_interval")), "{:?}", cfg.validate());
+        cfg.repo.fetch_interval_secs = MAX_FETCH_INTERVAL_SECS + 1;
+        assert!(cfg.validate().iter().any(|p| p.contains("repo.fetch_interval_secs must be at most")), "{:?}", cfg.validate());
     }
 
     #[test]
@@ -2594,6 +2729,16 @@ restart_backoff_secs = [5, 10]
         assert_eq!(cfg.scheduler.max_concurrent, 3, "read from main, the global default branch");
         assert_eq!(cfg.repo.default_branch.as_deref(), Some("develop"), "the override applies to new worktrees");
         assert_eq!(cfg.overrides.rev.as_deref(), Some("main"), "and the recorded commit is the one that was read");
+        // Reading again from the merged config (doctor, tune, config
+        // validate do) stays on the recorded commit, not on `develop`.
+        let again = cfg.read_repo_overrides(&repo).unwrap();
+        assert_eq!(again.rev.as_deref(), Some("main"));
+        assert!(again.text.unwrap().contains("max_concurrent = 3"));
+        assert_eq!(cfg.overrides_rev(&crate::worktree::Repo::new(&repo)).unwrap(), "main");
+        let mut reapplied = cfg.clone();
+        reapplied.apply_repo_overrides(&repo).unwrap();
+        assert_eq!(reapplied.scheduler.max_concurrent, 3);
+        assert_eq!(reapplied.overrides.keys, cfg.overrides.keys);
         // Without the file, the commit is still recorded.
         git(&repo, &["rm", "-q", REPO_CONFIG_FILE]);
         git(&repo, &["commit", "-qm", "drop"]);

@@ -299,4 +299,37 @@ fn repo_overrides_are_attributed_validated_and_read_from_the_default_branch() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("set by the repository"));
+
+    // A branch that cannot be read does not lock the CLI out: status, config
+    // show and doctor run on config.toml alone and say so; run refuses.
+    pq(home.path()).args(["config", "set", "repo.default_branch", "nope"]).assert().success();
+    pq(home.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("warning: cannot read .powerqueue.toml from nope"))
+        .stdout(predicate::str::contains("shown with config.toml alone"));
+    let out = pq(home.path()).args(["--json", "status"]).output().unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["repo_overrides_error"].as_str().unwrap().contains("nope"), "{v}");
+    pq(home.path())
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("repository overrides NOT applied: cannot read .powerqueue.toml from nope"))
+        .stdout(predicate::str::contains("max_concurrent = 2\n"));
+    pq(home.path())
+        .args(["doctor", "--offline"])
+        .assert()
+        .code(predicate::in_iter([0, 1]))
+        .stdout(predicate::str::contains(".powerqueue.toml"))
+        .stdout(predicate::str::contains("does not resolve"));
+    pq(home.path())
+        .args(["run", "--once", "--offline"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot start: cannot read .powerqueue.toml from nope"));
+    pq(home.path()).args(["config", "unset", "repo.default_branch"]).assert().success();
+    pq(home.path()).args(["status"]).assert().success().stderr(predicate::str::contains("warning").not());
 }

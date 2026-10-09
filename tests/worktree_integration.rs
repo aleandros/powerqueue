@@ -350,6 +350,7 @@ fn show_file_blob_ids_and_current_branch() {
     assert_eq!(repo.current_branch().unwrap().as_deref(), Some("main"));
     assert_eq!(repo.show_file("main", "README.md").unwrap().as_deref(), Some("hello\n"));
     assert_eq!(repo.show_file("main", "missing.txt").unwrap(), None);
+    assert_eq!(repo.show_file("main", "no/such/dir/PRIORITY.md").unwrap(), None, "a missing directory is just absent");
     std::fs::write(repo.path.join("README.md"), "dirty\n").unwrap();
     assert_eq!(repo.show_file("main", "README.md").unwrap().as_deref(), Some("hello\n"), "working tree ignored");
     let err = repo.show_file("nope", "README.md").unwrap_err().to_string();

@@ -53,7 +53,7 @@ anything else uses the explicit `codex:<name>` form.
 | `fast_forward_base` | `true` | after that fetch, before creating a branch, fast-forward the local default branch to `origin/<default_branch>` when it is safe (no local commits, no rebase/bisect, clean checkout; hooks off) |
 | `setup` | `[]` | commands run (`sh -c`) in a fresh worktree before Claude starts, with `POWERQUEUE_TASK_ID`, `POWERQUEUE_TASK_KEY`, `POWERQUEUE_TASK_SLUG`, `POWERQUEUE_TASK_DIR`, `POWERQUEUE_BRANCH`, `POWERQUEUE_WORKTREE`, `POWERQUEUE_DATA_DIR` and `POWERQUEUE_STATE_DIR` in the environment |
 | `overrides_from` | `"working-tree"` | where the repository's [`.powerqueue.toml`](#per-repository-overrides-powerqueuetoml) (and a relative `priority_file` named in it) is read from: the main checkout's working tree, or `"default-branch"` for the file as committed on `origin/<default_branch>` (the local branch when there is no remote), so a `git checkout` in the main checkout cannot change what the daemon runs |
-| `fetch_interval_secs` | `300` | with `overrides_from = "default-branch"`, how often the daemon runs `git fetch` so a change merged upstream reaches it while the queue is idle; `0` = only the fetch before a task starts |
+| `fetch_interval_secs` | `300` | with `overrides_from = "default-branch"`, how often the daemon runs `git fetch` so a change merged upstream reaches it while the queue is idle; `0` = only the fetch before a task starts; at most a week (604800) |
 
 ## `[github]`
 
@@ -530,6 +530,8 @@ replace the global value (lists are not merged), `instructions` and
 global: they describe the host, not the project. Unknown keys are rejected,
 and the daemon then keeps its previous configuration (event
 `daemon.reload_failed`; `config validate` and `doctor` show the problem).
+A relative `priority_file` must stay inside the repository (`../x` is
+rejected); `./` and doubled slashes are collapsed.
 
 ```toml
 setup = ["npm ci"]
@@ -599,4 +601,17 @@ when it changed (event `daemon.reloaded`, with the keys taken), or only the
 rules when nothing but the committed rules changed. As with `config set`,
 new sessions use the new values; running sessions keep theirs. A working-tree
 `PRIORITY.md` (global or `priority_file`) is watched as before
-(`priority.live_reload`).
+(`priority.live_reload`). A change that cannot be applied (the file does not
+parse, `config.toml` was mid-edit, git was busy) is reported once (event
+`daemon.reload_failed`) and retried every check, so a transient failure
+heals by itself; `doctor` ("config reload") says when the daemon is still on
+the configuration from before such a change. A git failure while checking
+is reported once (event `daemon.overrides_check_failed`) and never counts
+as a change. The periodic fetch runs on its own thread: an unreachable
+remote delays the next check, not the daemon.
+
+**When the branch cannot be read** (`default-branch` mode and the branch is
+missing, or git fails), the daemon does not start and a running daemon keeps
+what it has; every other command runs with `config.toml` alone and says so
+(`status`, `config show`, `doctor`), so the queue can still be inspected,
+paused or stopped.
