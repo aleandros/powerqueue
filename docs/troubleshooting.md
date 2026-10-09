@@ -66,6 +66,34 @@ powerqueue service logs -n 50  # journalctl --user -u powerqueue.service / launc
 - The service stops when you log out: `powerqueue service install --linger`
   (or `loginctl enable-linger $USER`).
 
+## The daemon ignores a change to `.powerqueue.toml`
+
+**Symptom**: `config show` prints the new value, the daemon still behaves as
+before; `powerqueue doctor` warns under "config reload".
+
+A change the daemon could not apply (the file did not parse, `config.toml`
+was being edited at that moment, git was holding a lock) is logged once as
+`daemon.reload_failed` and retried every 10 seconds. If it keeps failing:
+
+```sh
+powerqueue config validate          # names the offending key or line
+powerqueue logs --events | grep daemon.reload
+```
+
+Fix the file; the next check applies it. With `repo.overrides_from =
+"default-branch"` the file is the one committed on `origin/<default_branch>`:
+push the fix, or run `git fetch` in the main checkout to see it sooner.
+
+**Symptom**: `warning: cannot read .powerqueue.toml from origin/main ...;
+running with config.toml alone` on every command, and `powerqueue run`
+refuses to start.
+
+The main checkout has no `origin/<default_branch>` (fresh clone, renamed
+branch, no `origin` remote) or git fails there. `git fetch origin` in the
+main checkout, set `repo.default_branch` to the real name, or switch to
+`repo.overrides_from = "working-tree"`. The other commands keep working in
+the meantime.
+
 ## No tasks are picked up
 
 **Symptom**: the daemon runs, `status` is empty.

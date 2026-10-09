@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A `.powerqueue.toml` that cannot be read from the default branch no longer
+  locks every command out: `status`, `doctor`, `config show`, `stop`, `pause`
+  and the rest run with `config.toml` alone and say so (`status --json` and
+  `config show --json` carry the error); only `run` refuses to start.
+- `doctor`, `tune` and `config validate` read `.powerqueue.toml` from the
+  commit the daemon loaded it from, even when that file sets
+  `default_branch` itself.
+- Whether `.powerqueue.toml` exists on a branch is now an exit-status probe
+  (`git cat-file -e`), and git runs with `LC_ALL=C`: a localized git no
+  longer turns a missing file into a hard error.
+- The daemon retries a reload that failed (a half-written `config.toml`, a
+  git lock) every check instead of waiting for the next change, logs it once,
+  and `doctor` reports a daemon still running the configuration from before
+  such a change ("config reload").
+- A git failure while checking `.powerqueue.toml` for changes keeps the last
+  known fingerprint and is logged once (`daemon.overrides_check_failed`)
+  instead of causing a spurious reload (which also reset the GitHub
+  rate-limit backoff) once git recovered.
+- A reload asked for by `config set` moves the change baseline, so the next
+  check no longer reloads the same change a second time.
+- The periodic `git fetch` runs on a blocking thread; an unreachable remote
+  no longer stalls hook processing and `stop` / `pause` for the duration of
+  the network timeout. A fetch before a task start counts as the periodic one.
+- `repo.fetch_interval_secs` is capped at a week by `config validate`; an
+  absurd value no longer panics the daemon's first tick.
+- `priority simulate --json` prints one JSON document when the rules file is
+  missing (`rules_missing: true`) instead of two; the `priority` commands'
+  missing-file hint names the branch when the rules are committed.
+- A relative `priority_file` in `.powerqueue.toml` is normalised (`./`,
+  doubled slashes) and one that leaves the repository (`../x`) is rejected
+  when the file is applied, instead of making the rules permanently
+  unreadable.
+- `config show` marks values from `.powerqueue.toml` by editing the parsed
+  TOML (`toml_edit`) rather than scanning lines, and a repository
+  `instructions` value is attributed to `claude.append_system_prompt`, the
+  key it changes.
+
 ## [0.11.0] - 2026-10-08
 
 The queue's policy can live in the repository: `.powerqueue.toml` now carries
