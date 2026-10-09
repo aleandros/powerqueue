@@ -1,15 +1,18 @@
 //! Model-based test of a task's life (proptest).
 //!
 //! A random sequence of the calls the daemon makes into the pure core
-//! (commands, launches, hooks, probes, the PR watcher, re-scoring) is run
-//! against one task, with the preconditions of each call mirroring the
-//! daemon's call site. After every step the task, its session and the
+//! (commands, launches, hooks, probes, the PR watcher, re-scoring) and the
+//! writes the CLI makes straight into the store (`task complete`, `task
+//! block`) is run against one task, with the preconditions of each call
+//! mirroring its call site. After every step the task, its session and the
 //! effects are checked against invariants no single transition test can
-//! see: a live session only exists in states that expect one, `not_before`
-//! is only set while crashed or throttled, attempts move only through
-//! `claim` and a retry, terminal states are only left by a retry, review
-//! rounds stay within `review_rounds_max`, and every effect serialises and
-//! deserialises to itself (the trace a specification would consume).
+//! see: a live session only exists in states that may keep one,
+//! `not_before` is only set while crashed or throttled, attempts move only
+//! through `claim` and a retry, terminal states are only left by a retry
+//! (or a late done marker of a failed session), a launch under way is never
+//! interrupted by a direct write, review rounds stay within
+//! `review_rounds_max`, and every effect serialises and deserialises to
+//! itself (the trace a specification would consume).
 //!
 //! The ops are generated without preconditions and skipped when one does
 //! not hold, which keeps the generator simple and lets shrinking drop any
@@ -56,10 +59,12 @@ enum Op {
         pane_tail: Option<String>,
         cooldown_secs: Option<i64>,
     },
-    /// `powerqueue task complete` (no PR).
+    /// `powerqueue task complete` (no PR): a direct write.
     Complete(Option<String>),
-    /// `powerqueue task complete --pr <url>`.
+    /// `powerqueue task complete --pr <url>`: a direct write.
     HandOff(String),
+    /// `powerqueue task block`: a direct write.
+    Block(Option<String>),
     /// One poll of the PR (its number is patched to the task's PR).
     PrStatus(PrStatus),
     /// The Linear sync changed the task's links.
@@ -102,6 +107,7 @@ fn op() -> impl Strategy<Value = Op> {
             .prop_map(|(probe, nudged, pane_tail, cooldown_secs)| Op::Probe { probe, nudged, pane_tail, cooldown_secs }),
         2 => prop::option::of(line()).prop_map(Op::Complete),
         3 => any_pr_url().prop_map(Op::HandOff),
+        1 => prop::option::of(line()).prop_map(Op::Block),
         4 => pr_status(1).prop_map(Op::PrStatus),
         1 => (vec(linked_issue(), 0..3), vec(linked_issue(), 0..2))
             .prop_map(|(blocked_by, children)| Op::Links { blocked_by, children }),
@@ -149,9 +155,11 @@ impl World {
         let now = self.now;
         let live = self.session_live();
         // A start runs to its end inside one daemon tick (`start_task`):
-        // nothing else sees the task between `on_starting` and the launch
-        // or the crash that prevents it.
-        if self.start.is_some() && !matches!(op, Op::Claim | Op::LaunchFailed(_) | Op::Launched { .. }) {
+        // no other daemon call sees the task between `on_starting` and the
+        // launch or the crash that prevents it. The CLI's direct writes run
+        // in another process and do see it; they must refuse (checked).
+        let direct = matches!(op, Op::Complete(_) | Op::HandOff(_) | Op::Block(_));
+        if self.start.is_some() && !direct && !matches!(op, Op::Claim | Op::LaunchFailed(_) | Op::Launched { .. }) {
             return None;
         }
         match op {
@@ -254,29 +262,18 @@ impl World {
                 Some(transitions::on_probe(&mut self.task, session, probe, &self.cfg.scheduler, &ctx))
             }
             Op::Complete(summary) => {
-                // `cli::commands::task::complete_task`, then the daemon's finalize.
-                if self.task.state == TaskState::Completed || !self.task.state.can_transition_to(TaskState::Completed) {
-                    return None;
-                }
-                self.task.state = TaskState::Completed;
-                self.task.completed_at = Some(now);
-                self.task.not_before = None;
-                if let Some(s) = summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                    self.task.summary = Some(s.to_string());
-                }
-                self.task.last_error = None;
-                Some(self.finalize())
+                // `task complete` as the CLI writes it, then the daemon's finalize.
+                let mut effects = commands::on_complete(&mut self.task, summary.as_deref(), now).ok()?;
+                effects.extend(self.finalize());
+                Some(effects)
             }
             Op::HandOff(url) => {
-                // `cli::commands::task::hand_off_for_review`, then the daemon's finalize.
-                if review::pr_number_of(url).is_none()
-                    || (self.task.state != TaskState::InReview && !self.task.state.can_transition_to(TaskState::InReview))
-                {
-                    return None;
-                }
-                self.task.hand_off_for_review(url, now);
-                Some(self.finalize())
+                // `task complete --pr` as the CLI writes it, then the daemon's finalize.
+                let mut effects = commands::on_hand_off(&mut self.task, url, None, now).ok()?;
+                effects.extend(self.finalize());
+                Some(effects)
             }
+            Op::Block(reason) => commands::on_block(&mut self.task, reason.as_deref()).ok(),
             Op::PrStatus(status) => {
                 if self.task.state != TaskState::InReview || live {
                     return None;
@@ -291,7 +288,9 @@ impl World {
                 Some(Vec::new())
             }
             Op::Evaluate { criticality, score, skip } => {
-                if self.task.state.has_live_session() {
+                // The daemon never re-scores under a live session (a
+                // throttled or paused task may keep one).
+                if self.task.state.has_live_session() || live {
                     return None;
                 }
                 let eval = Evaluation {
@@ -347,13 +346,6 @@ fn fresh_task() -> impl Strategy<Value = Task> {
     )
 }
 
-/// States in which a live session may exist: the ones that expect one,
-/// plus a paused task (its session finishes its turn) and a throttled one
-/// (the agent waits in-session for its usage limit to reset).
-fn may_hold_live_session(state: TaskState) -> bool {
-    state.has_live_session() || matches!(state, TaskState::Paused | TaskState::Throttled)
-}
-
 fn check(step: usize, op: &Op, before: &World, after: &World, effects: &[Effect]) -> Result<(), TestCaseError> {
     let (b, a) = (&before.task, &after.task);
     let ctx = |what: &str| {
@@ -370,11 +362,22 @@ fn check(step: usize, op: &Op, before: &World, after: &World, effects: &[Effect]
         prop_assert!(b.state.can_transition_to(a.state), "{}", ctx("move not in TaskState::can_transition_to"));
     }
 
+    // A launch under way is never interrupted: `start_task` persists
+    // `running` when it ends, so a direct write landing in between would
+    // be lost. Only the launch's own steps apply.
+    if before.start.is_some() {
+        prop_assert!(
+            matches!(op, Op::Claim | Op::LaunchFailed(_) | Op::Launched { .. }),
+            "{}",
+            ctx("applied to a task the daemon is launching")
+        );
+    }
+
     // Session / task agreement.
     if let Some(s) = &after.session {
         prop_assert_eq!(s.task_id, a.id);
         if s.state.is_live() {
-            prop_assert!(may_hold_live_session(a.state), "{}", ctx("live session in a state that has none"));
+            prop_assert!(a.state.may_keep_session(), "{}", ctx("live session in a state that has none"));
             prop_assert_eq!(s.attempt, a.attempts, "{}", ctx("live session attempt differs from the task's"));
         }
     }
@@ -401,9 +404,19 @@ fn check(step: usize, op: &Op, before: &World, after: &World, effects: &[Effect]
         prop_assert!(a.attempts >= 1, "{}", ctx("started without an attempt"));
     }
 
-    // Terminal states are only left by a retry.
+    // Terminal states are only left by a retry; the one move between them
+    // is failed → completed: the done marker of the last attempt drained
+    // after the probe gave up on it, or a human who finished the work.
     if b.state.is_terminal() && !a.state.is_terminal() {
         prop_assert!(matches!(op, Op::Retry), "{}", ctx("left a terminal state"));
+    }
+    if b.state.is_terminal() && a.state.is_terminal() && a.state != b.state {
+        prop_assert!(
+            (b.state, a.state) == (TaskState::Failed, TaskState::Completed)
+                && matches!(op, Op::Hook(HookOutcome::Completed { .. }) | Op::Complete(_)),
+            "{}",
+            ctx("moved between terminal states")
+        );
     }
     prop_assert_eq!(a.completed_at.is_some(), a.state.is_terminal(), "{}", ctx("completed_at vs terminal"));
 

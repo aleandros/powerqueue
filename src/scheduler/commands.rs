@@ -1,18 +1,131 @@
-//! Pure transitions for user commands (`task pause|resume|cancel|retry|model`).
+//! Pure transitions for user commands (`task pause|resume|cancel|retry|model`)
+//! and the direct writes (`task complete`, `task complete --pr`, `task block`).
 //!
 //! Each function mutates the in-memory [`Task`] (and the live [`Session`],
 //! when one is handed in) and returns the [`Effect`]s the daemon must carry
 //! out: events to log, a window to kill, a cleanup, a relayed answer to
 //! forget. A command that does not apply to the task's state leaves it
 //! untouched and returns at most a log effect; the daemon persists a task
-//! only when it changed.
+//! only when it changed. A direct write that does not apply is [`Refused`]
+//! with the message the CLI shows.
 
 use chrono::{DateTime, Utc};
 
 use crate::domain::{EventLevel, ModelTier, Session, SessionState, Task, TaskState};
+use crate::github::PrRef;
 
 use super::review;
 use super::transitions::{Effect, SKIP_REASON};
+
+/// Why a direct write (`task complete`, `task block`) does not apply to the
+/// task; shown to the user as is.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct Refused(pub String);
+
+/// `task complete` without a PR, written straight into the store by the
+/// agent from inside its session or by a human: the task goes `completed`
+/// with `summary` and the daemon releases its session, if still live, on
+/// its next tick ([`super::transitions::release_session`]). Refused for a
+/// task that is already completed or that the table does not let complete
+/// ([`TaskState::can_transition_to`]), and for a `starting` one: the daemon
+/// is launching it and persists `running` when the launch ends, which would
+/// lose the completion.
+pub fn on_complete(task: &mut Task, summary: Option<&str>, now: DateTime<Utc>) -> Result<Vec<Effect>, Refused> {
+    if task.state == TaskState::Completed {
+        return Err(Refused(format!("{} is already completed", task.key)));
+    }
+    refuse_while_starting(task, "complete")?;
+    if !task.state.can_transition_to(TaskState::Completed) {
+        return Err(Refused(format!("cannot complete {} while it is {} (cancel it instead)", task.key, task.state)));
+    }
+    task.state = TaskState::Completed;
+    task.completed_at = Some(now);
+    task.not_before = None;
+    if let Some(s) = non_empty(summary) {
+        task.summary = Some(s.to_string());
+    }
+    task.last_error = None;
+    Ok(vec![Effect::log(
+        EventLevel::Info,
+        "task.completed_by_command",
+        "marked completed via `powerqueue task complete`",
+        serde_json::json!({ "summary": task.summary }),
+    )])
+}
+
+/// `task complete --pr <url>`: the task moves to `in_review` with the PR
+/// recorded ([`Task::hand_off_for_review`]), so the daemon releases its
+/// session, slot and worktree (keeping the branch) and watches the PR.
+/// Calling it again while in review re-arms the watch (e.g. after a review
+/// round). Refused for a URL that is not a GitHub pull request, a task that
+/// is not running (queued, finished, ...) and a `starting` one (see
+/// [`on_complete`]).
+pub fn on_hand_off(task: &mut Task, pr_url: &str, summary: Option<&str>, now: DateTime<Utc>) -> Result<Vec<Effect>, Refused> {
+    let pr: PrRef = pr_url.parse().map_err(Refused)?;
+    refuse_while_starting(task, "hand off for review")?;
+    if task.state != TaskState::InReview && !task.state.can_transition_to(TaskState::InReview) {
+        return Err(Refused(format!(
+            "cannot hand {} off for review while it is {} (only a running task opens a PR)",
+            task.key, task.state
+        )));
+    }
+    let from = task.state;
+    task.hand_off_for_review(pr_url, now);
+    if let Some(s) = non_empty(summary) {
+        task.summary = Some(s.to_string());
+    }
+    let rounds = task.review.as_ref().map_or(0, |r| r.rounds);
+    Ok(vec![Effect::log(
+        EventLevel::Info,
+        "task.in_review",
+        format!(
+            "handed off for review: {pr} (merge armed{})",
+            if rounds > 0 { format!(", after {rounds} review round(s)") } else { String::new() }
+        ),
+        serde_json::json!({ "pr": task.pr_url, "from": from, "rounds": rounds, "summary": task.summary }),
+    )])
+}
+
+/// `task block`: the task needs a human (`needs_attention`) for `reason`;
+/// a live session keeps running (the agent is waiting for the answer).
+/// Refused for a finished task, one the table does not let block, and a
+/// `starting` one (see [`on_complete`]).
+pub fn on_block(task: &mut Task, reason: Option<&str>) -> Result<Vec<Effect>, Refused> {
+    if task.state.is_terminal() {
+        return Err(Refused(format!("cannot block {}: it is already {}", task.key, task.state)));
+    }
+    refuse_while_starting(task, "block")?;
+    if !task.state.can_transition_to(TaskState::NeedsAttention) {
+        return Err(Refused(format!("cannot block {} while it is {}", task.key, task.state)));
+    }
+    task.state = TaskState::NeedsAttention;
+    // A throttled task's retry time is over: a human decides when it runs.
+    task.not_before = None;
+    if let Some(r) = non_empty(reason) {
+        task.last_error = Some(r.to_string());
+    }
+    Ok(vec![Effect::log(
+        EventLevel::Warn,
+        "task.blocked_by_command",
+        format!("blocked via `powerqueue task block`: {}", task.last_error.as_deref().unwrap_or("no reason given")),
+        serde_json::json!({ "reason": task.last_error }),
+    )])
+}
+
+fn refuse_while_starting(task: &Task, verb: &str) -> Result<(), Refused> {
+    if task.state == TaskState::Starting {
+        return Err(Refused(format!(
+            "cannot {verb} {} while the daemon is launching it; try again once it is running",
+            task.key
+        )));
+    }
+    Ok(())
+}
+
+fn non_empty(text: Option<&str>) -> Option<&str> {
+    text.map(str::trim).filter(|s| !s.is_empty())
+}
 
 /// `task pause`. `live` says whether the task has a live session (it
 /// finishes its turn and is not relaunched). Terminal and already paused

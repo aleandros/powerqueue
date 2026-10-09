@@ -37,9 +37,9 @@ pub const WATCHER_ERROR_PREFIX: &str = "PR watcher:";
 
 /// An `in_review` task whose `pr_url` is not a usable pull request: nothing
 /// can be watched, so a human must look at it.
-pub fn on_unusable_pr(task: &mut Task, error: &str) -> Vec<Effect> {
+pub fn on_unusable_pr(task: &mut Task, error: &str, now: DateTime<Utc>) -> Vec<Effect> {
     let url = task.pr_url.clone().unwrap_or_default();
-    park(task, format!("in review without a usable pull request: {error}"));
+    park(task, format!("in review without a usable pull request: {error}"), now);
     vec![Effect::Log {
         level: EventLevel::Warn,
         kind: "review.error".into(),
@@ -161,7 +161,7 @@ pub fn on_pr_status(task: &mut Task, status: &PrStatus, cfg: &SchedulerConfig, n
         effects.push(Effect::DeleteBranch);
         None
     } else if status.state == "CLOSED" {
-        park(task, CLOSED_UNMERGED.to_string());
+        park(task, CLOSED_UNMERGED.to_string(), now);
         watch.waiting_manual_merge = false;
         effects.push(log(EventLevel::Warn, "review.closed", format!("PR #{} was closed without merging", status.number)));
         None
@@ -191,7 +191,7 @@ pub fn on_pr_status(task: &mut Task, status: &PrStatus, cfg: &SchedulerConfig, n
             let since = watch.last_change_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             let reason =
                 format!("PR #{} has not changed since {since} (review_stale_hours = {})", status.number, cfg.review_stale_hours);
-            park(task, reason.clone());
+            park(task, reason.clone(), now);
             effects.push(log(EventLevel::Warn, "review.stale", reason));
             effects.push(Effect::LinearComment {
                 body: format!(
@@ -216,6 +216,7 @@ pub fn on_pr_status(task: &mut Task, status: &PrStatus, cfg: &SchedulerConfig, n
             park(
                 task,
                 format!("PR #{} needs work ({what}) but review_rounds_max = {} is used up", status.number, cfg.review_rounds_max),
+                now,
             );
             effects.push(log(
                 EventLevel::Warn,
@@ -289,16 +290,15 @@ pub fn pr_number_of(url: &str) -> Option<u64> {
     url.parse::<crate::github::PrRef>().ok().map(|pr| pr.number)
 }
 
-/// Hand the task to a human: `needs_attention` with `reason`. The watch is
-/// marked parked so `task resume` watches the PR again instead of running a
-/// relaunch that may be pending ([`Task::parked_in_review`]).
-fn park(task: &mut Task, reason: String) {
+/// Hand the task to a human: `needs_attention` with `reason`. The watch
+/// (created at `now` when the row has none) is marked parked so `task
+/// resume` watches the PR again instead of running a relaunch that may be
+/// pending, or re-queuing the task ([`Task::parked_in_review`]).
+fn park(task: &mut Task, reason: String, now: DateTime<Utc>) {
     task.state = TaskState::NeedsAttention;
     task.last_error = Some(reason);
     task.not_before = None;
-    if let Some(watch) = task.review.as_mut() {
-        watch.parked = true;
-    }
+    task.review.get_or_insert_with(|| ReviewWatch::armed(now, None)).parked = true;
 }
 
 fn log(level: EventLevel, kind: &str, message: String) -> Effect {
@@ -526,7 +526,7 @@ mod tests {
         let mut t = task();
         t.pr_url = Some("not a url".into());
         t.not_before = Some(now() + Duration::hours(1));
-        let effects = on_unusable_pr(&mut t, "invalid pull request URL");
+        let effects = on_unusable_pr(&mut t, "invalid pull request URL", now());
         assert_eq!(t.state, TaskState::NeedsAttention);
         assert_eq!(t.not_before, None, "parked like every other park: no stale retry time");
         assert_eq!(t.last_error.as_deref(), Some("in review without a usable pull request: invalid pull request URL"));
@@ -686,7 +686,7 @@ mod properties {
             prop_assert_eq!(t.last_error.as_deref().is_none(), error.starts_with(WATCHER_ERROR_PREFIX));
             // An unusable PR parks the task without a retry time.
             let mut t = task.clone();
-            on_unusable_pr(&mut t, &error);
+            on_unusable_pr(&mut t, &error, origin());
             prop_assert_eq!((t.state, t.not_before), (TaskState::NeedsAttention, None));
             prop_assert!(t.last_error.as_deref().is_some_and(|e| e.ends_with(&error)));
             prop_assert!(t.parked_in_review() || t.review.is_none());

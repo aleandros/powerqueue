@@ -1437,6 +1437,28 @@ fn check_worktree_base(store: &Store) -> CheckResult {
     worktree_base_status(stale, ff)
 }
 
+/// Launches whose task row was written by the CLI while they ran
+/// (`launch.superseded`): a command applied offline because the daemon's
+/// heartbeat went stale during a long `repo.setup`. The launched session
+/// is released, but the attempt was wasted.
+pub fn superseded_launch_status(superseded: u64) -> CheckResult {
+    const NAME: &str = "launches";
+    if superseded > 0 {
+        return CheckResult::warn(
+            STATE,
+            NAME,
+            format!("{superseded} launch(es) in the last 24h were superseded by a command the CLI applied offline"),
+            "the daemon looked dead while `repo.setup` ran; shorten the setup, or wait for `powerqueue status` to show the daemon alive before `task cancel` / `task pause`",
+        );
+    }
+    CheckResult::ok(STATE, NAME, "no launch was superseded by an offline command in the last 24h")
+}
+
+fn check_superseded_launches(store: &Store) -> CheckResult {
+    let since = Utc::now() - Duration::hours(24);
+    superseded_launch_status(store.count_events_of_kind("launch.superseded", since).unwrap_or(0))
+}
+
 /// The question relay through Linear comments: whether it is on
 /// (`linear.post_comments` not `false`), which tasks wait for a reply to a
 /// question posted on Linear (`waiting`), and failures typing replies or
@@ -2069,6 +2091,7 @@ pub async fn run_all(
     results.push(check_dependencies(cfg, store));
     results.push(check_reviews(cfg, store));
     results.push(check_worktree_base(store));
+    results.push(check_superseded_launches(store));
     results.push(check_question_relay(cfg, store));
     results.push(check_orphan_worktrees(cfg, paths, store, fix));
     results.push(check_orphan_windows(cfg, store, fix));
@@ -2307,6 +2330,14 @@ mod tests {
         assert_eq!(c.detail, "Not logged in");
         let d = parse_claude_auth(true, "not json", "");
         assert!(d.logged_in);
+    }
+
+    #[test]
+    fn superseded_launch_status_warns_when_any() {
+        assert_eq!(superseded_launch_status(0).status, Status::Ok);
+        let r = superseded_launch_status(2);
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("2 launch(es)"), "{}", r.detail);
     }
 
     #[test]

@@ -247,17 +247,23 @@ pub fn task_among(states: &[TaskState]) -> impl Strategy<Value = Task> {
     prop::sample::select(states.to_vec()).prop_flat_map(task_in)
 }
 
-/// A session row of `task`: same id and attempt, live iff the task expects
-/// one ([`TaskState::has_live_session`]), started before the origin.
+/// A session row of `task`: same id and attempt, started before the origin.
+/// Live iff the task expects one ([`TaskState::has_live_session`]); either
+/// way for a paused or throttled task, which may keep its session
+/// ([`TaskState::may_keep_session`]).
 pub fn session_for(task: &Task) -> BoxedStrategy<Session> {
     let task_id = task.id;
     let attempt = task.attempts.max(1);
-    let live = task.state.has_live_session();
-    let state = if live {
-        prop::sample::select(vec![SessionState::Launching, SessionState::Running, SessionState::Idle]).boxed()
+    let live = [SessionState::Launching, SessionState::Running, SessionState::Idle];
+    let dead = [SessionState::Exited, SessionState::Crashed, SessionState::Killed];
+    let states: Vec<SessionState> = if task.state.has_live_session() {
+        live.to_vec()
+    } else if task.state.may_keep_session() {
+        live.iter().chain(&dead).copied().collect()
     } else {
-        prop::sample::select(vec![SessionState::Exited, SessionState::Crashed, SessionState::Killed]).boxed()
+        dead.to_vec()
     };
+    let state = prop::sample::select(states);
     (
         any::<u128>(),
         state,
@@ -592,7 +598,11 @@ mod tests {
         #[test]
         fn generated_rows_are_consistent((task, session) in task_with_session()) {
             prop_assert_eq!(session.task_id, task.id);
-            prop_assert_eq!(session.state.is_live(), task.state.has_live_session());
+            if task.state.has_live_session() {
+                prop_assert!(session.state.is_live());
+            } else if !task.state.may_keep_session() {
+                prop_assert!(!session.state.is_live());
+            }
             prop_assert!(session.started_at <= origin());
             prop_assert!(session.last_activity_at <= origin());
             prop_assert!(session.last_activity_at >= session.started_at);

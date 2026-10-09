@@ -384,6 +384,30 @@ pub fn on_launched(task: &mut Task, session: &Session, launched: &Launched<'_>, 
     effects
 }
 
+/// The task row changed while the launch ran: `fresh` is the row as it is
+/// now (a cancel or pause the CLI applied offline during a long
+/// `repo.setup`, with the heartbeat gone stale), `claimed` the copy the
+/// launch worked on. The claim is carried over (attempt, branch, worktree,
+/// model) so the session row stays consistent with the task, and the new
+/// state is kept: the launched session is released by the finalize or
+/// probe phase like any session of a task that moved on. Logged as
+/// `launch.superseded`.
+pub fn on_launch_superseded(fresh: &mut Task, claimed: &Task, session: &Session) -> Vec<Effect> {
+    fresh.attempts = claimed.attempts;
+    fresh.branch = claimed.branch.clone();
+    fresh.worktree_path = claimed.worktree_path.clone();
+    fresh.model = claimed.model.clone();
+    vec![Effect::log(
+        EventLevel::Warn,
+        "launch.superseded",
+        format!(
+            "the task became {} while attempt {} was being launched; the launched session will be released",
+            fresh.state, session.attempt
+        ),
+        serde_json::json!({ "state": fresh.state, "attempt": session.attempt, "window": session.tmux_window }),
+    )]
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Duration;
@@ -742,6 +766,28 @@ mod properties {
     }
 
     proptest! {
+        /// A launch whose row changed underneath keeps the row's state and
+        /// bookkeeping, takes the claim (attempt, branch, worktree, model)
+        /// and only logs.
+        #[test]
+        fn superseded_launch_keeps_the_new_state_and_the_claim(fresh in task(), (claimed, session) in task_with_session()) {
+            let mut t = fresh.clone();
+            let effects = on_launch_superseded(&mut t, &claimed, &session);
+            prop_assert_eq!(effect_kinds(&effects), vec!["launch.superseded".to_string()]);
+            prop_assert_eq!(
+                (t.attempts, &t.branch, &t.worktree_path, &t.model),
+                (claimed.attempts, &claimed.branch, &claimed.worktree_path, &claimed.model)
+            );
+            let expected = Task {
+                attempts: claimed.attempts,
+                branch: claimed.branch.clone(),
+                worktree_path: claimed.worktree_path.clone(),
+                model: claimed.model.clone(),
+                ..fresh.clone()
+            };
+            prop_assert_eq!(&t, &expected);
+        }
+
         /// Starting is two-phase: `on_starting` settles the attempt without
         /// touching the task's bookkeeping (only the state, the model, the
         /// retry time that is now over and, when resuming, the parking

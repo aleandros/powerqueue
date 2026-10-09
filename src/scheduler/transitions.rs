@@ -129,12 +129,16 @@ pub fn on_hook_outcome(
     // Late signals from a session the daemon already closed (a crash seen
     // by the probe, a kill by a cancel or retry): its end must not crash
     // the task again, which could fail a task re-queued since; its done
-    // marker must not revive a finished task or complete one whose next
-    // attempt is under way (the resumed session prints the marker again).
+    // marker must not revive a finished or cancelled task, nor one that was
+    // re-queued since (a retry starts over). It does complete a task the
+    // probe crashed or failed in the meantime: the pane died right after
+    // the marker was printed, and the work was done.
     if !session.state.is_live() {
         let late = match outcome {
             HookOutcome::SessionEnded { reason } => Some(format!("session ended ({reason}); already {}", session.state)),
-            HookOutcome::Completed { .. } if task.state.is_terminal() || !task.state.can_transition_to(TaskState::Completed) => {
+            HookOutcome::Completed { .. }
+                if task.state == TaskState::Completed || !task.state.can_transition_to(TaskState::Completed) =>
+            {
                 Some(format!("completion ignored: the session already ended and the task is {}", task.state))
             }
             _ => None,
@@ -1997,8 +2001,33 @@ mod properties {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::domain::ReviewWatch;
     use crate::priority::Evaluation;
     use crate::strategies::*;
+
+    /// A live session row of `task`'s current attempt, started at the origin.
+    fn session_stub(task: &Task) -> Session {
+        Session {
+            id: uuid::Uuid::from_u128(7),
+            task_id: task.id,
+            attempt: task.attempts,
+            model: ModelTier::sonnet(),
+            state: SessionState::Running,
+            tmux_session: "powerqueue".into(),
+            tmux_window: "@1".into(),
+            pane_id: Some("%1".into()),
+            pid: Some(42),
+            transcript_path: None,
+            exit_code: None,
+            started_at: origin(),
+            ended_at: None,
+            last_activity_at: origin(),
+            error: None,
+            agent_session_id: None,
+            waiting_since: None,
+            waited_secs: 0,
+        }
+    }
 
     fn logs_are_well_formed(effects: &[Effect]) -> bool {
         effects.iter().all(|e| !matches!(e, Effect::Log { kind, message, .. } if kind.is_empty() || message.is_empty()))
@@ -2006,13 +2035,6 @@ mod properties {
 
     fn has<F: Fn(&Effect) -> bool>(effects: &[Effect], f: F) -> bool {
         effects.iter().any(f)
-    }
-
-    /// `used` attempts of this try, derived exactly as [`on_crash`] does.
-    fn used_attempts(task: &Task, session: Option<&Session>) -> u32 {
-        let attempt = session.map_or(task.attempts, |s| s.attempt.max(task.attempts));
-        let base = task.review_relaunch().and(task.review.as_ref()).map_or(0, |r| r.attempt_base);
-        attempt.saturating_sub(base)
     }
 
     fn evaluation() -> impl Strategy<Value = Evaluation> {
@@ -2039,9 +2061,10 @@ mod properties {
     }
 
     proptest! {
-        /// A crash either schedules a retry with the configured backoff or
-        /// gives up at `max_attempts`; the session (when there is one) is
-        /// closed as crashed.
+        /// A crash either schedules a retry (`crashed`, with one of the
+        /// configured backoffs) or gives up (`failed`, cleaned up, issue
+        /// marked blocked); the session (when there is one) is closed as
+        /// crashed. When to give up is [`crash_gives_up_exactly_at_max_attempts`].
         #[test]
         fn crash_backs_off_or_gives_up(
             (task, session) in task_with_session_among(&[TaskState::Starting, TaskState::Running, TaskState::Idle, TaskState::NeedsAttention, TaskState::Crashed]),
@@ -2053,8 +2076,6 @@ mod properties {
             let now = origin();
             let mut t = task.clone();
             let mut s = session.clone();
-            let used = used_attempts(&task, with_session.then_some(&session));
-            let max = task.max_attempts.unwrap_or(cfg.max_attempts).max(1);
             let effects = on_crash(&mut t, with_session.then_some(&mut s), "boom", exit_status, &cfg, now, tail.as_deref());
             prop_assert!(logs_are_well_formed(&effects));
             prop_assert!(task.state.can_transition_to(t.state), "{:?} -> {:?}", task.state, t.state);
@@ -2064,14 +2085,71 @@ mod properties {
             } else {
                 prop_assert_eq!(&s, &session);
             }
-            if used >= max {
-                prop_assert_eq!((t.state, t.completed_at, t.not_before), (TaskState::Failed, Some(now), None));
-                prop_assert!(has(&effects, |e| matches!(e, Effect::Cleanup { succeeded: false })), "{:?}", effects);
-                prop_assert!(has(&effects, |e| matches!(e, Effect::Linear { target: LinearTarget::Blocked, .. })), "{:?}", effects);
-            } else {
-                let backoff = Duration::seconds(cfg.backoff_for_attempt(used) as i64);
-                prop_assert_eq!((t.state, t.not_before), (TaskState::Crashed, Some(now + backoff)));
-                prop_assert!(!has(&effects, |e| matches!(e, Effect::Cleanup { .. })), "{:?}", effects);
+            match t.state {
+                TaskState::Failed => {
+                    prop_assert_eq!((t.completed_at, t.not_before), (Some(now), None));
+                    prop_assert!(has(&effects, |e| matches!(e, Effect::Cleanup { succeeded: false })), "{:?}", effects);
+                    prop_assert!(has(&effects, |e| matches!(e, Effect::Linear { target: LinearTarget::Blocked, .. })), "{:?}", effects);
+                }
+                TaskState::Crashed => {
+                    let configured: Vec<u64> = if cfg.restart_backoff_secs.is_empty() { vec![60] } else { cfg.restart_backoff_secs.clone() };
+                    let backoff = t.not_before.map(|at| (at - now).num_seconds());
+                    prop_assert!(
+                        backoff.is_some_and(|b| configured.contains(&(b as u64))),
+                        "backoff {backoff:?} is not one of {configured:?}"
+                    );
+                    prop_assert!(!has(&effects, |e| matches!(e, Effect::Cleanup { .. })), "{:?}", effects);
+                }
+                other => prop_assert!(false, "a crash left the task {other:?}"),
+            }
+        }
+
+        /// A task fails on exactly its `max_attempts`-th crash since it
+        /// started over (never earlier, never later), with the backoff of
+        /// the n-th crash being the n-th configured one (the last one
+        /// repeats). A review round starts the count again at its
+        /// `attempt_base`, so a relaunch never eats into the attempts.
+        #[test]
+        fn crash_gives_up_exactly_at_max_attempts(
+            task in task_in(TaskState::Queued),
+            cfg in scheduler_config(),
+            max in prop::option::of(1u32..=4),
+            review_round in prop::option::of((review_watch(), review_relaunch(), 0u32..=3)),
+        ) {
+            let now = origin();
+            let mut t = task.clone();
+            t.max_attempts = max;
+            let max = max.unwrap_or(cfg.max_attempts).max(1);
+            // Attempts used before this run: none for a fresh task, the
+            // round's base for a review relaunch.
+            let base = match review_round {
+                Some((watch, relaunch, base)) => {
+                    t.review = Some(ReviewWatch { attempt_base: base, relaunch: Some(relaunch), ..watch });
+                    base
+                }
+                None => {
+                    t.review = None;
+                    0
+                }
+            };
+            t.attempts = base;
+            for n in 1..=max {
+                // The claim of the n-th attempt of this run.
+                t.attempts += 1;
+                let mut s = Session { attempt: t.attempts, ..session_stub(&t) };
+                t.state = TaskState::Running;
+                let effects = on_crash(&mut t, Some(&mut s), "boom", None, &cfg, now, None);
+                if n < max {
+                    prop_assert_eq!(t.state, TaskState::Crashed, "crash {} of {} gave up", n, max);
+                    let expected = Duration::seconds(cfg.backoff_for_attempt(n) as i64);
+                    prop_assert_eq!(t.not_before, Some(now + expected), "backoff of crash {}", n);
+                    let cleaned = has(&effects, |e| matches!(e, Effect::Cleanup { .. }));
+                    prop_assert!(!cleaned, "crash {} of {} cleaned up", n, max);
+                } else {
+                    prop_assert_eq!(t.state, TaskState::Failed, "crash {} of {} did not give up", n, max);
+                    let cleaned = has(&effects, |e| matches!(e, Effect::Cleanup { succeeded: false }));
+                    prop_assert!(cleaned, "giving up did not clean up");
+                }
             }
         }
 
@@ -2122,12 +2200,18 @@ mod properties {
                     prop_assert_eq!((s.state, s.ended_at), (SessionState::Exited, Some(now)));
                 }
                 // A late done marker of a closed session completes the task
-                // only where the table lets a task complete; elsewhere (re-queued,
-                // crashed, finished) it is a duplicate.
-                HookOutcome::Completed { .. } if !session.state.is_live() && (task.state.is_terminal() || !task.state.can_transition_to(TaskState::Completed)) => {
+                // where the table lets a task complete (including one the
+                // probe crashed or failed in the meantime: the work was
+                // done); elsewhere (re-queued, finished, cancelled) it is a
+                // duplicate.
+                HookOutcome::Completed { .. } if !session.state.is_live() && (task.state == TaskState::Completed || !task.state.can_transition_to(TaskState::Completed)) => {
                     prop_assert_eq!(&t, &task);
                     prop_assert_eq!(&s, &session);
                     prop_assert!(matches!(&effects[..], [Effect::Log { kind, .. }] if kind == "hook.duplicate"), "{:?}", effects);
+                }
+                HookOutcome::Completed { .. } if !session.state.is_live() && task.state != TaskState::InReview => {
+                    prop_assert_eq!((t.state, t.completed_at, t.not_before), (TaskState::Completed, Some(now), None));
+                    prop_assert!(has(&effects, |e| matches!(e, Effect::Cleanup { succeeded: true })), "{:?}", effects);
                 }
                 _ => {}
             }

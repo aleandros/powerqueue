@@ -34,7 +34,7 @@ github.rs          `gh api graphql` PR status (state, mergeability, checks, thre
   scheduler/         daemon.rs (Daemon, tick loop, applies Effects against the store,
                      tmux, git, Linear and GitHub) around a pure core: transitions.rs
                      (hook outcomes, probes, crashes, re-scoring, finalize → Effect
-                     list), commands.rs (pause/resume/cancel/retry/model), launch.rs
+                     list), commands.rs (pause/resume/cancel/retry/model, the direct writes complete/hand-off/block), launch.rs
                      (LaunchPlanner, on_starting/on_launched, resume plan and prompt),
                      review.rs (PR watcher), lifecycle.rs (pick_next, cleanup_plan;
                      cleanup_task is the git/tmux half)
@@ -90,10 +90,11 @@ follows a live session, review rounds never exceed `review_rounds_max`, the
 planner hands out each task once per pass and reserves exactly the predicted
 cost, the policy never picks a model it cannot use, periods tile. The
 stateful model (`scheduler/model.rs`) runs random sequences of the daemon's
-calls, with each call's precondition mirroring its call site, against one
-task and checks the cross-cutting invariants after every step, including
-that every effect round-trips through serde (the trace a specification
-would consume). A failing property is a finding first: the shrunk case says
+calls and of the CLI's direct writes (`task complete`, `task block`), with
+each call's precondition mirroring its call site, against one task and
+checks the cross-cutting invariants after every step, including that a
+launch under way is never interrupted and that every effect round-trips
+through serde (the trace a specification would consume). A failing property is a finding first: the shrunk case says
 either that the invariant was overstated or that the code is wrong.
 
 ## Data flow

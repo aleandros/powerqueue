@@ -681,7 +681,16 @@ impl Daemon {
         }
 
         let tasks = self.store.list_open_tasks()?;
-        for mut task in tasks.into_iter().filter(|t| !t.state.has_live_session()) {
+        for mut task in tasks {
+            // Never under a live session: a throttled or paused task may
+            // keep one (the agent waits in-session for its usage reset, or
+            // finishes its turn), and a re-score could block or re-queue
+            // the task under it, leaving the window unattended.
+            if task.state.has_live_session()
+                || (task.state.may_keep_session() && self.store.latest_session(task.id)?.is_some_and(|s| s.state.is_live()))
+            {
+                continue;
+            }
             let jev_norm = self.jev_norm_for(&task, now).await;
             let eval =
                 self.rt.rules.evaluate(&task, now, jev_norm, self.cfg.priority.jev.weight, self.cfg.priority.age_boost_per_hour);
@@ -2561,7 +2570,7 @@ impl Daemon {
             let pr = match url.parse::<PrRef>() {
                 Ok(pr) => pr,
                 Err(e) => {
-                    let effects = review::on_unusable_pr(&mut task, &e);
+                    let effects = review::on_unusable_pr(&mut task, &e, now);
                     self.store.update_task(&task)?;
                     self.log_only(&task, None, effects);
                     continue;
@@ -2837,6 +2846,21 @@ impl Daemon {
             self.store.insert_session(&session)?;
         }
         self.forget_session(session.id);
+
+        // The row may have been written while the launch ran (a command
+        // applied offline during a long `repo.setup`, with the heartbeat
+        // gone stale): never persist `running` over it. The launched
+        // session is left to the finalize and probe phases like any session
+        // of a task that moved on.
+        if let Some(fresh) = self.store.get_task(task.id)?
+            && fresh.state != TaskState::Starting
+        {
+            let before = fresh.clone();
+            let mut fresh = fresh;
+            let effects = launch::on_launch_superseded(&mut fresh, &task, &session);
+            self.commit(&before, &mut fresh, Some(&session), effects).await?;
+            return Ok(());
+        }
 
         let before = task.clone();
         let facts = launch::Launched {
@@ -3225,6 +3249,60 @@ mod tests {
             stored.score_reasons
         );
         assert_eq!(store.count_events_of_kind("task.models_changed", since).unwrap(), 2);
+    }
+
+    /// A throttled task whose agent waits in-session for its usage reset
+    /// is not re-scored: its unsatisfied blocker must not move it to
+    /// `blocked` under the live session (nothing would probe the window).
+    #[tokio::test]
+    async fn rescore_skips_a_throttled_task_with_a_live_session() {
+        use crate::domain::{LinkedIssue, Task, TaskSource};
+        use crate::secrets::FileBackend;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        let store = Store::open_in_memory().unwrap();
+        let secrets = Secrets::with_backend(Box::new(FileBackend::new(paths.secrets_file())));
+        let mut cfg = Config::default();
+        cfg.priority.live_reload = false;
+        let mut daemon = Daemon::new(cfg, paths, store.clone(), secrets).unwrap();
+        let now = Utc::now();
+        let blocker = LinkedIssue { key: "DEP-1".into(), title: String::new(), state_type: "started".into(), pr_merged: false };
+        let mut waiting = Task::new("THR-1", "waiting in-session", TaskSource::Manual);
+        waiting.state = TaskState::Throttled;
+        waiting.attempts = 1;
+        waiting.blocked_by = vec![blocker.clone()];
+        store.insert_task(&waiting).unwrap();
+        let mut idle = Task::new("THR-2", "no session", TaskSource::Manual);
+        idle.state = TaskState::Throttled;
+        idle.blocked_by = vec![blocker];
+        store.insert_task(&idle).unwrap();
+        store
+            .insert_session(&Session {
+                id: uuid::Uuid::new_v4(),
+                task_id: waiting.id,
+                attempt: 1,
+                model: ModelTier::sonnet(),
+                state: SessionState::Running,
+                tmux_session: "pq".into(),
+                tmux_window: "@none".into(),
+                pane_id: None,
+                pid: None,
+                transcript_path: None,
+                exit_code: None,
+                started_at: now - Duration::minutes(1),
+                ended_at: None,
+                last_activity_at: now,
+                error: None,
+                agent_session_id: None,
+                waiting_since: None,
+                waited_secs: 0,
+            })
+            .unwrap();
+
+        daemon.refresh_rules(now).await.unwrap();
+        assert_eq!(store.get_task(waiting.id).unwrap().unwrap().state, TaskState::Throttled, "left to its session");
+        assert_eq!(store.get_task(idle.id).unwrap().unwrap().state, TaskState::Blocked, "no session: blocked as usual");
     }
 
     /// Switches of the mock Linear used by the dependency tests.

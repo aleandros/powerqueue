@@ -36,7 +36,7 @@ src/
   service.rs         `powerqueue service`: systemd user unit / launchd agent rendering, parsing, systemctl/launchctl ops
   session/           agent.rs (AgentCli trait, agent_for, shared helpers), claude.rs, codex.rs, gemini.rs (one per CLI), binary.rs (`<provider>.binary` command templates), inbox.rs (container shim + inbox for `<provider>.shim`), launcher (prompt, launch.sh), transcript tailing, probes
   scheduler/         daemon loop (daemon.rs: store, tmux, git, Linear, GitHub; applies Effects) around a pure core:
-                     transitions.rs (hooks, probes, crashes, rescoring, finalize), commands.rs (pause/resume/cancel/retry/model),
+                     transitions.rs (hooks, probes, crashes, rescoring, finalize), commands.rs (pause/resume/cancel/retry/model, the direct writes complete/hand-off/block),
                      launch.rs (LaunchPlanner, on_starting/on_launched, resume plan + prompt), review.rs (PR watcher),
                      lifecycle.rs (pick_next, cleanup_plan; cleanup_task is the git/tmux half)
   hook.rs            `powerqueue hook` (called by Claude Code hooks)
