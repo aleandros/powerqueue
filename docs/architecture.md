@@ -59,7 +59,7 @@ rows, calls the function, persists what changed and carries out the effects.
 |---|---|
 | `transitions::on_hook_outcome`, `on_probe`, `on_crash`, `on_progress`, `on_evaluation`, `on_dependencies`, `on_container_closed`, `on_answer_sent`, `on_answer_queued`, `release_session` | `Daemon::process_hook`, `probe_sessions`, `refresh_rules`, `close_finished_parents`, `relay_comments`, `finalize_terminal` |
 | `commands::on_pause`, `on_resume`, `on_cancel`, `on_retry`, `on_set_model` | `Daemon::apply_command` |
-| `launch::LaunchPlanner` (`next` / `started`), `on_throttled`, `on_starting`, `resume_plan`, `resume_prompt`, `on_launched` | `Daemon::launch_tasks` / `start_task` (git, launcher, tmux) |
+| `launch::LaunchPlanner` (`next` / `started`), `on_throttled`, `on_starting`, `claim`, `resume_plan`, `resume_prompt`, `on_launched` | `Daemon::launch_tasks` / `start_task` (git, launcher, tmux) |
 | `review::on_pr_status`, `request_round`, `on_unusable_pr`, `on_watch_error` | `Daemon::watch_reviews` (`gh`) |
 | `lifecycle::pick_next`, `cleanup_plan` | `lifecycle::cleanup_task` (git, tmux) |
 | `budget::Ledger::build`, `resolve_clock`, `Policy::decide`, `Estimator`, `probe::append_observation` | `budget::io` (`Ledger::load`, observations in kv) |
@@ -70,7 +70,12 @@ change it further. `Effect` is `Serialize`, so a run can be replayed or
 checked against a model from the event log. The budget core takes
 `LedgerSource` (plain usage rows and the observation history) and never
 sees the store, which is what lets `budget plan` and `priority simulate`
-share `LaunchPlanner`'s helpers with the daemon.
+share `LaunchPlanner` with the daemon (`budget plan` runs `plan_all`). The
+planner owns the estimator and a copy of the ledgers (reservations within a
+pass) and borrows the budget config, rules and rate limits per step through
+`LaunchContext`, so a rate limit marked by a failed start is seen by the next
+candidate of the same pass. `task pause|resume|cancel|retry` applied offline by
+the CLI (no daemon) call the same `commands::*` transitions.
 
 ## Data flow
 

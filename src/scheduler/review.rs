@@ -39,8 +39,7 @@ pub const WATCHER_ERROR_PREFIX: &str = "PR watcher:";
 /// can be watched, so a human must look at it.
 pub fn on_unusable_pr(task: &mut Task, error: &str) -> Vec<Effect> {
     let url = task.pr_url.clone().unwrap_or_default();
-    task.state = TaskState::NeedsAttention;
-    task.last_error = Some(format!("in review without a usable pull request: {error}"));
+    park(task, format!("in review without a usable pull request: {error}"));
     vec![Effect::Log {
         level: EventLevel::Warn,
         kind: "review.error".into(),
@@ -521,8 +520,10 @@ mod tests {
     fn an_unusable_pr_parks_the_task_for_a_human() {
         let mut t = task();
         t.pr_url = Some("not a url".into());
+        t.not_before = Some(now() + Duration::hours(1));
         let effects = on_unusable_pr(&mut t, "invalid pull request URL");
         assert_eq!(t.state, TaskState::NeedsAttention);
+        assert_eq!(t.not_before, None, "parked like every other park: no stale retry time");
         assert_eq!(t.last_error.as_deref(), Some("in review without a usable pull request: invalid pull request URL"));
         assert!(matches!(&effects[..], [Effect::Log { kind, data, .. }] if kind == "review.error" && data["pr"] == "not a url"));
     }

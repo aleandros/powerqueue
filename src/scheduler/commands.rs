@@ -58,11 +58,7 @@ pub fn on_cancel(task: &mut Task, session: Option<&mut Session>, now: DateTime<U
         return Vec::new();
     }
     let mut effects = Vec::new();
-    if let Some(session) = session.filter(|s| s.state.is_live()) {
-        session.state = SessionState::Killed;
-        session.ended_at = Some(now);
-        effects.push(Effect::KillWindow);
-    }
+    end_live(session, now, &mut effects);
     task.state = TaskState::Cancelled;
     task.completed_at = Some(now);
     task.not_before = None;
@@ -109,15 +105,12 @@ pub fn on_retry(task: &mut Task, session: Option<&mut Session>, now: DateTime<Ut
     // A retry is a fresh attempt: a session that is still alive (e.g. the
     // agent reported a blocker and is waiting) is ended first, otherwise it
     // would keep the slot and the task could never relaunch.
-    if let Some(session) = session.filter(|s| s.state.is_live()) {
-        session.state = SessionState::Killed;
-        session.ended_at = Some(now);
-        effects.push(Effect::KillWindow);
+    if let Some(attempt) = end_live(session, now, &mut effects) {
         effects.push(Effect::log(
             EventLevel::Info,
             "session.ended",
             "live session ended by retry",
-            serde_json::json!({ "attempt": session.attempt }),
+            serde_json::json!({ "attempt": attempt }),
         ));
     }
     if review_round {
@@ -129,6 +122,18 @@ pub fn on_retry(task: &mut Task, session: Option<&mut Session>, now: DateTime<Ut
     effects.push(Effect::ForgetAnswer);
     effects.push(Effect::log(EventLevel::Info, "task.retried", "re-queued by user", serde_json::json!({})));
     effects
+}
+
+/// End the live session a command must not leave behind (it would keep the
+/// slot): `killed`, ended now, its window to be killed (the daemon forgets
+/// the session with it). Returns its attempt number; `None` when there is
+/// no live session.
+fn end_live(session: Option<&mut Session>, now: DateTime<Utc>, effects: &mut Vec<Effect>) -> Option<u32> {
+    let session = session.filter(|s| s.state.is_live())?;
+    session.state = SessionState::Killed;
+    session.ended_at = Some(now);
+    effects.push(Effect::KillWindow);
+    Some(session.attempt)
 }
 
 /// `task model <tier>` / `task model --clear`: the override for the next

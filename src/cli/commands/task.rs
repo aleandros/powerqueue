@@ -139,64 +139,54 @@ pub fn offline_target(cmd: &DaemonCommand) -> Option<TaskState> {
 /// Apply a control command directly (used when no daemon is running).
 /// Returns `Ok(false)` when the transition is not allowed from the current state.
 pub fn apply_offline(store: &Store, task: &mut Task, cmd: &DaemonCommand) -> Result<bool> {
-    let Some(mut target) = offline_target(cmd) else { return Ok(false) };
-    if matches!(cmd, DaemonCommand::Retry { .. }) && task.state == TaskState::InReview {
-        // A review round resuming the released session, as the daemon does.
-        let Some(crate::scheduler::transitions::Effect::Log { level, kind, message, data }) =
-            crate::scheduler::review::request_round(task, Utc::now())
-        else {
-            return Ok(false);
-        };
-        store.update_task(task)?;
-        store.log_event(
-            Some(task.id),
-            None,
-            level,
-            &kind,
-            &format!("{message} (applied by the CLI, no daemon running)"),
-            data,
-        )?;
-        return Ok(true);
-    }
-    if matches!(cmd, DaemonCommand::Resume { .. }) && task.parked_in_review() {
-        target = TaskState::InReview;
-        if let Some(watch) = task.review.as_mut() {
-            watch.rearm(Utc::now());
-        }
-        task.last_error = None;
-    }
-    if task.state == target {
-        return Ok(true);
-    }
-    if !task.state.can_transition_to(target) {
-        return Ok(false);
-    }
-    let from = task.state;
-    task.state = target;
-    match cmd {
-        DaemonCommand::Retry { .. } => {
-            task.not_before = None;
-            task.last_error = None;
-            task.completed_at = None;
-        }
-        DaemonCommand::Cancel { .. } => task.completed_at = Some(Utc::now()),
-        _ => {}
+    use crate::scheduler::commands;
+    use crate::scheduler::transitions::Effect;
+    let Some(target) = offline_target(cmd) else { return Ok(false) };
+    let now = Utc::now();
+    let before = task.clone();
+    // The daemon's own transitions, with no live session to end (there is
+    // no daemon to have one; a stale `running` row is left to it).
+    let effects = match cmd {
+        DaemonCommand::Pause { .. } => commands::on_pause(task, false),
+        DaemonCommand::Resume { .. } => commands::on_resume(task, false, now),
+        DaemonCommand::Cancel { .. } => commands::on_cancel(task, None, now),
+        DaemonCommand::Retry { .. } => commands::on_retry(task, None, now),
+        _ => return Ok(false),
+    };
+    if *task == before {
+        // Nothing to do: already there, or the command does not apply here.
+        return Ok(task.state == target);
     }
     store.update_task(task)?;
-    let kind = match cmd {
-        DaemonCommand::Cancel { .. } => "task.cancelled",
-        DaemonCommand::Pause { .. } => "task.paused",
-        DaemonCommand::Resume { .. } => "task.resumed",
-        _ => "task.retried",
-    };
-    store.log_event(
-        Some(task.id),
-        None,
-        EventLevel::Info,
-        kind,
-        &format!("{from} → {target} (applied by the CLI, no daemon running)"),
-        serde_json::json!({ "from": from, "to": target, "offline": true }),
-    )?;
+    for effect in effects {
+        match effect {
+            Effect::Log { level, kind, message, mut data } => {
+                if let Some(map) = data.as_object_mut() {
+                    map.insert("offline".into(), serde_json::Value::Bool(true));
+                }
+                store.log_event(
+                    Some(task.id),
+                    None,
+                    level,
+                    &kind,
+                    &format!("{message} (applied by the CLI, no daemon running)"),
+                    data,
+                )?;
+            }
+            Effect::ForgetAnswer => {
+                use crate::scheduler::relay::{RelayState, relay_key};
+                let key = relay_key(task.id);
+                if let Some(mut state) = store.kv_get::<RelayState>(&key)? {
+                    state.pending_answer = None;
+                    state.pending_session = None;
+                    store.kv_set(&key, &state)?;
+                }
+            }
+            // Cleanup (worktree, window, issue) needs the daemon's runtime;
+            // it runs when the daemon drains the command.
+            _ => {}
+        }
+    }
     Ok(true)
 }
 
@@ -1006,6 +996,42 @@ mod tests {
         assert!(apply_offline(&store, &mut na, &DaemonCommand::Resume { task_id: na_id }).unwrap());
         assert_eq!(na.state, TaskState::Queued, "a human may re-queue a task that needed attention");
         assert!(!apply_offline(&store, &mut na, &DaemonCommand::SyncNow).unwrap());
+        assert!(apply_offline(&store, &mut na, &DaemonCommand::Retry { task_id: na_id }).unwrap(), "already queued: fine");
+        let mut running = stored(&store, "RUN", TaskState::Running);
+        let running_id = running.id;
+        assert!(!apply_offline(&store, &mut running, &DaemonCommand::Retry { task_id: running_id }).unwrap());
+        assert_eq!(running.state, TaskState::Running, "a running task is not re-queued offline");
+    }
+
+    #[test]
+    fn offline_commands_are_the_daemons_transitions() {
+        use crate::scheduler::SKIP_REASON;
+        let store = Store::open_in_memory().unwrap();
+        // A retry of a finished task starts over, as with the daemon.
+        let mut done = stored(&store, "DONE", TaskState::Failed);
+        done.attempts = 3;
+        done.summary = Some("gave up".into());
+        done.last_error = Some("boom".into());
+        store.update_task(&done).unwrap();
+        let id = done.id;
+        assert!(apply_offline(&store, &mut done, &DaemonCommand::Retry { task_id: id }).unwrap());
+        let back = store.get_task(id).unwrap().unwrap();
+        assert_eq!((back.state, back.attempts, back.summary, back.last_error), (TaskState::Queued, 0, None, None));
+        let event = store.events_for_task(id, 5).unwrap().into_iter().find(|e| e.kind == "task.retried").unwrap();
+        assert!(event.message.ends_with("(applied by the CLI, no daemon running)"), "{}", event.message);
+        assert_eq!(event.data["offline"], true);
+
+        // Resuming a task the rules skipped clears the marker; pausing drops a retry time.
+        let mut skipped = stored(&store, "SKIP", TaskState::Paused);
+        skipped.last_error = Some(SKIP_REASON.into());
+        store.update_task(&skipped).unwrap();
+        let id = skipped.id;
+        assert!(apply_offline(&store, &mut skipped, &DaemonCommand::Resume { task_id: id }).unwrap());
+        assert_eq!((skipped.state, skipped.last_error.clone()), (TaskState::Queued, None));
+        skipped.not_before = Some(Utc::now());
+        assert!(apply_offline(&store, &mut skipped, &DaemonCommand::Pause { task_id: id }).unwrap());
+        assert_eq!((skipped.state, skipped.not_before), (TaskState::Paused, None));
+        assert!(apply_offline(&store, &mut skipped, &DaemonCommand::Pause { task_id: id }).unwrap(), "already paused");
     }
 
     #[test]

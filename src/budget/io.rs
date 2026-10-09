@@ -84,6 +84,10 @@ pub fn load_observations(store: &Store, provider: Provider) -> Result<Vec<Observ
 /// [`super::probe::SAMPLE_SPACING_RECENT`] is not stored (the status line
 /// fires after every response).
 pub fn record_observation(store: &Store, provider: Provider, obs: &ObservedUsage) -> Result<()> {
+    if ObservationSample::of(obs).is_empty() {
+        // Most status-line payloads carry no usage: nothing to read or write.
+        return Ok(());
+    }
     let samples = load_observations(store, provider)?;
     match append_observation(samples, obs) {
         Some(thinned) => store

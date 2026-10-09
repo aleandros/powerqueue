@@ -41,7 +41,7 @@ use crate::tmux::Tmux;
 use crate::worktree::{BasePreference, FastForward, Repo, run_commands};
 
 use super::commands;
-use super::launch::{self, Candidate, LaunchPlanner};
+use super::launch::{self, Candidate, LaunchContext, LaunchPlanner};
 use super::lifecycle::cleanup_task;
 use super::relay::{self, PostedQuestion, RelayState, relay_key};
 use super::review;
@@ -521,22 +521,25 @@ impl Daemon {
             DaemonCommand::Cancel { task_id } => {
                 let mut task = self.require_task(*task_id)?;
                 let mut session = self.store.latest_session(task.id)?.filter(|s| s.state.is_live());
-                let before = task.clone();
+                let before = (task.clone(), session.clone());
                 let effects = commands::on_cancel(&mut task, session.as_mut(), now);
-                if let Some(session) = &session {
+                let ended = session.as_ref().filter(|s| Some(*s) != before.1.as_ref());
+                if let Some(session) = ended {
                     self.store.update_session(session)?;
                 }
-                self.commit(&before, &mut task, session.as_ref(), effects).await?;
+                self.commit(&before.0, &mut task, ended, effects).await?;
             }
             DaemonCommand::Retry { task_id } => {
                 let mut task = self.require_task(*task_id)?;
                 let mut session = self.store.latest_session(task.id)?.filter(|s| s.state.is_live());
                 let before = (task.clone(), session.clone());
                 let effects = commands::on_retry(&mut task, session.as_mut(), now);
-                if let Some(session) = session.as_ref().filter(|s| Some(*s) != before.1.as_ref()) {
+                // The events name the session only when the retry ended it.
+                let ended = session.as_ref().filter(|s| Some(*s) != before.1.as_ref());
+                if let Some(session) = ended {
                     self.store.update_session(session)?;
                 }
-                self.commit(&before.0, &mut task, session.as_ref(), effects).await?;
+                self.commit(&before.0, &mut task, ended, effects).await?;
             }
             DaemonCommand::SetModel { task_id, model } => {
                 let mut task = self.require_task(*task_id)?;
@@ -2110,10 +2113,11 @@ impl Daemon {
                     }
                 }
                 Effect::KillWindow => {
-                    if let Some(s) = session
-                        && let Err(e) = self.rt.tmux.kill_window(&s.tmux_window)
-                    {
-                        tracing::debug!(task = %task.key, window = %s.tmux_window, error = %format!("{e:#}"), "kill window");
+                    if let Some(s) = session {
+                        if let Err(e) = self.rt.tmux.kill_window(&s.tmux_window) {
+                            tracing::debug!(task = %task.key, window = %s.tmux_window, error = %format!("{e:#}"), "kill window");
+                        }
+                        self.forget_session(s.id);
                     }
                 }
                 Effect::RateLimit { tier, until } => {
@@ -2647,6 +2651,12 @@ impl Daemon {
 
     // --------------------------------------------------------------- launch
 
+    /// What the planner decides with, borrowed per step rather than copied:
+    /// a failed start may mark a rate limit the next candidate must see.
+    fn launch_context(&self) -> LaunchContext<'_> {
+        LaunchContext { budget: &self.cfg.budget, rules: &self.rt.rules, rate_limits: &self.rt.rate_limits }
+    }
+
     async fn launch_tasks(&mut self, now: DateTime<Utc>) -> Result<()> {
         if let Some(pause) = self.store.scheduling_pause()? {
             tracing::debug!(since = %pause.since, "scheduling paused; launching nothing");
@@ -2665,22 +2675,15 @@ impl Daemon {
         let estimator = Estimator::from_summaries(&self.store.task_usage_summaries()?);
         let ledgers = Ledgers::load(&self.store, &self.cfg.budget, now)?;
         self.rt.rate_limits.clear_expired(now);
-        let mut planner = LaunchPlanner::new(
-            self.cfg.budget.clone(),
-            self.rt.rules.clone(),
-            estimator,
-            self.rt.rate_limits.clone(),
-            ledgers,
-            tasks,
-            slots,
-        );
-        while let Some(Candidate { task, decision, .. }) = planner.next(now) {
+        let mut planner = LaunchPlanner::new(estimator, ledgers, tasks, slots);
+        while let Some(candidate) = planner.next(self.launch_context(), now) {
+            let Candidate { task, decision, .. } = candidate.clone();
             match decision.model.clone() {
                 None => self.throttle(task, &decision, now)?,
                 Some(model) => {
                     let (key, id) = (task.key.clone(), task.id);
                     match self.start_task(task, model, &decision, now).await {
-                        Ok(()) => planner.started(&decision),
+                        Ok(()) => planner.started(&self.cfg.budget, &candidate),
                         Err(e) => {
                             tracing::error!(task = %key, error = %format!("{e:#}"), "start failed");
                             self.log(
@@ -2724,8 +2727,11 @@ impl Daemon {
         let root = self.cfg.worktree_root(&self.paths);
         let before = task.clone();
         let start = launch::on_starting(&mut task, &model, decision, &self.cfg, &root, relaunch.is_some() || answer.is_some());
-        let launch::Start { branch, worktree, attempt, effects } = start;
-        self.commit(&before, &mut task, None, effects).await?;
+        self.commit(&before, &mut task, None, start.effects.clone()).await?;
+        // On the task from here on, persisted by the launch or by the crash
+        // that prevents it (never by a `starting` row alone).
+        launch::claim(&mut task, &start);
+        let launch::Start { branch, worktree, attempt, .. } = start;
 
         let prepared = self.prepare_worktree(&task, &root, &worktree, &branch);
         if let Ok(true) = prepared {
@@ -3411,6 +3417,62 @@ mod tests {
         daemon.launch_tasks(now).await.unwrap();
         let t = store.get_task_by_key("PAUSE-1").unwrap().unwrap();
         assert_ne!(t.state, TaskState::Queued, "resumed: the task was considered (started or failed to start): {:?}", t.state);
+    }
+
+    #[tokio::test]
+    async fn a_retry_ends_and_forgets_the_live_session_a_refused_one_names_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let (mut daemon, _mock, _server) = dependency_daemon(&store, dir.path()).await;
+        let now = Utc::now();
+        let live = |task: &Task| Session {
+            id: uuid::Uuid::new_v4(),
+            task_id: task.id,
+            attempt: 1,
+            model: ModelTier::sonnet(),
+            state: SessionState::Idle,
+            tmux_session: "pq".into(),
+            tmux_window: "@none".into(),
+            pane_id: None,
+            pid: None,
+            transcript_path: None,
+            exit_code: None,
+            started_at: now - Duration::minutes(1),
+            ended_at: None,
+            last_activity_at: now,
+            error: None,
+            agent_session_id: None,
+            waiting_since: None,
+            waited_secs: 0,
+        };
+
+        // Waiting on a human, nudged once: the retry ends the session, and
+        // the daemon forgets it was nudged.
+        let mut waiting = Task::new("RETRY-1", "blocked", TaskSource::Manual);
+        waiting.state = TaskState::NeedsAttention;
+        store.insert_task(&waiting).unwrap();
+        let session = live(&waiting);
+        store.insert_session(&session).unwrap();
+        daemon.rt.nudged.insert(session.id);
+        daemon.apply_command(&DaemonCommand::Retry { task_id: waiting.id }, now).await.unwrap();
+        assert_eq!(store.get_task(waiting.id).unwrap().unwrap().state, TaskState::Queued);
+        assert_eq!(store.get_session(session.id).unwrap().unwrap().state, SessionState::Killed);
+        assert!(!daemon.rt.nudged.contains(&session.id), "the ended session is forgotten");
+        let events = store.events_for_task(waiting.id, 10).unwrap();
+        let retried = events.iter().find(|e| e.kind == "task.retried").expect("task.retried");
+        assert_eq!(retried.session_id, Some(session.id), "the event names the session the retry ended");
+
+        // Running: the retry is refused and its event names no session.
+        let mut running = Task::new("RETRY-2", "busy", TaskSource::Manual);
+        running.state = TaskState::Running;
+        store.insert_task(&running).unwrap();
+        let session = live(&running);
+        store.insert_session(&session).unwrap();
+        daemon.apply_command(&DaemonCommand::Retry { task_id: running.id }, now).await.unwrap();
+        assert_eq!(store.get_session(session.id).unwrap().unwrap().state, SessionState::Idle, "untouched");
+        let events = store.events_for_task(running.id, 10).unwrap();
+        let ignored = events.iter().find(|e| e.kind == "task.retry_ignored").expect("task.retry_ignored");
+        assert_eq!(ignored.session_id, None);
     }
 
     #[tokio::test]

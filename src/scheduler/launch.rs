@@ -3,10 +3,11 @@
 //!
 //! The daemon drives a [`LaunchPlanner`] one candidate at a time ([`next`],
 //! then [`started`] once the session really launched, so a failed start
-//! frees its slot for the next candidate in the same tick); simulations
-//! take the whole plan at once ([`plan_all`]). Everything in between
+//! frees its slot for the next candidate in the same tick); `budget plan`
+//! takes the whole plan at once ([`plan_all`]). Everything in between
 //! (`git`, the launcher, tmux) stays in the daemon and reports back through
-//! [`on_starting`] / [`on_launched`] / [`crate::scheduler::transitions::on_crash`].
+//! [`on_starting`] / [`claim`] / [`on_launched`] /
+//! [`crate::scheduler::transitions::on_crash`].
 //!
 //! [`next`]: LaunchPlanner::next
 //! [`started`]: LaunchPlanner::started
@@ -62,15 +63,22 @@ impl Candidate {
     }
 }
 
+/// What the policy decides with, borrowed for each step of a pass so the
+/// planner sees rate-limit marks made between two of its steps (a failed
+/// start may mark a provider) and nothing is copied per tick.
+#[derive(Debug, Clone, Copy)]
+pub struct LaunchContext<'a> {
+    pub budget: &'a BudgetConfig,
+    pub rules: &'a PriorityRules,
+    pub rate_limits: &'a RateLimitState,
+}
+
 /// Hands out schedulable tasks in [`pick_next`] order with a model decision
 /// each, while slots remain. Owns a copy of the ledgers so reservations
 /// made during the pass do not touch the stored usage.
 #[derive(Debug, Clone)]
 pub struct LaunchPlanner {
-    cfg: BudgetConfig,
-    rules: PriorityRules,
     estimator: Estimator,
-    rate_limits: RateLimitState,
     ledgers: Ledgers,
     candidates: Vec<Task>,
     considered: HashSet<TaskId>,
@@ -81,33 +89,15 @@ impl LaunchPlanner {
     /// `candidates` are the open tasks without a live session; `slots` how
     /// many sessions may still start. Expired rate-limit marks should be
     /// cleared by the caller first.
-    pub fn new(
-        cfg: BudgetConfig,
-        rules: PriorityRules,
-        estimator: Estimator,
-        rate_limits: RateLimitState,
-        ledgers: Ledgers,
-        candidates: Vec<Task>,
-        slots: u32,
-    ) -> Self {
-        Self { cfg, rules, estimator, rate_limits, ledgers, candidates, considered: HashSet::new(), slots }
-    }
-
-    /// Sessions that may still start in this pass.
-    pub fn slots(&self) -> u32 {
-        self.slots
-    }
-
-    /// The ledgers with every confirmed start reserved.
-    pub fn ledgers(&self) -> &Ledgers {
-        &self.ledgers
+    pub fn new(estimator: Estimator, ledgers: Ledgers, candidates: Vec<Task>, slots: u32) -> Self {
+        Self { estimator, ledgers, candidates, considered: HashSet::new(), slots }
     }
 
     /// The next task to consider and the policy's decision for it: the best
     /// schedulable task not handed out yet. `None` when no slot is left or
     /// nothing else can start now. A task is handed out once per pass
     /// whether or not it starts.
-    pub fn next(&mut self, now: DateTime<Utc>) -> Option<Candidate> {
+    pub fn next(&mut self, ctx: LaunchContext<'_>, now: DateTime<Utc>) -> Option<Candidate> {
         if self.slots == 0 {
             return None;
         }
@@ -115,34 +105,53 @@ impl LaunchPlanner {
             let remaining: Vec<Task> = self.candidates.iter().filter(|t| !self.considered.contains(&t.id)).cloned().collect();
             pick_next(&remaining, now).cloned()?
         };
+        Some(self.decide(ctx, task, now))
+    }
+
+    fn decide(&mut self, ctx: LaunchContext<'_>, task: Task, now: DateTime<Utc>) -> Candidate {
         self.considered.insert(task.id);
         let prediction = self.estimator.predict(&task);
         // Rules express a *preference* (`## Models`, `KEY: model = x`); only
         // `task model <tier>` on the CLI is a hard override. Either way the
         // policy may still downgrade when the tier is out of budget.
-        let preferred = preferred_models(&self.rules, &task, now);
-        let decision = Policy::new(&self.cfg, &self.ledgers, &self.rate_limits).decide(&task, prediction, &preferred);
-        Some(Candidate { task, preferred, decision })
+        let preferred = preferred_models(ctx.rules, &task, now);
+        let decision = Policy::new(ctx.budget, &self.ledgers, ctx.rate_limits).decide(&task, prediction, &preferred);
+        Candidate { task, preferred, decision }
     }
 
     /// A candidate's session launched: its slot is used and its predicted
     /// cost reserved against the ledgers for the rest of the pass. A
     /// throttled decision (no model) changes nothing.
-    pub fn started(&mut self, decision: &Decision) {
-        let Some(model) = &decision.model else { return };
+    pub fn started(&mut self, budget: &BudgetConfig, candidate: &Candidate) {
+        let Some(model) = &candidate.decision.model else { return };
         self.slots = self.slots.saturating_sub(1);
-        reserve(&mut self.ledgers, model, decision.prediction.weighted_tokens * tier_weight(&self.cfg, model));
+        reserve(&mut self.ledgers, model, candidate.weighted_cost(budget));
     }
 
-    /// Every candidate of the pass, assuming each start succeeds (what a
-    /// simulation shows). Throttled tasks are included with `model = None`.
-    pub fn plan_all(mut self, now: DateTime<Utc>) -> Vec<Candidate> {
+    /// What a simulation shows: every candidate of the pass in start order,
+    /// assuming each start succeeds, then the tasks the pass would not reach
+    /// (waiting on `not_before` or a dependency, or beyond the slots), each
+    /// decided after the ones before it. Throttled tasks have `model = None`.
+    pub fn plan_all(mut self, ctx: LaunchContext<'_>, now: DateTime<Utc>) -> Vec<Candidate> {
         let mut out = Vec::new();
-        while let Some(candidate) = self.next(now) {
-            self.started(&candidate.decision);
+        while let Some(candidate) = self.next(ctx, now) {
+            self.started(ctx.budget, &candidate);
+            out.push(candidate);
+        }
+        let rest: Vec<Task> =
+            self.candidates.iter().filter(|t| t.state.is_schedulable() && !self.considered.contains(&t.id)).cloned().collect();
+        for task in rest {
+            let candidate = self.decide(ctx, task, now);
+            self.started(ctx.budget, &candidate);
             out.push(candidate);
         }
         out
+    }
+
+    /// The ledgers with every confirmed start reserved.
+    #[cfg(test)]
+    pub fn ledgers(&self) -> &Ledgers {
+        &self.ledgers
     }
 }
 
@@ -176,11 +185,14 @@ pub struct Start {
     pub effects: Vec<Effect>,
 }
 
-/// The policy chose `model` for the task: it goes `starting` with the
-/// branch, worktree path and attempt number of this try. `resuming_with_prompt`
-/// says a review round or a relayed answer is about to be resumed, which
-/// un-parks a review watch (`task retry` of a task parked with its rounds
-/// used up). `root` is the worktree root directory.
+/// The policy chose `model` for the task: it goes `starting` on that model,
+/// and the branch, worktree path and attempt number of this try are settled
+/// (not yet on the task: [`claim`] puts them there once the `starting` row is
+/// written, so a daemon that dies mid-launch leaves the previous attempt
+/// count behind). `resuming_with_prompt` says a review round or a relayed
+/// answer is about to be resumed, which un-parks a review watch (`task
+/// retry` of a task parked with its rounds used up). `root` is the worktree
+/// root directory.
 pub fn on_starting(
     task: &mut Task,
     model: &ModelTier,
@@ -202,9 +214,6 @@ pub fn on_starting(
         .or_else(|| task.review.as_ref().and_then(|r| r.worktree_path.clone()))
         .map(PathBuf::from)
         .unwrap_or_else(|| worktree_dir(root, task));
-    task.branch = Some(branch.clone());
-    task.worktree_path = Some(worktree.display().to_string());
-    task.attempts = attempt;
     let effects = vec![Effect::log(
         EventLevel::Info,
         "task.starting",
@@ -212,6 +221,15 @@ pub fn on_starting(
         serde_json::json!({ "model": model, "attempt": attempt, "reasons": decision.reasons, "prediction": decision.prediction }),
     )];
     Start { branch, worktree, attempt, effects }
+}
+
+/// The attempt is under way: its branch, worktree path and number go on
+/// the task, to be persisted with whatever comes next (the launch, or the
+/// crash that prevented it).
+pub fn claim(task: &mut Task, start: &Start) {
+    task.branch = Some(start.branch.clone());
+    task.worktree_path = Some(start.worktree.display().to_string());
+    task.attempts = start.attempt;
 }
 
 /// How to start the next attempt: `(session id, resume?, provider session id)`.
@@ -433,16 +451,23 @@ mod tests {
     }
 
     fn planner(tasks: Vec<Task>, slots: u32) -> LaunchPlanner {
-        let cfg = Config::default();
-        LaunchPlanner::new(
-            cfg.budget.clone(),
-            PriorityRules::default(),
-            Estimator::from_summaries(&[]),
-            RateLimitState::default(),
-            Ledgers::single(claude_ledger(1.0e9)),
-            tasks,
-            slots,
-        )
+        LaunchPlanner::new(Estimator::from_summaries(&[]), Ledgers::single(claude_ledger(1.0e9)), tasks, slots)
+    }
+
+    struct Fixed {
+        cfg: Config,
+        rules: PriorityRules,
+        limits: RateLimitState,
+    }
+
+    impl Fixed {
+        fn new() -> Self {
+            Self { cfg: Config::default(), rules: PriorityRules::default(), limits: RateLimitState::default() }
+        }
+
+        fn ctx(&self) -> LaunchContext<'_> {
+            LaunchContext { budget: &self.cfg.budget, rules: &self.rules, rate_limits: &self.limits }
+        }
     }
 
     #[test]
@@ -468,34 +493,58 @@ mod tests {
             task("paused", TaskState::Paused, 100.0),
             task("mid", TaskState::Crashed, 50.0),
         ];
+        let f = Fixed::new();
         let mut p = planner(tasks.clone(), 2);
-        let first = p.next(now()).expect("a candidate");
+        let first = p.next(f.ctx(), now()).expect("a candidate");
         assert_eq!(first.task.key, "high");
         assert!(first.decision.model.is_some(), "{:?}", first.decision.reasons);
-        p.started(&first.decision);
-        assert_eq!(p.slots(), 1);
+        p.started(&f.cfg.budget, &first);
         let spent = p.ledgers().get(Provider::Claude).unwrap().total_period_weighted;
         assert!(spent > 0.0, "the predicted cost is reserved");
-        let second = p.next(now()).expect("a second candidate");
+        let second = p.next(f.ctx(), now()).expect("a second candidate");
         assert_eq!(second.task.key, "mid");
         // Not started (launch failed): the slot stays free for the next one.
-        let third = p.next(now()).expect("the slot is still free");
+        let third = p.next(f.ctx(), now()).expect("the slot is still free");
         assert_eq!(third.task.key, "low");
-        p.started(&third.decision);
-        assert!(p.next(now()).is_none(), "no slot left");
+        p.started(&f.cfg.budget, &third);
+        assert!(p.next(f.ctx(), now()).is_none(), "no slot left");
 
-        let all = planner(tasks, 10).plan_all(now());
-        assert_eq!(all.iter().map(|c| c.task.key.as_str()).collect::<Vec<_>>(), ["high", "mid", "low"]);
-        assert!(planner(Vec::new(), 3).next(now()).is_none());
-        assert!(planner(vec![task("x", TaskState::Queued, 1.0)], 0).next(now()).is_none(), "no slot: nothing is handed out");
+        // The whole plan: pass order first, then what the pass would not
+        // reach (here: a task waiting on its retry time).
+        let mut waiting = task("later", TaskState::Throttled, 70.0);
+        waiting.not_before = Some(now() + Duration::hours(1));
+        let mut tasks = tasks;
+        tasks.push(waiting);
+        let all = planner(tasks, 10).plan_all(f.ctx(), now());
+        assert_eq!(all.iter().map(|c| c.task.key.as_str()).collect::<Vec<_>>(), ["high", "mid", "low", "later"]);
+        assert!(all.iter().all(|c| c.decision.model.is_some()));
+        assert!(planner(Vec::new(), 3).next(f.ctx(), now()).is_none());
+        assert!(
+            planner(vec![task("x", TaskState::Queued, 1.0)], 0).next(f.ctx(), now()).is_none(),
+            "no slot: nothing is handed out"
+        );
     }
 
     #[test]
     fn a_throttled_decision_consumes_nothing() {
+        let f = Fixed::new();
         let mut p = planner(vec![task("x", TaskState::Queued, 1.0)], 1);
-        p.started(&decision(None));
-        assert_eq!(p.slots(), 1);
+        let throttled = Candidate { task: task("x", TaskState::Queued, 1.0), preferred: Vec::new(), decision: decision(None) };
+        p.started(&f.cfg.budget, &throttled);
+        assert!(p.next(f.ctx(), now()).is_some(), "the slot is still free");
         assert_eq!(p.ledgers().get(Provider::Claude).unwrap().total_period_weighted, 0.0);
+    }
+
+    #[test]
+    fn the_planner_sees_rate_limits_marked_between_steps() {
+        let mut f = Fixed::new();
+        let mut p = planner(vec![task("a", TaskState::Queued, 2.0), task("b", TaskState::Queued, 1.0)], 2);
+        let first = p.next(f.ctx(), now()).expect("a candidate");
+        let model = first.decision.model.clone().expect("a model");
+        // A failed start marks the provider; the next candidate must not get it.
+        f.limits.mark_provider(&f.cfg.budget, model.provider(), now() + Duration::minutes(10));
+        let second = p.next(f.ctx(), now()).expect("a second candidate");
+        assert_ne!(second.decision.model.as_ref().map(|m| m.provider()), Some(model.provider()), "{:?}", second.decision);
     }
 
     #[test]
@@ -519,15 +568,18 @@ mod tests {
         let root = Path::new("/tmp/wt");
         let mut t = task("ENG-7", TaskState::Queued, 1.0);
         let start = on_starting(&mut t, &ModelTier::opus(), &decision(Some("opus")), &cfg, root, false);
-        assert_eq!((t.state, t.attempts, t.model.clone()), (TaskState::Starting, 1, Some(ModelTier::opus())));
+        assert_eq!((t.state, t.model.clone()), (TaskState::Starting, Some(ModelTier::opus())));
         assert_eq!(start.attempt, 1);
-        assert_eq!(t.branch.as_deref(), Some(start.branch.as_str()));
         assert!(start.branch.contains("eng-7"), "{}", start.branch);
         assert!(start.worktree.starts_with(root));
-        assert_eq!(t.worktree_path.as_deref(), Some(start.worktree.to_str().unwrap()));
+        assert_eq!((t.attempts, t.branch.as_deref(), t.worktree_path.as_deref()), (0, None, None), "settled, not yet claimed");
         assert!(
             matches!(&start.effects[..], [Effect::Log { kind, message, .. }] if kind == "task.starting" && message == "starting attempt 1 with opus")
         );
+        claim(&mut t, &start);
+        assert_eq!(t.attempts, 1);
+        assert_eq!(t.branch.as_deref(), Some(start.branch.as_str()));
+        assert_eq!(t.worktree_path.as_deref(), Some(start.worktree.to_str().unwrap()));
 
         // A later attempt keeps its branch; a review round reuses the
         // remembered worktree path and un-parks the watch.

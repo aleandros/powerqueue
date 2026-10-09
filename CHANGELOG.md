@@ -15,12 +15,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loads rows, persists what changed and carries the effects out. The
   budget core (`Ledger::build`, `resolve_clock`, the observation history
   rules) takes plain rows; store access lives in `budget::io`. `budget
-  plan` and `priority simulate` share the daemon's reservation and
-  preferred-model helpers. No behaviour change; events logged from a
-  cancel or retry now carry the session they ended.
+  plan` runs the daemon's `LaunchPlanner`; `priority simulate` shares its
+  preferred-model helper. Events logged from a cancel or retry now carry
+  the session they ended (a refused retry names none). `task pause|resume|
+  cancel|retry` applied offline (no daemon) use the daemon's own
+  transitions: an offline retry of a finished task starts over (attempts,
+  error and summary reset) and an offline resume clears a PRIORITY.md
+  skip, as they do with the daemon running.
 
 ### Fixed
 
+- `task retry` of a task with a live session no longer keeps the ended
+  session in the daemon's nudge list.
+- A task parked because its PR URL is unusable has its retry time
+  cleared like every other parked task.
+- A status-line usage payload without readings no longer reads the
+  observation history before being dropped.
 - A `.powerqueue.toml` that cannot be read from the default branch no longer
   locks every command out: `status`, `doctor`, `config show`, `stop`, `pause`
   and the rest run with `config.toml` alone and say so (`status --json` and

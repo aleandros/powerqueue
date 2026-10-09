@@ -38,6 +38,11 @@ impl ObservationSample {
     pub fn of(obs: &ObservedUsage) -> Self {
         Self { at: obs.observed_at, period_used: obs.period_used, window_used: obs.window_used }
     }
+
+    /// Neither a period nor a window reading: nothing to record.
+    pub fn is_empty(&self) -> bool {
+        self.period_used.is_none() && self.window_used.is_none()
+    }
 }
 
 /// Samples younger than this are kept at most one per [`SAMPLE_SPACING_RECENT`];
@@ -72,7 +77,7 @@ pub fn fold_legacy_calibration(mut samples: Vec<ObservationSample>, legacy: Opti
 /// (the status line fires after every response). Input oldest first.
 pub fn append_observation(mut samples: Vec<ObservationSample>, obs: &ObservedUsage) -> Option<Vec<ObservationSample>> {
     let sample = ObservationSample::of(obs);
-    if sample.period_used.is_none() && sample.window_used.is_none() {
+    if sample.is_empty() {
         return None;
     }
     if let Some(last) = samples.last()

@@ -29,7 +29,7 @@ pub mod review;
 pub mod transitions;
 
 pub use daemon::{Daemon, DaemonHandle};
-pub use launch::{Candidate, LaunchPlanner, preferred_models, reserve};
+pub use launch::{Candidate, LaunchContext, LaunchPlanner, preferred_models, reserve};
 pub use lifecycle::{CleanupPlan, cleanup_plan, cleanup_task, pick_next, worktree_dir};
 pub use transitions::{
     CRASH_TAIL_LINES, Effect, LinearTarget, NUDGE_TEXT, ProbeContext, SKIP_REASON, on_crash, on_hook_outcome, on_probe,
