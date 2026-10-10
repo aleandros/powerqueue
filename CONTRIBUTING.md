@@ -61,7 +61,9 @@ just test
   tasks, sessions, configs, ledgers, hook outcomes and PR statuses live in
   `src/strategies.rs` (tests only); each pure module has a `properties`
   test module, and `src/scheduler/model.rs` runs random sequences of the
-  daemon's calls against one task and checks the cross-cutting invariants
+  daemon's calls against one task, and of launch passes, per-task calls,
+  usage, the scheduling pause and time against several tasks sharing
+  slots, ledgers and rate limits, checking the cross-cutting invariants
   after every step. A failing property writes its seed under
   `proptest-regressions/`; commit that file with the fix so the case is
   replayed first from then on. A new transition needs a property (or an op
