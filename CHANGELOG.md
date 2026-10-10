@@ -25,7 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A start that fails before the launch (worktree setup, `repo.setup`, the
   launcher) no longer uses up its slot and its predicted budget for the
   rest of the launch pass: the next candidate is tried in the same tick,
-  as the planner documents. Found by the whole-daemon model.
+  as the planner documents. Found by the whole-daemon model. (A failure
+  that hits every task, such as a missing repository, now crashes every
+  ready task in one pass rather than one per tick; each still gets its
+  backoff and `max_attempts`.)
 
 ## [0.13.0] - 2026-10-10
 

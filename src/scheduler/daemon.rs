@@ -207,6 +207,17 @@ pub struct Daemon {
     rt: RuntimeState,
 }
 
+/// How [`Daemon::start_task`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Started {
+    /// The session launched: its slot is used and its cost reserved.
+    Launched,
+    /// The worktree, the setup or the launcher failed first; the task is
+    /// crashed with a backoff and its slot is free for the next candidate
+    /// of the pass.
+    CrashedBeforeLaunch,
+}
+
 impl Daemon {
     /// Build a daemon. Fails when the running executable cannot be located
     /// (needed for hook commands). Does not touch tmux, git or the network.
@@ -2692,12 +2703,9 @@ impl Daemon {
                 Some(model) => {
                     let (key, id) = (task.key.clone(), task.id);
                     match self.start_task(task, model, &decision, now).await {
-                        Ok(true) => planner.started(&self.cfg.budget, &candidate),
-                        // The start failed before the launch (worktree,
-                        // setup, launcher) and the task is crashed with a
-                        // backoff: the slot and the budget go to the next
-                        // candidate of this pass.
-                        Ok(false) => {}
+                        Ok(Started::Launched) => planner.started(&self.cfg.budget, &candidate),
+                        // The slot and the budget go to the next candidate.
+                        Ok(Started::CrashedBeforeLaunch) => {}
                         Err(e) => {
                             tracing::error!(task = %key, error = %format!("{e:#}"), "start failed");
                             self.log(
@@ -2730,10 +2738,12 @@ impl Daemon {
     }
 
     /// Create the worktree, run setup, launch the agent and record the
-    /// session. `Ok(true)` when the session launched; `Ok(false)` when the
-    /// start failed before that and the task was crashed instead (its slot
-    /// is free again). `Err` only for store failures.
-    async fn start_task(&mut self, mut task: Task, model: ModelTier, decision: &Decision, now: DateTime<Utc>) -> Result<bool> {
+    /// session. A worktree, setup or launcher failure is not an error: the
+    /// task is crashed with a backoff and [`Started::CrashedBeforeLaunch`]
+    /// says its slot is free again. `Err` is a store failure; one after the
+    /// `starting` row was written leaves that row without a session (no
+    /// phase picks a `starting` task up again; `task retry` does).
+    async fn start_task(&mut self, mut task: Task, model: ModelTier, decision: &Decision, now: DateTime<Utc>) -> Result<Started> {
         // A review round resumes the session that armed the merge, in the
         // same worktree path, told only what changed on the PR.
         let relaunch = task.review_relaunch().cloned();
@@ -2767,7 +2777,7 @@ impl Daemon {
                 None,
             );
             self.commit(&before, &mut task, None, effects).await?;
-            return Ok(false);
+            return Ok(Started::CrashedBeforeLaunch);
         }
 
         let mut previous = self.store.latest_session(task.id)?;
@@ -2840,7 +2850,7 @@ impl Daemon {
                     None,
                 );
                 self.commit(&before, &mut task, None, effects).await?;
-                return Ok(false);
+                return Ok(Started::CrashedBeforeLaunch);
             }
         };
         if resume && let Some(p) = previous.as_ref().filter(|p| p.id == session.id) {
@@ -2867,7 +2877,7 @@ impl Daemon {
             let mut fresh = fresh;
             let effects = launch::on_launch_superseded(&mut fresh, &task, &session);
             self.commit(&before, &mut fresh, Some(&session), effects).await?;
-            return Ok(true);
+            return Ok(Started::Launched);
         }
 
         let before = task.clone();
@@ -2884,7 +2894,7 @@ impl Daemon {
         };
         let effects = launch::on_launched(&mut task, &session, &facts, &self.cfg, now);
         self.commit(&before, &mut task, Some(&session), effects).await?;
-        Ok(true)
+        Ok(Started::Launched)
     }
 
     /// Fast-forward the local branch `base` to `origin/<base>`: the default

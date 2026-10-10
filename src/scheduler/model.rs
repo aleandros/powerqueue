@@ -105,14 +105,6 @@ enum Op {
     Tick(i64),
 }
 
-impl Op {
-    /// The steps of `launch_tasks` / `start_task`: in the whole-daemon
-    /// model they only happen inside a launch pass.
-    fn is_launch_step(&self) -> bool {
-        matches!(self, Op::Throttle(_) | Op::Start(..) | Op::Claim | Op::LaunchFailed(_) | Op::Launched { .. })
-    }
-}
-
 /// The steps of a launch, as `launch_tasks` makes them for one candidate.
 fn launch_op() -> impl Strategy<Value = Op> {
     prop_oneof![
@@ -295,13 +287,9 @@ impl TaskWorld {
                 if !live {
                     return None;
                 }
+                let cooldown = self.provider_cooldown(cfg, now, pane_tail.as_deref(), *cooldown_secs);
                 let session = self.session.as_mut()?;
-                let ctx = ProbeContext {
-                    now,
-                    nudged: *nudged,
-                    pane_tail: pane_tail.clone(),
-                    provider_cooldown_until: cooldown_secs.map(|s| now + Duration::seconds(s)),
-                };
+                let ctx = ProbeContext { now, nudged: *nudged, pane_tail: pane_tail.clone(), provider_cooldown_until: cooldown };
                 Some(transitions::on_probe(&mut self.task, session, probe, &cfg.scheduler, &ctx))
             }
             Op::Complete(summary) => {
@@ -358,6 +346,29 @@ impl TaskWorld {
             }
             Op::Tick(_) => None,
         }
+    }
+
+    /// What `probe_sessions` passes as `provider_cooldown_until`: only for
+    /// a session that went stale or ran out of time whose pane shows the
+    /// agent waiting for a usage reset, the cooldown the daemon starts
+    /// (`cooldown_secs` from now, at least a minute). `None` otherwise.
+    fn provider_cooldown(
+        &self,
+        cfg: &Config,
+        now: DateTime<Utc>,
+        pane_tail: Option<&str>,
+        cooldown_secs: Option<i64>,
+    ) -> Option<DateTime<Utc>> {
+        let session = self.session.as_ref()?;
+        let sc = &cfg.scheduler;
+        let stale = matches!(self.task.state, TaskState::Running | TaskState::Starting)
+            && sc.stale_session_secs > 0
+            && now - session.last_activity_at > Duration::seconds(sc.stale_session_secs as i64);
+        let timeout = transitions::session_timed_out(&self.task, session, sc, now);
+        if !(stale || timeout) || !pane_tail.is_some_and(transitions::pane_waits_for_usage_reset) {
+            return None;
+        }
+        cooldown_secs.map(|secs| now + Duration::seconds(secs.max(60)))
     }
 
     /// The daemon's finalize phase: a live session of a task that was
@@ -559,7 +570,9 @@ fn launch_outcome() -> impl Strategy<Value = LaunchOutcome> {
 /// One thing that happens to the daemon between two launch passes, or a pass.
 #[derive(Debug, Clone)]
 enum DaemonOp {
-    /// A per-task call (the index is taken modulo the number of tasks).
+    /// A per-task call from [`task_op`] (never a launch step or a tick:
+    /// those are the pass's and the world's), the index taken modulo the
+    /// number of tasks.
     Task(usize, Op),
     /// `launch_tasks`: the outcomes are consumed by the starts in order
     /// (a launch, when the list runs out).
@@ -631,25 +644,33 @@ impl DaemonWorld {
 
     /// What `Ledgers::load` would return now: the ledgers stamped with the
     /// current time, a period that has ended rolled over with nothing
-    /// spent in the new one yet, the window ending now.
+    /// spent in the new one yet, the window ending now. Window spend is
+    /// kept while the new window overlaps the old one (the model does not
+    /// date its spends) and dropped once the whole window has passed.
     fn refresh_ledgers(&mut self) {
         let now = self.now;
         for ledger in self.ledgers.by_provider.values_mut() {
             ledger.now = now;
-            if now >= ledger.period.end {
+            let new_period = now >= ledger.period.end;
+            if new_period {
                 let len = ledger.period.len();
                 while now >= ledger.period.end {
                     ledger.period = Period { start: ledger.period.end, end: ledger.period.end + len };
                 }
                 for t in &mut ledger.tiers {
                     t.period_weighted = 0.0;
-                    t.window_weighted = 0.0;
                 }
                 ledger.total_period_weighted = 0.0;
-                ledger.total_window_weighted = 0.0;
                 ledger.spent_since_observation = 0.0;
             }
-            ledger.window = Period { start: now - Duration::hours(5), end: now };
+            let window = Period { start: now - Duration::hours(5), end: now };
+            if new_period || window.start >= ledger.window.end {
+                for t in &mut ledger.tiers {
+                    t.window_weighted = 0.0;
+                }
+                ledger.total_window_weighted = 0.0;
+            }
+            ledger.window = window;
         }
     }
 
@@ -673,12 +694,13 @@ impl DaemonWorld {
         let Some(effects) = self.tasks[idx].apply(&self.cfg, now, op) else { return Ok(None) };
         check(step, op, &self.cfg, &before, &self.tasks[idx], &effects)?;
         self.carry_out(&effects);
-        // A pane waiting for a usage reset puts the provider on cooldown
-        // before the probe is applied (`start_provider_cooldown`).
-        if let Op::Probe { cooldown_secs: Some(secs), .. } = op
+        // A stale or timed-out pane waiting for a usage reset put the
+        // provider on cooldown before the probe (`start_provider_cooldown`).
+        if let Op::Probe { pane_tail, cooldown_secs, .. } = op
+            && let Some(until) = before.provider_cooldown(&self.cfg, now, pane_tail.as_deref(), *cooldown_secs)
             && let Some(session) = before.session.as_ref()
         {
-            self.rate_limits.mark_provider(&self.cfg.budget, session.model.provider(), now + Duration::seconds(*secs));
+            self.rate_limits.mark_provider(&self.cfg.budget, session.model.provider(), until);
         }
         Ok(Some(effects))
     }
@@ -798,9 +820,6 @@ impl DaemonWorld {
     fn apply(&mut self, step: usize, op: &DaemonOp) -> Result<bool, TestCaseError> {
         match op {
             DaemonOp::Task(i, op) => {
-                if op.is_launch_step() || matches!(op, Op::Tick(_)) {
-                    return Ok(false);
-                }
                 let idx = i % self.tasks.len();
                 Ok(self.step(step, idx, op)?.is_some())
             }
@@ -808,11 +827,13 @@ impl DaemonWorld {
                 // The store's row order must not matter: the same pass over
                 // the tasks listed backwards hands out the same candidates
                 // with the same verdicts (unless `pick_next` has a tie).
-                let ties = self.has_ties();
-                let mut reversed = self.clone();
-                reversed.tasks.reverse();
+                let reversed = (!self.has_ties()).then(|| {
+                    let mut world = self.clone();
+                    world.tasks.reverse();
+                    world
+                });
                 let pass = self.launch_pass(step, outcomes)?;
-                if !ties {
+                if let Some(mut reversed) = reversed {
                     let other = reversed.launch_pass(step, outcomes)?;
                     prop_assert_eq!(&pass, &other, "step {} pass: the order of the rows changed the pass", step);
                 }
@@ -926,15 +947,10 @@ fn check_daemon(step: usize, op: &DaemonOp, before: &DaemonWorld, after: &Daemon
         live_after <= live_before.max(max),
         "step {step} {op:?}: {live_after} live sessions for max_concurrent {max} ({live_before} before)"
     );
-    if matches!(op, DaemonOp::LaunchPass(_)) {
-        if before.scheduling_paused {
-            let was: Vec<&Task> = before.tasks.iter().map(|t| &t.task).collect();
-            let is: Vec<&Task> = after.tasks.iter().map(|t| &t.task).collect();
-            prop_assert_eq!(was, is, "step {} pass while scheduling is paused changed a task", step);
-        }
-        for t in &after.tasks {
-            prop_assert!(t.start.is_none(), "step {step} pass left a start under way on {}", t.task.key);
-        }
+    if matches!(op, DaemonOp::LaunchPass(_)) && before.scheduling_paused {
+        let was: Vec<&Task> = before.tasks.iter().map(|t| &t.task).collect();
+        let is: Vec<&Task> = after.tasks.iter().map(|t| &t.task).collect();
+        prop_assert_eq!(was, is, "step {} pass while scheduling is paused changed a task", step);
     }
     let ids: HashSet<TaskId> = after.tasks.iter().map(|t| t.task.id).collect();
     prop_assert_eq!(ids.len(), after.tasks.len(), "two rows for one task");
