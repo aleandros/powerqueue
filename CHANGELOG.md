@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-10
+
+The stateful model now covers the whole daemon: several tasks sharing
+slots, ledgers and rate limits through the real launch pass. It found one
+scheduling bug, fixed here: a start that fails before the launch no longer
+keeps its slot and its predicted budget for the rest of the pass.
+
 ### Changed
 
 - Testing: a whole-daemon model (`scheduler/model.rs`) runs random
@@ -880,7 +887,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.14.0
 [0.13.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.13.0
 [0.12.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.12.0
 [0.11.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.11.0
