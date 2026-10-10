@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-10
+
+The pure core is now checked by property-based tests and a stateful
+model of the daemon's calls, and the bugs they found are fixed: relayed
+answers no longer revive finished tasks, stale retry times are cleared,
+and a done marker that arrives after the probe still completes the task.
+`task complete` and `task block` refuse a task the daemon is launching.
+
 ### Changed
 
 - Testing: the pure core is checked by property-based tests (`proptest`)
@@ -849,7 +857,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.13.0
 [0.12.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.12.0
 [0.11.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.11.0
 [0.10.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.10.0
