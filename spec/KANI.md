@@ -13,7 +13,7 @@ Install [Kani 0.68.0](https://model-checking.github.io/kani/install-guide.html)
 ```sh
 cargo install --locked kani-verifier --version 0.68.0
 cargo kani setup
-CARGO_TARGET_DIR=target-kani cargo kani --lib -Z unstable-options --harness-timeout 120s --output-format terse --jobs 2
+CARGO_TARGET_DIR=target-kani cargo kani --lib -Z unstable-options --harness-timeout 300s --output-format terse --jobs 2
 # One proof:
 CARGO_TARGET_DIR=target-kani cargo kani --lib --harness kani_periods_contain_now_and_tile
 ```
@@ -25,7 +25,7 @@ timeout option requires Kani's `unstable-options` flag. A timeout or insufficien
 unwind bound is a failure, not a proof. No unwind assertions are disabled.
 
 `.github/workflows/kani.yml` runs on relevant PRs and manual dispatch. Its job
-is advisory (`continue-on-error: true`), with a 30-minute job limit and 120 seconds
+is advisory (`continue-on-error: true`), with a 30-minute job limit and 300 seconds
 per harness. It does not change release behavior or add a required Rust check.
 
 ## What is bounded
@@ -54,7 +54,7 @@ the bound was increased instead of disabling the check.
 
 Broader prototypes for two-provider `reserve`, cooldown clearing/overwrites, multiple tiers and
 `provider_blocked_until`, full `Policy::eligibility`, and up to six history
-samples repeatedly exceeded the 120-second budget on Kani 0.68.0. Profiling
+samples repeatedly exceeded the initial 120-second exploration budget on Kani 0.68.0. Profiling
 showed time in symbolic execution and heap-pointer simplification, before SAT
 solving. Those prototypes are not shipped as permanently failing advisory
 checks, and no successful proof is claimed for them. A later cut can investigate
@@ -73,3 +73,8 @@ Silicon, with unwind checks enabled. Measured proof times: period tiling ~30 s,
 fraction/remaining ~4 s, rate-limit boundary ~10 s, ledger conservation ~1 s,
 and two-sample thinning ~57 s. These are bounded proofs, not guarantees outside
 the documented domains. The advisory CI job repeats the complete set on Linux.
+
+The initial Linux run verified four harnesses; thinning reached the original
+120-second timeout (other Linux proof times were roughly twice the local times).
+The advisory runner therefore allows 300 seconds per harness for headroom.
+Timeouts still fail the check; input domains and assertions are unchanged.
