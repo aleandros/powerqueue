@@ -78,7 +78,7 @@ docs/                user docs (priority grammar, budget algorithm, troubleshoot
   must do something new, an `Effect` variant. The budget core (`period`, `ledger`, `probe`, `estimator`,
   `policy`) takes plain data; store access lives in `budget/io.rs`.
 - Tests: unit tests next to the code; properties (`proptest`) next to them in `mod properties`,
-  drawing from `src/strategies.rs`, plus the stateful model test in `scheduler/model.rs`;
+  drawing from `src/strategies.rs`, plus the stateful models (one task; the whole daemon with its launch pass) in `scheduler/model.rs`;
   a failing property's seed under `proptest-regressions/` is committed with the fix; integration tests in `tests/` using `POWERQUEUE_HOME` + `POWERQUEUE_SECRETS=file` in a tempdir. Network via `wiremock`. tmux/git tests skip themselves with `which::which(...)` when the tool is not on PATH and use a private tmux socket (`-L powerqueue-test-<pid>-<random>`); see CONTRIBUTING.md.
 - UX: output goes through `cli::output` helpers; colours respect `--no-color`/`NO_COLOR`; `--json` prints machine-readable output for status/task/budget/doctor.
 - Keep the CLI surface in `cli/mod.rs` in sync with `docs/commands.md`; keep README.md focused on the overview and quick start.

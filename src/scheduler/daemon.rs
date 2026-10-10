@@ -2692,7 +2692,12 @@ impl Daemon {
                 Some(model) => {
                     let (key, id) = (task.key.clone(), task.id);
                     match self.start_task(task, model, &decision, now).await {
-                        Ok(()) => planner.started(&self.cfg.budget, &candidate),
+                        Ok(true) => planner.started(&self.cfg.budget, &candidate),
+                        // The start failed before the launch (worktree,
+                        // setup, launcher) and the task is crashed with a
+                        // backoff: the slot and the budget go to the next
+                        // candidate of this pass.
+                        Ok(false) => {}
                         Err(e) => {
                             tracing::error!(task = %key, error = %format!("{e:#}"), "start failed");
                             self.log(
@@ -2724,8 +2729,11 @@ impl Daemon {
         Ok(())
     }
 
-    /// Create the worktree, run setup, launch the agent and record the session.
-    async fn start_task(&mut self, mut task: Task, model: ModelTier, decision: &Decision, now: DateTime<Utc>) -> Result<()> {
+    /// Create the worktree, run setup, launch the agent and record the
+    /// session. `Ok(true)` when the session launched; `Ok(false)` when the
+    /// start failed before that and the task was crashed instead (its slot
+    /// is free again). `Err` only for store failures.
+    async fn start_task(&mut self, mut task: Task, model: ModelTier, decision: &Decision, now: DateTime<Utc>) -> Result<bool> {
         // A review round resumes the session that armed the merge, in the
         // same worktree path, told only what changed on the PR.
         let relaunch = task.review_relaunch().cloned();
@@ -2759,7 +2767,7 @@ impl Daemon {
                 None,
             );
             self.commit(&before, &mut task, None, effects).await?;
-            return Ok(());
+            return Ok(false);
         }
 
         let mut previous = self.store.latest_session(task.id)?;
@@ -2832,7 +2840,7 @@ impl Daemon {
                     None,
                 );
                 self.commit(&before, &mut task, None, effects).await?;
-                return Ok(());
+                return Ok(false);
             }
         };
         if resume && let Some(p) = previous.as_ref().filter(|p| p.id == session.id) {
@@ -2859,7 +2867,7 @@ impl Daemon {
             let mut fresh = fresh;
             let effects = launch::on_launch_superseded(&mut fresh, &task, &session);
             self.commit(&before, &mut fresh, Some(&session), effects).await?;
-            return Ok(());
+            return Ok(true);
         }
 
         let before = task.clone();
@@ -2876,7 +2884,7 @@ impl Daemon {
         };
         let effects = launch::on_launched(&mut task, &session, &facts, &self.cfg, now);
         self.commit(&before, &mut task, Some(&session), effects).await?;
-        Ok(())
+        Ok(true)
     }
 
     /// Fast-forward the local branch `base` to `origin/<base>`: the default
@@ -3495,6 +3503,40 @@ mod tests {
         daemon.launch_tasks(now).await.unwrap();
         let t = store.get_task_by_key("PAUSE-1").unwrap().unwrap();
         assert_ne!(t.state, TaskState::Queued, "resumed: the task was considered (started or failed to start): {:?}", t.state);
+    }
+
+    /// A start that fails before the launch (here: the repository does not
+    /// exist, so the worktree cannot be created) crashes its task and hands
+    /// the slot to the next candidate of the same pass.
+    #[tokio::test]
+    async fn a_failed_start_frees_its_slot_for_the_next_candidate() {
+        use crate::domain::{Criticality, Task, TaskSource};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let (mut daemon, _mock, _server) = dependency_daemon(&store, dir.path()).await;
+        daemon.cfg.scheduler.max_concurrent = 1;
+        let now = Utc::now();
+        for (key, score) in [("SLOT-1", 2.0), ("SLOT-2", 1.0)] {
+            let mut task = Task::new(key, "queued work", TaskSource::Manual);
+            task.criticality = Criticality::Critical;
+            task.score = score;
+            store.insert_task(&task).unwrap();
+        }
+
+        daemon.launch_tasks(now).await.unwrap();
+
+        for key in ["SLOT-1", "SLOT-2"] {
+            let t = store.get_task_by_key(key).unwrap().unwrap();
+            assert_eq!(t.state, TaskState::Crashed, "{key}: {:?} {:?}", t.state, t.last_error);
+            assert_eq!(t.attempts, 1, "{key} was tried once");
+            assert!(t.last_error.as_deref().is_some_and(|e| e.contains("worktree setup failed")), "{key}: {:?}", t.last_error);
+        }
+        assert!(store.list_live_sessions().unwrap().is_empty());
+        assert_eq!(
+            store.count_events_of_kind("task.starting", now - Duration::minutes(1)).unwrap(),
+            2,
+            "both candidates were started in one pass"
+        );
     }
 
     #[tokio::test]

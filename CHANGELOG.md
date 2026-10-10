@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Testing: a whole-daemon model (`scheduler/model.rs`) runs random
+  interleavings of launch passes, per-task calls, recorded usage, the
+  scheduling pause and time against several tasks sharing slots, ledgers
+  and rate-limit marks. Launches go through the real `LaunchPlanner` as
+  `launch_tasks` drives it; the checks cover slots (never beyond
+  `max_concurrent`), one hand-out per ready task per pass, the retry time
+  of a throttled candidate, budget (every ledger a pass reserved on stays
+  within the safety margin), bounded progress (no ready task left
+  unconsidered while a slot is free) and independence from the order the
+  store lists the tasks in.
+
+### Fixed
+
+- A start that fails before the launch (worktree setup, `repo.setup`, the
+  launcher) no longer uses up its slot and its predicted budget for the
+  rest of the launch pass: the next candidate is tried in the same tick,
+  as the planner documents. Found by the whole-daemon model.
+
 ## [0.13.0] - 2026-10-10
 
 The pure core is now checked by property-based tests and a stateful

@@ -89,13 +89,27 @@ cleared by anything that is not a backoff or a throttle, `KillWindow` only
 follows a live session, review rounds never exceed `review_rounds_max`, the
 planner hands out each task once per pass and reserves exactly the predicted
 cost, the policy never picks a model it cannot use, periods tile. The
-stateful model (`scheduler/model.rs`) runs random sequences of the daemon's
+stateful models (`scheduler/model.rs`) run random sequences of the daemon's
 calls and of the CLI's direct writes (`task complete`, `task block`), with
-each call's precondition mirroring its call site, against one task and
-checks the cross-cutting invariants after every step, including that a
-launch under way is never interrupted and that every effect round-trips
-through serde (the trace a specification would consume). A failing property is a finding first: the shrunk case says
-either that the invariant was overstated or that the code is wrong.
+each call's precondition mirroring its call site. The one-task model checks
+the cross-cutting invariants after every step, including that a launch
+under way is never interrupted and that every effect round-trips through
+serde (the trace a specification would consume). The whole-daemon model
+runs several tasks that share slots, ledgers and rate-limit marks, where
+launches only happen through a *launch pass* that mirrors
+`Daemon::launch_tasks` (slots from `max_concurrent` minus the live
+sessions, the real `LaunchPlanner`, each candidate throttled or started as
+`start_task` does, a generated outcome deciding whether the start launches
+or fails before it) and where recorded usage, the scheduling pause, time
+and the rate-limit marks of hooks and probes feed the next pass. It checks
+that a pass never creates more live sessions than `max_concurrent` allows,
+hands out each ready task at most once, gives a throttled candidate the
+policy's retry time and no slot, lets a failed start free its slot, keeps
+every ledger it reserved on within the safety margin, leaves no ready task
+unconsidered while a slot is free (bounded progress), and is the same
+whatever order the store lists the tasks in. A failing property is a
+finding first: the shrunk case says either that the invariant was
+overstated or that the code is wrong.
 
 ## Data flow
 
