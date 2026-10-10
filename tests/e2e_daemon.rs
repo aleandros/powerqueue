@@ -225,6 +225,15 @@ push_branch = false
         }
     }
 
+    /// Optional formal-test artifact; ordinary Rust tests do not require Quint.
+    fn export_events(&self, name: &str) {
+        let Some(dir) = std::env::var_os("POWERQUEUE_TRACE_DIR") else { return };
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).expect("create trace artifact directory");
+        let events = self.run_ok(&["logs", "--events", "--json", "-n", "100000"]);
+        std::fs::write(dir.join(format!("{name}.json")), events).expect("write e2e event trace");
+    }
+
     fn daemon_log(&self) -> String {
         std::fs::read_to_string(self.root.path().join("daemon.log")).unwrap_or_default()
     }
@@ -561,6 +570,7 @@ fn task_runs_to_completion_with_usage_and_cleanup() {
     let branches = Command::new("git").args(["branch", "--list", &format!("pq/{key}")]).current_dir(&repo).output().unwrap();
     assert!(String::from_utf8_lossy(&branches.stdout).contains(&format!("pq/{key}")));
     assert!(kinds.contains(&"cleanup.kept"));
+    env.export_events("completion");
 }
 
 /// A commit merged on the remote (a blocker's PR) is in the next task's
@@ -694,6 +704,7 @@ fn crashed_session_is_resumed_and_completes() {
     assert!(launched[1].contains("resumed"), "second launch resumes the same Claude session: {launched:?}");
     let sessions = v["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 1, "a resumed attempt reuses the session row");
+    env.export_events("crash-resume");
 }
 
 #[test]
@@ -801,6 +812,7 @@ fn codex_rate_limit_puts_provider_on_cooldown() {
     assert!(limited["message"].as_str().unwrap_or("").contains("gpt-6-astra"), "names the codex model: {limited}");
     assert_eq!(limited["data"]["error_type"].as_str(), Some("rate_limit"));
     assert!(v["task"]["last_error"].as_str().unwrap_or("").contains("usage limit"), "{}", v["task"]);
+    env.export_events("rate-limit");
 }
 
 #[test]
