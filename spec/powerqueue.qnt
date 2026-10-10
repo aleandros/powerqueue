@@ -202,7 +202,7 @@ module progress {
     nondet throttled = Set(false, true).oneOf()
     all { now' = 0, task' = if (throttled) { ...fresh, state: "throttled", notBefore: 2 } else fresh }
   }
-  action tick = all { now < 3, now' = now + 1, task' = task }
+  action tick = all { now' = if (now < 3) now + 1 else now, task' = task }
   action launch = all {
     ready(task, now), now' = now,
     task' = advance(advance(task, "Start", -1), "Launch", -1),
@@ -212,4 +212,7 @@ module progress {
   temporal eventuallyStarts = all { tick.weakFair(vars), launch.weakFair(vars) }.implies(eventually(task.live))
   run retryTimeTest = (all { now' = 0, task' = { ...fresh, state: "throttled", notBefore: 2 } })
     .then(tick).expect(not(ready(task, now))).then(tick).then(launch).expect(task.live)
+  run clockCanStutterBeforeLaunchTest = (all { now' = 0, task' = fresh })
+    .then(tick).then(tick).then(tick).then(tick).expect(now == 3 and not(task.live))
+
 }

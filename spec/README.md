@@ -139,10 +139,12 @@ completion after a session has ended.
 ## Validation (2026-10-10)
 
 Local checks passed: Rust fmt/clippy/full tests (590 unit tests and all integration
-suites), three scheduler scenarios plus the progress scenario, 1,000 simulations
+suites), three scheduler scenarios plus two progress scenarios, 1,000 simulations
 of 100 steps, 15 adapter/negative replay tests, and all three real e2e traces.
 Apalache checked `safety` through five transitions; TLC exhaustively checked the
-finite `progress` model's `eventuallyStarts` temporal property. Neither result
+finite `progress` model's `eventuallyStarts` temporal property. Removing fairness
+from that property produces a TLC counterexample (the capped clock can stutter
+forever before launch). Neither result
 extends beyond the abstractions and assumptions above.
 
 ## Real queue evidence (2026-10-10)
