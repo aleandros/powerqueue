@@ -1,6 +1,6 @@
 # Quint: queue, launch, crash, budget
 
-This is the first specification cut from `HANDOFF-formal-testing.md`.
+This specification models queue lifecycle and launch scheduling.
 It supplements the Rust properties and whole-daemon model. It does not replace
 those tests or prove the implementation equivalent to the specification.
 
@@ -53,7 +53,7 @@ A direct CLI completion changes the task before the daemon closes its session;
 `Complete` and `Release` represent those separate steps. A done marker can
 instead close that still-live session with `Finish`.
 
-Two proposed handoff invariants required qualification against actual Rust:
+The model reflects two details of the Rust lifecycle:
 
 - A terminal task can temporarily retain a session after a direct completion
   or source cancellation; cleanup releases it later.
@@ -136,27 +136,15 @@ produce a false success. Adapter tests include negative schedules: double launch
 wrong attempt, premature restart, early failure, crash past the limit, and duplicate
 completion after a session has ended.
 
-## Validation (2026-10-10)
+## Operational validation
 
-Local checks passed: Rust fmt/clippy/full tests (590 unit tests and all integration
-suites), three scheduler scenarios plus two progress scenarios, 1,000 simulations
-of 100 steps, 15 adapter/negative replay tests, and all three real e2e traces.
-Apalache checked `safety` through five transitions; TLC exhaustively checked the
-finite `progress` model's `eventuallyStarts` temporal property. Removing fairness
-from that property produces a TLC counterexample (the capped clock can stutter
-forever before launch). Neither result
-extends beyond the abstractions and assumptions above.
+Replay logs from a consistent application version and retain task creation
+histories within the selected window. Tasks whose creation falls outside that
+window are skipped; inspect the coverage report before interpreting a pass.
+Historical logs may contain behavior that the current implementation no longer
+allows. Investigate rejected transitions against the version that emitted them
+rather than weakening the model to accept them.
 
-## Real queue evidence (2026-10-10)
-
-Read-only export from `ssh dev`: 67,504 events spanning October 5–10. The running
-binary is 0.14.0, activated at 19:50:07 UTC October 10. The export ends with its
-startup; **there is no post-upgrade task activity yet**, so this is historical
-evidence, not the requested full day on 0.14.0.
-
-The historical replay rejects event 3558: a second `task.completed` after event
-3556 already completed the task and ended its session. That behavior predates
-0.14.0; the current dead-session guard logs `hook.duplicate` instead. A synthetic
-negative test preserves the check without committing production data. Do not
-weaken the guard to make an old trace pass. Re-export after a day of actual
-queue activity, retaining creation histories, and inspect the coverage report.
+Use synthetic regression fixtures for invalid schedules, such as a second
+completion after a session has ended. Keep raw operational logs and generated
+traces outside version control.
