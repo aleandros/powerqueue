@@ -2,8 +2,8 @@
 
 These optional harnesses call production functions directly, under
 `#[cfg(kani)] mod verification` in the budget modules. They compile out of
-normal builds. This is the first Kani cut from `HANDOFF-formal-testing.md`;
-the [Quint specification](README.md) is the complementary scheduler model.
+normal builds. The [Quint specification](README.md) is the complementary
+scheduler model.
 
 ## Run
 
@@ -47,34 +47,19 @@ is forgotten after assertions to keep unrelated collection destruction outside
 the proof; the production functions and memory checks within them are unchanged.
 
 The sample harness uses unwind 8 even with only two readings: Rust's internal
-byte-swap loop also needs a sufficient bound. Unwind 4 failed an unwind assertion;
-the bound was increased instead of disabling the check.
+byte-swap loop also needs a sufficient bound. Unwind assertions remain enabled.
 
-## Deferred after actual verifier runs
+## Deferred scope
 
-Broader prototypes for two-provider `reserve`, cooldown clearing/overwrites, multiple tiers and
-`provider_blocked_until`, full `Policy::eligibility`, and up to six history
-samples repeatedly exceeded the initial 120-second exploration budget on Kani 0.68.0. Profiling
-showed time in symbolic execution and heap-pointer simplification, before SAT
-solving. Those prototypes are not shipped as permanently failing advisory
-checks, and no successful proof is claimed for them. A later cut can investigate
-library contracts or further decomposition without rewriting production behavior
-solely to accommodate the verifier.
+Two-provider `reserve`, cooldown clearing/overwrites, multiple tiers,
+`provider_blocked_until`, full `Policy::eligibility`, and larger history samples
+are outside the retained proof domains. Symbolic execution and heap-pointer
+simplification can make these larger domains expensive before SAT solving begins.
+Extending coverage may require library contracts or further decomposition; no
+successful proof is claimed for these cases.
 
 The existing proptest suite still covers provider routing, complete policy
 eligibility and broad observation histories. Kani adds exhaustive checks within
 the small domains above; it does not replace those tests. Inspect individual
 harness results: a nonblocking CI job's overall status alone is not proof evidence.
 
-## Local verification (2026-10-10)
-
-All five retained harnesses verified with Kani 0.68.0 / CBMC 6.11.0 on Apple
-Silicon, with unwind checks enabled. Measured proof times: period tiling ~30 s,
-fraction/remaining ~4 s, rate-limit boundary ~10 s, ledger conservation ~1 s,
-and two-sample thinning ~57 s. These are bounded proofs, not guarantees outside
-the documented domains. The advisory CI job repeats the complete set on Linux.
-
-The initial Linux run verified four harnesses; thinning reached the original
-120-second timeout (other Linux proof times were roughly twice the local times).
-The advisory runner therefore allows 300 seconds per harness for headroom.
-Timeouts still fail the check; input domains and assertions are unchanged.
