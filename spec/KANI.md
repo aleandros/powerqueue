@@ -62,4 +62,3 @@ The existing proptest suite still covers provider routing, complete policy
 eligibility and broad observation histories. Kani adds exhaustive checks within
 the small domains above; it does not replace those tests. Inspect individual
 harness results: a nonblocking CI job's overall status alone is not proof evidence.
-
