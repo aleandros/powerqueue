@@ -2231,9 +2231,10 @@ mod tests {
         use crate::domain::{Task, TaskSource, TokenUsage, UsageRecord};
         let store = Store::open_in_memory().unwrap();
         let mut cfg = Config::default();
-        cfg.budget.providers.claude.period_anchor = Some("2026-09-28T00:00:00Z".into());
         cfg.budget.providers.claude.period_weighted_tokens = 80_000_000;
         let now = Utc::now();
+        // Keep both readings in this period, including when run near a weekly reset.
+        cfg.budget.providers.claude.period_anchor = Some((now - Duration::hours(4)).to_rfc3339());
         let task = Task::new("ENG-1", "t", TaskSource::Manual);
         store.insert_task(&task).unwrap();
         // Two readings 5 points apart with 50M weighted tokens between them: 1B per period.
