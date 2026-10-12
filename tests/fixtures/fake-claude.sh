@@ -57,6 +57,19 @@ if [ "$headless" = 1 ]; then
       printf '\n[[overrides]]\nkey = "FAKE-1"\ncriticality = "critical"\n' >> priority.toml
       printf '\n[scheduler]\nmax_concurrent = 3\n' >> config.toml
       ;;
+    intent)
+      # Deliberately consume the read-only snapshot, without a live model.
+      if ! grep -q 'FAKE-1 should be critical' PRIORITY.md; then
+        echo 'expected intent snapshot missing' >&2
+        exit 1
+      fi
+      printf '\n[[overrides]]\nkey = "FAKE-1"\ncriticality = "critical"\n' >> priority.toml
+      ;;
+    report-error)
+      printf '\n[[overrides]]\nkey = "FAKE-1"\ncriticality = "critical"\n' >> priority.toml
+      echo '{"type":"result","is_error":true,"result":"model failed after editing"}'
+      exit 0
+      ;;
     priority)
       printf '\n[[overrides]]\nkey = "FAKE-1"\ncriticality = "critical"\n' >> priority.toml
       ;;

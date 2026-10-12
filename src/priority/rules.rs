@@ -1038,7 +1038,7 @@ mod tests {
 
     #[test]
     fn parses_template_without_errors_or_warnings() {
-        let rules = parse_ok(include_str!("PRIORITY.template.md"));
+        let rules = parse_ok(include_str!("../../tests/fixtures/priority/legacy-template.md"));
         assert_eq!(rules.sections[&Criticality::Critical].len(), 3);
         assert_eq!(rules.sections[&Criticality::High].len(), 2);
         assert_eq!(rules.sections[&Criticality::Normal].len(), 1);
@@ -1467,7 +1467,7 @@ mod tests {
 
     #[test]
     fn describe_is_readable() {
-        let rules = parse_ok(include_str!("PRIORITY.template.md"));
+        let rules = parse_ok(include_str!("../../tests/fixtures/priority/legacy-template.md"));
         let text = rules.describe();
         assert!(text.contains("Critical (3 rules)"));
         assert!(text.contains("label: incident"));

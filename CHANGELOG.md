@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Tune free-form Markdown intent into validated TOML proposals, with project
+  selection, intent-change diagnostics, scoped queue simulation and reviewable
+  working-copy changes for committed repository policies. Stale drafts refuse
+  to overwrite newer input; applied snapshots remain available for undo.
+
 ### Changed
 
 - Replace executable Markdown priority rules with strict versioned `priority.toml`.

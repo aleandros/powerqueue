@@ -22,7 +22,7 @@ mod properties {
     proptest! {
         #[test]
         fn migrated_policies_preserve_evaluation(task in arb::policy_task(), now in arb::instant(), jev in 0.0f64..1.0, age in 0.0f64..10.0) {
-            for text in [include_str!("PRIORITY.template.md"), include_str!("../../tests/fixtures/priority/legacy.md")] {
+            for text in [include_str!("../../tests/fixtures/priority/legacy-template.md"), include_str!("../../tests/fixtures/priority/legacy.md")] {
                 let old = PriorityRules::parse_legacy(text).unwrap();
                 let (toml, _) = migrate(text).unwrap();
                 let new = PriorityRules::parse(&toml).unwrap();

@@ -634,6 +634,12 @@ impl std::fmt::Display for TuneScope {
 
 #[derive(Debug, Args, Default)]
 pub struct TuneArgs {
+    /// Select an execution project (otherwise use the machine policy).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Free-form intent document (default: PRIORITY.md beside the selected policy).
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["apply", "undo"])]
+    pub intent: Option<PathBuf>,
     /// What you expect, in plain words: "ENG-12 should run before ENG-40", "tasks labelled
     /// `chore` are low and use sonnet", "run three tasks at once". `-` reads stdin.
     #[arg(value_name = "INSTRUCTION", conflicts_with_all = ["apply", "undo"])]

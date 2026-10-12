@@ -736,9 +736,49 @@ fn check_overrides_source(cfg: &Config) -> CheckResult {
     }
 }
 
-/// How to learn a provider's period reset when nothing is known yet.
-/// `powerqueue tune` drafts: a proposal nobody applied, or a run that failed
-/// or produced invalid files, is worth a look (the directory explains why).
+/// Report prose drift separately from the executable policy, including a
+/// repository proposal that has not reached the configured committed source.
+fn check_priority_intent(cfg: &Config, paths: &Paths) -> CheckResult {
+    let policy = cfg.rules_source(paths).path();
+    let result = (|| -> Result<String> {
+        let applied = crate::tune::Draft::list(paths)?.into_iter().rev().find(|d| {
+            d.meta.status == crate::tune::DraftStatus::Applied
+                && d.meta.scope.includes_priority()
+                && d.meta.live_priority == policy
+                && d.meta.intent_path.is_some()
+        });
+        let intent = applied
+            .as_ref()
+            .and_then(|d| d.meta.intent_path.clone())
+            .unwrap_or_else(|| policy.with_file_name(crate::tune::INTENT_FILE));
+        let mut status = crate::tune::intent_status(paths, &policy, &intent)?;
+        if let Some(d) = applied
+            && cfg.rules_source(paths).rev().is_some()
+            && cfg.read_rules_text(paths)? != Some(std::fs::read_to_string(d.priority_path())?)
+        {
+            status.push_str("; repository proposal differs from active committed policy: review, commit and merge it");
+        }
+        Ok(format!("{}: {status}", intent.display()))
+    })();
+    match result {
+        Ok(message)
+            if message.contains("intent changed")
+                || message.contains("no applied proposal")
+                || message.contains("repository proposal differs") =>
+        {
+            CheckResult::warn(
+                CONF,
+                "priority intent",
+                message,
+                "review with `powerqueue tune --scope priority` (select --project ID for a project)",
+            )
+        }
+        Ok(message) => CheckResult::ok(CONF, "priority intent", message),
+        Err(e) => CheckResult::warn(CONF, "priority intent", format!("{e:#}"), "repair the intent document or tune metadata"),
+    }
+}
+
+/// A pending or failed tune draft is worth a look; its directory explains why.
 fn check_tune_drafts(paths: &Paths) -> CheckResult {
     let drafts = match crate::tune::Draft::list(paths) {
         Ok(d) => d,
@@ -2111,6 +2151,7 @@ pub async fn run_all(
                     check_repo(&project),
                     check_worktree_root(&project, paths),
                     check_priority_file(&project, paths),
+                    check_priority_intent(&project, paths),
                     check_repo_overrides(&project),
                     check_overrides_source(&project),
                     check_prompt_template(&project),
@@ -2678,7 +2719,18 @@ mod tests {
             d.set_status(status, vec!["timed out".into()]).unwrap();
             d
         };
-        mk("20260101T000000Z-a00000", DraftStatus::Applied);
+        let mut applied = mk("20260101T000000Z-a00000", DraftStatus::Applied);
+        let cfg = Config::default();
+        let intent = paths.config_dir.join("goals.md");
+        std::fs::write(&intent, "Incidents first.").unwrap();
+        applied.capture_intent(&paths, None, cfg.rules_source(&paths), intent.clone()).unwrap();
+        assert_eq!(check_priority_intent(&cfg, &paths).status, Status::Ok);
+        std::fs::write(&intent, "Prefer customer work.").unwrap();
+        let changed = check_priority_intent(&cfg, &paths);
+        assert_eq!(changed.status, Status::Warn);
+        assert!(changed.detail.contains("intent changed since last applied proposal"));
+        std::fs::remove_file(intent).unwrap();
+        assert_eq!(check_priority_intent(&cfg, &paths).status, Status::Warn);
         assert_eq!(check_tune_drafts(&paths).status, Status::Ok);
         mk("20260101T000001Z-a00001", DraftStatus::Failed);
         let r = check_tune_drafts(&paths);

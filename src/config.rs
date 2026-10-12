@@ -1527,7 +1527,7 @@ impl LoadedOverrides {
 }
 
 /// Where the priority rules come from (see [`Config::rules_source`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RulesSource {
     /// A file on disk (watched for live reload).
     File(PathBuf),

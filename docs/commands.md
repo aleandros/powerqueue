@@ -76,9 +76,32 @@ state machine allows it. `complete` and `block` always write directly.
 | `priority migrate --from MARKDOWN --to TOML` | explicitly convert legacy rules, report warnings, and create a new TOML file; never overwrites files or updates configuration |
 | `priority explain TASK` | explain evaluation using the task's execution-project policy |
 | `priority simulate [--project ID] [--file PATH] [--config PATH] [--all] [--linear] [--reasons] [--no-budget] [-n LIMIT]` | dry-run ranking and budget decisions; live policies resolve per task, `--file` applies a draft; no state changes |
-| `tune "what you expect" [--scope priority\|config\|all] [-m MODEL] [-y] [--dry-run] [--no-budget] [--timeout SECS]` | describe the change in plain words ("ENG-12 should run before ENG-40", "chores are low and use sonnet", "run three tasks at once") and let a headless Claude Code session edit **drafts** of `priority.toml` and `config.toml` under `<state>/tune/<id>/`; powerqueue validates the result, prints Claude's summary, the diff and the simulated queue with the drafts, then asks before writing the live files (`-y` applies directly, `--dry-run` never applies). Exit 0 applied/unchanged/dry run, 1 failed/invalid/declined, 3 proposed but not applied (no terminal, no `-y`). `-` reads the instruction from stdin |
-| `tune --apply [DIR]` | apply the newest proposed draft (or `DIR`) after reviewing it; `-y` skips the question |
-| `tune --undo` | restore the files the most recent apply replaced (a running daemon is asked to reload) |
+| `tune "what you expect" [--project ID] [--intent PATH] [--scope priority\|config\|all] [-m MODEL] [-y] [--dry-run] [--no-budget] [--timeout SECS]` | describe the change in plain words ("ENG-12 should run before ENG-40", "chores are low and use sonnet", "run three tasks at once") and let a headless Claude Code session edit **drafts** of `priority.toml` and `config.toml` under `<state>/tune/<id>/`; powerqueue validates the result, prints Claude's summary, the diff and the simulated queue with the drafts, then asks before writing the live files (`-y` applies directly, `--dry-run` never applies). Exit 0 applied/unchanged/dry run, 1 failed/invalid/declined, 3 proposed but not applied (no terminal, no `-y`). `-` reads the instruction from stdin |
+| `tune --apply [DIR] [--project ID]` | apply the newest proposed draft (or `DIR`) after reviewing it; `-y` skips the question |
+| `tune --undo [--project ID]` | restore the files the most recent apply replaced (a running daemon is asked to reload) |
+
+`tune` reads free-form `PRIORITY.md` beside the selected policy (or `--intent PATH`)
+and snapshots it with the current executable TOML. `--project ID` selects the
+project's effective policy and queue; omitted means the machine policy. The
+proposal records its project, so later `--apply DIR` uses the same target.
+`--project` also filters the newest proposal/apply/undo selection. Configuration
+edits still target machine `config.toml`; repository overrides remain read-only.
+Out-of-scope edits are ignored in both application and simulation. Machine-policy
+proposals simulate other projects using their own policies.
+
+Each proposal reports whether intent differs from the last applied proposal;
+`doctor` reports changed intent and repository proposals awaiting a commit.
+Changing prose alone never changes scheduling. Missing default intent is allowed;
+an explicit unreadable/missing `--intent` fails. Intent is a read-only snapshot:
+changing it or live policy after drafting requires a new proposal.
+
+Repository policies work with the same approval options. For `default-branch`
+policies, tuning starts from the configured committed copy and requires the
+working-copy policy to match it. Apply writes a reviewable working-copy change;
+review, commit and merge it into the configured branch before the daemon sees
+it. No branch, commit or push is performed by tune. Undo restores that working
+copy too; reverting an already merged policy requires the same commit workflow.
+Applied drafts are retained for undo and intent comparison.
 
 ## Budget
 
