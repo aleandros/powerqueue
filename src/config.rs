@@ -2015,8 +2015,13 @@ impl Config {
     /// Structural validation; returns a list of human-readable problems.
     pub fn validate(&self) -> Vec<String> {
         let mut problems = self.project_problems();
-        if self.repo.path.trim().is_empty() && !self.projects.contains_key("default") {
+        if self.repo.path.trim().is_empty() && self.projects.is_empty() {
             problems.push("repo.path is empty".to_string());
+        }
+        if self.linear.enabled && !self.projects.is_empty() && !self.project_ids().contains("default") {
+            problems.push(
+                "Linear intake requires a default execution project; register default or set linear.enabled = false".into(),
+            );
         }
         if !self.repo.branch_template.contains("{key}") && !self.repo.branch_template.contains("{id}") {
             problems.push("repo.branch_template must contain {key} or {id}".to_string());

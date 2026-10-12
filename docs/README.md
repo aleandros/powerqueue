@@ -5,6 +5,7 @@
 ## Setup and daily use
 
 - [Getting started](getting-started.md): installation, updates, Linear, GitHub Issues, manual tasks and unattended use.
+- [Multiple projects](multi-project.md): registration, approval preview, shared queue operation and opt-in smoke testing.
 - [Command reference](commands.md): commands, flags and output behavior.
 - [Configuration reference](configuration.md): defaults, providers, issue sources, prompts and repository overrides.
 - [Containers](containers.md): run agents in per-task containers with command templates and the inbox shim.

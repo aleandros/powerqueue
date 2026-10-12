@@ -206,6 +206,7 @@ pub fn provider_cooldowns(
 pub struct RowData {
     pub task_id: TaskId,
     pub key: String,
+    pub execution_project: String,
     pub state: TaskState,
     pub criticality: Criticality,
     pub model: Option<ModelTier>,
@@ -235,6 +236,7 @@ pub fn rows_for(snapshot: &Snapshot, hide_terminal: bool, now: DateTime<Utc>) ->
             RowData {
                 task_id: t.id,
                 key: t.key.clone(),
+                execution_project: t.execution_project.clone(),
                 state: t.state,
                 criticality: t.criticality,
                 model: t.model.clone().or(t.model_override.clone()),
@@ -269,6 +271,8 @@ pub enum Action {
 /// Selection, scroll and mode state.
 #[derive(Debug, Clone, Default)]
 pub struct DashboardApp {
+    /// Only the task table is filtered; resource accounting stays global.
+    pub project_filter: Option<String>,
     pub snapshot: Snapshot,
     pub selected: usize,
     pub show_help: bool,
@@ -295,6 +299,9 @@ impl DashboardApp {
     /// Current table rows.
     pub fn rows(&self) -> Vec<RowData> {
         rows_for(&self.snapshot, self.filter_terminal, self.now())
+            .into_iter()
+            .filter(|r| self.project_filter.as_ref().is_none_or(|p| p == &r.execution_project))
+            .collect()
     }
 
     /// Keep the selection inside the row range.
@@ -441,6 +448,24 @@ mod tests {
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn project_filter_preserves_global_slots_and_refresh_selection() {
+        let mut snapshot = snapshot();
+        snapshot.tasks[0].execution_project = "api".into();
+        snapshot.tasks[1].execution_project = "web".into();
+        snapshot.tasks[3].execution_project = "worker".into();
+        let mut app = DashboardApp::new(snapshot.clone());
+        app.project_filter = Some("api".into());
+        assert_eq!(app.rows().len(), 1);
+        assert_eq!(app.selected_task().unwrap().key, "A");
+        assert_eq!(app.snapshot.slots_used(), 1, "web still consumes a global slot");
+        app.set_snapshot(snapshot);
+        assert_eq!(app.selected_task().unwrap().key, "A");
+        app.project_filter = Some("removed".into());
+        app.clamp_selection();
+        assert!(app.selected_task().is_none());
     }
 
     #[test]

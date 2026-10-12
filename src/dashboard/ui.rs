@@ -292,38 +292,54 @@ fn draw_header(frame: &mut Frame, app: &DashboardApp, area: Rect) {
 
 fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) {
     let rows = app.rows();
-    let title_width = area.width.saturating_sub(2 + 12 + 11 + 9 + 13 + 7 + 5 + 9 + 7 + 13 + 8).max(10);
-    let header = Row::new(
-        ["KEY", "STATE", "CRIT", "MODEL", "WTOK", "CPU", "RSS", "AGE", "WAITING ON", "TITLE"].map(|h| Cell::from(h).bold()),
-    )
-    .style(Style::default().fg(Color::DarkGray));
+    let compact = area.width < 145;
+    let title_width = area.width.saturating_sub(if compact { 56 } else { 125 }).max(10);
+    let headings = if compact {
+        vec!["KEY", "PROJECT", "STATE", "MODEL", "TITLE"]
+    } else {
+        vec!["KEY", "PROJECT", "STATE", "CRIT", "MODEL", "WTOK", "CPU", "RSS", "AGE", "WAITING ON", "TITLE"]
+    };
+    let header = Row::new(headings.into_iter().map(|h| Cell::from(h).bold())).style(Style::default().fg(Color::DarkGray));
     let body = rows.iter().map(|r| {
-        Row::new(vec![
+        let mut cells = vec![
             Cell::from(r.key.clone()),
+            Cell::from(r.execution_project.clone()),
             Cell::from(r.state.as_str()).style(state_style(r.state)),
-            Cell::from(r.criticality.as_str()).style(criticality_style(r.criticality)),
-            Cell::from(r.model.as_ref().map(|m| m.as_str()).unwrap_or("-")).style(model_style(r.model.as_ref())),
-            Cell::from(r.tokens.clone()),
-            Cell::from(r.cpu.clone()),
-            Cell::from(r.rss.clone()),
-            Cell::from(r.age.clone()),
-            Cell::from(sym.truncate(&r.waiting, 12)).style(if r.waiting == "-" {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                state_style(TaskState::Blocked)
-            }),
-            Cell::from(sym.truncate(&r.title, title_width as usize)),
-        ])
+        ];
+        if !compact {
+            cells.push(Cell::from(r.criticality.as_str()).style(criticality_style(r.criticality)));
+        }
+        cells.push(Cell::from(r.model.as_ref().map(|m| m.as_str()).unwrap_or("-")).style(model_style(r.model.as_ref())));
+        if !compact {
+            cells.extend([
+                Cell::from(r.tokens.clone()),
+                Cell::from(r.cpu.clone()),
+                Cell::from(r.rss.clone()),
+                Cell::from(r.age.clone()),
+                Cell::from(sym.truncate(&r.waiting, 12)).style(if r.waiting == "-" {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    state_style(TaskState::Blocked)
+                }),
+            ]);
+        }
+        cells.push(Cell::from(sym.truncate(&r.title, title_width as usize)));
+        Row::new(cells)
     });
     let count = rows.len();
     let title = if app.filter_terminal { format!(" tasks ({count} open) ") } else { format!(" tasks ({count}, all) ") };
-    let table = Table::new(
-        body,
-        [
-            Constraint::Length(12),
+    let title = match &app.project_filter {
+        Some(project) => format!("{title} project {project} "),
+        None => title,
+    };
+    let widths = if compact {
+        vec![Constraint::Length(16), Constraint::Length(10), Constraint::Length(11), Constraint::Length(12), Constraint::Min(10)]
+    } else {
+        vec![
+            Constraint::Length(16),
+            Constraint::Length(10),
             Constraint::Length(11),
             Constraint::Length(8),
-            // Wide enough for Codex / Gemini names (`gpt-6.1-sol`).
             Constraint::Length(12),
             Constraint::Length(6),
             Constraint::Length(4),
@@ -331,12 +347,13 @@ fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) 
             Constraint::Length(6),
             Constraint::Length(12),
             Constraint::Min(10),
-        ],
-    )
-    .header(header)
-    .block(sym.panel(title))
-    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-    .highlight_symbol(sym.pointer);
+        ]
+    };
+    let table = Table::new(body, widths)
+        .header(header)
+        .block(sym.panel(title))
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol(sym.pointer);
     let mut state = TableState::default().with_selected(if count == 0 { None } else { Some(app.selected.min(count - 1)) });
     frame.render_stateful_widget(table, area, &mut state);
     if count == 0 {

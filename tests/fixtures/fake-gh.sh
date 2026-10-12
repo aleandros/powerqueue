@@ -26,11 +26,18 @@ case "${1:-}" in
   *) echo "fake-gh: unsupported command: $*" >&2; exit 2 ;;
 esac
 number=""
+owner=""
+repo=""
 for arg in "$@"; do
-  case "$arg" in number=*) number="${arg#number=}" ;; esac
+  case "$arg" in
+    number=*) number="${arg#number=}" ;;
+    owner=*) owner="${arg#owner=}" ;;
+    name=*) repo="${arg#name=}" ;;
+  esac
 done
-echo "api graphql number=$number" >> "$dir/gh-calls.log"
+echo "api graphql number=$number owner=$owner repo=$repo" >> "$dir/gh-calls.log"
 file="$dir/pr-$number.json"
+if [ "${FAKE_PR_FROM_SOURCE:-0}" = 1 ]; then file="$dir/pr-$owner-$repo-$number.json"; fi
 if [ ! -f "$file" ]; then
   echo "fake-gh: Could not resolve to a PullRequest with the number of $number." >&2
   exit 1

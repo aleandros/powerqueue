@@ -42,7 +42,7 @@ the normal Rust gate and advisory CI simulation job. See the
 ## Model and assumptions
 
 `lifecycle` defines the shared transition guards and updates. `powerqueue`
-uses them in a three-task, two-provider, two-project scheduler with two slots, unit-cost
+uses them in a three-task, two-provider, three-project scheduler with two slots, unit-cost
 launches, and a one-unit budget per provider. A pass considers each task once.
 Successful launches reserve cost; a failed start consumes neither a slot nor
 budget. `spent` is a **pass-local reservation**, reset on the next pass, not
@@ -68,7 +68,10 @@ GitHub tasks, admission changes, restart round trips and revocation during setup
 A separate SQLite stateful property interleaves saved candidates, approval changes,
 material edits, re-reads after restart, and conditional claims. It checks that stale
 approval/scope cannot claim a start. These models call production transitions;
-Quint supplies the independent abstract lifecycle guards.
+Quint supplies the independent abstract lifecycle guards. A SQLite property also
+checks that a bound GitHub task’s new attempt, branch and worktree claim survive
+the post-setup approval reload, including denied evidence. The atomic start now
+persists the claim; Quint already makes Start update attempts and artifacts together.
 
 Source-to-project reconciliation is also an operation in both Rust stateful
 models. Generated source destinations and approval decisions interleave with

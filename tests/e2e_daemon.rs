@@ -987,7 +987,10 @@ impl wiremock::Respond for GitHubFixture {
         }
         let mut state = self.0.lock().unwrap();
         let method = request.method.as_str();
-        let path = request.url.path();
+        let repository =
+            state.issue["html_url"].as_str().unwrap().trim_start_matches("https://github.com/").split("/issues/").next().unwrap();
+        let normalized = request.url.path().replace(&format!("/repos/{repository}"), "/repos/acme/app");
+        let path = normalized.as_str();
         match (method, path) {
             ("POST", "/graphql") => ResponseTemplate::new(200).set_body_json(json!({"data":{"repository":{"issue":{
                 "title":state.issue["title"], "body":state.issue["body"], "state":state.issue["state"].as_str().unwrap().to_uppercase(),
@@ -1011,6 +1014,11 @@ impl wiremock::Respond for GitHubFixture {
                 excluded["state"] = json!("open");
                 excluded["labels"] = json!([{"name": "agent:ready"}, {"name": "no-agent"}]);
                 entries.push(excluded);
+                let mut unapproved = state.issue.clone();
+                unapproved["number"] = json!(4);
+                unapproved["state"] = json!("open");
+                unapproved["labels"] = json!([{"name": "bug"}]);
+                entries.push(unapproved);
                 ResponseTemplate::new(200).set_body_json(entries)
             }
             ("GET", "/repos/acme/app/issues/1") => ResponseTemplate::new(200).set_body_json(&state.issue),
@@ -1325,4 +1333,203 @@ fn execution_projects_push_and_clean_up_only_their_own_repositories() {
         let worktrees = powerqueue::worktree::Repo::new(&repos[index]).list_worktrees().unwrap();
         assert_eq!(worktrees.len(), 1, "only the original checkout should remain");
     }
+}
+
+/// Three real checkouts with independent mocked GitHub APIs and identical issue
+/// and PR numbers. No credentials, remotes or agent services leave the tempdir.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn three_project_github_queue_routes_approved_work_through_review_and_cleanup() {
+    use powerqueue::config::Config;
+    use serde_json::json;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let Some(mut env) = Env::new("pr", "max_concurrent = 1\npr_poll_secs = 1") else { return };
+    let config_path = env.home().join("config/config.toml");
+    let mut cfg = Config::from_toml(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    cfg.repo.path.clear();
+    cfg.cleanup.push_branch = true;
+    cfg.budget.probe_interval_mins = 0;
+    cfg.budget.providers.claude.period_weighted_tokens = 1;
+    cfg.scheduler.gh_binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-gh.sh").display().to_string();
+    cfg.claude.env.insert("FAKE_PR_FROM_SOURCE".into(), "1".into());
+    std::fs::write(&config_path, cfg.to_toml().unwrap()).unwrap();
+    let state_dir = env.root.path().join("fakestate");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    env.vars.push(("FAKE_GH_DIR".into(), state_dir.display().to_string()));
+    env.vars.push(("FAKE_PR_FROM_SOURCE".into(), "1".into()));
+    let mut fixtures = Vec::new();
+    let mut servers = Vec::new();
+    let mut repos = Vec::new();
+    let mut remotes = Vec::new();
+    for id in ["api", "web", "worker"] {
+        let repo = env.root.path().join(id);
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("identity"), id).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit", "-qm", "init"]);
+        let remote = env.root.path().join(format!("{id}.git"));
+        std::fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "--bare", "-q"]);
+        git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&repo, &["push", "-qu", "origin", "main"]);
+        std::fs::write(
+            repo.join(".powerqueue.toml"),
+            format!(
+                r#"
+setup = ['test "$(cat identity)" = "{id}" && test "$POWERQUEUE_PROJECT" = "{id}" && echo {id} > setup-{id}']
+[scheduler]
+max_concurrent = 99
+[cleanup]
+run = ['test "$POWERQUEUE_PROJECT" = "{id}" && echo {id} > cleanup-{id}']
+"#
+            ),
+        )
+        .unwrap();
+        env.run_ok(&[
+            "project",
+            "register",
+            id,
+            repo.to_str().unwrap(),
+            "--github",
+            &format!("acme/{id}"),
+            "--trusted-approver",
+            "maintainer",
+        ]);
+        let server = MockServer::start().await;
+        let fixture = GitHubFixture(std::sync::Arc::new(std::sync::Mutex::new(GitHubFixtureState {
+            issue: json!({"number": 1, "title": format!("Implement {id}"), "body": format!("Work only in {id}."),
+                "html_url": format!("https://github.com/acme/{id}/issues/1"), "state": "open",
+                "labels": [{"name":"agent:ready"},{"name":"bug"}], "created_at":"2026-09-01T12:00:00Z", "updated_at":"2026-09-01T12:01:00Z"}),
+            comments: Vec::new(),
+            operations: Vec::new(),
+        })));
+        Mock::given(wiremock::matchers::any()).respond_with(fixture.clone()).mount(&server).await;
+        std::fs::write(state_dir.join(format!("pr-acme-{id}-7.json")), gh_pr(7, "OPEN", "MERGEABLE")).unwrap();
+        fixtures.push(fixture);
+        servers.push(server);
+        repos.push(repo);
+        remotes.push(remote);
+    }
+    cfg = Config::from_toml(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    for (source, server) in cfg.github_sources.iter_mut().zip(&servers) {
+        source.endpoint = server.uri();
+        source.poll_interval_secs = 1;
+        source.in_progress_label = Some("agent:working".into());
+        source.done_label = Some("agent:review".into());
+        source.close_on_complete = true;
+    }
+    std::fs::write(&config_path, cfg.to_toml().unwrap()).unwrap();
+    env.run_ok(&["secrets", "set", "github", "github-e2e-token"]);
+    let preview: serde_json::Value = serde_json::from_str(&env.run_ok(&["--json", "github", "sync"])).unwrap();
+    assert_eq!(preview["changes"].as_array().unwrap().len(), 3);
+    for (index, id) in ["api", "web", "worker"].iter().enumerate() {
+        assert_eq!(preview["changes"][index]["task"]["execution_project"], *id);
+        assert_eq!(env.task_state(&format!("acme/{id}#1")), "?", "preview is read-only");
+    }
+    env.run_ok(&["github", "sync", "--apply"]);
+    env.start_daemon();
+    for id in ["api", "web", "worker"] {
+        assert_eq!(
+            env.wait_for_state(&format!("acme/{id}#1"), "throttled", Duration::from_secs(60)),
+            "throttled",
+            "{}",
+            env.daemon_log()
+        );
+        assert_eq!(env.task_state(&format!("acme/{id}#4")), "?", "ordinary issue labels never grant approval");
+    }
+    // One API fails after import. The other two must still make progress;
+    // the unavailable source must not falsely close or reroute its saved task.
+    servers[2].reset().await;
+    Mock::given(wiremock::matchers::any()).respond_with(ResponseTemplate::new(503)).mount(&servers[2]).await;
+    env.run_ok(&["config", "set", "budget.providers.claude.period_weighted_tokens", "1000000000"]);
+    // Clear only the budget delay via the supported retry command.
+    for id in ["api", "web", "worker"] {
+        env.run_ok(&["task", "retry", &format!("acme/{id}#1")]);
+    }
+    for id in ["api", "web"] {
+        let show =
+            env.wait_for_show(&format!("acme/{id}#1"), |v| v["task"]["state"] == "in_review" && has_event(v, "session.released"));
+        assert_eq!(show["task"]["state"], "in_review", "{}", env.daemon_log());
+    }
+    let held: serde_json::Value = serde_json::from_str(&env.run_ok(&["--json", "task", "show", "acme/worker#1"])).unwrap();
+    assert_eq!(held["task"]["execution_project"], "worker");
+    assert!(held["sessions"].as_array().unwrap().is_empty(), "unavailable approval cannot start: {held}");
+    assert_ne!(held["task"]["state"], "cancelled");
+    servers[2].reset().await;
+    Mock::given(wiremock::matchers::any()).respond_with(fixtures[2].clone()).mount(&servers[2]).await;
+    env.run_ok(&["github", "sync", "--apply"]);
+    env.run_ok(&["task", "retry", "acme/worker#1"]);
+    let held = env.wait_for_show("acme/worker#1", |v| v["task"]["state"] == "in_review" && has_event(v, "session.released"));
+    assert_eq!(held["task"]["state"], "in_review", "{}", env.daemon_log());
+
+    for (index, id) in ["api", "web", "worker"].iter().enumerate() {
+        let key = format!("acme/{id}#1");
+        let initial: serde_json::Value = serde_json::from_str(&env.run_ok(&["--json", "task", "show", &key])).unwrap();
+        assert_eq!(initial["task"]["execution_repo"], repos[index].canonicalize().unwrap().display().to_string());
+        assert_eq!(initial["task"]["pr_url"], format!("https://github.com/acme/{id}/pull/7"));
+        assert_eq!(fixtures[index].0.lock().unwrap().issue["state"], "open");
+        let session_id = initial["sessions"][0]["session"]["id"].clone();
+        let branch = initial["task"]["branch"].as_str().unwrap();
+        for (other, remote) in remotes.iter().enumerate() {
+            assert_eq!(powerqueue::worktree::Repo::new(remote).branch_exists(branch).unwrap(), other == index);
+        }
+        let wt = initial["events"].as_array().unwrap().iter().find(|e| e["kind"] == "worktree.ready").unwrap()["data"]["path"]
+            .as_str()
+            .unwrap();
+        assert!(wt.contains(&format!("projects/{id}/")));
+        assert!(!Path::new(wt).exists(), "hand-off removes this project's worktree");
+        std::fs::write(state_dir.join(format!("pr-acme-{id}-7.next.json")), gh_pr(7, "MERGED", "UNKNOWN")).unwrap();
+        std::fs::write(state_dir.join(format!("pr-acme-{id}-7.json")), gh_pr(7, "OPEN", "CONFLICTING")).unwrap();
+        let done = env.wait_for_show(&key, |v| {
+            v["task"]["state"] == "completed" && has_event(v, "cleanup.branch_deleted") && has_event(v, "github.closed")
+        });
+        assert_eq!(done["task"]["state"], "completed", "{}", env.daemon_log());
+        assert_eq!(done["task"]["review"]["rounds"], 1);
+        assert_eq!(done["task"]["attempts"], 2, "approval reload retains the new review attempt");
+        assert_eq!(done["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(done["sessions"][0]["session"]["id"], session_id);
+        assert!(output_tokens(&done) >= 800);
+        assert!(!has_event(&done, "github.update_failed"));
+        assert_eq!(fixtures[index].0.lock().unwrap().issue["state"], "closed");
+        let remote = powerqueue::worktree::Repo::new(&remotes[index]);
+        for marker in ["identity".to_string(), format!("setup-{id}"), format!("cleanup-{id}")] {
+            assert_eq!(remote.git(None, &["show", &format!("{branch}:{marker}")]).unwrap().trim(), *id);
+        }
+        let repo = powerqueue::worktree::Repo::new(&repos[index]);
+        assert!(!repo.branch_exists(branch).unwrap());
+        assert_eq!(repo.list_worktrees().unwrap().len(), 1);
+        let pane = &done["sessions"][0]["session"];
+        assert!(
+            powerqueue::tmux::Tmux::new("tmux", Some(env.socket.clone()))
+                .find_pane(pane["tmux_session"].as_str().unwrap(), pane["pane_id"].as_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+    let all: serde_json::Value = serde_json::from_str(&env.run_ok(&["--json", "status", "--all"])).unwrap();
+    assert_eq!(all["tasks"].as_array().unwrap().len(), 3);
+    // Replay the global launch/release order: project-local max_concurrent=99
+    // never enlarges the machine's single shared slot, including review rounds.
+    let events: serde_json::Value = serde_json::from_str(&env.run_ok(&["--json", "logs", "--events", "-n", "10000"])).unwrap();
+    let mut ordered = events.as_array().unwrap().clone();
+    ordered.sort_by_key(|e| e["id"].as_i64().unwrap());
+    let mut live = 0;
+    let mut starts = 0;
+    for event in ordered {
+        match event["kind"].as_str().unwrap() {
+            "session.launched" => {
+                live += 1;
+                starts += 1;
+                assert_eq!(live, 1);
+            }
+            "session.released" => {
+                live -= 1;
+                assert_eq!(live, 0);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(starts, 6);
+    assert_eq!(live, 0);
+    drop(env);
 }

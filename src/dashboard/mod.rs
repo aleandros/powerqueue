@@ -44,8 +44,10 @@ pub const POLL_EVERY: Duration = Duration::from_millis(250);
 pub const ONCE_DEFAULT_SIZE: (u16, u16) = (120, 36);
 
 /// Rendering options chosen by the CLI.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Options {
+    /// Restrict displayed tasks; shared ledgers and slot counts remain unfiltered.
+    pub project: Option<String>,
     /// Draw with ASCII symbols and `+-|` borders instead of Unicode glyphs.
     pub ascii: bool,
 }
@@ -140,6 +142,7 @@ pub fn run(cfg: &Config, paths: &Paths, store: &Store, options: Options) -> Resu
     let _ = paths;
     let mut app = DashboardApp::new(Snapshot::load(store, cfg, Utc::now())?);
     app.ascii = options.ascii;
+    app.project_filter = options.project;
     // ratatui installs its own restoring hook in `try_init`; ours makes sure
     // the terminal is sane even when a panic happens before/after that.
     let previous_hook = std::panic::take_hook();
@@ -179,6 +182,7 @@ fn restore_and_clear_terminal() {
 pub fn render_once(snapshot: Snapshot, options: Options, width: u16, height: u16) -> String {
     let mut app = DashboardApp::new(snapshot);
     app.ascii = options.ascii;
+    app.project_filter = options.project;
     render_once_app(&app, width, height)
 }
 
@@ -321,10 +325,17 @@ fn apply(
             Some(s) => attach(app, cfg, terminal, &s),
         },
         Action::Refresh | Action::ToggleTerminal | Action::Help | Action::OpenAdd => {}
-        Action::AddTask(title) => match create_task(store, &NewTask { title, ..Default::default() }) {
-            Ok(t) => app.status_line = Some(format!("added {} ({})", t.key, t.id.short())),
-            Err(e) => app.status_line = Some(format!("add failed: {e:#}")),
-        },
+        Action::AddTask(title) => {
+            let project = app.project_filter.as_deref().unwrap_or("default");
+            if !cfg.project_ids().contains(project) {
+                app.status_line = Some("select a registered project with dashboard --project ID before adding tasks".into());
+            } else {
+                match create_task(store, &NewTask { title, execution_project: Some(project.into()), ..Default::default() }) {
+                    Ok(t) => app.status_line = Some(format!("added {} ({}) to {}", t.key, t.id.short(), project)),
+                    Err(e) => app.status_line = Some(format!("add failed: {e:#}")),
+                }
+            }
+        }
     }
     Ok(Flow::Continue)
 }
@@ -363,14 +374,14 @@ mod tests {
         let mut t = Task::new("ENG-7", "Ship the dashboard", TaskSource::Manual);
         t.state = TaskState::Queued;
         let snapshot = Snapshot { tasks: vec![t], max_concurrent: 2, ..Default::default() };
-        let text = render_once(snapshot.clone(), Options { ascii: true }, 100, 24);
+        let text = render_once(snapshot.clone(), Options { ascii: true, ..Default::default() }, 100, 24);
         assert!(text.contains("powerqueue"), "{text}");
         assert!(text.contains("ENG-7"), "{text}");
         assert!(text.contains("+-"), "ascii borders: {text}");
         assert!(text.is_ascii(), "ascii mode must not emit non-ASCII glyphs: {text}");
         assert_eq!(text.lines().count(), 24);
         assert!(!text.lines().any(|l| l.ends_with(' ')), "trailing spaces trimmed");
-        let unicode = render_once(snapshot, Options { ascii: false }, 100, 24);
+        let unicode = render_once(snapshot, Options { ascii: false, ..Default::default() }, 100, 24);
         assert!(unicode.contains('┌'), "{unicode}");
         // Degenerate sizes are clamped, not panicking.
         assert!(!render_once(Snapshot::default(), Options::default(), 0, 0).is_empty());

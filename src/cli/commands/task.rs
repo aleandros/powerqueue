@@ -216,9 +216,22 @@ fn opt_ts(ts: Option<chrono::DateTime<Utc>>) -> String {
     ts.map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_else(|| "-".to_string())
 }
 
+fn execution_location(ctx: &mut Context, task: &Task) -> Result<serde_json::Value> {
+    let cfg = ctx.config_or_default()?.clone();
+    Ok(match cfg.for_task(task, &ctx.paths) {
+        Ok(project) => serde_json::json!({
+            "checkout": project.repo_path(),
+            "worktree_root": project.worktree_root(&ctx.paths),
+            "rules": project.rules_source(&ctx.paths).describe(),
+        }),
+        Err(error) => serde_json::json!({"error": format!("{error:#}")}),
+    })
+}
+
 fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let store = ctx.store()?.clone();
     let task = find_task(&store, &task_ref.task)?;
+    let location = execution_location(ctx, &task)?;
     let sessions = store.list_sessions_for_task(task.id)?;
     let events = store.events_for_task(task.id, 50)?;
     let pr_events = if task.pr_url.is_some() { pr_timeline(&store.events_for_task(task.id, 2000)?) } else { Vec::new() };
@@ -248,6 +261,7 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
         let out = serde_json::json!({
             "task": task,
             "source_route": source_route,
+            "execution_location": location,
             "provider": effective_model(&task).map(|m| m.provider()),
             "usage": usage,
             "weighted_tokens": usage.weighted(),
@@ -315,6 +329,7 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
         );
     }
     kv("execution project", task.execution_project.clone());
+    kv("configured checkout", location["checkout"].as_str().or(location["error"].as_str()).unwrap_or_default().into());
     if let Some(route) = &source_route {
         let description = if let Some(error) = route["error"].as_str() {
             error.to_string()
@@ -508,12 +523,14 @@ pub fn format_event(e: &Event, color: bool) -> String {
 fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let store = ctx.store()?.clone();
     let task = find_task(&store, &task_ref.task)?;
+    let location = execution_location(ctx, &task)?;
     let events = store.events_for_task(task.id, 500)?;
     let throttled = events.iter().rev().find(|e| e.kind == "task.throttled");
     let chosen = events.iter().rev().find(|e| e.kind == "task.model_chosen" || e.kind == "task.starting");
     if ctx.json {
         let out = serde_json::json!({
             "execution_project": task.execution_project,
+            "execution_location": location,
             "execution_repo": task.execution_repo,
             "key": task.key,
             "id": task.id,
@@ -539,6 +556,8 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     }
     let color = ctx.color;
     println!("{} {}", task.key.if_supports_color(Stream::Stdout, |t| t.bold()), task.title);
+    println!("  project      {}", task.execution_project);
+    println!("  checkout     {}", location["checkout"].as_str().or(location["error"].as_str()).unwrap_or_default());
     println!("  state        {}", paint(color, output::state_colored(task.state), task.state.as_str()));
     println!("  criticality  {}", paint(color, output::criticality_colored(task.criticality), task.criticality.as_str()));
     println!("  score        {:.1}", task.score);

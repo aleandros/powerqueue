@@ -120,6 +120,10 @@ For multi-project execution, run:
 cargo test --all-features --test e2e_daemon execution_project -- --nocapture
 ```
 
+Also run `cargo test --test e2e_daemon three_project -- --nocapture` for the
+three-source approved GitHub lifecycle. See [multi-project validation](docs/multi-project.md)
+for the coverage and opt-in live smoke procedure.
+
 These scenarios drive two disposable checkouts through shared concurrency,
 daemon restart, crash/resume, PR review, a project setup failure, and pushing to
 separate local bare remotes followed by worktree cleanup. They assert that

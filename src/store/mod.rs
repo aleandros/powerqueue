@@ -419,8 +419,9 @@ impl Store {
         Ok(changed != 0)
     }
 
-    /// Persist the pure start transition only if the candidate still belongs
-    /// to the same project and is in the state the planner read. Returns false
+    /// Persist the pure start transition and its claimed attempt/artifacts only
+    /// if the candidate still belongs to the same project and is in the state
+    /// the planner read. Returns false
     /// when another command superseded it; no repository operation may follow.
     pub fn claim_task_start(&self, before: &Task, starting: &Task) -> Result<bool> {
         if !before.execution_approved() || !starting.execution_approved() {
@@ -429,7 +430,8 @@ impl Store {
         let changed = self
             .lock()
             .execute(
-                "UPDATE tasks SET state=?5, model=?6, not_before=?7, review=?8, updated_at=?9
+                "UPDATE tasks SET state=?5, model=?6, not_before=?7, review=?8, updated_at=?9,
+             attempts=?13, branch=?14, worktree_path=?15
              WHERE id=?1 AND execution_project=?2 AND state=?3 AND attempts=?4
              AND github_admission IS ?10 AND title=?11 AND description=?12",
                 params![
@@ -444,7 +446,10 @@ impl Store {
                     ts(&Utc::now()),
                     before.github_admission.as_ref().map(json),
                     before.title,
-                    before.description
+                    before.description,
+                    starting.attempts,
+                    starting.branch,
+                    starting.worktree_path
                 ],
             )
             .context("claim task start in its execution project")?;

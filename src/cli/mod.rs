@@ -64,6 +64,9 @@ pub struct Cli {
 pub enum Command {
     /// Guided first-time setup: API keys, repository, Linear team, priority file.
     Init(InitArgs),
+    /// Register checkouts and GitHub intake, or inspect effective project settings.
+    #[command(subcommand)]
+    Project(ProjectCommand),
     /// Run the scheduler in the foreground (use tmux/launchd/systemd to keep it up).
     Run(RunArgs),
     /// Ask the running daemon to stop (sessions keep running in tmux).
@@ -127,8 +130,33 @@ pub enum Command {
     Completions { shell: clap_complete::Shell },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum ProjectCommand {
+    /// Show registered projects, checkouts, worktree roots and source mappings.
+    List,
+    /// Register or update a checkout and optionally its GitHub source in one edit.
+    Register {
+        /// Stable execution project ID (letters, digits, - and _).
+        id: String,
+        /// Existing git checkout.
+        path: PathBuf,
+        /// GitHub owner/repo to map to this project (enabled with agent:ready for new sources).
+        #[arg(long)]
+        github: Option<String>,
+        /// Token environment variable for this source (value is never stored).
+        #[arg(long, requires = "github")]
+        token_env: Option<String>,
+        /// Replace this source's trusted approvers; repeat for multiple logins.
+        #[arg(long, requires = "github")]
+        trusted_approver: Vec<String>,
+    },
+}
+
 #[derive(Debug, Args, Default)]
 pub struct DashboardArgs {
+    /// Show tasks from this execution project; budgets and slots remain global.
+    #[arg(long)]
+    pub project: Option<String>,
     /// Render one frame as plain text and exit (no TTY needed; with `--json` prints the snapshot).
     #[arg(long)]
     pub once: bool,
@@ -191,6 +219,9 @@ pub struct RunArgs {
 
 #[derive(Debug, Args, Default)]
 pub struct StatusArgs {
+    /// Show tasks from this execution project; counts remain global.
+    #[arg(long)]
+    pub project: Option<String>,
     /// Include completed/failed/cancelled tasks.
     #[arg(short, long)]
     pub all: bool,

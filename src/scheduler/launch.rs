@@ -244,9 +244,8 @@ pub struct Start {
 
 /// The policy chose `model` for the task: it goes `starting` on that model,
 /// and the branch, worktree path and attempt number of this try are settled
-/// (not yet on the task: [`claim`] puts them there once the `starting` row is
-/// written, so a daemon that dies mid-launch leaves the previous attempt
-/// count behind). `resuming_with_prompt` says a review round or a relayed
+/// (not yet on the task: [`claim`] puts them there before the shell atomically
+/// persists the start). `resuming_with_prompt` says a review round or a relayed
 /// answer is about to be resumed, which un-parks a review watch (`task
 /// retry` of a task parked with its rounds used up). `root` is the worktree
 /// root directory. Returns `None` without mutation when source approval is missing.
@@ -286,8 +285,8 @@ pub fn on_starting(
 }
 
 /// The attempt is under way: its branch, worktree path and number go on
-/// the task, to be persisted with whatever comes next (the launch, or the
-/// crash that prevented it).
+/// the task. Persist these together with the starting state before setup or
+/// reloading admission, even when an existing checkout binding is unchanged.
 pub fn claim(task: &mut Task, start: &Start) {
     task.branch = Some(start.branch.clone());
     task.worktree_path = Some(start.worktree.display().to_string());
@@ -872,7 +871,7 @@ mod properties {
 
     proptest! {
         #[test]
-        fn project_pass_shares_slots_and_reservations(tasks in candidates(), slots in 0u32..=4, ledgers in ledgers()) {
+        fn project_pass_shares_slots_and_reservations(tasks in three_project_candidates(), slots in 0u32..=4, ledgers in ledgers()) {
             let f = Fixed::new();
             let rules = ["default", "api", "web"].into_iter().map(|id| (id.to_string(), f.rules.clone())).collect();
             let mut projects = LaunchPlanner::new(Estimator::from_summaries(&[]), ledgers.clone(), tasks.clone(), slots);

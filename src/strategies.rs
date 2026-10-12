@@ -180,6 +180,21 @@ pub fn execution_project() -> impl Strategy<Value = String> {
     prop::sample::select(vec!["default".to_string(), "api".to_string(), "web".to_string()])
 }
 
+/// A queued candidate from each of three distinct execution projects. This
+/// guarantees shared-pass properties exercise every project on every case.
+pub fn three_project_candidates() -> impl Strategy<Value = Vec<Task>> {
+    prop::array::uniform3(task_in(TaskState::Queued)).prop_map(|tasks| {
+        tasks
+            .into_iter()
+            .zip(["default", "api", "web"])
+            .map(|(mut task, project)| {
+                task.execution_project = project.into();
+                task
+            })
+            .collect()
+    })
+}
+
 /// Project availability, checkout revision and independently chosen model preference.
 pub fn execution_project_settings() -> impl Strategy<Value = (bool, bool, ModelTier)> {
     (prop::bool::weighted(0.8), any::<bool>(), prop::sample::select(known_models()))

@@ -1371,3 +1371,43 @@ proptest! {
         }
     }
 }
+
+proptest! {
+    /// A review/retry keeps its checkout pin but must persist its NEW worktree
+    /// claim before the post-setup GitHub approval read. An unchanged binding
+    /// cannot be relied on to trigger a separate full-row write.
+    #[test]
+    fn github_relaunch_claim_survives_admission_reload(
+        mut task in github_task(), previous_attempts in 0u32..5,
+        decision in decision(), refreshed in admission_decision()
+    ) {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let checkout = format!("/repos/{}", task.execution_project);
+        task.state = TaskState::Queued;
+        task.execution_repo = Some(checkout.clone());
+        task.attempts = previous_attempts;
+        task.worktree_path = None;
+        task.github_admission = Some(crate::domain::GitHubAdmission { approved: true, reason: "verified".into() });
+        store.insert_task(&task).unwrap();
+        let before = store.get_task(task.id).unwrap().unwrap();
+        let mut starting = before.clone();
+        let root = std::path::PathBuf::from("/wt").join(&task.execution_project);
+        let start = launch::on_starting(&mut starting, &ModelTier::sonnet(), &decision, &Config::default(), &root, true).unwrap();
+        launch::claim(&mut starting, &start);
+        prop_assert!(store.claim_task_start(&before, &starting).unwrap());
+        prop_assert!(commands::bind_project(&mut starting, &checkout).unwrap().is_empty());
+        let mut loaded = store.get_task(task.id).unwrap().unwrap();
+        prop_assert_eq!(loaded.attempts, previous_attempts + 1);
+        prop_assert_eq!(&loaded.branch, &starting.branch);
+        prop_assert_eq!(&loaded.worktree_path, &starting.worktree_path);
+        let before_admission = loaded.clone();
+        transitions::on_github_admission(&mut loaded, refreshed);
+        prop_assert!(store.record_github_admission(&before_admission, &loaded).unwrap());
+        let saved = store.get_task(task.id).unwrap().unwrap();
+        prop_assert_eq!(saved.attempts, start.attempt);
+        prop_assert_eq!(saved.worktree_path, Some(start.worktree.display().to_string()));
+        prop_assert_eq!(saved.branch, Some(start.branch));
+        prop_assert_eq!(saved.execution_repo, Some(checkout));
+        prop_assert_eq!(saved.github_admission, loaded.github_admission);
+    }
+}

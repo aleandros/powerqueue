@@ -12,7 +12,7 @@ Global flags work on every command.
 | `-v`, `-vv` | debug / trace logging on stderr |
 | `-q`, `--quiet` | only print errors |
 | `--home DIR` | base directory for config/data/state (env `POWERQUEUE_HOME`) |
-| `--json` | machine-readable output where supported (status, add, task, priority, tune, budget, linear, github, doctor, update, service, config, `logs --events`) |
+| `--json` | machine-readable output where supported (status, add, task, project, priority, tune, budget, linear, github, doctor, update, service, config, `logs --events`) |
 | `--no-color` | disable colours (env `NO_COLOR`) |
 
 ## Setup and daemon
@@ -20,13 +20,15 @@ Global flags work on every command.
 | Command | What it does |
 |---------|--------------|
 | `init [--repo PATH] [--team KEY]... [--linear-key K] [--jev-key K] [--no-linear] [--permission-mode MODE] [--provider P]... [--non-interactive] [--reconfigure] [--force]` | guided first-time setup; writes `config.toml` and `PRIORITY.md`, stores keys; `--no-linear` sets `linear.enabled = false` (GitHub can be enabled separately); `--permission-mode` picks `acceptEdits` (default), `auto`, `bypassPermissions`, `dontAsk`, `plan` or `default`; when `codex` / `agy` are on PATH it asks whether to run tasks on them too (`--provider codex --provider gemini` answers yes non-interactively and warns when the CLI is not logged in); on an existing install the menu offers "Change settings", and `--reconfigure` walks the editable settings (repository, default branch, Linear team and states, concurrency, permission mode, weekly budget, reset anchor, providers) with the current values as defaults, keeping keys and every other key |
+| `project register ID PATH [--github OWNER/REPO] [--token-env NAME] [--trusted-approver LOGIN]...` | register/reconfigure a checkout and optional GitHub intake in one validated edit; creates a GitHub/manual config if absent, retains unspecified settings, rejects source retargeting and pinned-checkout moves; token/approver flags require `--github` |
+| `project list` | show effective checkout/worktree paths and source mappings; `--json` also includes per-project settings and shared limits |
 | `run [--once] [--offline]` | run the scheduler in the foreground; `--once` does one pass; `--offline` skips Linear and GitHub |
 | `stop` | ask the running daemon to exit (sessions keep running in tmux) |
 | `pause [--reason TEXT]` | stop launching sessions: running ones continue, the daemon keeps monitoring, cleaning up and syncing, nothing new starts (crashed sessions are not relaunched either) until `resume`; survives a daemon restart; `status`, `dashboard` and `doctor` show it |
 | `resume` | launch sessions again after `pause` |
 | `reset [-y] [--dry-run] [--force] [--delete-branches] [--everything] [--revert-linear]` | start over: stops the daemon, kills the tmux session, removes task worktrees (dirty or unpushed ones are kept and reported unless `--force`) and stray directories under the worktree root, empties `state/tasks/` and every table of the database; `--dry-run` prints the plan (`--json` for machine-readable), `-y` skips the prompt (required without a TTY), `--delete-branches` also deletes the local `pq/*` branches, `--everything` also clears `kv` (usage readings, cooldowns, probe results, pause), `--revert-linear` moves open Linear issues back to the first `linear.queued_states` entry. Config, secrets, `PRIORITY.md` and logs are never touched |
-| `dashboard [--once] [--ascii]` (`ui`, `top`) | live TUI: task table, one budget block per enabled provider (period, window, cooldown, a gauge per model), a header with the compact per-provider summary (`cl 34/12%  cx 17/–` = period/window spent) and `next <model>` (what the policy would run now); needs an interactive terminal (exit 2 otherwise). `--once` prints one frame as text and exits (works in pipes; with `--json` prints the snapshot); `--ascii` uses `*`/`>`/`#` and `+-\|` borders (automatic when the locale is not UTF-8) |
-| `status [-a]` (`ls`) | one-shot table; `-a` includes completed/failed/cancelled |
+| `dashboard [--once] [--ascii] [--project ID]` (`ui`, `top`) | live TUI: task table, one budget block per enabled provider (period, window, cooldown, a gauge per model), a header with the compact per-provider summary (`cl 34/12%  cx 17/–` = period/window spent) and `next <model>` (what the policy would run now); needs an interactive terminal (exit 2 otherwise). `--once` prints one frame as text and exits (works in pipes; with `--json` prints the snapshot); `--ascii` uses `*`/`>`/`#` and `+-\|` borders (automatic when the locale is not UTF-8) |
+| `status [-a] [--project ID]` (`ls`) | one-shot table with execution project; `-a` includes completed/failed/cancelled; `--project` filters tasks (counts remain global) |
 | `doctor [--fix] [--offline]` | diagnostics and tuning advice, per enabled provider (binary and version, logged in, model shares, period anchor source, probe freshness, top-model pacing, window pressure, the learned usage rate vs the configured budget, whether the top model's share can hold one typical task, a daemon-wide pause); `--fix` applies safe repairs |
 | `update [--check] [--version TAG] [-y] [--force]` | replace this binary with a [GitHub release](https://github.com/aleandros/powerqueue/releases): downloads `powerqueue-<target>.tar.gz` and its `.sha256`, verifies the checksum, writes the new file next to the current one, runs it with `--version`, then renames it over the old one (atomic; a running daemon keeps the old version until `service restart`, or `stop` / `run`); asks before replacing unless `-y` / `--yes` or stdin is not a terminal; `--check` only reports (exit 0 up to date, 10 newer release available); `--version v0.4.0` installs a specific tag; `--force` reinstalls the same version; `--json` prints `{"current","latest","updated","path",...}`; `GITHUB_TOKEN` is used for the API when set; `POWERQUEUE_UPDATE_API` / `POWERQUEUE_UPDATE_TARGET` override the API base and target triple (mirrors, tests) |
 | `service install [--print] [--manager systemd\|launchd] [--no-start] [-f] [--linger] [--env KEY=VALUE]...` | run the daemon as a user service: writes the systemd user unit (`~/.config/systemd/user/powerqueue.service`) or launchd agent (`~/Library/LaunchAgents/dev.powerqueue.plist`) for `<this binary> run` with the current `PATH` (and `POWERQUEUE_HOME`, `POWERQUEUE_SECRETS`, `XDG_*_HOME`, `TMUX_TMPDIR`, `LANG`, `LC_ALL` when set), enables it and starts it. Restarts after crashes, not after `stop`, and leaves tmux sessions running when it stops (`KillMode=process` / `AbandonProcessGroup`). `--print` only prints the file (`--manager` picks the platform); `--no-start` enables without starting; `-f` / `--force` replaces a different existing file (shown as a diff otherwise) and restarts a running service with it; `--linger` runs `loginctl enable-linger` so the service outlives your login (Linux); `--env` adds variables (stored in plain text, so no API keys); needs `init` first; `--json` reports what was done |
@@ -37,21 +39,23 @@ Global flags work on every command.
 | `logs [-f] [-n N] [-t TASK] [-l LEVEL] [--events]` | read the daemon log (default 200 lines); `--events` shows the DB timeline instead; `-f` follows either |
 | `completions <shell>` | shell completions (bash, elvish, fish, powershell, zsh) |
 
+Project filters on `status`, `task list` and `dashboard` affect only the task list; shared budgets and slot/count summaries remain global. See the [multi-project walkthrough](multi-project.md).
+
 ## Tasks
 
 | Command | What it does |
 |---------|--------------|
 | `add "title" [-d DESC\|-] [-c CRIT] [-m MODEL] [-k KEY] [-l LABEL]... [--paused] [--project ID]` | enqueue a manual task in a registered execution project; omitted `--project` always selects `default`, unknown IDs fail; `-d -` reads stdin |
 | `task project <task> <id>` | reassign an unstarted task to a registered execution project; refuses tasks with previous execution history; validates again when the daemon applies the command |
-| `task show <task>` | details and timeline |
-| `task list [-a]` | same as `status` |
+| `task show <task>` | details, execution project/configured checkout, source route and timeline |
+| `task list [-a] [--project ID]` | same as `status` |
 | `task complete <task> [-s SUMMARY] [--pr URL]` | mark completed (Claude calls this from inside the session); with `--pr` hand it off for review instead: `in_review`, slot and worktree released, the daemon watches the PR (see [Review](task-lifecycle.md#review-pull-requests)). Refused while the task is `starting` (the daemon is launching it; try again once it is running) |
 | `task block <task> [-r REASON]` | mark blocked / needs a human; refused while the task is `starting` |
 | `task cancel <task>` | cancel and release resources |
 | `task pause <task>` | do not schedule; a running session stops after its turn |
 | `task resume <task>` | resume a paused or needs-attention task; one the PR watcher parked goes back to `in_review` |
 | `task retry <task>` | re-queue a failed, cancelled or completed task (also crashed, throttled, paused, needs-attention); one parked with its review rounds used up runs one more round; one `in_review` resumes its session for a review round now; in any other state the daemon ignores it (`task.retry_ignored`, debug) |
-| `task explain <task>` | current score and model decision, with reasons; for Linear tasks also what it waits on (pending `blocked by` issues, open sub-issues of a parent) |
+| `task explain <task>` | execution project/configured checkout, current score and model decision, with reasons; for Linear tasks also what it waits on (pending `blocked by` issues, open sub-issues of a parent) |
 | `task model <task> <model\|auto>` | force (or clear) the model for the next attempt (`fable`, `opus`, `sonnet`, `haiku`, or another provider's model such as `gpt-6.1-sol`, `gemini-3-pro`, `codex:<name>`); the policy may still downgrade it within the same provider when the model is out of budget |
 | `task prompt <task>` | print the prompt the next attempt would receive (renders `prompt.template` with attempt = attempts + 1, the task's last error and its forced/last model); nothing is launched. `--json` prints `{"task", "template", "prompt", "warnings"}` |
 | `task output <task> [-n LINES]` | last screen of the task's tmux pane (default 60 lines) |
