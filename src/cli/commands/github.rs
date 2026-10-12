@@ -41,9 +41,14 @@ pub fn run(ctx: &mut Context, cmd: GitHubCommand) -> Result<i32> {
                     plan.changes.len()
                 );
                 let mut table = output::table();
-                table.set_header(["ACTION", "KEY", "TITLE"]);
+                table.set_header(["ACTION", "KEY", "TITLE", "ADMISSION"]);
                 for change in &plan.changes {
-                    table.add_row([change.action.to_string(), change.task.key.clone(), output::truncate(&change.task.title, 60)]);
+                    table.add_row([
+                        change.action.to_string(),
+                        change.task.key.clone(),
+                        output::truncate(&change.task.title, 60),
+                        change.task.github_admission.as_ref().map(|a| a.reason.clone()).unwrap_or_default(),
+                    ]);
                 }
                 if !plan.changes.is_empty() {
                     println!("{table}");

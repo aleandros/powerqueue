@@ -130,8 +130,12 @@ the CLI and the daemon are real. The same git/tmux/python3 prerequisites apply.
 `cargo test --lib scheduler::model` also exercises generated reassignment and
 checkout checks, independent project policies, availability/path changes, shared
 capacity, and stale launch candidates against SQLite. The [Quint specification](spec/README.md)
-adds project ownership invariants and a finite reassignment/claim race model;
+adds project ownership and admission invariants, plus a finite reassignment/claim race model;
 `npm --prefix spec test` and `npm --prefix spec run check` include both models.
+Admission changes also require the replay rejection checks
+(`cargo test --example quint-replay -- --include-ignored`). The advisory workflow
+captures and replays a real GitHub approval/launch trace as well as the existing
+completion, crash and rate-limit traces.
 
 The same file tests the container transport (`<provider>.shim`, see
 docs/containers.md): `shim_routes_hooks_and_completion_through_the_inbox`

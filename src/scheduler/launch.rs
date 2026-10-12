@@ -161,8 +161,12 @@ impl LaunchPlanner {
             self.started(ctx.budget, &candidate);
             out.push(candidate);
         }
-        let rest: Vec<Task> =
-            self.candidates.iter().filter(|t| t.state.is_schedulable() && !self.considered.contains(&t.id)).cloned().collect();
+        let rest: Vec<Task> = self
+            .candidates
+            .iter()
+            .filter(|t| t.state.is_schedulable() && t.execution_approved() && !self.considered.contains(&t.id))
+            .cloned()
+            .collect();
         for task in rest {
             let candidate = self.decide(ctx, task, now);
             self.started(ctx.budget, &candidate);
@@ -186,8 +190,12 @@ impl LaunchPlanner {
             self.started(budget, &candidate);
             out.push(candidate);
         }
-        let rest: Vec<Task> =
-            self.candidates.iter().filter(|t| t.state.is_schedulable() && !self.considered.contains(&t.id)).cloned().collect();
+        let rest: Vec<Task> = self
+            .candidates
+            .iter()
+            .filter(|t| t.state.is_schedulable() && t.execution_approved() && !self.considered.contains(&t.id))
+            .cloned()
+            .collect();
         for task in rest {
             let Some(selected) = rules.get(&task.execution_project) else { continue };
             let candidate = self.decide(LaunchContext { budget, rules: selected, rate_limits: limits }, task, now);
@@ -241,7 +249,7 @@ pub struct Start {
 /// count behind). `resuming_with_prompt` says a review round or a relayed
 /// answer is about to be resumed, which un-parks a review watch (`task
 /// retry` of a task parked with its rounds used up). `root` is the worktree
-/// root directory.
+/// root directory. Returns `None` without mutation when source approval is missing.
 pub fn on_starting(
     task: &mut Task,
     model: &ModelTier,
@@ -249,7 +257,10 @@ pub fn on_starting(
     cfg: &Config,
     root: &Path,
     resuming_with_prompt: bool,
-) -> Start {
+) -> Option<Start> {
+    if !task.execution_approved() {
+        return None;
+    }
     let attempt = task.attempts + 1;
     if resuming_with_prompt && let Some(watch) = task.review.as_mut() {
         watch.parked = false;
@@ -271,7 +282,7 @@ pub fn on_starting(
         format!("starting attempt {attempt} with {model}"),
         serde_json::json!({ "model": model, "attempt": attempt, "reasons": decision.reasons, "prediction": decision.prediction }),
     )];
-    Start { branch, worktree, attempt, effects }
+    Some(Start { branch, worktree, attempt, effects })
 }
 
 /// The attempt is under way: its branch, worktree path and number go on
@@ -642,7 +653,7 @@ mod tests {
         let cfg = Config::default();
         let root = Path::new("/tmp/wt");
         let mut t = task("ENG-7", TaskState::Queued, 1.0);
-        let start = on_starting(&mut t, &ModelTier::opus(), &decision(Some("opus")), &cfg, root, false);
+        let start = on_starting(&mut t, &ModelTier::opus(), &decision(Some("opus")), &cfg, root, false).unwrap();
         assert_eq!((t.state, t.model.clone()), (TaskState::Starting, Some(ModelTier::opus())));
         assert_eq!(start.attempt, 1);
         assert!(start.branch.contains("eng-7"), "{}", start.branch);
@@ -665,7 +676,7 @@ mod tests {
         watch.worktree_path = Some("/elsewhere/eng-7".into());
         watch.parked = true;
         t.review = Some(watch);
-        let start = on_starting(&mut t, &ModelTier::sonnet(), &decision(Some("sonnet")), &cfg, root, true);
+        let start = on_starting(&mut t, &ModelTier::sonnet(), &decision(Some("sonnet")), &cfg, root, true).unwrap();
         assert_eq!((start.branch.as_str(), start.attempt), ("pq/keep", 3));
         assert_eq!(start.worktree, PathBuf::from("/elsewhere/eng-7"));
         assert!(!t.review.unwrap().parked);
@@ -845,6 +856,22 @@ mod properties {
 
     proptest! {
         #[test]
+        fn unapproved_github_tasks_never_start(mut task in github_task(), decision in decision()) {
+            task.github_admission = None;
+            let before = task.clone();
+            prop_assert!(pick_next(&[task.clone()], origin()).is_none());
+            prop_assert!(on_starting(&mut task, &ModelTier::sonnet(), &decision, &Config::default(), Path::new("/wt"), false).is_none());
+            prop_assert_eq!(&task, &before);
+            task.github_admission = Some(crate::domain::GitHubAdmission::denied("revoked"));
+            let before = task.clone();
+            prop_assert!(pick_next(&[task.clone()], origin()).is_none());
+            prop_assert!(on_starting(&mut task, &ModelTier::sonnet(), &decision, &Config::default(), Path::new("/wt"), true).is_none());
+            prop_assert_eq!(task, before);
+        }
+    }
+
+    proptest! {
+        #[test]
         fn project_pass_shares_slots_and_reservations(tasks in candidates(), slots in 0u32..=4, ledgers in ledgers()) {
             let f = Fixed::new();
             let rules = ["default", "api", "web"].into_iter().map(|id| (id.to_string(), f.rules.clone())).collect();
@@ -898,7 +925,7 @@ mod properties {
             let cfg = Config::default();
             let root = Path::new("/wt");
             let mut t = task.clone();
-            let start = on_starting(&mut t, &model, &decision, &cfg, root, resuming);
+            let start = on_starting(&mut t, &model, &decision, &cfg, root, resuming).unwrap();
             prop_assert_eq!((t.state, t.model.clone()), (TaskState::Starting, Some(model.clone())));
             prop_assert_eq!(start.attempt, task.attempts + 1);
             if let Some(branch) = &task.branch {

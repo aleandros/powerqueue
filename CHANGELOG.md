@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Explicit GitHub execution approval with configurable `required_labels` (default
+  `agent:ready`) and optional `trusted_approvers`. Verify effective label actors and
+  title/body edit history before starts and after setup; revocation holds future
+  starts while preserving active work. Persist decisions and explain them in task
+  inspection, sync previews, events and `doctor`.
+- Stateful daemon/SQLite and Quint admission checks, including revocation during
+  setup, reapproval, restart, stale candidates and rejection of unapproved event
+  traces. Advisory CI also replays a real GitHub approval/launch trace.
+
+### Changed
+
+- Explicit existing GitHub label settings remain unchanged. Omitted settings now
+  use `agent:ready`; empty approval labels are invalid for enabled intake. Title or
+  body edits require review and label reapplication. Approval verification requires
+  GraphQL access; unavailable evidence blocks starts, including offline starts.
+- `scheduler::launch::on_starting` returns `Option<Start>` and refuses unapproved
+  tasks without mutation.
+
+### Fixed
+
+- Make the multi-project cleanup test wait for transcript usage collection,
+  avoiding a timing race when cleanup finishes before usage is recorded.
+- Record crash retry deadlines for formal replay, so delayed event logging
+  cannot make an on-time restart appear premature.
+
 ## [0.15.0] - 2026-10-12
 
 ### Added

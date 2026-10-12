@@ -7,7 +7,9 @@ use chrono::{DateTime, Duration, Utc};
 use reqwest::{Method, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 
+use super::admission::{Actor, ApprovalEvent, evaluate};
 use crate::config::GitHubConfig;
+use crate::domain::GitHubAdmission;
 
 /// GitHub requested that API calls pause until this time.
 #[derive(Debug, thiserror::Error)]
@@ -25,7 +27,11 @@ pub struct GitHubIssue {
     pub html_url: String,
     pub state: String,
     pub labels: Vec<Label>,
+    #[serde(default)]
+    pub assignees: Vec<Actor>,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub pull_request: Option<serde_json::Value>,
 }
@@ -197,6 +203,103 @@ impl GitHubClient {
             .json()
             .await
             .context("decode GitHub issue")
+    }
+
+    /// Verify approval history and material edits using GraphQL. Fails closed on
+    /// missing fields, partial/error responses, inconsistent snapshots or pagination limits.
+    pub async fn admission(&self, cfg: &GitHubConfig, issue: &GitHubIssue) -> Result<GitHubAdmission> {
+        // Obvious revocations need no history request.
+        let preliminary = evaluate(cfg, issue, None, &[]);
+        if issue.state != "open"
+            || issue.pull_request.is_some()
+            || cfg.required_labels.is_empty()
+            || cfg.required_labels.iter().any(|r| !issue.labels.iter().any(|l| l.name.eq_ignore_ascii_case(r)))
+            || issue.labels.iter().any(|l| cfg.excluded_labels.iter().any(|x| l.name.eq_ignore_ascii_case(x)))
+        {
+            return Ok(preliminary);
+        }
+        let (owner, name) = cfg.repository.split_once('/').context("github.repository must be owner/repo")?;
+        let mut url = self.endpoint.clone();
+        let base = url.path().trim_end_matches('/');
+        // GitHub Enterprise REST /api/v3 corresponds to GraphQL /api/graphql.
+        let path = if let Some(prefix) = base.strip_suffix("/api/v3") {
+            format!("{prefix}/api/graphql")
+        } else {
+            format!("{base}/graphql")
+        };
+        url.set_path(&path);
+        let query = r#"query($owner:String!, $name:String!, $number:Int!, $after:String) {
+          repository(owner:$owner, name:$name) { issue(number:$number) {
+            title body state lastEditedAt updatedAt
+            timelineItems(first:100, after:$after, itemTypes:[LABELED_EVENT, UNLABELED_EVENT, RENAMED_TITLE_EVENT]) {
+              nodes { __typename
+                ... on LabeledEvent { id createdAt actor { login } label { name } }
+                ... on UnlabeledEvent { label { name } }
+                ... on RenamedTitleEvent { createdAt }
+              }
+              pageInfo { hasNextPage endCursor }
+            }
+          } }
+        }"#;
+        let mut cursor: Option<String> = None;
+        let mut events = Vec::new();
+        let mut revision = None;
+        for _ in 0..100 {
+            let value: serde_json::Value = self
+                .request(
+                    Method::POST,
+                    url.clone(),
+                    Some(serde_json::json!({
+                        "query": query, "variables": {"owner": owner, "name": name, "number": issue.number, "after": cursor}
+                    })),
+                )
+                .await?
+                .json()
+                .await
+                .context("decode GitHub approval response")?;
+            if value.get("errors").is_some_and(|e| !e.is_null() && e.as_array().is_none_or(|a| !a.is_empty())) {
+                bail!("GitHub approval query returned errors; check GraphQL access");
+            }
+            let remote = value.pointer("/data/repository/issue").context("GitHub approval issue unavailable")?;
+            let title = remote.get("title").and_then(|v| v.as_str()).context("GitHub approval title unavailable")?;
+            let body = remote.get("body").and_then(|v| v.as_str()).context("GitHub approval body unavailable")?;
+            let state = remote.get("state").and_then(|v| v.as_str()).context("GitHub approval state unavailable")?;
+            let updated = remote.get("updatedAt").and_then(|v| v.as_str()).context("GitHub approval revision unavailable")?;
+            if title != issue.title
+                || body != issue.body.as_deref().unwrap_or_default()
+                || !state.eq_ignore_ascii_case(&issue.state)
+                || revision.as_ref().is_some_and(|r| r != updated)
+            {
+                bail!("GitHub issue changed during approval verification; retry with a fresh snapshot");
+            }
+            let remote_updated: DateTime<Utc> = updated.parse().context("decode GitHub approval revision")?;
+            if issue.updated_at != Some(remote_updated) {
+                bail!("GitHub issue revision unavailable or changed during approval verification");
+            }
+            revision = Some(updated.to_string());
+            let edited: Option<DateTime<Utc>> =
+                serde_json::from_value(remote.get("lastEditedAt").context("GitHub edit history unavailable")?.clone())
+                    .context("decode GitHub last edit")?;
+            let timeline = remote.get("timelineItems").context("GitHub approval timeline unavailable")?;
+            let page: Vec<ApprovalEvent> =
+                serde_json::from_value(timeline.get("nodes").context("GitHub approval events unavailable")?.clone())
+                    .context("decode GitHub approval events")?;
+            events.extend(page);
+            let more = timeline
+                .pointer("/pageInfo/hasNextPage")
+                .and_then(|v| v.as_bool())
+                .context("GitHub approval pagination unavailable")?;
+            if !more {
+                return Ok(evaluate(cfg, issue, edited, &events));
+            }
+            let next =
+                timeline.pointer("/pageInfo/endCursor").and_then(|v| v.as_str()).context("GitHub approval cursor unavailable")?;
+            if cursor.as_deref() == Some(next) {
+                bail!("GitHub approval cursor did not advance");
+            }
+            cursor = Some(next.to_string());
+        }
+        bail!("GitHub approval history exceeds 100 pages; cannot verify complete approval history")
     }
 
     /// Add the target lifecycle label and remove only other configured lifecycle labels.

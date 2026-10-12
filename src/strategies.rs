@@ -601,6 +601,45 @@ pub fn effect_kinds(effects: &[crate::scheduler::Effect]) -> Vec<String> {
         .collect()
 }
 
+/// Admission decisions from trusted approval, revocation, edits or unavailable evidence.
+pub fn admission_decision() -> impl Strategy<Value = crate::domain::GitHubAdmission> {
+    prop::sample::select(vec![
+        crate::domain::GitHubAdmission { approved: true, reason: "trusted approval event".into() },
+        crate::domain::GitHubAdmission::denied("approval label removed"),
+        crate::domain::GitHubAdmission::denied("material issue edit requires reapproval"),
+        crate::domain::GitHubAdmission::denied("untrusted approval actor"),
+        crate::domain::GitHubAdmission::denied("approval evidence unavailable"),
+    ])
+}
+
+/// Mix ordinary tasks and GitHub tasks with missing, denied or verified admission.
+pub fn with_source_admission(task: Task) -> impl Strategy<Value = Task> {
+    (any::<bool>(), prop::option::of(admission_decision())).prop_map(move |(github, admission)| {
+        let mut task = task.clone();
+        if github {
+            task.source = TaskSource::GitHub {
+                repository: "acme/app".into(),
+                number: 1,
+                url: "https://github.com/acme/app/issues/1".into(),
+            };
+            task.github_admission = admission;
+        }
+        task
+    })
+}
+
+/// GitHub task in any lifecycle state with initially unverified execution approval.
+pub fn github_task() -> impl Strategy<Value = Task> {
+    (task(), 1u64..10000).prop_map(|(mut task, number)| {
+        task.source = TaskSource::GitHub {
+            repository: "acme/app".into(),
+            number,
+            url: format!("https://github.com/acme/app/issues/{number}"),
+        };
+        task
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

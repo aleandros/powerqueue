@@ -989,6 +989,12 @@ impl wiremock::Respond for GitHubFixture {
         let method = request.method.as_str();
         let path = request.url.path();
         match (method, path) {
+            ("POST", "/graphql") => ResponseTemplate::new(200).set_body_json(json!({"data":{"repository":{"issue":{
+                "title":state.issue["title"], "body":state.issue["body"], "state":state.issue["state"].as_str().unwrap().to_uppercase(),
+                "updatedAt":state.issue["updated_at"], "lastEditedAt":null,
+                "timelineItems":{"nodes":[{"__typename":"LabeledEvent", "id":"approval-1", "createdAt":"2026-09-01T12:01:00Z",
+                    "actor":{"login":"maintainer"}, "label":{"name":"agent:ready"}}], "pageInfo":{"hasNextPage":false,"endCursor":null}}
+            }}}})),
             ("GET", "/repos/acme/app") => ResponseTemplate::new(200).set_body_json(json!({"full_name": "acme/app"})),
             ("GET", "/repos/acme/app/issues") => {
                 let mut entries = Vec::new();
@@ -1003,7 +1009,7 @@ impl wiremock::Respond for GitHubFixture {
                 let mut excluded = state.issue.clone();
                 excluded["number"] = json!(3);
                 excluded["state"] = json!("open");
-                excluded["labels"] = json!([{"name": "powerqueue"}, {"name": "no-agent"}]);
+                excluded["labels"] = json!([{"name": "agent:ready"}, {"name": "no-agent"}]);
                 entries.push(excluded);
                 ResponseTemplate::new(200).set_body_json(entries)
             }
@@ -1054,7 +1060,8 @@ async fn github_lifecycle_e2e(close_on_complete: bool, with_review: bool) {
         issue: json!({
             "number": 1, "title": "GitHub end-to-end task", "body": "Make the fixture commit in the dedicated worktree.",
             "html_url": "https://github.com/acme/app/issues/1", "state": "open",
-            "labels": [{"name": "powerqueue"}, {"name": "bug"}], "created_at": chrono::Utc::now(),
+            "labels": [{"name": "agent:ready"}, {"name": "bug"}], "created_at": "2026-09-01T12:00:00Z",
+            "updated_at": "2026-09-01T12:01:00Z",
         }),
         comments: Vec::new(),
         operations: Vec::new(),
@@ -1152,7 +1159,7 @@ async fn github_lifecycle_e2e(close_on_complete: bool, with_review: bool) {
     let remote = remote_state.0.lock().unwrap();
     assert_eq!(remote.issue["state"], if close_on_complete { "closed" } else { "open" });
     let labels: Vec<_> = remote.issue["labels"].as_array().unwrap().iter().map(|l| l["name"].as_str().unwrap()).collect();
-    assert_eq!(labels, vec!["powerqueue", "bug", "agent:review"]);
+    assert_eq!(labels, vec!["agent:ready", "bug", "agent:review"]);
     assert_eq!(remote.comments.len(), 2, "start and completion comments only");
     assert!(remote.comments[0].contains("started attempt 1"));
     assert!(remote.comments[1].contains("fake-claude finished"));
@@ -1163,6 +1170,9 @@ async fn github_lifecycle_e2e(close_on_complete: bool, with_review: bool) {
     operations.push("comment");
     assert_eq!(remote.operations, operations);
     drop(remote);
+    if close_on_complete && !with_review {
+        env.export_events("github-approved");
+    }
     // Shut down while the API fixture is still serving requests.
     drop(env);
 }
@@ -1290,8 +1300,13 @@ fn execution_projects_push_and_clean_up_only_their_own_repositories() {
     env.start_daemon();
 
     for (index, key) in keys.iter().enumerate() {
+        // Hooks can finish cleanup before this tick reaches transcript polling.
+        // Wait for usage independently so the assertion cannot race that phase.
         let show = env.wait_for_show(key, |v| {
-            v["task"]["state"] == "completed" && has_event(v, "cleanup.done") && v["task"]["worktree_path"].is_null()
+            v["task"]["state"] == "completed"
+                && has_event(v, "cleanup.done")
+                && v["task"]["worktree_path"].is_null()
+                && output_tokens(v) >= 1400
         });
         assert_eq!(show["task"]["state"], "completed", "{}", env.daemon_log());
         assert!(show["task"]["worktree_path"].is_null(), "worktree should be removed after push: {show}");

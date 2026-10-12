@@ -1064,7 +1064,9 @@ async fn check_secrets(cfg: &Config, secrets: &Secrets, online: bool) -> Vec<Che
                     client.test_repository(&cfg.github.repository).await?;
                     let mut probe = cfg.github.clone();
                     probe.max_issues = 1;
-                    client.fetch_issues(&probe).await?;
+                    for issue in client.fetch_issues(&probe).await? {
+                        client.admission(&probe, &issue).await?;
+                    }
                     anyhow::Ok(())
                 }
                 .await;
@@ -2106,6 +2108,23 @@ pub async fn run_all(
             CheckResult::warn(STATE, "GitHub sync", format!("{errors} API error(s), {missed} missed lifecycle update(s) in 24 h"),
                 "inspect github.* events in logs/task show; verify token Issues permissions and repository access, wait for rate-limit reset, and manually reconcile missed labels/comments/closure")
         });
+    }
+
+    let unapproved: Vec<_> = store
+        .list_open_tasks()?
+        .into_iter()
+        .filter(|t| !t.execution_approved())
+        .map(|t| {
+            format!(
+                "{}: {}",
+                t.key,
+                t.github_admission.as_ref().map(|a| a.reason.as_str()).unwrap_or("approval not yet verified")
+            )
+        })
+        .collect();
+    if !unapproved.is_empty() {
+        results.push(CheckResult::warn(STATE, "GitHub admission", unapproved.join("; "),
+            "inspect task show/explain and github.admitted/revoked/admission_blocked events; verify GraphQL access, required_labels and trusted_approvers; review title/body changes before removing and reapplying approval labels. Active sessions are preserved; future starts require fresh approval"));
     }
 
     results.push(check_db(store));

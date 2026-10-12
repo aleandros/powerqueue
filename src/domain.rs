@@ -612,6 +612,20 @@ impl FromStr for TaskState {
     }
 }
 
+/// Last verified GitHub admission decision. Missing evidence always prevents launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubAdmission {
+    pub approved: bool,
+    pub reason: String,
+}
+
+impl GitHubAdmission {
+    /// Deny execution with a human-readable reason; does not affect active work.
+    pub fn denied(reason: impl Into<String>) -> Self {
+        Self { approved: false, reason: reason.into() }
+    }
+}
+
 /// A unit of work: one Linear/GitHub issue or one manual request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
@@ -622,6 +636,8 @@ pub struct Task {
     pub title: String,
     pub description: String,
     pub source: TaskSource,
+    #[serde(default)]
+    pub github_admission: Option<GitHubAdmission>,
     /// Stable execution project ID, independent of source/Linear project metadata.
     #[serde(default = "default_execution_project")]
     pub execution_project: String,
@@ -701,6 +717,7 @@ impl Task {
             title: title.into(),
             description: String::new(),
             source,
+            github_admission: None,
             execution_project: default_execution_project(),
             execution_repo: None,
             state: TaskState::Queued,
@@ -732,6 +749,11 @@ impl Task {
             pr_url: None,
             review: None,
         }
+    }
+
+    /// Whether source approval permits scheduling. GitHub tasks without evidence fail closed.
+    pub fn execution_approved(&self) -> bool {
+        !matches!(self.source, TaskSource::GitHub { .. }) || self.github_admission.as_ref().is_some_and(|a| a.approved)
     }
 
     /// True for a task the PR watcher parked (stale PR, closed PR, rounds

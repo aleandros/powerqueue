@@ -192,6 +192,19 @@ fn crash_backoff_is_required_and_overflow_checked() {
 }
 
 #[test]
+fn crash_uses_recorded_deadline_instead_of_log_time() {
+    let mut row = crash(3);
+    // The transition ran at second 3; its event was persisted at second 4.
+    row.data["retry_at"] = json!(event(13, "").timestamp);
+    let (observations, _) = project(with_tail(vec![row.clone()])).unwrap();
+    assert_eq!(observations[3].until, 12, "deadline is relative to creation at second 1");
+    for invalid in [Value::Null, json!("not a date"), json!("2026-01-01T00:00:13")] {
+        row.data["retry_at"] = invalid;
+        rejects(with_tail(vec![row.clone()]), "timestamp");
+    }
+}
+
+#[test]
 fn clock_regression_including_stutters_is_rejected() {
     for kind in ["task.completed", "session.started"] {
         let row = Event { timestamp: event(1, "").timestamp, ..event(4, kind) };
@@ -317,6 +330,17 @@ fn quint_checks_backoff_boundary() {
 
 #[test]
 #[ignore = "requires Quint"]
+fn quint_checks_recorded_crash_deadline_despite_delayed_logging() {
+    let mut row = crash(3);
+    row.data["retry_at"] = json!(event(13, "").timestamp);
+    for (seconds, success) in [(12, false), (13, true), (14, true)] {
+        let restart = Event { timestamp: event(seconds, "").timestamp, ..payload(5, "task.starting", json!({"attempt": 2})) };
+        check_trace(with_tail(vec![row.clone(), restart]), success);
+    }
+}
+
+#[test]
+#[ignore = "requires Quint"]
 fn quint_checks_failure_attempt_limit() {
     check_trace(with_tail(vec![payload(4, "task.failed", json!({"attempt": 1, "max_attempts": 3}))]), false);
     check_trace(with_tail(vec![crash(1)]), false);
@@ -352,4 +376,96 @@ fn quint_rejects_duplicate_creation_but_accepts_source_echoes() {
         event(7, "session.finalized"),
     ]);
     check_trace(rows, true);
+}
+
+fn github_created() -> Event {
+    payload(1, "task.created", json!({"source":"github"}))
+}
+
+fn admission(index: i64, approved: bool) -> Event {
+    payload(index, if approved { "github.admitted" } else { "github.revoked" }, json!({"admission":{"approved":approved}}))
+}
+
+#[test]
+fn github_admission_is_projected_and_unmapped_github_events_are_rejected() {
+    let rows = vec![
+        github_created(),
+        admission(2, true),
+        payload(3, "task.starting", json!({"attempt":1})),
+        admission(4, false),
+        event(5, "github.launch_held"),
+        admission(6, true),
+        payload(7, "task.starting", json!({"attempt":2})),
+        payload(8, "session.launched", json!({"attempt":2})),
+    ];
+    let (observations, report) = project(rows).unwrap();
+    assert_eq!(
+        observations.iter().map(|o| o.op).collect::<Vec<_>>(),
+        [Op::CreateGitHub, Op::Approve, Op::Start, Op::Revoke, Op::Hold, Op::Approve, Op::Start, Op::Launch]
+    );
+    assert!(report.stutters.is_empty());
+    for kind in ["github.teleported", "github.admission_unknown"] {
+        rejects(with_tail(vec![event(4, kind)]), "unmapped kind");
+    }
+    rejects(with_tail(vec![event(4, "github.admitted")]), "missing approval decision");
+    rejects(with_tail(vec![payload(4, "github.admitted", json!({"admission":{"approved":false}}))]), "inconsistent approval");
+}
+
+#[test]
+#[ignore = "requires Quint"]
+fn quint_rejects_unapproved_github_starts_and_launches() {
+    check_trace(
+        vec![
+            github_created(),
+            payload(2, "task.starting", json!({"attempt":1})),
+            payload(3, "session.launched", json!({"attempt":1})),
+        ],
+        false,
+    );
+    // Valid before setup, revoked before the agent launch.
+    check_trace(
+        vec![
+            github_created(),
+            admission(2, true),
+            payload(3, "task.starting", json!({"attempt":1})),
+            admission(4, false),
+            payload(5, "session.launched", json!({"attempt":1})),
+        ],
+        false,
+    );
+    // Local pause/resume/retry cannot restore remote approval.
+    check_trace(
+        vec![
+            github_created(),
+            admission(2, true),
+            admission(3, false),
+            event(4, "task.paused"),
+            event(5, "task.resumed"),
+            event(6, "task.cancelled"),
+            event(7, "task.retried"),
+            payload(8, "task.starting", json!({"attempt":1})),
+            payload(9, "session.launched", json!({"attempt":1})),
+        ],
+        false,
+    );
+}
+
+#[test]
+#[ignore = "requires Quint"]
+fn quint_accepts_reapproval_and_preserves_active_work_on_revocation() {
+    check_trace(
+        vec![
+            github_created(),
+            admission(2, true),
+            payload(3, "task.starting", json!({"attempt":1})),
+            admission(4, false),
+            event(5, "github.launch_held"),
+            admission(6, true),
+            payload(7, "task.starting", json!({"attempt":2})),
+            payload(8, "session.launched", json!({"attempt":2})),
+            admission(9, false),
+            event(10, "task.completed"),
+        ],
+        true,
+    );
 }
