@@ -72,7 +72,8 @@ impl Context {
 
     fn with_repo_overrides(&self, mut cfg: Config) -> Config {
         let repo = cfg.repo_path();
-        if !cfg.repo.path.trim().is_empty()
+        if cfg.projects.is_empty()
+            && !cfg.repo.path.trim().is_empty()
             && repo.exists()
             && let Some(error) = cfg.apply_repo_overrides_or_record(&repo)
         {

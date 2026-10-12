@@ -20,6 +20,8 @@ const SPEC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/spec");
 const STUTTERS: &[&str] = &[
     "task.updated",
     "task.models_changed",
+    "task.project_bound",
+    "task.project_set",
     "task.model_set",
     "task.model_override",
     "task.retry_ignored",
@@ -32,6 +34,7 @@ const STUTTERS: &[&str] = &[
     "session.stale",
     "session.timeout",
     "session.discovered",
+    "session.discovery_failed",
     "review.lookup_failed",
     "session.marker_polled",
     "session.rate_limit_detected",

@@ -23,6 +23,58 @@ use super::transitions::{Effect, SKIP_REASON};
 #[error("{0}")]
 pub struct Refused(pub String);
 
+/// Change an unstarted task's project after the caller validates the target.
+/// Refuses live, previously bound or artifact-bearing tasks: moving existing
+/// work requires a new task so transcripts and branches cannot cross repos.
+pub fn on_set_project(task: &mut Task, project: &str, has_session: bool) -> Result<Vec<Effect>, Refused> {
+    if has_session
+        || task.execution_repo.is_some()
+        || task.attempts > 0
+        || task.started_at.is_some()
+        || task.branch.is_some()
+        || task.worktree_path.is_some()
+        || task.review.is_some()
+        || task.pr_url.is_some()
+        || !matches!(
+            task.state,
+            TaskState::Queued | TaskState::Paused | TaskState::Blocked | TaskState::Throttled | TaskState::NeedsAttention
+        )
+    {
+        return Err(Refused(format!(
+            "cannot reassign {} after execution started; create a new task in the target project",
+            task.key
+        )));
+    }
+    if task.execution_project == project {
+        return Ok(Vec::new());
+    }
+    let old = std::mem::replace(&mut task.execution_project, project.to_string());
+    Ok(vec![Effect::log(
+        EventLevel::Info,
+        "task.project_set",
+        format!("execution project changed from {old} to {project}"),
+        serde_json::json!({"from": old, "project": project}),
+    )])
+}
+
+/// Pin the checkout before the first repository operation. Refuses a changed
+/// checkout on retries and reviews. The shell supplies the canonical path.
+pub fn bind_project(task: &mut Task, checkout: &str) -> Result<Vec<Effect>, Refused> {
+    if let Some(bound) = &task.execution_repo {
+        if bound != checkout {
+            return Err(Refused(format!("task {} is pinned to {bound}, not {checkout}", task.key)));
+        }
+        return Ok(Vec::new());
+    }
+    task.execution_repo = Some(checkout.into());
+    Ok(vec![Effect::log(
+        EventLevel::Info,
+        "task.project_bound",
+        format!("execution project {} pinned to {checkout}", task.execution_project),
+        serde_json::json!({"project": task.execution_project, "checkout": checkout}),
+    )])
+}
+
 /// `task complete` without a PR, written straight into the store by the
 /// agent from inside its session or by a human: the task goes `completed`
 /// with `summary` and the daemon releases its session, if still live, on
@@ -452,6 +504,36 @@ mod properties {
 
     fn has_kill(effects: &[Effect]) -> bool {
         effects.iter().any(|e| matches!(e, Effect::KillWindow))
+    }
+
+    proptest! {
+        #[test]
+        fn project_binding_is_stable_and_reassignment_is_explicit(mut task in crate::strategies::task(), project in crate::strategies::execution_project()) {
+            let original_project = task.execution_project.clone();
+            let source = task.source.clone();
+            let linear_project = task.project.clone();
+            let checkout = format!("/repos/{original_project}");
+            bind_project(&mut task, &checkout).unwrap();
+            let bound = task.clone();
+            prop_assert!(bind_project(&mut task, "/another/repo").is_err());
+            prop_assert!(on_set_project(&mut task, &project, false).is_err());
+            prop_assert_eq!(&task, &bound);
+            prop_assert_eq!(&task.source, &source);
+            prop_assert_eq!(&task.project, &linear_project);
+            prop_assert!(bind_project(&mut task, &checkout).unwrap().is_empty());
+        }
+
+        #[test]
+        fn fresh_project_reassignment_preserves_source(project in crate::strategies::execution_project()) {
+            let mut task = Task::new("T", "t", crate::domain::TaskSource::Manual);
+            task.project = Some("source project".into());
+            let before = task.clone();
+            let effects = on_set_project(&mut task, &project, false).unwrap();
+            prop_assert_eq!(&task.execution_project, &project);
+            prop_assert_eq!(&task, &Task { execution_project: project.clone(), ..before.clone() });
+            prop_assert_eq!(effects.is_empty(), before.execution_project == project);
+            prop_assert!(on_set_project(&mut task, "other", true).is_err());
+        }
     }
 
     proptest! {

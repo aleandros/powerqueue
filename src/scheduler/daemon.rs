@@ -139,11 +139,19 @@ struct OverridesFingerprint {
     rules: Option<String>,
 }
 
+#[derive(Default)]
+struct ProjectFetch {
+    last: Option<DateTime<Utc>>,
+    handle: Option<tokio::task::JoinHandle<Result<()>>>,
+}
+
 /// Mutable runtime state that is not part of the public daemon surface.
 struct RuntimeState {
     tmux: Tmux,
     repo: Repo,
     launcher: Launcher,
+    project_rules: HashMap<String, PriorityRules>,
+    project_fetches: HashMap<String, ProjectFetch>,
     rules: PriorityRules,
     rules_loaded: bool,
     rules_missing_logged: bool,
@@ -231,6 +239,8 @@ impl Daemon {
             tmux,
             repo,
             launcher,
+            project_rules: HashMap::new(),
+            project_fetches: HashMap::new(),
             rules: PriorityRules::default(),
             rules_loaded: false,
             rules_missing_logged: false,
@@ -361,6 +371,8 @@ impl Daemon {
     pub async fn tick(&mut self) -> Result<()> {
         let now = Utc::now();
         self.store.heartbeat(std::process::id()).context("write heartbeat")?;
+        let r = self.bind_existing_projects().await;
+        self.report_phase("projects", r);
         let r = self.apply_commands(now).await;
         self.report_phase("commands", r);
         if self.rt.shutdown {
@@ -552,6 +564,14 @@ impl Daemon {
                 }
                 self.commit(&before.0, &mut task, ended, effects).await?;
             }
+            DaemonCommand::SetProject { task_id, project } => {
+                self.cfg.for_project(project, &self.paths)?;
+                let mut task = self.require_task(*task_id)?;
+                let before = task.clone();
+                let effects = commands::on_set_project(&mut task, project, self.store.latest_session(*task_id)?.is_some())?;
+                self.store.set_execution_project(task.id, &before.execution_project, project)?;
+                self.log_only(&task, None, effects);
+            }
             DaemonCommand::SetModel { task_id, model } => {
                 let mut task = self.require_task(*task_id)?;
                 let before = task.clone();
@@ -639,7 +659,7 @@ impl Daemon {
     fn reload_config(&mut self) -> Result<()> {
         let mut cfg = Config::load(&self.paths)?;
         let repo = cfg.repo_path();
-        if repo.exists() {
+        if cfg.projects.is_empty() && repo.exists() {
             cfg.apply_repo_overrides(&repo)?;
         }
         cfg.ensure_valid()?;
@@ -651,6 +671,7 @@ impl Daemon {
         self.rt.linear_warned = false;
         self.rt.jev = None;
         self.rt.rules_loaded = false;
+        self.rt.project_rules.clear();
         self.rt.watcher = None;
         self.rt.watcher_failed = false;
         self.cfg = cfg;
@@ -670,6 +691,9 @@ impl Daemon {
     // --------------------------------------------------------------- rules
 
     async fn refresh_rules(&mut self, now: DateTime<Utc>) -> Result<()> {
+        if !self.cfg.projects.is_empty() {
+            return self.refresh_project_rules(now).await;
+        }
         let source = self.cfg.rules_source(&self.paths);
         // Rules on disk are watched; committed rules are polled through git
         // by `refresh_overrides`, which clears `rules_loaded` on a change.
@@ -712,6 +736,112 @@ impl Daemon {
                 self.store.update_task(&task)?;
                 tracing::debug!(task = %task.key, criticality = %task.criticality, score = task.score, "re-scored");
             }
+        }
+        Ok(())
+    }
+
+    fn project_error(&self, id: &str, message: &str) {
+        self.log(
+            None,
+            None,
+            EventLevel::Error,
+            "project.error",
+            &format!("project {id}: {message}"),
+            serde_json::json!({"project": id}),
+        );
+    }
+
+    async fn bind_existing_projects(&mut self) -> Result<()> {
+        for mut task in self.store.list_tasks()? {
+            if task.execution_repo.is_some()
+                || (task.attempts == 0 && task.branch.is_none() && task.worktree_path.is_none() && task.review.is_none())
+            {
+                continue;
+            }
+            let resolved = self.cfg.for_task(&task, &self.paths).and_then(|cfg| {
+                cfg.repo_path().canonicalize().with_context(|| format!("resolve project {} checkout", task.execution_project))
+            });
+            match resolved {
+                Ok(path) => {
+                    let before = task.clone();
+                    let effects = commands::bind_project(&mut task, &path.to_string_lossy())?;
+                    self.commit(&before, &mut task, None, effects).await?;
+                }
+                Err(e) => self.project_error(&task.execution_project, &format!("{}: {e:#}", task.key)),
+            }
+        }
+        Ok(())
+    }
+
+    fn refresh_project_fetches(&mut self, now: DateTime<Utc>) {
+        for id in self.cfg.project_ids() {
+            let cfg = self.cfg.projects.get(&id).map(|p| &p.repo).unwrap_or(&self.cfg.repo);
+            let state = self.rt.project_fetches.entry(id).or_default();
+            if state.handle.as_ref().is_some_and(|h| h.is_finished())
+                && let Some(handle) = state.handle.take()
+            {
+                // Completed handles are collected without blocking the daemon.
+                tokio::spawn(async move {
+                    report_fetch(handle.await);
+                });
+            }
+            if self.offline
+                || cfg.overrides_from != OverridesSource::DefaultBranch
+                || cfg.fetch_interval_secs == 0
+                || state.handle.is_some()
+            {
+                continue;
+            }
+            if state.last.is_some_and(|last| {
+                now.signed_duration_since(last).num_seconds() < cfg.fetch_interval_secs.min(i64::MAX as u64) as i64
+            }) {
+                continue;
+            }
+            let repo = Repo::new(crate::paths::expand_tilde(&cfg.path));
+            state.last = Some(now);
+            state.handle = Some(tokio::task::spawn_blocking(move || repo.fetch()));
+        }
+    }
+
+    async fn refresh_project_rules(&mut self, now: DateTime<Utc>) -> Result<()> {
+        let previous_rules = std::mem::take(&mut self.rt.project_rules);
+        let tasks = self.store.list_open_tasks()?;
+        for id in self.cfg.project_ids() {
+            let resolved = self.cfg.for_project(&id, &self.paths).and_then(|cfg| {
+                let rules = if !cfg.priority.live_reload
+                    && let Some(rules) = previous_rules.get(&id)
+                {
+                    rules.clone()
+                } else {
+                    crate::projects::load_rules(&cfg, &self.paths)?
+                };
+                Ok((cfg, rules))
+            });
+            let (cfg, rules) = match resolved {
+                Ok(pair) => pair,
+                Err(e) => {
+                    self.log(
+                        None,
+                        None,
+                        EventLevel::Error,
+                        "project.error",
+                        &format!("project {id}: {e:#}"),
+                        serde_json::json!({"project": id}),
+                    );
+                    continue;
+                }
+            };
+            for mut task in tasks.iter().filter(|t| t.execution_project == id).cloned() {
+                if task.state.has_live_session() || self.store.latest_session(task.id)?.is_some_and(|s| s.state.is_live()) {
+                    continue;
+                }
+                let jev = self.jev_norm_with(&task, now, &cfg, &rules).await;
+                let eval = rules.evaluate(&task, now, jev, cfg.priority.jev.weight, cfg.priority.age_boost_per_hour);
+                let before = task.clone();
+                let effects = transitions::on_evaluation(&mut task, &eval);
+                self.commit(&before, &mut task, None, effects).await?;
+            }
+            self.rt.project_rules.insert(id, rules);
         }
         Ok(())
     }
@@ -795,6 +925,10 @@ impl Daemon {
     /// A git failure while fingerprinting is logged once and the last good
     /// fingerprint kept, so it never counts as a change.
     async fn refresh_overrides(&mut self, now: DateTime<Utc>) -> Result<()> {
+        if !self.cfg.projects.is_empty() {
+            self.refresh_project_fetches(now);
+            return Ok(());
+        }
         if self.rt.last_overrides_check.is_some_and(|t| now - t < Duration::seconds(OVERRIDES_CHECK_SECS)) {
             return Ok(());
         }
@@ -946,22 +1080,39 @@ impl Daemon {
 
     /// Jev score for a task normalised to 0..=1, from cache or by scoring.
     async fn jev_norm_for(&mut self, task: &Task, now: DateTime<Utc>) -> Option<f64> {
-        let levels = self.rt.rules.jev.levels.len().max(2);
+        let cfg = self.cfg.for_project(&task.execution_project, &self.paths).ok()?;
+        let rules = self.rt.project_rules.get(&task.execution_project).unwrap_or(&self.rt.rules).clone();
+        self.jev_norm_with(task, now, &cfg, &rules).await
+    }
+
+    async fn jev_norm_with(&mut self, task: &Task, now: DateTime<Utc>, cfg: &Config, rules: &PriorityRules) -> Option<f64> {
+        let levels = rules.jev.levels.len().max(2);
         let normalise = |score: f64| (score / (levels as f64 - 1.0)).clamp(0.0, 1.0);
-        let hash = content_hash(&task.title, &task.description, &task.labels);
+        let title = if self.cfg.projects.is_empty() {
+            task.title.clone()
+        } else {
+            format!(
+                "{}\n{}\n{}\n{:?}\n{}",
+                task.execution_project, cfg.priority.jev.model, rules.jev.question, rules.jev.levels, task.title
+            )
+        };
+        let hash = content_hash(&title, &task.description, &task.labels);
         let cached = self.store.jev_cached(task.id).ok().flatten();
-        let enabled = self.cfg.priority.jev.enabled && self.rt.rules.jev.enabled;
+        let enabled = cfg.priority.jev.enabled && rules.jev.enabled;
         if let Some(c) = &cached
-            && (!enabled || c.content_hash == hash || !self.cfg.priority.jev.rescore_on_change)
+            && (!enabled || c.content_hash == hash || !cfg.priority.jev.rescore_on_change)
         {
             return Some(normalise(c.score));
         }
         if !enabled {
             return None;
         }
+        if !self.cfg.projects.is_empty() {
+            self.rt.jev = None;
+        }
         if self.rt.jev.is_none() {
             match self.secrets.get(SecretKind::JevApiKey) {
-                Ok(Some(key)) => match JevClient::new(&self.cfg.priority.jev.endpoint, key, &self.cfg.priority.jev.model) {
+                Ok(Some(key)) => match JevClient::new(&cfg.priority.jev.endpoint, key, &cfg.priority.jev.model) {
                     Ok(c) => self.rt.jev = Some(c),
                     Err(e) => self.jev_error_once(&format!("cannot build Jev client: {e:#}")),
                 },
@@ -970,7 +1121,7 @@ impl Daemon {
             }
         }
         let client = self.rt.jev.clone()?;
-        let question = JevQuestion { instructions: self.rt.rules.jev.question.clone(), levels: self.rt.rules.jev.levels.clone() };
+        let question = JevQuestion { instructions: rules.jev.question.clone(), levels: rules.jev.levels.clone() };
         let state = crate::jev::task_state(task);
         match client.score(&state, &question).await {
             Ok(score) => {
@@ -1695,7 +1846,8 @@ impl Daemon {
         }
         let mut task = task.clone();
         let mut session = session.clone();
-        let effects = transitions::on_answer_sent(&mut task, &mut session, text, ids, &self.cfg, now);
+        let cfg = self.cfg.for_project(&task.execution_project, &self.paths)?;
+        let effects = transitions::on_answer_sent(&mut task, &mut session, text, ids, &cfg, now);
         self.store.update_session(&session)?;
         self.store.update_task(&task)?;
         self.rt.nudged.remove(&session.id);
@@ -2064,7 +2216,8 @@ impl Daemon {
         let outcome = interpret_hook(ev.event, &ev.payload);
         tracing::debug!(task = %task.key, session = %session.id, event = ev.event.as_str(), ?outcome, "hook outcome");
         let session_was_live = session.state.is_live();
-        let mut effects = transitions::on_hook_outcome(&mut task, &mut session, &outcome, &self.cfg, now, period_end);
+        let cfg = self.cfg.for_project(&task.execution_project, &self.paths)?;
+        let mut effects = transitions::on_hook_outcome(&mut task, &mut session, &outcome, &cfg, now, period_end);
         // Only the hook that ends the session of a completed task: later
         // ones (duplicate Stop, SessionEnd) come after its cleanup ran.
         if session_was_live
@@ -2089,6 +2242,12 @@ impl Daemon {
         Ok(())
     }
 
+    fn cleanup_project_task(&self, task: &mut Task, succeeded: bool, review: bool) -> Result<()> {
+        let cfg = self.cfg.for_task(task, &self.paths)?;
+        let repo = Repo::new(cfg.repo_path());
+        cleanup_task(&cfg, &self.store, &repo, &self.rt.tmux, task, succeeded, review)
+    }
+
     /// Carry out effects requested by a transition. Runtime failures are
     /// logged; they never propagate.
     async fn apply_effects(&mut self, task: &mut Task, session: Option<&Session>, effects: Vec<Effect>) {
@@ -2097,7 +2256,7 @@ impl Daemon {
             match effect {
                 Effect::Log { level, kind, message, data } => self.log(Some(task.id), session_id, level, &kind, &message, data),
                 Effect::Cleanup { succeeded } => {
-                    if let Err(e) = cleanup_task(&self.cfg, &self.store, &self.rt.repo, &self.rt.tmux, task, succeeded, false) {
+                    if let Err(e) = self.cleanup_project_task(task, succeeded, false) {
                         self.log(
                             Some(task.id),
                             session_id,
@@ -2163,7 +2322,7 @@ impl Daemon {
                     {
                         watch.worktree_path = task.worktree_path.clone();
                     }
-                    if let Err(e) = cleanup_task(&self.cfg, &self.store, &self.rt.repo, &self.rt.tmux, task, true, true) {
+                    if let Err(e) = self.cleanup_project_task(task, true, true) {
                         self.log(
                             Some(task.id),
                             session_id,
@@ -2193,10 +2352,25 @@ impl Daemon {
                     state.pending_session = None;
                 }),
                 Effect::DeleteBranch => {
+                    let cfg = match self.cfg.for_task(task, &self.paths) {
+                        Ok(cfg) => cfg,
+                        Err(e) => {
+                            self.log(
+                                Some(task.id),
+                                session_id,
+                                EventLevel::Error,
+                                "project.error",
+                                &format!("{e:#}"),
+                                serde_json::json!({}),
+                            );
+                            continue;
+                        }
+                    };
+                    let repo = Repo::new(cfg.repo_path());
                     let Some(branch) = task.branch.clone() else { continue };
                     if let Some(wt) = task.worktree_path.clone() {
                         // Kept earlier (e.g. nothing was pushed); the PR is merged now.
-                        match self.rt.repo.remove_worktree(Path::new(&wt), false) {
+                        match repo.remove_worktree(Path::new(&wt), false) {
                             Ok(()) => task.worktree_path = None,
                             Err(e) => {
                                 self.log(
@@ -2211,7 +2385,7 @@ impl Daemon {
                             }
                         }
                     }
-                    match self.rt.repo.delete_branch(&branch, true) {
+                    match repo.delete_branch(&branch, true) {
                         Ok(()) => self.log(
                             Some(task.id),
                             session_id,
@@ -2258,7 +2432,14 @@ impl Daemon {
                 None => {
                     let Some(task) = self.store.get_task(session.task_id)? else { continue };
                     let Some(wt) = &task.worktree_path else { continue };
-                    let guess = transcript_path_for(&claude_home(&self.cfg), Path::new(wt), session.id);
+                    let cfg = match self.cfg.for_project(&task.execution_project, &self.paths) {
+                        Ok(cfg) => cfg,
+                        Err(e) => {
+                            self.project_error(&task.execution_project, &format!("{e:#}"));
+                            continue;
+                        }
+                    };
+                    let guess = transcript_path_for(&claude_home(&cfg), Path::new(wt), session.id);
                     if !guess.exists() {
                         continue;
                     }
@@ -2341,7 +2522,17 @@ impl Daemon {
     /// restarts resume that id.
     fn discover_agent_sessions(&mut self, now: DateTime<Utc>) -> Result<()> {
         for session in self.store.list_sessions_active_since(now - TRANSCRIPT_GRACE)? {
-            self.discover_agent_session(session)?;
+            let task_id = session.task_id;
+            if let Err(e) = self.discover_agent_session(session) {
+                self.log(
+                    Some(task_id),
+                    None,
+                    EventLevel::Warn,
+                    "session.discovery_failed",
+                    &format!("{e:#}"),
+                    serde_json::json!({}),
+                );
+            }
         }
         Ok(())
     }
@@ -2354,7 +2545,8 @@ impl Daemon {
         }
         let Some(task) = self.store.get_task(session.task_id)? else { return Ok(session) };
         let Some(wt) = task.worktree_path.as_deref() else { return Ok(session) };
-        match agent.discover_session(&self.cfg, Path::new(wt), session.started_at) {
+        let cfg = self.cfg.for_task(&task, &self.paths)?;
+        match agent.discover_session(&cfg, Path::new(wt), session.started_at) {
             Ok(Some((id, path))) => {
                 session.agent_session_id = Some(id.clone());
                 session.transcript_path = Some(path.display().to_string());
@@ -2447,7 +2639,14 @@ impl Daemon {
                     task = fresh;
                 }
             }
-            let sc = &self.cfg.scheduler;
+            let cfg = match self.cfg.for_project(&task.execution_project, &self.paths) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    self.project_error(&task.execution_project, &format!("{e:#}"));
+                    continue;
+                }
+            };
+            let sc = &cfg.scheduler;
             let silent = now - session.last_activity_at;
             let stale = matches!(task.state, TaskState::Running | TaskState::Starting)
                 && sc.stale_session_secs > 0
@@ -2472,7 +2671,7 @@ impl Daemon {
             }
             let ctx = ProbeContext { now, nudged: self.rt.nudged.contains(&session.id), pane_tail, provider_cooldown_until };
             let wait_before = (session.waiting_since, session.waited_secs);
-            let effects = transitions::on_probe(&mut task, &mut session, &probe, &self.cfg.scheduler, &ctx);
+            let effects = transitions::on_probe(&mut task, &mut session, &probe, &cfg.scheduler, &ctx);
             if effects.is_empty() {
                 // A wait on a human started or ended: keep the bookkeeping.
                 if (session.waiting_since, session.waited_secs) != wait_before {
@@ -2498,12 +2697,16 @@ impl Daemon {
     /// (not installed, not a GitHub repo) is logged at debug level and
     /// leaves the task completed.
     fn adopt_open_pr(&mut self, task: &mut Task, now: DateTime<Utc>) -> bool {
-        if task.state != TaskState::Completed || self.cfg.scheduler.pr_poll_secs == 0 {
+        let cfg = match self.cfg.for_task(task, &self.paths) {
+            Ok(cfg) => cfg,
+            Err(_) => return false,
+        };
+        if task.state != TaskState::Completed || cfg.scheduler.pr_poll_secs == 0 {
             return false;
         }
         let Some(branch) = task.branch.clone() else { return false };
-        let dir = task.worktree_path.clone().map(PathBuf::from).filter(|p| p.is_dir()).unwrap_or_else(|| self.cfg.repo_path());
-        let gh = Gh::new(&self.cfg.scheduler.gh_binary);
+        let dir = task.worktree_path.clone().map(PathBuf::from).filter(|p| p.is_dir()).unwrap_or_else(|| cfg.repo_path());
+        let gh = Gh::new(&cfg.scheduler.gh_binary);
         let url = match gh.open_pr_for_branch(&dir, &branch) {
             Ok(Some(url)) => url,
             Ok(None) => return false,
@@ -2561,12 +2764,19 @@ impl Daemon {
     /// it is noted in `last_error` (logged as `review.error` when the message
     /// changes) and retried at the next interval.
     async fn watch_reviews(&mut self, now: DateTime<Utc>) -> Result<()> {
-        let interval = self.cfg.scheduler.pr_poll_secs;
-        if interval == 0 {
-            return Ok(());
-        }
-        let gh = Gh::new(&self.cfg.scheduler.gh_binary);
         for mut task in self.store.list_tasks_in_states(&[TaskState::InReview])? {
+            let cfg = match self.cfg.for_task(&task, &self.paths) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    self.project_error(&task.execution_project, &format!("{e:#}"));
+                    continue;
+                }
+            };
+            let interval = cfg.scheduler.pr_poll_secs;
+            if interval == 0 {
+                continue;
+            }
+            let gh = Gh::new(&cfg.scheduler.gh_binary);
             let due =
                 task.review.as_ref().and_then(|r| r.last_polled_at).is_none_or(|t| now - t >= Duration::seconds(interval as i64));
             if !due {
@@ -2597,7 +2807,7 @@ impl Daemon {
                 }
             };
             review::on_watch_recovered(&mut task);
-            let effects = review::on_pr_status(&mut task, &status, &self.cfg.scheduler, now);
+            let effects = review::on_pr_status(&mut task, &status, &cfg.scheduler, now);
             self.store.update_task(&task)?;
             self.apply_effects(&mut task, None, effects).await;
             if task.state == TaskState::Completed && matches!(&task.source, TaskSource::GitHub { .. }) {
@@ -2696,7 +2906,13 @@ impl Daemon {
         let ledgers = Ledgers::load(&self.store, &self.cfg.budget, now)?;
         self.rt.rate_limits.clear_expired(now);
         let mut planner = LaunchPlanner::new(estimator, ledgers, tasks, slots);
-        while let Some(candidate) = planner.next(self.launch_context(), now) {
+        loop {
+            let candidate = if self.cfg.projects.is_empty() {
+                planner.next(self.launch_context(), now)
+            } else {
+                planner.next_for_projects(&self.cfg.budget, &self.rt.project_rules, &self.rt.rate_limits, now)
+            };
+            let Some(candidate) = candidate else { break };
             let Candidate { task, decision, .. } = candidate.clone();
             match decision.model.clone() {
                 None => self.throttle(task, &decision, now)?,
@@ -2744,6 +2960,7 @@ impl Daemon {
     /// `starting` row was written leaves that row without a session (no
     /// phase picks a `starting` task up again; `task retry` does).
     async fn start_task(&mut self, mut task: Task, model: ModelTier, decision: &Decision, now: DateTime<Utc>) -> Result<Started> {
+        let cfg = self.cfg.for_task(&task, &self.paths)?;
         // A review round resumes the session that armed the merge, in the
         // same worktree path, told only what changed on the PR.
         let relaunch = task.review_relaunch().cloned();
@@ -2751,31 +2968,39 @@ impl Daemon {
         // the session with it as the prompt.
         let latest = self.store.latest_session(task.id)?.map(|s| s.id);
         let answer = self.store.kv_get::<RelayState>(&relay_key(task.id))?.and_then(|r| r.answer_for(latest).map(str::to_string));
-        let root = self.cfg.worktree_root(&self.paths);
+        let root = cfg.worktree_root(&self.paths);
         let before = task.clone();
-        let start = launch::on_starting(&mut task, &model, decision, &self.cfg, &root, relaunch.is_some() || answer.is_some());
-        self.commit(&before, &mut task, None, start.effects.clone()).await?;
+        let start = launch::on_starting(&mut task, &model, decision, &cfg, &root, relaunch.is_some() || answer.is_some());
+        if !self.store.claim_task_start(&before, &task)? {
+            bail!("task {} changed before launch; its project and state will be reconsidered next tick", task.key);
+        }
+        self.log_only(&task, None, start.effects.clone());
         // On the task from here on, persisted by the launch or by the crash
         // that prevents it (never by a `starting` row alone).
         launch::claim(&mut task, &start);
         let launch::Start { branch, worktree, attempt, .. } = start;
 
-        let prepared = self.prepare_worktree(&task, &root, &worktree, &branch);
+        let prepared = match cfg
+            .repo_path()
+            .canonicalize()
+            .with_context(|| format!("resolve project {} checkout", task.execution_project))
+        {
+            Ok(checkout) => {
+                let before = task.clone();
+                let effects = commands::bind_project(&mut task, &checkout.to_string_lossy())?;
+                self.commit(&before, &mut task, None, effects).await?;
+                self.prepare_worktree(&task, &root, &worktree, &branch)
+            }
+            Err(e) => Err(e),
+        };
         if let Ok(true) = prepared {
             // The periodic fetch has nothing to add right after this one.
             self.rt.last_fetch = Some(now);
         }
         if let Err(e) = prepared {
             let before = task.clone();
-            let effects = transitions::on_crash(
-                &mut task,
-                None,
-                &format!("worktree setup failed: {e:#}"),
-                None,
-                &self.cfg.scheduler,
-                now,
-                None,
-            );
+            let effects =
+                transitions::on_crash(&mut task, None, &format!("worktree setup failed: {e:#}"), None, &cfg.scheduler, now, None);
             self.commit(&before, &mut task, None, effects).await?;
             return Ok(Started::CrashedBeforeLaunch);
         }
@@ -2801,7 +3026,7 @@ impl Daemon {
             launch::resume_plan(previous.as_ref(), &model, transcript_present, relaunch.is_some() || answer.is_some());
         let review_prompt = relaunch
             .as_ref()
-            .map(|r| review::review_prompt(&self.cfg.scheduler.review_prompt, r, task.pr_url.as_deref().unwrap_or_default()));
+            .map(|r| review::review_prompt(&cfg.scheduler.review_prompt, r, task.pr_url.as_deref().unwrap_or_default()));
         let prompts = launch::resume_prompt(
             review_prompt.as_deref(),
             answer.as_deref(),
@@ -2810,7 +3035,7 @@ impl Daemon {
             task.last_error.as_deref(),
         );
         let prepared = self.rt.launcher.prepare_with_prompt(
-            &self.cfg,
+            &cfg,
             &task,
             session_id,
             &model,
@@ -2829,10 +3054,10 @@ impl Daemon {
                         EventLevel::Warn,
                         "prompt.template_error",
                         warning,
-                        serde_json::json!({ "template": plan.prompt_template, "configured": self.cfg.prompt.template_path() }),
+                        serde_json::json!({ "template": plan.prompt_template, "configured": cfg.prompt.template_path() }),
                     );
                 }
-                self.rt.launcher.launch(&self.cfg, &task, &plan, session_id, &model, attempt)
+                self.rt.launcher.launch(&cfg, &task, &plan, session_id, &model, attempt)
             }
             Err(e) => Err(e),
         };
@@ -2840,15 +3065,8 @@ impl Daemon {
             Ok(s) => s,
             Err(e) => {
                 let before = task.clone();
-                let effects = transitions::on_crash(
-                    &mut task,
-                    None,
-                    &format!("launch failed: {e:#}"),
-                    None,
-                    &self.cfg.scheduler,
-                    now,
-                    None,
-                );
+                let effects =
+                    transitions::on_crash(&mut task, None, &format!("launch failed: {e:#}"), None, &cfg.scheduler, now, None);
                 self.commit(&before, &mut task, None, effects).await?;
                 return Ok(Started::CrashedBeforeLaunch);
             }
@@ -2892,7 +3110,7 @@ impl Daemon {
             worktree: &worktree,
             answered: answer.is_some(),
         };
-        let effects = launch::on_launched(&mut task, &session, &facts, &self.cfg, now);
+        let effects = launch::on_launched(&mut task, &session, &facts, &cfg, now);
         self.commit(&before, &mut task, Some(&session), effects).await?;
         Ok(Started::Launched)
     }
@@ -2903,8 +3121,8 @@ impl Daemon {
     /// the PR since the hand-off. Never fails the task; a skip is logged at
     /// debug level, a git failure as `repo.fast_forward_failed` (counted by
     /// `doctor`).
-    fn fast_forward_base(&self, task: &Task, base: &str) {
-        let (level, kind, message, data) = match self.rt.repo.fast_forward_branch(base) {
+    fn fast_forward_base(&self, repo: &Repo, task: &Task, base: &str) {
+        let (level, kind, message, data) = match repo.fast_forward_branch(base) {
             Ok(FastForward::UpToDate) => return,
             Ok(FastForward::Updated { from, to }) => (
                 EventLevel::Info,
@@ -2942,11 +3160,13 @@ impl Daemon {
     /// PR on GitHub since the hand-off); a branch with local commits the
     /// remote lacks is left as is.
     fn prepare_worktree(&self, task: &Task, root: &Path, worktree: &Path, branch: &str) -> Result<bool> {
+        let cfg = self.cfg.for_task(task, &self.paths)?;
+        let repo = Repo::new(cfg.repo_path());
+        repo.ensure_worktree_owner(worktree)?;
         std::fs::create_dir_all(root).with_context(|| format!("create worktree root {}", root.display()))?;
-        let new_branch = !self.rt.repo.branch_exists(branch).with_context(|| format!("look up branch {branch}"))?;
-        let fetch_error =
-            if self.cfg.repo.fetch_before_start { self.rt.repo.fetch().err().map(|e| format!("{e:#}")) } else { None };
-        let fetched = self.cfg.repo.fetch_before_start && fetch_error.is_none();
+        let new_branch = !repo.branch_exists(branch).with_context(|| format!("look up branch {branch}"))?;
+        let fetch_error = if cfg.repo.fetch_before_start { repo.fetch().err().map(|e| format!("{e:#}")) } else { None };
+        let fetched = cfg.repo.fetch_before_start && fetch_error.is_none();
         if let (Some(e), false) = (&fetch_error, new_branch) {
             self.log(
                 Some(task.id),
@@ -2958,28 +3178,26 @@ impl Daemon {
             );
         }
         let start = if new_branch {
-            let base = match &self.cfg.repo.default_branch {
+            let base = match &cfg.repo.default_branch {
                 Some(b) => b.clone(),
-                None => self.rt.repo.default_branch().context("detect the default branch (set repo.default_branch)")?,
+                None => repo.default_branch().context("detect the default branch (set repo.default_branch)")?,
             };
-            let prefer = match (self.cfg.repo.fetch_before_start, &fetch_error) {
+            let prefer = match (cfg.repo.fetch_before_start, &fetch_error) {
                 (false, _) => BasePreference::Local,
                 (true, Some(_)) => BasePreference::Newest,
                 (true, None) => BasePreference::Remote,
             };
-            if prefer == BasePreference::Remote && self.cfg.repo.fast_forward_base {
-                self.fast_forward_base(task, &base);
+            if prefer == BasePreference::Remote && cfg.repo.fast_forward_base {
+                self.fast_forward_base(&repo, task, &base);
             }
-            Some(self.rt.repo.start_point(&base, prefer)?)
+            Some(repo.start_point(&base, prefer)?)
         } else {
-            if self.cfg.repo.fetch_before_start && fetch_error.is_none() {
-                self.fast_forward_base(task, branch);
+            if cfg.repo.fetch_before_start && fetch_error.is_none() {
+                self.fast_forward_base(&repo, task, branch);
             }
             None
         };
-        self.rt
-            .repo
-            .add_worktree_on(worktree, branch, start.as_ref().map(|s| s.sha.as_str()))
+        repo.add_worktree_on(worktree, branch, start.as_ref().map(|s| s.sha.as_str()))
             .with_context(|| format!("create worktree {} on {branch}", worktree.display()))?;
         if let Some(s) = &start {
             self.log(
@@ -3010,10 +3228,11 @@ impl Daemon {
                 );
             }
         }
-        if !self.cfg.repo.setup.is_empty() {
+        if !cfg.repo.setup.is_empty() {
             let env = vec![
                 ("POWERQUEUE_TASK_ID".to_string(), task.id.to_string()),
                 ("POWERQUEUE_TASK_KEY".to_string(), task.key.clone()),
+                ("POWERQUEUE_PROJECT".to_string(), task.execution_project.clone()),
                 ("POWERQUEUE_TASK_SLUG".to_string(), task.slug()),
                 ("POWERQUEUE_TASK_DIR".to_string(), self.paths.task_dir(&task.id.to_string()).display().to_string()),
                 ("POWERQUEUE_BRANCH".to_string(), branch.to_string()),
@@ -3021,7 +3240,7 @@ impl Daemon {
                 ("POWERQUEUE_DATA_DIR".to_string(), self.paths.data_dir.display().to_string()),
                 ("POWERQUEUE_STATE_DIR".to_string(), self.paths.state_dir.display().to_string()),
             ];
-            let output = run_commands(worktree, &self.cfg.repo.setup, &env).context("repo.setup commands")?;
+            let output = run_commands(worktree, &cfg.repo.setup, &env).context("repo.setup commands")?;
             self.log(Some(task.id), None, EventLevel::Debug, "worktree.setup", "setup commands finished", serde_json::json!({ "output": output.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect::<String>() }));
         }
         // A reused branch keeps the base recorded when it was created.

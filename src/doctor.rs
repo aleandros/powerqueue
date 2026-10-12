@@ -2053,17 +2053,43 @@ pub async fn run_all(
     results.push(check_terminal());
 
     results.push(check_config(cfg, paths));
-    results.push(check_repo(cfg));
-    results.push(check_worktree_root(cfg, paths));
-    results.push(check_priority_file(cfg, paths));
-    results.push(check_repo_overrides(cfg));
-    results.push(check_overrides_source(cfg));
-    results.push(check_prompt_template(cfg));
+    for id in cfg.project_ids() {
+        match cfg.for_project(&id, paths) {
+            Ok(project) => {
+                let checks = [
+                    check_repo(&project),
+                    check_worktree_root(&project, paths),
+                    check_priority_file(&project, paths),
+                    check_repo_overrides(&project),
+                    check_overrides_source(&project),
+                    check_prompt_template(&project),
+                    check_workspace_trust(&project, fix),
+                ];
+                results.extend(checks.into_iter().map(|mut check| {
+                    if !cfg.projects.is_empty() {
+                        check.name = format!("project {id}: {}", check.name);
+                    }
+                    check
+                }));
+            }
+            Err(e) => results.push(CheckResult::fail(
+                CONF,
+                &format!("project {id}"),
+                format!("{e:#}"),
+                "fix this project's configuration or repository overrides",
+            )),
+        }
+    }
+    for task in store.list_tasks()? {
+        if let Err(e) = cfg.for_task(&task, paths) {
+            results.push(CheckResult::fail(STATE, &format!("{} execution project", task.key), format!("{e:#}"),
+                "restore the registered checkout; reassign unstarted tasks with `powerqueue task project <task> <project>`; existing work requires a new task"));
+        }
+    }
     results.push(check_tune_drafts(paths));
     results.extend(check_provider_models(cfg));
     results.extend(check_period_anchors(cfg, store));
     results.extend(check_providers(cfg));
-    results.push(check_workspace_trust(cfg, fix));
     if let Some(r) = check_session_inbox(cfg, paths) {
         results.push(r);
     }

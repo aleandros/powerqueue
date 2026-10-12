@@ -87,8 +87,10 @@ powerqueue doctor
 powerqueue run
 ```
 
-Use `init --reconfigure` to change an existing installation. Each instance
-manages one checkout; `--home DIR` keeps additional instances separate.
+Use `init --reconfigure` to change an existing installation. Register additional
+[execution projects](configuration.md#execution-projects) to share one daemon
+and budget pool across checkouts, then use `add --project <id>`.
+`--home DIR` keeps separate instances independent.
 
 ## Running unattended
 

@@ -41,7 +41,8 @@ Global flags work on every command.
 
 | Command | What it does |
 |---------|--------------|
-| `add "title" [-d DESC\|-] [-c CRIT] [-m MODEL] [-k KEY] [-l LABEL]... [--paused]` | enqueue a manual task; `-d -` reads stdin |
+| `add "title" [-d DESC\|-] [-c CRIT] [-m MODEL] [-k KEY] [-l LABEL]... [--paused] [--project ID]` | enqueue a manual task in the execution project (default `default`); `-d -` reads stdin |
+| `task project <task> <id>` | reassign an unstarted task to a registered execution project; refuses tasks with previous execution history; validates again when the daemon applies the command |
 | `task show <task>` | details and timeline |
 | `task list [-a]` | same as `status` |
 | `task complete <task> [-s SUMMARY] [--pr URL]` | mark completed (Claude calls this from inside the session); with `--pr` hand it off for review instead: `in_review`, slot and worktree released, the daemon watches the PR (see [Review](task-lifecycle.md#review-pull-requests)). Refused while the task is `starting` (the daemon is launching it; try again once it is running) |

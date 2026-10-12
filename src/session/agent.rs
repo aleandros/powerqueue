@@ -176,6 +176,7 @@ pub fn session_env(
     let mut env: Vec<(String, String)> = provider_env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     env.push(("POWERQUEUE_TASK_ID".to_string(), task.id.to_string()));
     env.push(("POWERQUEUE_TASK_KEY".to_string(), task.key.clone()));
+    env.push(("POWERQUEUE_PROJECT".to_string(), task.execution_project.clone()));
     env.push(("POWERQUEUE_SESSION_ID".to_string(), session_id.to_string()));
     if !provider_env.contains_key("POWERQUEUE_BIN") {
         env.push(("POWERQUEUE_BIN".to_string(), powerqueue_bin.to_string_lossy().to_string()));

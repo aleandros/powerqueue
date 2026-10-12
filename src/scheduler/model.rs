@@ -52,7 +52,7 @@ use crate::priority::{Evaluation, PriorityRules};
 use crate::session::{HookOutcome, SessionProbe};
 use crate::strategies::*;
 
-use super::launch::{LaunchContext, LaunchPlanner};
+use super::launch::LaunchPlanner;
 use super::transitions::{Effect, ProbeContext};
 use super::{commands, launch, review, transitions};
 
@@ -209,8 +209,11 @@ impl TaskWorld {
                     return None;
                 }
                 let resuming = self.task.review_relaunch().is_some();
-                let start = launch::on_starting(&mut self.task, model, d, cfg, std::path::Path::new("/wt"), resuming);
-                let effects = start.effects.clone();
+                let checkout = format!("/repos/{}", self.task.execution_project);
+                let mut effects = commands::bind_project(&mut self.task, &checkout).expect("same checkout");
+                let root = std::path::PathBuf::from("/wt").join(&self.task.execution_project);
+                let start = launch::on_starting(&mut self.task, model, d, cfg, &root, resuming);
+                effects.extend(start.effects.clone());
                 self.start = Some(start);
                 self.claimed = false;
                 Some(effects)
@@ -383,9 +386,10 @@ impl TaskWorld {
 
 /// A fresh task as `powerqueue add` or the sync would insert it.
 fn fresh_task() -> impl Strategy<Value = Task> {
-    (word(), criticality(), 0.0f64..2000.0, prop::option::of(1u32..=4), vec(word(), 0..2)).prop_map(
-        |(key, criticality, score, max_attempts, labels)| {
+    (word(), criticality(), 0.0f64..2000.0, prop::option::of(1u32..=4), vec(word(), 0..2), execution_project()).prop_map(
+        |(key, criticality, score, max_attempts, labels, project)| {
             let mut t = Task::new(format!("ENG-{key}"), "t", TaskSource::Manual);
+            t.execution_project = project;
             t.criticality = criticality;
             t.score = score;
             t.max_attempts = max_attempts;
@@ -406,6 +410,16 @@ fn check(
     effects: &[Effect],
 ) -> Result<(), TestCaseError> {
     let (b, a) = (&before.task, &after.task);
+    prop_assert_eq!(&a.execution_project, &b.execution_project, "execution project changed in a lifecycle transition");
+    if let Some(bound) = &b.execution_repo {
+        prop_assert_eq!(a.execution_repo.as_ref(), Some(bound), "checkout changed on retry/review");
+    }
+    if let Some(path) = &a.worktree_path {
+        prop_assert!(
+            std::path::Path::new(path).starts_with(std::path::Path::new("/wt").join(&a.execution_project)),
+            "worktree crossed projects"
+        );
+    }
     let ctx = |what: &str| {
         format!(
             "step {step} {op:?}: {what}\n  before: {:?} {:?}\n  after:  {:?} {:?}",
@@ -730,8 +744,10 @@ impl DaemonWorld {
         let mut planner = LaunchPlanner::new(self.estimator.clone(), self.ledgers.clone(), candidates, slots);
         let mut outcomes = outcomes.iter();
         loop {
-            let ctx = LaunchContext { budget: &self.cfg.budget, rules: &self.rules, rate_limits: &self.rate_limits };
-            let Some(candidate) = planner.next(ctx, now) else { break };
+            let project_rules = self.tasks.iter().map(|t| (t.task.execution_project.clone(), self.rules.clone())).collect();
+            let Some(candidate) = planner.next_for_projects(&self.cfg.budget, &project_rules, &self.rate_limits, now) else {
+                break;
+            };
             let idx = self.tasks.iter().position(|t| t.task.id == candidate.task.id).expect("a candidate is one of the tasks");
             let what = format!(
                 "step {step} pass: {} ({:?}, score {}) decided {:?}",
@@ -889,6 +905,18 @@ fn daemon_task() -> impl Strategy<Value = TaskWorld> {
     state
         .prop_flat_map(|state| (task_in(state), prop::bool::weighted(0.75), prop::option::weighted(0.5, 0i64..6 * 3600)))
         .prop_map(|(mut t, unlinked, retry_in)| {
+            let worktree = format!("/wt/{}/{}", t.execution_project, t.slug());
+            if t.worktree_path.is_some() {
+                t.worktree_path = Some(worktree.clone());
+            }
+            if let Some(review) = t.review.as_mut()
+                && review.worktree_path.is_some()
+            {
+                review.worktree_path = Some(worktree);
+            }
+            if t.attempts > 0 {
+                t.execution_repo = Some(format!("/repos/{}", t.execution_project));
+            }
             if unlinked {
                 t.blocked_by.clear();
                 t.children.clear();

@@ -108,6 +108,29 @@ impl LaunchPlanner {
         Some(self.decide(ctx, task, now))
     }
 
+    /// Select with project-specific rules while sharing this pass's slots
+    /// and ledgers. Missing rules exclude only that project's tasks.
+    pub fn next_for_projects(
+        &mut self,
+        budget: &BudgetConfig,
+        rules: &std::collections::HashMap<String, PriorityRules>,
+        limits: &RateLimitState,
+        now: DateTime<Utc>,
+    ) -> Option<Candidate> {
+        if self.slots == 0 {
+            return None;
+        }
+        let remaining: Vec<_> = self
+            .candidates
+            .iter()
+            .filter(|t| !self.considered.contains(&t.id) && rules.contains_key(&t.execution_project))
+            .cloned()
+            .collect();
+        let task = pick_next(&remaining, now)?.clone();
+        let selected = rules.get(&task.execution_project)?;
+        Some(self.decide(LaunchContext { budget, rules: selected, rate_limits: limits }, task, now))
+    }
+
     fn decide(&mut self, ctx: LaunchContext<'_>, task: Task, now: DateTime<Utc>) -> Candidate {
         self.considered.insert(task.id);
         let prediction = self.estimator.predict(&task);
@@ -143,6 +166,32 @@ impl LaunchPlanner {
         for task in rest {
             let candidate = self.decide(ctx, task, now);
             self.started(ctx.budget, &candidate);
+            out.push(candidate);
+        }
+        out
+    }
+
+    /// Simulate every queued task with its project's rules, reserving all
+    /// predicted costs against the same provider ledgers. Missing projects
+    /// are omitted, matching the daemon's refusal to launch them.
+    pub fn plan_all_projects(
+        mut self,
+        budget: &BudgetConfig,
+        rules: &std::collections::HashMap<String, PriorityRules>,
+        limits: &RateLimitState,
+        now: DateTime<Utc>,
+    ) -> Vec<Candidate> {
+        let mut out = Vec::new();
+        while let Some(candidate) = self.next_for_projects(budget, rules, limits, now) {
+            self.started(budget, &candidate);
+            out.push(candidate);
+        }
+        let rest: Vec<Task> =
+            self.candidates.iter().filter(|t| t.state.is_schedulable() && !self.considered.contains(&t.id)).cloned().collect();
+        for task in rest {
+            let Some(selected) = rules.get(&task.execution_project) else { continue };
+            let candidate = self.decide(LaunchContext { budget, rules: selected, rate_limits: limits }, task, now);
+            self.started(budget, &candidate);
             out.push(candidate);
         }
         out
@@ -763,6 +812,53 @@ mod properties {
             out.push(c);
         }
         out
+    }
+
+    #[test]
+    fn each_project_supplies_its_own_model_preferences() {
+        let mut api = Task::new("API", "API", TaskSource::Manual);
+        api.execution_project = "api".into();
+        api.score = 3.0;
+        let mut web = Task::new("WEB", "web", TaskSource::Manual);
+        web.execution_project = "web".into();
+        web.score = 2.0;
+        let mut missing = Task::new("MISSING", "missing", TaskSource::Manual);
+        missing.execution_project = "removed".into();
+        missing.score = 10.0;
+        let cfg = Config::default();
+        let rules = [
+            ("api".into(), PriorityRules::parse("## Models\n- normal: haiku\n").unwrap()),
+            ("web".into(), PriorityRules::parse("## Models\n- normal: sonnet\n").unwrap()),
+        ]
+        .into_iter()
+        .collect();
+        let mut planner = LaunchPlanner::new(Estimator::from_summaries(&[]), Ledgers::default(), vec![api, web, missing], 2);
+        let limits = RateLimitState::default();
+        let first = planner.next_for_projects(&cfg.budget, &rules, &limits, origin()).unwrap();
+        let second = planner.next_for_projects(&cfg.budget, &rules, &limits, origin()).unwrap();
+        assert_eq!(first.task.execution_project, "api");
+        assert_eq!(first.preferred, vec![ModelTier::haiku()]);
+        assert_eq!(second.task.execution_project, "web");
+        assert_eq!(second.preferred, vec![ModelTier::sonnet()]);
+        assert!(planner.next_for_projects(&cfg.budget, &rules, &limits, origin()).is_none());
+    }
+
+    proptest! {
+        #[test]
+        fn project_pass_shares_slots_and_reservations(tasks in candidates(), slots in 0u32..=4, ledgers in ledgers()) {
+            let f = Fixed::new();
+            let rules = ["default", "api", "web"].into_iter().map(|id| (id.to_string(), f.rules.clone())).collect();
+            let mut projects = LaunchPlanner::new(Estimator::from_summaries(&[]), ledgers.clone(), tasks.clone(), slots);
+            let mut single = LaunchPlanner::new(Estimator::from_summaries(&[]), ledgers, tasks, slots);
+            while let Some(candidate) = projects.next_for_projects(&f.cfg.budget, &rules, &f.limits, origin()) {
+                let reference = single.next(f.ctx(), origin()).expect("shared queue candidate");
+                prop_assert_eq!(&candidate, &reference);
+                projects.started(&f.cfg.budget, &candidate);
+                single.started(&f.cfg.budget, &reference);
+                prop_assert_eq!(projects.ledgers(), single.ledgers());
+            }
+            prop_assert!(single.next(f.ctx(), origin()).is_none());
+        }
     }
 
     proptest! {

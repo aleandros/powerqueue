@@ -198,6 +198,9 @@ pub struct StatusArgs {
 
 #[derive(Debug, Args)]
 pub struct AddArgs {
+    /// Execution project ID (independent of a Linear project).
+    #[arg(long, default_value = "default")]
+    pub project: String,
     /// Task title.
     pub title: String,
     /// Longer description (markdown). `-` reads stdin.
@@ -223,6 +226,12 @@ pub struct AddArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum TaskCommand {
+    /// Reassign an unstarted task to a registered execution project.
+    Project {
+        #[command(flatten)]
+        task: TaskRef,
+        project: String,
+    },
     /// Show a task's details and timeline.
     Show(TaskRef),
     /// List tasks (same as `status`).

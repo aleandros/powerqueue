@@ -179,6 +179,11 @@ pub fn review_watch() -> impl Strategy<Value = ReviewWatch> {
 /// rest is drawn so the row is one the daemon could hold: `in_review` has a
 /// parseable PR URL and a watch, terminal tasks have `completed_at`, a task
 /// that ran has a branch.
+pub fn execution_project() -> impl Strategy<Value = String> {
+    prop::sample::select(vec!["default".to_string(), "api".to_string(), "web".to_string()])
+}
+
+/// A generated task with independent source metadata and execution project.
 pub fn task_in(state: TaskState) -> impl Strategy<Value = Task> {
     let ran = !matches!(state, TaskState::Queued | TaskState::Blocked | TaskState::Paused | TaskState::Throttled);
     let in_review = state == TaskState::InReview;
@@ -198,14 +203,16 @@ pub fn task_in(state: TaskState) -> impl Strategy<Value = Task> {
         vec(word(), 0..3),
         prop::option::of(prop::sample::select(vec![1.0, 2.0, 3.0, 5.0, 8.0])),
     );
-    (identity, bookkeeping, links).prop_map(
+    (identity, bookkeeping, links, execution_project()).prop_map(
         move |(
             (id, key, criticality, score, attempts, max_attempts, created_at),
             (not_before, last_error, summary, model_override, pr_url, review),
             (blocked_by, children, labels, estimate),
+            project,
         )| {
             let mut t = Task::new(format!("ENG-{key}"), "t", TaskSource::Manual);
             t.id = TaskId(uuid::Uuid::from_u128(id));
+            t.execution_project = project;
             t.state = state;
             t.criticality = criticality;
             t.score = score;

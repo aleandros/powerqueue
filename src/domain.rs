@@ -622,6 +622,12 @@ pub struct Task {
     pub title: String,
     pub description: String,
     pub source: TaskSource,
+    /// Stable execution project ID, independent of source/Linear project metadata.
+    #[serde(default = "default_execution_project")]
+    pub execution_project: String,
+    /// Canonical checkout pinned before the first repository operation.
+    #[serde(default)]
+    pub execution_repo: Option<String>,
     pub state: TaskState,
     pub criticality: Criticality,
     /// Scheduling score; higher first. Derived from criticality, rules, Jev and age.
@@ -680,6 +686,11 @@ pub struct Task {
     pub review: Option<ReviewWatch>,
 }
 
+/// Legacy tasks and source intake execute in the `default` project.
+pub fn default_execution_project() -> String {
+    "default".into()
+}
+
 impl Task {
     /// Minimal constructor for a new, queued task.
     pub fn new(key: impl Into<String>, title: impl Into<String>, source: TaskSource) -> Self {
@@ -690,6 +701,8 @@ impl Task {
             title: title.into(),
             description: String::new(),
             source,
+            execution_project: default_execution_project(),
+            execution_repo: None,
             state: TaskState::Queued,
             criticality: Criticality::Normal,
             score: Criticality::Normal.base_score(),
@@ -1220,6 +1233,11 @@ pub enum DaemonCommand {
     },
     Retry {
         task_id: TaskId,
+    },
+    /// Deliberately change an unstarted task's execution project.
+    SetProject {
+        task_id: TaskId,
+        project: String,
     },
     /// Force a model for the next attempt.
     SetModel {

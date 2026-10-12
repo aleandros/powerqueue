@@ -35,6 +35,7 @@ pub mod linear;
 pub mod logging;
 pub mod paths;
 pub mod priority;
+pub mod projects;
 pub mod scheduler;
 pub mod secrets;
 pub mod service;

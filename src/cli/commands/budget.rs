@@ -296,11 +296,19 @@ fn queued_decisions(
     estimator: &Estimator,
     now: DateTime<Utc>,
 ) -> Result<Vec<Candidate>> {
-    let rules = PriorityRules::from_source(&cfg.rules_source(paths))?.unwrap_or_default();
     let tasks: Vec<Task> = store.list_open_tasks()?.into_iter().filter(|t| t.state.is_schedulable()).collect();
     // The daemon's planner with no slot limit: what the queue would get if
     // every task could start.
     let planner = LaunchPlanner::new(estimator.clone(), ledgers.clone(), tasks, u32::MAX);
+    if !cfg.projects.is_empty() {
+        let mut rules = std::collections::HashMap::new();
+        for id in cfg.project_ids() {
+            let project = cfg.for_project(&id, paths)?;
+            rules.insert(id, crate::projects::load_rules(&project, paths)?);
+        }
+        return Ok(planner.plan_all_projects(&cfg.budget, &rules, limits, now));
+    }
+    let rules = PriorityRules::from_source(&cfg.rules_source(paths))?.unwrap_or_default();
     Ok(planner.plan_all(LaunchContext { budget: &cfg.budget, rules: &rules, rate_limits: limits }, now))
 }
 

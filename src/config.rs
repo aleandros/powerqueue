@@ -54,6 +54,8 @@ pub struct Config {
     #[serde(skip)]
     pub overrides: AppliedOverrides,
     pub repo: RepoConfig,
+    /// Execution projects keyed by stable ID; `repo` is the legacy default.
+    pub projects: BTreeMap<String, crate::projects::ProjectConfig>,
     pub linear: LinearConfig,
     pub github: GitHubConfig,
     pub priority: PriorityConfig,
@@ -1563,7 +1565,7 @@ impl Config {
         let mut cfg = Self::from_toml(&text).with_context(|| format!("invalid config {}", file.display()))?;
         cfg.prompt.base_dir = Some(paths.config_dir.clone());
         let repo = cfg.repo_path();
-        if !cfg.repo.path.trim().is_empty() && repo.exists() {
+        if cfg.projects.is_empty() && !cfg.repo.path.trim().is_empty() && repo.exists() {
             cfg.apply_repo_overrides(&repo)?;
         }
         Ok(cfg)
@@ -1971,8 +1973,8 @@ impl Config {
 
     /// Structural validation; returns a list of human-readable problems.
     pub fn validate(&self) -> Vec<String> {
-        let mut problems = Vec::new();
-        if self.repo.path.trim().is_empty() {
+        let mut problems = self.project_problems();
+        if self.repo.path.trim().is_empty() && !self.projects.contains_key("default") {
             problems.push("repo.path is empty".to_string());
         }
         if !self.repo.branch_template.contains("{key}") && !self.repo.branch_template.contains("{id}") {

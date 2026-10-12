@@ -218,6 +218,15 @@ pub fn path_entries(cfg: &Config, paths: &Paths) -> Vec<(&'static str, PathBuf)>
 pub fn validation_problems(cfg: &Config) -> (Config, Vec<String>) {
     let mut merged = cfg.clone();
     let mut problems = Vec::new();
+    if !cfg.projects.is_empty() {
+        problems.extend(cfg.validate());
+        for id in cfg.project_ids() {
+            if let Err(e) = cfg.for_project(&id, &crate::paths::Paths::resolve()) {
+                problems.push(format!("{e:#}"));
+            }
+        }
+        return (merged, problems);
+    }
     let repo = cfg.repo_path();
     if !cfg.repo.path.trim().is_empty()
         && repo.exists()
