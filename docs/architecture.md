@@ -87,7 +87,10 @@ failures remain failures, and do not stand for successful proofs.
 The optional [Quint specification and replay](../spec/README.md) add an independent
 queue/launch/crash/budget abstraction and conditional progress property. The
 advisory workflow simulates bounded schedules and replays actual e2e event logs
-through shared specification guards. Replay checks observable lifecycle prefixes,
+through shared specification guards. A Rust Cargo example reads the shared
+`Event` type and writes anonymized schedules and coverage reports; its projection
+tests run in the Rust gate, and Quint rejection tests run in advisory CI.
+Replay checks observable lifecycle prefixes,
 not unlogged budget reservations or full state equivalence; the linked event-kind
 mapping and coverage report make omissions explicit. `serde_json` enables
 `float_roundtrip` for exact float payload round trips.

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Testing: replace the Python Quint replay adapter with a Rust Cargo example,
+  reusing application event types and preserving anonymized schedules, coverage
+  reports, task-prefix cutoffs and invalid-schedule checks. Projection tests run
+  in the Rust gate; advisory CI runs Quint checks and all three daemon traces.
+
 ## [0.14.0] - 2026-10-10
 
 The stateful model now covers the whole daemon: several tasks sharing
