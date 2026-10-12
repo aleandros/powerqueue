@@ -22,12 +22,20 @@ pub fn run(ctx: &mut Context, args: DashboardArgs) -> Result<i32> {
     let cfg = ctx.config_cloned()?;
     let store = ctx.store()?.clone();
     let env = TerminalEnv::detect();
-    let options = Options { ascii: args.ascii || !env.utf8_locale };
+    let options = Options { ascii: args.ascii || !env.utf8_locale, project: args.project.clone() };
 
     if args.once {
         let snapshot = Snapshot::load(&store, &cfg, Utc::now())?;
         if ctx.json {
-            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            let mut json = serde_json::to_value(&snapshot)?;
+            json["project_filter"] = serde_json::json!(args.project);
+            if let Some(project) = &args.project {
+                json["tasks"]
+                    .as_array_mut()
+                    .expect("snapshot tasks are an array")
+                    .retain(|t| t["execution_project"].as_str() == Some(project));
+            }
+            println!("{}", serde_json::to_string_pretty(&json)?);
         } else {
             let (width, height) = env.size.unwrap_or(dashboard::ONCE_DEFAULT_SIZE);
             print!("{}", dashboard::render_once(snapshot, options, width, height));

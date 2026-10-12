@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Focused `project register`/`project list` setup and reconfiguration, project
+  columns and filters in status/dashboard, per-project doctor cleanup/isolation
+  checks, and disposable three-project GitHub review lifecycle validation.
+  Named-only registries work with Linear disabled. Quint now models three projects.
+
 - Multiple GitHub intake sources with explicit execution-project mappings,
   per-source credentials, filters, polling and lifecycle settings. Preserve legacy
   `[github]` configuration and task assignments; reject unknown or conflicting
@@ -24,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stateful daemon/SQLite and Quint admission checks, including revocation during
   setup, reapproval, restart, stale candidates and rejection of unapproved event
   traces. Advisory CI also replays a real GitHub approval/launch trace.
+
+### Fixed
+
+- GitHub review/retry launches now persist the attempt and worktree claim before
+  rechecking approval, even when the checkout is already bound. Approval reloads
+  no longer discard the recreated worktree or reset crash accounting.
 
 ### Changed
 

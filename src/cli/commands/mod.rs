@@ -13,6 +13,7 @@ pub mod init;
 pub mod linear;
 pub mod logs;
 pub mod priority;
+pub mod project;
 pub mod reset;
 pub mod run;
 pub mod secrets;
@@ -66,6 +67,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 Command::Budget(cmd) => budget::run(&mut ctx, cmd),
                 Command::Linear(cmd) => linear::run(&mut ctx, cmd),
                 Command::Github(cmd) => github::run(&mut ctx, cmd),
+                Command::Project(cmd) => project::run(&mut ctx, cmd),
                 Command::Doctor(args) => doctor::run(&mut ctx, args),
                 Command::Update(args) => update::run(&mut ctx, args),
                 Command::Service(cmd) => service::run(&mut ctx, cmd),

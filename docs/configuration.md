@@ -10,6 +10,10 @@ problems in plain language.
 
 ## Execution projects
 
+Use `project register ID PATH --github OWNER/REPO` for focused setup and
+reconfiguration, and `project list --json` to inspect effective settings. See the
+[multi-project walkthrough and smoke test](multi-project.md).
+
 One daemon can schedule tasks across several checkouts on the same machine.
 The registry keys are stable execution project IDs, independent of Linear's
 project names and of GitHub issue repositories. Issue admission and source
@@ -71,8 +75,9 @@ existing tasks with execution history are pinned to its canonical path. A task
 is otherwise pinned before its first repository operation. Retry, daemon
 restart and PR review preserve that binding and existing worktree paths.
 You may use `[projects.default.repo]` instead of `[repo]`, but cannot configure
-both. Register `default` even if you mainly use other projects: Linear intake,
-dashboard additions, and `add` without `--project` still select it. GitHub sources
+both. A named-only registry is supported with Linear disabled. Register `default`
+for Linear intake and `add` without `--project`. Dashboard additions use the
+selected `--project`, otherwise `default`; a missing selection fails. GitHub sources
 select their configured `execution_project` (also `default` when omitted).
 
 `powerqueue task project <task> <id>` deliberately reassigns an unstarted task,

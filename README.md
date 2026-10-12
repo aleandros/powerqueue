@@ -102,6 +102,7 @@ launchd on macOS). See [Operations](docs/operations.md) for server setup and log
 | I want to… | Read |
 |------------|------|
 | Set up Linear, GitHub Issues or a server | [Getting started](docs/getting-started.md) |
+| Operate one queue across several repositories | [Multiple projects](docs/multi-project.md) |
 | Find a command or flag | [Command reference](docs/commands.md) |
 | Configure providers, prompts or repository settings | [Configuration reference](docs/configuration.md) |
 | Change task order or model preferences | [Priority rules](docs/priority.md) |

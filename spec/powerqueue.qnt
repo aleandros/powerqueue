@@ -65,7 +65,7 @@ module powerqueue {
   import lifecycle.*
   pure val ids = Set(0, 1, 2)
   pure val providers = Set(0, 1)
-  pure val projects = Set(0, 1)
+  pure val projects = Set(0, 1, 2)
   pure val maxConcurrent = 2
   pure val maxAttempts = 3
   pure val budget = 1
@@ -123,7 +123,7 @@ module powerqueue {
     tasks' = ids.mapBy(_ => fresh), now' = 0,
     spent' = providers.mapBy(_ => 0), limitedUntil' = providers.mapBy(_ => -1),
     considered' = Set(), inPass' = false, schedulingPaused' = false,
-    project' = ids.mapBy(i => i % 2), checkout' = projects.mapBy(p => p), available' = projects,
+    project' = ids.mapBy(i => i), checkout' = projects.mapBy(p => p), available' = projects,
     boundProject' = ids.mapBy(_ => -1), boundCheckout' = ids.mapBy(_ => -1),
     firstBinding' = ids.mapBy(_ => { project: -1, checkout: -1 }),
     artifactProject' = ids.mapBy(_ => -1), artifactCheckout' = ids.mapBy(_ => -1),
@@ -328,7 +328,7 @@ module powerqueue {
     .then(start(1)).then(launch(1)).then(endPass).then(command(0, "Cancel"))
     .then(command(0, "Retry")).then(reassign(0, 1))
     .expect(safety and tasks.get(0).attempts == 0 and project.get(0) == 0 and boundCheckout.get(0) == 0)
-  run missingProjectDoesNotBlockOtherTest = init.then(configure(0, false, 0))
+  run missingProjectDoesNotBlockOtherTest = init.then(configure(0, false, 0)).then(configure(2, false, 2))
     .then(beginPass).then(start(1)).then(launch(1)).then(endPass)
     .expect(safety and live == 1 and tasks.get(0) == fresh and spent.get(0) == 0)
   run movedCheckoutRejectedTest = init.then(beginPass).then(start(0)).then(crash(0))
@@ -341,6 +341,17 @@ module powerqueue {
   run projectsShareProviderBudgetTest = init.then(reassign(2, 1))
     .then(beginPass).then(start(0)).then(launch(0)).then(throttle(2))
     .expect(safety and project.get(0) != project.get(2) and live == 1 and spent.get(0) == 1)
+
+  run threeProjectsShareSlotsAndBudgetTest = init
+    .then(beginPass).then(start(0)).then(launch(0)).then(throttle(2))
+    .then(start(1)).then(launch(1)).then(endPass)
+    .expect(safety and live == maxConcurrent and spent.get(0) == budget and spent.get(1) == budget)
+    .then(command(0, "Complete")).then(command(0, "Release"))
+    .then(tick).then(beginPass).then(start(2)).then(launch(2)).then(endPass)
+    .expect(safety and live == maxConcurrent and boundProject.get(2) == 2)
+  run threeProjectsApprovalAndFailureIsolationTest = init.then(admission(0, false)).then(configure(1, false, 1))
+    .then(beginPass).then(start(2)).then(launch(2)).then(endPass)
+    .expect(safety and live == 1 and tasks.get(0).attempts == 0 and tasks.get(1).attempts == 0 and boundProject.get(2) == 2)
 
   run completesTest = init.then(beginPass).then(start(0)).then(launch(0))
     .then(start(1)).then(launch(1)).then(endPass)

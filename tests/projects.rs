@@ -141,3 +141,149 @@ fn reassignment_and_launch_claim_cannot_cross_each_other() {
     assert_eq!(stored.execution_project, "api");
     assert_eq!(stored.state, powerqueue::domain::TaskState::Starting);
 }
+
+#[test]
+fn project_setup_reconfiguration_and_filtered_views() {
+    use assert_cmd::Command;
+    use predicates::str::contains;
+    if which::which("git").is_err() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let paths = powerqueue::paths::Paths::rooted(&home);
+    let cmd = || {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("powerqueue"));
+        cmd.env("POWERQUEUE_HOME", &home).env("POWERQUEUE_SECRETS", "file").env("NO_COLOR", "1");
+        cmd
+    };
+    let mut repos = Vec::new();
+    for id in ["api", "web", "worker"] {
+        let repo = tmp.path().join(id);
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(std::process::Command::new("git").args(["init", "-q", "-b", "main"]).arg(&repo).status().unwrap().success());
+        cmd()
+            .args([
+                "project",
+                "register",
+                id,
+                repo.to_str().unwrap(),
+                "--github",
+                &format!("example/{id}"),
+                "--token-env",
+                "FIXTURE_TOKEN",
+                "--trusted-approver",
+                "maintainer",
+            ])
+            .assert()
+            .success();
+        cmd().args(["add", &format!("Task in {id}"), "--project", id, "--key", id]).assert().success();
+        repos.push(repo);
+    }
+    let mut text = std::fs::read_to_string(paths.config_file()).unwrap();
+    let initial = powerqueue::config::Config::from_toml(&text).unwrap();
+    assert_eq!(initial.github_sources[0].required_labels, ["agent:ready"]);
+    text = text.replacen("required_labels = [\"agent:ready\"]", "required_labels = [\"approved-work\"]", 1).replacen(
+        "enabled = true",
+        "enabled = false",
+        1,
+    );
+    text.push_str(
+        "\n# preserve this machine setting\n[scheduler]\nmax_concurrent = 3\n[projects.api.cleanup]\npush_branch = false\n",
+    );
+    std::fs::write(paths.config_file(), &text).unwrap();
+    cmd().args(["project", "register", "api", repos[0].to_str().unwrap(), "--github", "EXAMPLE/API"]).assert().success();
+    let updated = std::fs::read_to_string(paths.config_file()).unwrap();
+    assert!(updated.contains("# preserve this machine setting"));
+    let cfg = powerqueue::config::Config::from_toml(&updated).unwrap();
+    assert_eq!(cfg.scheduler.max_concurrent, 3);
+    assert_eq!(cfg.github_sources.len(), 3);
+    assert_eq!(cfg.github_sources[0].required_labels, ["approved-work"]);
+    assert!(!cfg.github_sources[0].enabled);
+    assert_eq!(cfg.github_sources[0].trusted_approvers, ["maintainer"]);
+    assert_eq!(cfg.github_sources[0].token_env.as_deref(), Some("FIXTURE_TOKEN"));
+    assert!(!cfg.projects["api"].cleanup.as_ref().unwrap().push_branch);
+    cmd()
+        .args(["project", "register", "worker", repos[2].to_str().unwrap(), "--github", "example/api"])
+        .assert()
+        .failure()
+        .stderr(contains("already maps"));
+    cmd().args(["project", "register", "../bad", repos[0].to_str().unwrap()]).assert().failure();
+    cmd().args(["project", "register", "api", tmp.path().to_str().unwrap()]).assert().failure();
+    assert_eq!(std::fs::read_to_string(paths.config_file()).unwrap(), updated, "rejected edits leave config intact");
+    let out = cmd().args(["project", "list", "--json"]).assert().success().get_output().stdout.clone();
+    let list: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(list["projects"].as_array().unwrap().len(), 3);
+    assert_eq!(list["max_concurrent"], 3);
+    for command in [
+        vec!["status", "--project", "web"],
+        vec!["task", "list", "--project", "web"],
+        vec!["dashboard", "--once", "--project", "web"],
+    ] {
+        let out = cmd().arg("--json").args(&command).assert().success().get_output().stdout.clone();
+        let view: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(view["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(view["tasks"][0]["execution_project"], "web");
+        assert_eq!(view["project_filter"], "web");
+    }
+    cmd().args(["status"]).assert().success().stdout(contains("PROJECT")).stdout(contains("worker"));
+    cmd()
+        .args(["dashboard", "--once", "--ascii", "--project", "worker"])
+        .assert()
+        .success()
+        .stdout(contains("PROJECT"))
+        .stdout(contains("worker"));
+    cmd().args(["task", "explain", "api"]).assert().success().stdout(contains("project      api"));
+    for operation in ["show", "explain"] {
+        let out = cmd().args(["--json", "task", operation, "api"]).assert().success().get_output().stdout.clone();
+        let view: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(view["execution_location"]["checkout"], repos[0].canonicalize().unwrap().display().to_string());
+    }
+    // A pinned task prevents checkout redirection during reconfiguration.
+    let store = Store::open(&paths.database()).unwrap();
+    let mut task = store.get_task_by_key("api").unwrap().unwrap();
+    task.execution_repo = Some(repos[0].canonicalize().unwrap().display().to_string());
+    store.update_task(&task).unwrap();
+    cmd().args(["project", "register", "api", repos[1].to_str().unwrap()]).assert().failure().stderr(contains("pinned"));
+    assert_eq!(std::fs::read_to_string(paths.config_file()).unwrap(), updated);
+}
+
+#[test]
+fn project_registration_preserves_legacy_default_and_explicit_approval() {
+    use assert_cmd::Command;
+    if which::which("git").is_err() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    assert!(std::process::Command::new("git").args(["init", "-q"]).arg(&repo).status().unwrap().success());
+    let paths = powerqueue::paths::Paths::rooted(&tmp.path().join("home"));
+    paths.ensure().unwrap();
+    let original = format!(
+        r#"# existing installation
+[repo]
+path = {:?}
+setup = ["echo preserved"]
+[github]
+repository = "example/legacy"
+enabled = false
+required_labels = ["powerqueue"]
+"#,
+        repo.display().to_string()
+    );
+    std::fs::write(paths.config_file(), original).unwrap();
+    Command::new(assert_cmd::cargo::cargo_bin!("powerqueue"))
+        .env("POWERQUEUE_HOME", tmp.path().join("home"))
+        .env("POWERQUEUE_SECRETS", "file")
+        .args(["project", "register", "default", repo.to_str().unwrap(), "--github", "example/legacy"])
+        .assert()
+        .success();
+    let text = std::fs::read_to_string(paths.config_file()).unwrap();
+    assert!(text.contains("# existing installation"));
+    let cfg = powerqueue::config::Config::from_toml(&text).unwrap();
+    assert!(cfg.projects.is_empty() && cfg.github_sources.is_empty());
+    assert_eq!(cfg.repo.setup, ["echo preserved"]);
+    assert_eq!(cfg.github.required_labels, ["powerqueue"]);
+    assert!(!cfg.github.enabled);
+    assert_eq!(cfg.github.execution_project, "default");
+}

@@ -453,6 +453,57 @@ fn check_worktree_root(cfg: &Config, paths: &Paths) -> CheckResult {
     }
 }
 
+/// Check effective paths after writable-root checks have resolved symlinks.
+/// Overlapping roots make ownership and orphan cleanup ambiguous.
+fn check_project_isolation(cfg: &Config, paths: &Paths) -> CheckResult {
+    let projects: Vec<_> = cfg
+        .project_ids()
+        .into_iter()
+        .filter_map(|id| {
+            let effective = cfg.for_project(&id, paths).ok()?;
+            let checkout = effective.repo_path().canonicalize().ok()?;
+            let root = effective.worktree_root(paths);
+            let root = root.canonicalize().unwrap_or(root);
+            let common = Repo::new(&checkout).git(None, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).ok();
+            Some((id, checkout, root, common))
+        })
+        .collect();
+    let mut problems = Vec::new();
+    for (i, (id, checkout, root, common)) in projects.iter().enumerate() {
+        for (other, other_checkout, other_root, other_common) in &projects[i + 1..] {
+            if checkout == other_checkout || common.is_some() && common == other_common {
+                problems.push(format!("{id} and {other} share a git repository"));
+            }
+            if root.starts_with(other_root) || other_root.starts_with(root) {
+                problems.push(format!(
+                    "{id} ({}) and {other} ({}) have overlapping worktree roots",
+                    root.display(),
+                    other_root.display()
+                ));
+            }
+        }
+        for (other, other_checkout, _, _) in &projects {
+            if other_checkout.starts_with(root) {
+                problems.push(format!("{id} worktree root {} contains checkout {other}", root.display()));
+            }
+        }
+    }
+    if problems.is_empty() {
+        CheckResult::ok(
+            CONF,
+            "project isolation",
+            format!("{} resolved project(s); checkouts and worktree roots are separate", projects.len()),
+        )
+    } else {
+        CheckResult::fail(
+            CONF,
+            "project isolation",
+            problems.join("; "),
+            "register distinct checkouts with `project register`; set non-overlapping repo.worktree_root values; inspect `project list --json` before cleanup",
+        )
+    }
+}
+
 fn check_priority_file(cfg: &Config, paths: &Paths) -> CheckResult {
     let source = cfg.rules_source(paths);
     let text = match source.read() {
@@ -2080,6 +2131,9 @@ pub async fn run_all(
             )),
         }
     }
+    let isolation = check_project_isolation(cfg, paths);
+    let isolated = isolation.status == Status::Ok;
+    results.push(isolation);
     for task in store.list_tasks()? {
         if let Err(e) = cfg.for_task(&task, paths) {
             results.push(CheckResult::fail(STATE, &format!("{} execution project", task.key), format!("{e:#}"),
@@ -2152,7 +2206,13 @@ pub async fn run_all(
     results.push(check_worktree_base(store));
     results.push(check_superseded_launches(store));
     results.push(check_question_relay(cfg, store));
-    results.push(check_orphan_worktrees(cfg, paths, store, fix));
+    for id in cfg.project_ids() {
+        if let Ok(project) = cfg.for_project(&id, paths) {
+            let mut check = check_orphan_worktrees(&project, paths, store, fix && isolated);
+            check.name = format!("project {id}: {}", check.name);
+            results.push(check);
+        }
+    }
     results.push(check_orphan_windows(cfg, store, fix));
     results.push(check_stale_lock(paths, store, fix));
 
@@ -2171,6 +2231,40 @@ pub fn exit_code(results: &[CheckResult]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_isolation_checks_effective_roots_and_checkout_aliases() {
+        if which::which("git").is_err() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(&tmp.path().join("home"));
+        let mut cfg = Config::default();
+        cfg.linear.enabled = false;
+        for id in ["api", "web", "worker"] {
+            let checkout = tmp.path().join(id);
+            std::fs::create_dir_all(&checkout).unwrap();
+            assert!(std::process::Command::new("git").args(["init", "-q"]).arg(&checkout).status().unwrap().success());
+            let mut project = crate::projects::ProjectConfig::default();
+            project.repo.path = checkout.display().to_string();
+            cfg.projects.insert(id.into(), project);
+            let effective = cfg.for_project(id, &paths).unwrap();
+            assert_eq!(check_worktree_root(&effective, &paths).status, Status::Ok);
+        }
+        assert_eq!(check_project_isolation(&cfg, &paths).status, Status::Ok);
+        let original = cfg.projects["web"].repo.path.clone();
+        cfg.projects.get_mut("web").unwrap().repo.path = cfg.projects["api"].repo.path.clone();
+        assert_eq!(check_project_isolation(&cfg, &paths).status, Status::Fail);
+        cfg.projects.get_mut("web").unwrap().repo.path = original;
+        // Custom roots still receive the project ID suffix, but can overlap.
+        let api_root = cfg.for_project("api", &paths).unwrap().worktree_root(&paths);
+        cfg.projects.get_mut("web").unwrap().repo.worktree_root = Some(api_root.display().to_string());
+        let effective = cfg.for_project("web", &paths).unwrap();
+        assert_eq!(check_worktree_root(&effective, &paths).status, Status::Ok);
+        let check = check_project_isolation(&cfg, &paths);
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.detail.contains("overlapping worktree roots"));
+    }
 
     #[test]
     fn a_failed_reload_is_reported_until_a_later_reload_or_start() {

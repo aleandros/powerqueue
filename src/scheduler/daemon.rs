@@ -3060,13 +3060,13 @@ impl Daemon {
         let before = task.clone();
         let start = launch::on_starting(&mut task, &model, decision, &cfg, &root, relaunch.is_some() || answer.is_some())
             .context("source approval is required before launch")?;
+        launch::claim(&mut task, &start);
         if !self.store.claim_task_start(&before, &task)? {
             bail!("task {} changed before launch; its project and state will be reconsidered next tick", task.key);
         }
         self.log_only(&task, None, start.effects.clone());
-        // On the task from here on, persisted by the launch or by the crash
-        // that prevents it (never by a `starting` row alone).
-        launch::claim(&mut task, &start);
+        // The claim is durable before setup and the second approval read,
+        // including review/retry launches whose checkout binding is unchanged.
         let launch::Start { branch, worktree, attempt, .. } = start;
 
         let prepared = match cfg
