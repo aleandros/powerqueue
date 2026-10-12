@@ -17,6 +17,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     linear_priority INTEGER,
     estimate        REAL,
     project         TEXT,
+    execution_project TEXT NOT NULL DEFAULT 'default', -- execution registry ID (v7)
+    execution_repo TEXT, -- pinned canonical checkout (v7)
     cycle           TEXT,                      -- active | next | past | future (v3)
     cycle_number    INTEGER,                   -- Linear Cycle.number (v3)
     blocked_by      TEXT NOT NULL DEFAULT '[]', -- JSON [LinkedIssue]: Linear `blocked by` relations (v4)

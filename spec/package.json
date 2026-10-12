@@ -3,8 +3,9 @@
   "private": true,
   "scripts": {
     "typecheck": "quint typecheck powerqueue.qnt",
-    "test": "quint test powerqueue.qnt",
-    "check": "quint run powerqueue.qnt --invariant=safety --max-samples=1000 --max-steps=100 --seed=42 --verbosity=1"
+    "test": "quint test powerqueue.qnt && quint test powerqueue.qnt --main=assignment_race",
+    "check": "quint run powerqueue.qnt --invariant=safety --max-samples=1000 --max-steps=100 --seed=42 --verbosity=1 && quint run powerqueue.qnt --main=assignment_race --invariant=safety --max-samples=1000 --max-steps=100 --seed=42 --verbosity=1",
+    "verify:assignment": "quint verify powerqueue.qnt --main=assignment_race --backend=tlc --invariant=safety"
   },
   "devDependencies": {
     "@informalsystems/quint": "0.33.0"

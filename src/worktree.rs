@@ -66,6 +66,24 @@ impl Repo {
         Self { path: path.into(), git_binary: "git".to_string() }
     }
 
+    /// Verify that an existing worktree belongs to this checkout before
+    /// setup, launch or cleanup. Missing paths may be recreated later.
+    /// Fails for another repository or a path that is not a git worktree.
+    pub fn ensure_worktree_owner(&self, path: &Path) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let args = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
+        let expected = self.git(None, &args)?;
+        let actual = self.git(Some(path), &args)?;
+        let expected = Path::new(expected.trim()).canonicalize().context("resolve checkout git directory")?;
+        let actual = Path::new(actual.trim()).canonicalize().context("resolve worktree git directory")?;
+        if expected != actual {
+            bail!("worktree {} belongs to another repository, not {}", path.display(), self.path.display());
+        }
+        Ok(())
+    }
+
     /// Run `git <args>` in `cwd` (defaults to the repo), returning stdout.
     /// Fails with the command line and git's stderr on a non-zero exit.
     pub fn git(&self, cwd: Option<&Path>, args: &[&str]) -> Result<String> {

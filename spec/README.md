@@ -1,4 +1,4 @@
-# Quint: queue, launch, crash, budget
+# Quint: queue, launch, crash, budget, execution projects
 
 This specification models queue lifecycle and launch scheduling.
 It supplements the Rust properties and whole-daemon model. It does not replace
@@ -22,24 +22,27 @@ cargo test --example quint-replay -- --include-ignored
 Quint is locked to 0.33.0. Its `adm-zip` dependency is overridden to 0.6.1
 (the fixed version); `npm audit` is clean. Quint downloads its Rust evaluator
 on first use. `check` runs 1,000 samples of up to 100 steps with seed 42.
-Simulation is randomized testing, **not exhaustive verification**.
+Both the scheduler and assignment-race modules run in `test` and `check`,
+including advisory CI. Simulation is randomized testing, **not exhaustive verification**.
 
 For bounded symbolic checking, install Java and run:
 
 ```sh
 spec/node_modules/.bin/quint verify spec/powerqueue.qnt --invariant=safety --max-steps=5
 spec/node_modules/.bin/quint verify spec/powerqueue.qnt --main=progress --backend=tlc --temporal=eventuallyStarts
+npm --prefix spec run verify:assignment
 ```
 
 Quint downloads Apalache/TLC on first use. The finite progress model uses TLC
-for full temporal checking; Apalache checks safety to the requested depth. These commands are deliberately outside
+for full temporal checking; TLC also exhaustively checks the finite assignment-race
+model (34 reachable states). Apalache checks safety to the requested depth. These commands are deliberately outside
 the normal Rust gate and advisory CI simulation job. See the
 [Quint CLI documentation](https://quint.sh/docs/quint) for backend requirements.
 
 ## Model and assumptions
 
 `lifecycle` defines the shared transition guards and updates. `powerqueue`
-uses them in a three-task, two-provider scheduler with two slots, unit-cost
+uses them in a three-task, two-provider, two-project scheduler with two slots, unit-cost
 launches, and a one-unit budget per provider. A pass considers each task once.
 Successful launches reserve cost; a failed start consumes neither a slot nor
 budget. `spent` is a **pass-local reservation**, reset on the next pass, not
@@ -50,10 +53,32 @@ the replay additionally rejects a launch while that task already has one.
 
 `Start` combines `on_starting` with `claim`: the observed attempt is reserved
 at that point. The daemon finishes a start within a tick. Commands in this
-cut run between passes. Paused and throttled tasks may retain live sessions.
+cut run between passes, except project reassignment attempts, which can also
+interleave with a launch and must then be rejected. Paused and throttled tasks may retain live sessions.
 A direct CLI completion changes the task before the daemon closes its session;
 `Complete` and `Release` represent those separate steps. A done marker can
 instead close that still-live session with `Finish`.
+
+Execution projects carry separate configured checkout identities, immutable task
+bindings, and artifact ownership. Configuration can remove/restore a project or
+move/restore its checkout. Missing projects are excluded; mismatched pinned
+checkouts are rejected before repository operations, using no slot or reservation.
+The `projectSafety` invariant checks task assignment, binding, artifact ownership,
+and the target of the last abstract repository operation. A write-once history
+witness checks that later starts cannot overwrite a task's original binding.
+Provider allocation stays
+independent of project assignment, so different projects contend for the same budget.
+An abstract repository operation represents ownership checks for push/cleanup;
+filesystem canonicalization and git common-directory checks remain integration tests.
+
+`assignment_race` separately models a daemon's saved candidate, CLI reassignment,
+conditional launch claim, binding, completion, and retry. This exposes interleavings
+hidden by the scheduler's atomic `Start`: a stale project cannot claim the task,
+and a claimed task cannot be reassigned, even before its binding is persisted.
+After completion/retry, a retained binding still prohibits reassignment. This finite
+model abstracts state/project guards; the Rust SQLite property additionally checks
+actual row updates and isolation between two task rows. It does not model every
+state/attempt guard or prove SQLite equivalent to the specification.
 
 The model reflects two details of the Rust lifecycle:
 
@@ -70,8 +95,8 @@ time. This is a conditional property, not a starvation-freedom claim about the
 real priority scheduler. There is no per-task progress guarantee under arbitrary
 pause/cancel commands, competing higher-priority work, or perpetual budget exhaustion.
 
-Not modeled: PR review, relayed answers, dependency changes, config reloads,
-provider/model selection, observed usage, floating-point costing, or actual
+Not modeled: PR review, relayed answers, dependency changes, configuration changes
+beyond project availability/checkout identity, provider/model selection, observed usage, floating-point costing, or actual
 rolling spend. Rust properties still cover these arithmetic/policy details.
 
 ## Replay real event logs
@@ -97,7 +122,10 @@ sequence is admitted by this abstraction, not that every database row matched it
 
 Replay cannot reconstruct pass boundaries, predicted-cost reservations, complete
 budget ledgers, or actual simultaneous session counts from these logs. It does
-not validate those invariants. Task idle/running changes are collapsed into an
+not validate those invariants. Replay still projects only lifecycle state:
+`task.project_set` and `task.project_bound` stutter, so replay does not validate
+project isolation. Project safety is checked by the simulations/models above and
+Rust properties/integration tests, not by the event-log projection. Task idle/running changes are collapsed into an
 active state because some progress changes emit no event. Crash delay is available
 only in the v0.14 message (`retrying in Ns`); the adapter reads it strictly, checks
 that the next start respects it, but cannot verify it against historical config.

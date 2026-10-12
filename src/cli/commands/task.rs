@@ -292,6 +292,10 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
         crate::domain::TaskSource::Manual => "manual".to_string(),
     };
     kv("source", source);
+    kv("execution project", task.execution_project.clone());
+    if let Some(repo) = &task.execution_repo {
+        kv("execution checkout", repo.clone());
+    }
     if !task.labels.is_empty() {
         kv("labels", task.labels.join(", "));
     }
@@ -470,6 +474,8 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let chosen = events.iter().rev().find(|e| e.kind == "task.model_chosen" || e.kind == "task.starting");
     if ctx.json {
         let out = serde_json::json!({
+            "execution_project": task.execution_project,
+            "execution_repo": task.execution_repo,
             "key": task.key,
             "id": task.id,
             "state": task.state,
@@ -672,6 +678,7 @@ fn prompt(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let cfg = ctx.config_cloned()?;
     let store = ctx.store()?.clone();
     let task = find_task(&store, &task_ref.task)?;
+    let cfg = cfg.for_task(&task, &ctx.paths)?;
     let rendered = preview_prompt(&cfg, &ctx.paths, &task);
     if ctx.json {
         let out = serde_json::json!({
@@ -698,6 +705,34 @@ fn prompt(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
 pub fn run(ctx: &mut Context, cmd: TaskCommand) -> Result<i32> {
     ensure_initialised(ctx)?;
     match cmd {
+        TaskCommand::Project { task, project } => {
+            let cfg = ctx.config_cloned()?;
+            cfg.for_project(&project, &ctx.paths)?;
+            let store = ctx.store()?.clone();
+            let mut t = find_task(&store, &task.task)?;
+            let previous_project = t.execution_project.clone();
+            let has_session = store.latest_session(t.id)?.is_some();
+            let effects = commands::on_set_project(&mut t, &project, has_session)?;
+            let queued = store.daemon_alive(chrono::Duration::seconds(3 * cfg.scheduler.tick_secs.max(1) as i64))?;
+            if queued {
+                store.enqueue_command(&DaemonCommand::SetProject { task_id: t.id, project: project.clone() })?;
+            } else {
+                store.set_execution_project(t.id, &previous_project, &project)?;
+                for effect in effects {
+                    if let Effect::Log { level, kind, message, data } = effect {
+                        store.log_event(Some(t.id), None, level, &kind, &message, data)?;
+                    }
+                }
+            }
+            if ctx.json {
+                println!("{}", serde_json::json!({"task": t.key, "id": t.id, "execution_project": project, "queued": queued}));
+            } else if queued {
+                println!("execution project change to {project} requested for {}", t.key);
+            } else {
+                println!("{} execution project: {project}", t.key);
+            }
+            Ok(0)
+        }
         TaskCommand::List(args) => super::status::run(ctx, args),
         TaskCommand::Show(t) => show(ctx, &t),
         TaskCommand::Explain(t) => explain(ctx, &t),

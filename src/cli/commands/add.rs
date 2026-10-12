@@ -12,6 +12,7 @@ use crate::store::Store;
 /// What a new manual task should look like; shared by the CLI and the dashboard.
 #[derive(Debug, Clone, Default)]
 pub struct NewTask {
+    pub execution_project: Option<String>,
     pub title: String,
     pub description: String,
     pub key: Option<String>,
@@ -35,6 +36,9 @@ pub fn build_task(req: &NewTask) -> Result<Task> {
         Some(k) => k.to_string(),
         None => format!("manual-{}", task.id.short()),
     };
+    if let Some(project) = &req.execution_project {
+        task.execution_project = project.clone();
+    }
     task.description = req.description.trim().to_string();
     task.criticality = req.criticality.unwrap_or(Criticality::Normal);
     task.score = task.criticality.base_score();
@@ -105,7 +109,9 @@ pub fn run(ctx: &mut Context, args: AddArgs) -> Result<i32> {
         Some(d) => d.to_string(),
         None => String::new(),
     };
+    ctx.config_cloned()?.for_project(&args.project, &ctx.paths)?;
     let req = NewTask {
+        execution_project: Some(args.project),
         title: args.title,
         description,
         key: args.key,
@@ -167,6 +173,7 @@ mod tests {
     #[test]
     fn build_task_honours_options() {
         let t = build_task(&NewTask {
+            execution_project: None,
             title: "x".into(),
             key: Some("MY-KEY".into()),
             criticality: Some(Criticality::High),

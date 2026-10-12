@@ -683,8 +683,21 @@ fn committed_overrides_reach_the_daemon_after_a_fetch() {
 
 #[test]
 fn crashed_session_is_resumed_and_completes() {
+    crash_resume_in_project(false);
+}
+
+#[test]
+fn execution_project_crash_resumes_in_the_same_checkout() {
+    crash_resume_in_project(true);
+}
+
+fn crash_resume_in_project(multi: bool) {
     let Some(mut env) = Env::new("crash-once", "") else { return };
-    let key = add_task(&env, "Crashy", &["--label", "customer"]);
+    if multi {
+        register_execution_project(&env);
+    }
+    let args = if multi { vec!["--label", "customer", "--project", "api"] } else { vec!["--label", "customer"] };
+    let key = add_task(&env, "Crashy", &args);
     env.start_daemon();
     let st = env.wait_for_state(&key, "completed", Duration::from_secs(90));
     assert_eq!(st, "completed", "daemon log:\n{}", env.daemon_log());
@@ -704,7 +717,10 @@ fn crashed_session_is_resumed_and_completes() {
     assert!(launched[1].contains("resumed"), "second launch resumes the same Claude session: {launched:?}");
     let sessions = v["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 1, "a resumed attempt reuses the session row");
-    env.export_events("crash-resume");
+    assert_eq!(v["task"]["execution_project"], if multi { "api" } else { "default" });
+    if !multi {
+        env.export_events("crash-resume");
+    }
 }
 
 #[test]
@@ -890,15 +906,25 @@ fn completion_without_a_pr_link_adopts_the_branch_open_pr() {
 
 #[test]
 fn review_hand_off_frees_the_slot_and_a_conflict_resumes_the_same_session() {
+    review_in_project(false);
+}
+
+#[test]
+fn execution_project_review_resumes_and_deletes_only_its_own_branch() {
+    review_in_project(true);
+}
+
+fn review_in_project(multi: bool) {
     let gh = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-gh.sh");
     let extra = format!("max_concurrent = 1\npr_poll_secs = 1\ngh_binary = \"{}\"", gh.display());
     let Some(mut env) = Env::new("pr", &extra) else { return };
+    let repo = if multi { register_execution_project(&env) } else { env.root.path().join("repo") };
     let state = env.root.path().join("fakestate");
     std::fs::create_dir_all(&state).unwrap();
     env.vars.push(("FAKE_GH_DIR".into(), state.display().to_string()));
     std::fs::write(state.join("pr-7.json"), gh_pr(7, "OPEN", "MERGEABLE")).unwrap();
     std::fs::write(state.join("pr-8.json"), gh_pr(8, "OPEN", "MERGEABLE")).unwrap();
-    let a = add_task(&env, "Ship A", &[]);
+    let a = add_task(&env, "Ship A", if multi { &["--project", "api"] } else { &[] });
     std::fs::write(state.join(format!("pr-{a}")), "7").unwrap();
     let b = add_task(&env, "Ship B", &[]);
     std::fs::write(state.join(format!("pr-{b}")), "8").unwrap();
@@ -917,6 +943,7 @@ fn review_hand_off_frees_the_slot_and_a_conflict_resumes_the_same_session() {
     std::fs::write(state.join("pr-7.json"), gh_pr(7, "OPEN", "CONFLICTING")).unwrap();
     let v = env.wait_for_show(&a, |v| v["task"]["state"] == "completed" && has_event(v, "cleanup.branch_deleted"));
     assert_eq!(v["task"]["state"].as_str(), Some("completed"), "{}", env.daemon_log());
+    assert_eq!(v["task"]["execution_project"], if multi { "api" } else { "default" });
     let kinds = event_kinds(&v);
     for expected in ["task.in_review", "review.relaunch", "review.merged", "cleanup.branch_deleted"] {
         assert!(kinds.iter().any(|k| k == expected), "missing event {expected} in {kinds:?}");
@@ -935,11 +962,7 @@ fn review_hand_off_frees_the_slot_and_a_conflict_resumes_the_same_session() {
         .collect();
     assert!(launched.last().is_some_and(|m| m.contains("resumed") && m.contains("review: conflict")), "{launched:?}");
     assert_eq!(v["task"]["review"]["rounds"].as_u64(), Some(1));
-    let branches = Command::new("git")
-        .args(["branch", "--list", &format!("pq/{a}")])
-        .current_dir(env.root.path().join("repo"))
-        .output()
-        .unwrap();
+    let branches = Command::new("git").args(["branch", "--list", &format!("pq/{a}")]).current_dir(&repo).output().unwrap();
     assert!(String::from_utf8_lossy(&branches.stdout).trim().is_empty(), "local branch deleted after the merge");
     assert_eq!(env.task_state(&b), "in_review", "B's PR is still open");
 }
@@ -1157,4 +1180,134 @@ async fn github_issue_runs_to_completion_and_stays_open_for_review() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn github_issue_waits_for_pr_merge_before_closing() {
     github_lifecycle_e2e(true, true).await;
+}
+
+/// Register a second checkout with the same basename as the legacy checkout.
+/// Repository-local overrides must not enlarge the machine's slot limit.
+fn register_execution_project(env: &Env) -> PathBuf {
+    let repo = env.root.path().join("second/repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("README.md"), "second repository\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
+    std::fs::write(
+        repo.join(".powerqueue.toml"),
+        r#"
+instructions = "SECOND_PROJECT_ONLY"
+setup = ["test \"$POWERQUEUE_PROJECT\" = api; echo api > project-setup"]
+[scheduler]
+max_concurrent = 99
+[cleanup]
+run = ["test \"$POWERQUEUE_PROJECT\" = api; echo api > project-cleanup"]
+"#,
+    )
+    .unwrap();
+    let path = env.home().join("config/config.toml");
+    let mut cfg = powerqueue::config::Config::from_toml(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let mut project = powerqueue::projects::ProjectConfig::default();
+    project.repo.path = repo.display().to_string();
+    project.repo.fetch_before_start = false;
+    cfg.projects.insert("api".into(), project);
+    std::fs::write(path, cfg.to_toml().unwrap()).unwrap();
+    repo
+}
+
+#[test]
+fn execution_projects_share_slots_and_survive_daemon_restart() {
+    let Some(mut env) = Env::new("idle", "max_concurrent = 1\npr_poll_secs = 0") else { return };
+    let second_repo = register_execution_project(&env);
+    let a = add_task(&env, "Second project first", &["--project", "api"]);
+    let b = add_task(&env, "Default project next", &[]);
+    env.start_daemon();
+    let first = env.wait_for_show(&a, |v| v["task"]["state"] == "needs_attention");
+    assert_eq!(first["task"]["state"], "needs_attention", "{}", env.daemon_log());
+    assert_eq!(env.task_state(&b), "queued", "the project override cannot enlarge shared concurrency");
+    let wt = PathBuf::from(first["task"]["worktree_path"].as_str().unwrap());
+    assert!(wt.to_string_lossy().contains("projects/api/"));
+    assert_eq!(std::fs::read_to_string(wt.join("project-setup")).unwrap().trim(), "api");
+    let id = first["task"]["id"].as_str().unwrap();
+    let prompt = std::fs::read_to_string(env.home().join("state/tasks").join(id).join("prompt.md")).unwrap();
+    // instructions are appended through provider settings; prompt preview uses the same project.
+    let preview = env.run_ok(&["task", "prompt", &a]);
+    assert!(!prompt.is_empty() && !preview.is_empty());
+    assert_eq!(first["task"]["execution_repo"], second_repo.canonicalize().unwrap().display().to_string());
+    env.run_ok(&["stop"]);
+    assert!(env.daemon.take().unwrap().wait().unwrap().success());
+    env.start_daemon();
+    env.run_ok(&["task", "complete", &a, "--summary", "restart test"]);
+    let done = env.wait_for_show(&a, |v| has_event(v, "cleanup.done"));
+    assert!(has_event(&done, "cleanup.done"), "{}", env.daemon_log());
+    assert_eq!(std::fs::read_to_string(wt.join("project-cleanup")).unwrap().trim(), "api");
+    assert_eq!(done["task"]["execution_project"], "api");
+    let next = env.wait_for_show(&b, |v| v["task"]["state"] == "needs_attention");
+    assert_eq!(next["task"]["state"], "needs_attention", "{}", env.daemon_log());
+    assert_eq!(next["task"]["execution_project"], "default");
+    assert!(!Path::new(next["task"]["worktree_path"].as_str().unwrap()).join("project-setup").exists());
+    let branch = first["task"]["branch"].as_str().unwrap();
+    let out = Command::new("git")
+        .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
+        .current_dir(env.root.path().join("repo"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "project branch must not be created in the default repo");
+}
+
+#[test]
+fn execution_project_failure_does_not_prevent_another_project_launch() {
+    let Some(mut env) = Env::new("complete", "max_concurrent = 1\nmax_attempts = 1\npr_poll_secs = 0") else { return };
+    let second_repo = register_execution_project(&env);
+    std::fs::write(env.root.path().join("repo/.powerqueue.toml"), "setup = ['exit 1']\n").unwrap();
+    let failed = add_task(&env, "Broken default setup", &[]);
+    let healthy = add_task(&env, "Healthy project", &["--project", "api"]);
+    env.start_daemon();
+    assert_eq!(env.wait_for_state(&healthy, "completed", Duration::from_secs(60)), "completed", "{}", env.daemon_log());
+    assert_eq!(env.task_state(&failed), "failed");
+    let show = env.wait_for_show(&healthy, |v| has_event(v, "cleanup.done"));
+    assert_eq!(show["task"]["execution_repo"], second_repo.canonicalize().unwrap().display().to_string());
+    let wt = Path::new(show["task"]["worktree_path"].as_str().unwrap());
+    assert!(wt.join("project-setup").is_file());
+    assert!(wt.join("project-cleanup").is_file());
+}
+
+#[test]
+fn execution_projects_push_and_clean_up_only_their_own_repositories() {
+    let Some(mut env) = Env::new("complete", "max_concurrent = 2\npr_poll_secs = 0") else { return };
+    let second_repo = register_execution_project(&env);
+    let repos = [env.root.path().join("repo"), second_repo];
+    let remotes = [env.root.path().join("default.git"), env.root.path().join("api.git")];
+    for (repo, remote) in repos.iter().zip(&remotes) {
+        std::fs::create_dir_all(remote).unwrap();
+        git(remote, &["init", "--bare", "-q"]);
+        git(repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(repo, &["push", "-qu", "origin", "main"]);
+    }
+    let path = env.home().join("config/config.toml");
+    let mut cfg = powerqueue::config::Config::from_toml(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    cfg.cleanup.push_branch = true;
+    std::fs::write(path, cfg.to_toml().unwrap()).unwrap();
+    let keys = [add_task(&env, "Default project push", &[]), add_task(&env, "API project push", &["--project", "api"])];
+    env.start_daemon();
+
+    for (index, key) in keys.iter().enumerate() {
+        let show = env.wait_for_show(key, |v| {
+            v["task"]["state"] == "completed" && has_event(v, "cleanup.done") && v["task"]["worktree_path"].is_null()
+        });
+        assert_eq!(show["task"]["state"], "completed", "{}", env.daemon_log());
+        assert!(show["task"]["worktree_path"].is_null(), "worktree should be removed after push: {show}");
+        assert!(has_event(&show, "cleanup.done"), "{}", env.daemon_log());
+        assert!(output_tokens(&show) >= 1400, "both projects report usage: {show}");
+        let branch = show["task"]["branch"].as_str().unwrap();
+        let own_remote = powerqueue::worktree::Repo::new(&remotes[index]);
+        let other_remote = powerqueue::worktree::Repo::new(&remotes[1 - index]);
+        assert!(own_remote.branch_exists(branch).unwrap(), "branch pushed to its own remote");
+        assert!(!other_remote.branch_exists(branch).unwrap(), "branch must not reach the other project's remote");
+        let files = own_remote.git(None, &["ls-tree", "-r", "--name-only", branch]).unwrap();
+        assert!(files.lines().any(|p| p == "FAKE_CLAUDE_TOUCHED.txt"), "agent commit was pushed: {files}");
+        for marker in ["project-setup", "project-cleanup"] {
+            assert_eq!(files.lines().any(|p| p == marker), index == 1, "project commands stay isolated: {files}");
+        }
+        let worktrees = powerqueue::worktree::Repo::new(&repos[index]).list_worktrees().unwrap();
+        assert_eq!(worktrees.len(), 1, "only the original checkout should remain");
+    }
 }

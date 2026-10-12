@@ -114,6 +114,25 @@ These tests run in the existing Linux/macOS CI suite. They verify the complete
 powerqueue flow against controlled services; live GitHub token permissions and
 real agent behavior need a separate smoke test with a designated test repository.
 
+For multi-project execution, run:
+
+```sh
+cargo test --all-features --test e2e_daemon execution_project -- --nocapture
+```
+
+These scenarios drive two disposable checkouts through shared concurrency,
+daemon restart, crash/resume, PR review, a project setup failure, and pushing to
+separate local bare remotes followed by worktree cleanup. They assert that
+project-specific setup/cleanup commands and branches do not cross repositories.
+The agent and GitHub PR responses are fixtures; git, tmux, hooks, transcripts,
+the CLI and the daemon are real. The same git/tmux/python3 prerequisites apply.
+
+`cargo test --lib scheduler::model` also exercises generated reassignment and
+checkout checks, independent project policies, availability/path changes, shared
+capacity, and stale launch candidates against SQLite. The [Quint specification](spec/README.md)
+adds project ownership invariants and a finite reassignment/claim race model;
+`npm --prefix spec test` and `npm --prefix spec run check` include both models.
+
 The same file tests the container transport (`<provider>.shim`, see
 docs/containers.md): `shim_routes_hooks_and_completion_through_the_inbox`
 runs on the host (the fixture finds the generated shim on PATH, hooks and

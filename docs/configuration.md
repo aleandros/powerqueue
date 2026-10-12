@@ -8,6 +8,93 @@ must point to your checkout, and enabled integrations need their required settin
 Unknown keys are rejected. `powerqueue config validate` and `doctor` explain
 problems in plain language.
 
+## Execution projects
+
+One daemon can schedule tasks across several checkouts on the same machine.
+The registry keys are stable execution project IDs, independent of Linear's
+project names and of GitHub issue repositories. Issue admission and source
+metadata remain in `[linear]` and `[github]`; priority decides ordering and
+model preferences, while execution settings decide how work runs.
+
+Keep your existing `[repo]` as the `default` project and add repositories:
+
+```toml
+[repo]
+path = "/home/me/code/app"
+
+[scheduler]
+max_concurrent = 3 # shared by every project
+
+[projects.api.repo]
+path = "/home/me/code/api"
+setup = ["cargo build"]
+
+[projects.api.prompt]
+instructions = "Run the API contract checks before finishing."
+
+[projects.api.cleanup]
+push_branch = true
+
+[projects.api.priority]
+file = "/home/me/code/api/PRIORITY.md"
+```
+
+Use `powerqueue add "Fix the API" --project api`. IDs allow ASCII letters,
+digits, `_` and `-`. Checkout paths in the registry must be absolute (`~` is
+expanded). All `RepoConfig` keys from the `[repo]` table below are available in
+`[projects.<id>.repo]`, with the same defaults. Optional `prompt`, `cleanup`, and
+`priority` tables use the same keys and defaults as their global counterparts.
+If supplied, these tables replace their global table, then the checkout's
+`.powerqueue.toml` overrides are applied. Relative prompt template paths in
+config.toml resolve from the config directory; paths in `.powerqueue.toml`
+resolve from that project's checkout, as in single-repository mode.
+
+Without a named project table, the global setting is inherited. Repository-local
+setup, agent options, prompts, priority file, cleanup and task/review limits
+apply only to that project. With a registry configured, repository overrides
+for source admission (`linear`/`github`), total `max_concurrent`, `tick_secs`,
+and `resource_sample_secs` are ignored. Provider budgets, cooldowns and usage
+ledgers are always machine-wide; projects cannot declare a budget or scheduler
+table in config.toml. One launch pass allocates slots and reserves predicted
+usage across all projects in priority order.
+
+The legacy `default` keeps its worktree paths. Explicit registry entries use
+`<data>/worktrees/projects/<id>/<task-slug>`, or `<worktree_root>/<id>/<task-slug>`
+when that project sets a custom root. Session files remain keyed by globally
+unique task IDs. Setup, cleanup and agent environments include
+`POWERQUEUE_PROJECT`. Never change a stable ID to refer to a different checkout.
+
+**Migration:** existing TOML files need no edits; old database rows and task
+JSON acquire `execution_project = "default"`. The database migration is
+idempotent. Keep the original checkout available for the first upgraded run:
+existing tasks with execution history are pinned to its canonical path. A task
+is otherwise pinned before its first repository operation. Retry, daemon
+restart and PR review preserve that binding and existing worktree paths.
+You may use `[projects.default.repo]` instead of `[repo]`, but cannot configure
+both. Register `default` even if you mainly use other projects: existing source
+intake and dashboard additions still select it. Automatic source routing is
+separate from execution registration.
+
+`powerqueue task project <task> <id>` deliberately reassigns an unstarted task,
+validates the target, and logs `task.project_set`. It refuses a task with a
+previous binding, session, branch, worktree or review history, even after retry.
+To move work after execution started, cancel/finish the old task and create a
+new task with `add --project`; existing branches and transcripts stay associated
+with their original task. Removing or moving a registered checkout prevents its
+bound tasks from launching or cleaning up; restore it rather than editing the
+database. Existing worktrees are checked for repository ownership before use.
+
+Project overrides are read each tick; rules reload each tick when
+`priority.live_reload` is true (otherwise on restart or configuration reload).
+Invalid files suspend launches
+for that project and log `project.error`. Committed overrides are refreshed by
+that project's `fetch_interval_secs` in the background. Restart or request a
+configuration reload after editing the registry itself. `config validate`
+checks the registry and overrides; `doctor` checks every checkout, worktree root,
+policy file and stored task binding. `task show` and its JSON expose both the
+execution project and pinned checkout. A broken project does not stop other
+projects from using the shared queue.
+
 ## Providers
 
 powerqueue can run tasks on three locally installed coding-agent CLIs, each
@@ -57,9 +144,9 @@ anything else uses the explicit `codex:<name>` form.
 
 ## `[github]`
 
-GitHub Issues and Linear can feed the same queue independently. Each daemon works
-in one checkout: set `github.repository` to the `owner/repo` corresponding to
-`repo.path`. For a GitHub-only installation, start with `powerqueue init --no-linear`
+GitHub Issues and Linear can feed the same queue independently. Source intake
+currently selects the `default` execution project: set `github.repository` to
+the `owner/repo` corresponding to that checkout. For a GitHub-only installation, start with `powerqueue init --no-linear`
 and add this to `config.toml`:
 
 ```toml

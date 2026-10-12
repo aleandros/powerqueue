@@ -7,8 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-12
+
+### Added
+
+- Execution projects: register multiple checkouts under `[projects.<id>]`, enqueue
+  with `add --project`, and reassign unstarted tasks with `task project`. One
+  daemon shares slots and provider budgets while resolving setup, prompts,
+  priority and cleanup per project. Existing tasks migrate to `default`; pinned
+  checkouts and ownership checks protect retries, review and cleanup across
+  restarts. `doctor` reports project configuration and binding problems.
+
 ### Changed
 
+- Testing: extend the Rust daemon model with project reassignment, independent
+  policies, unavailable/moved checkouts, and stale SQLite launch claims. Extend
+  Quint with execution-project ownership invariants and a finite model of the
+  reassignment/launch race, including both models in the simulation checks.
 - Testing: replace the Python Quint replay adapter with a Rust Cargo example,
   reusing application event types and preserving anonymized schedules, coverage
   reports, task-prefix cutoffs and invalid-schedule checks. Projection tests run
@@ -894,7 +909,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.15.0
 [0.14.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.14.0
 [0.13.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.13.0
 [0.12.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.12.0

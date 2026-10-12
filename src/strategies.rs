@@ -175,10 +175,19 @@ pub fn review_watch() -> impl Strategy<Value = ReviewWatch> {
         )
 }
 
-/// What a task row looks like in each state. `state` fixes the state; the
-/// rest is drawn so the row is one the daemon could hold: `in_review` has a
-/// parseable PR URL and a watch, terminal tasks have `completed_at`, a task
-/// that ran has a branch.
+/// Independent execution project IDs used across lifecycle and scheduling models.
+pub fn execution_project() -> impl Strategy<Value = String> {
+    prop::sample::select(vec!["default".to_string(), "api".to_string(), "web".to_string()])
+}
+
+/// Project availability, checkout revision and independently chosen model preference.
+pub fn execution_project_settings() -> impl Strategy<Value = (bool, bool, ModelTier)> {
+    (prop::bool::weighted(0.8), any::<bool>(), prop::sample::select(known_models()))
+}
+
+/// What a task row looks like in each state, with independent source metadata
+/// and execution project: reviews have a PR/watch, terminal tasks a completion
+/// time, and tasks that ran have a branch.
 pub fn task_in(state: TaskState) -> impl Strategy<Value = Task> {
     let ran = !matches!(state, TaskState::Queued | TaskState::Blocked | TaskState::Paused | TaskState::Throttled);
     let in_review = state == TaskState::InReview;
@@ -198,14 +207,16 @@ pub fn task_in(state: TaskState) -> impl Strategy<Value = Task> {
         vec(word(), 0..3),
         prop::option::of(prop::sample::select(vec![1.0, 2.0, 3.0, 5.0, 8.0])),
     );
-    (identity, bookkeeping, links).prop_map(
+    (identity, bookkeeping, links, execution_project()).prop_map(
         move |(
             (id, key, criticality, score, attempts, max_attempts, created_at),
             (not_before, last_error, summary, model_override, pr_url, review),
             (blocked_by, children, labels, estimate),
+            project,
         )| {
             let mut t = Task::new(format!("ENG-{key}"), "t", TaskSource::Manual);
             t.id = TaskId(uuid::Uuid::from_u128(id));
+            t.execution_project = project;
             t.state = state;
             t.criticality = criticality;
             t.score = score;
