@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metadata changes, retries and review; reassignment remains explicit.
 - Routing properties and integration coverage for conflicting labels, unknown
   projects, metadata changes, database restart, project isolation and stale
-  sync/launch races.
+  sync/launch races. Quint trace replay models routing holds independently from
+  source approval and validates the real daemon routing events.
 - Tune free-form Markdown intent into validated TOML proposals, with project
   selection, intent-change diagnostics, scoped queue simulation and reviewable
   working-copy changes for committed repository policies. Stale drafts refuse

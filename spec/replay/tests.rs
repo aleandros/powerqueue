@@ -469,3 +469,128 @@ fn quint_accepts_reapproval_and_preserves_active_work_on_revocation() {
         true,
     );
 }
+
+fn routing(index: i64, permitted: bool) -> Event {
+    payload(index, if permitted { "routing.selected" } else { "routing.blocked" }, json!({"routing":{"permitted":permitted}}))
+}
+
+#[test]
+fn routing_events_are_explicit_and_decisions_are_validated() {
+    let rows = vec![
+        github_created(),
+        routing(2, true),
+        admission(3, true),
+        payload(4, "task.starting", json!({"attempt":1})),
+        routing(5, false),
+        event(6, "routing.launch_held"),
+        routing(7, true),
+        payload(8, "task.starting", json!({"attempt":2})),
+        payload(9, "session.launched", json!({"attempt":2})),
+    ];
+    let (observations, report) = project(rows).unwrap();
+    assert_eq!(
+        observations.iter().map(|o| o.op).collect::<Vec<_>>(),
+        [
+            Op::CreateGitHub,
+            Op::RouteAllow,
+            Op::Approve,
+            Op::Start,
+            Op::RouteBlock,
+            Op::Hold,
+            Op::RouteAllow,
+            Op::Start,
+            Op::Launch,
+        ]
+    );
+    assert!(report.stutters.is_empty());
+    rejects(with_tail(vec![event(4, "routing.selected")]), "missing routing decision");
+    rejects(with_tail(vec![payload(4, "routing.blocked", json!({"routing":{"permitted":true}}))]), "inconsistent routing");
+    rejects(with_tail(vec![event(4, "routing.unknown")]), "unmapped kind");
+}
+
+#[test]
+fn production_routing_effects_are_projected_without_discarding_holds() {
+    use powerqueue::{
+        config::Config,
+        domain::{Task, TaskSource},
+        routing::RoutingDecision,
+        scheduler::transitions::{Effect, on_routing},
+    };
+    let mut task = Task::new("test", "test", TaskSource::Manual);
+    let mut cfg = Config::default();
+    cfg.repo.path = "/repo".into();
+    let mut rows = launched();
+    for decision in [cfg.route(&task), RoutingDecision::blocked("conflicting labels")] {
+        for effect in on_routing(&mut task, decision, false) {
+            if let Effect::Log { kind, data, .. } = effect {
+                rows.push(payload(rows.len() as i64 + 1, &kind, data));
+            }
+        }
+    }
+    let (observations, _) = project(rows).unwrap();
+    assert_eq!(
+        observations.iter().map(|o| o.op).collect::<Vec<_>>(),
+        [Op::Create, Op::Start, Op::Launch, Op::RouteAllow, Op::RouteBlock]
+    );
+}
+
+#[test]
+#[ignore = "requires Quint"]
+fn quint_keeps_routing_and_source_approval_independent() {
+    // Neither a selected route nor fresh approval may repair the other prerequisite.
+    for rows in [
+        vec![github_created(), routing(2, true)],
+        vec![github_created(), routing(2, false), admission(3, true)],
+        vec![github_created(), admission(2, true), routing(3, false), admission(4, true)],
+    ] {
+        let mut rows = rows;
+        let next = rows.len() as i64 + 1;
+        rows.push(payload(next, "task.starting", json!({"attempt":1})));
+        rows.push(payload(next + 1, "session.launched", json!({"attempt":1})));
+        check_trace(rows, false);
+    }
+    for github in [false, true] {
+        let created = if github { github_created() } else { event(1, "task.created") };
+        let rows = vec![
+            created,
+            admission(2, true),
+            routing(3, true),
+            payload(4, "task.starting", json!({"attempt":1})),
+            routing(5, false),
+            payload(6, "session.launched", json!({"attempt":1})),
+        ];
+        check_trace(rows, false);
+    }
+}
+
+#[test]
+#[ignore = "requires Quint"]
+fn quint_routing_holds_preserve_setup_and_active_work_and_survive_retry() {
+    check_trace(
+        vec![
+            github_created(),
+            admission(2, true),
+            routing(3, true),
+            payload(4, "task.starting", json!({"attempt":1})),
+            routing(5, false),
+            event(6, "routing.launch_held"),
+            routing(7, true),
+            payload(8, "task.starting", json!({"attempt":2})),
+            payload(9, "session.launched", json!({"attempt":2})),
+            routing(10, false),
+            event(11, "task.completed"),
+        ],
+        true,
+    );
+    check_trace(
+        vec![
+            event(1, "task.created"),
+            routing(2, false),
+            event(3, "task.cancelled"),
+            event(4, "task.retried"),
+            payload(5, "task.starting", json!({"attempt":1})),
+            payload(6, "session.launched", json!({"attempt":1})),
+        ],
+        false,
+    );
+}

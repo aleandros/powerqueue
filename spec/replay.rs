@@ -71,6 +71,8 @@ enum Op {
     CreateGitHub,
     Approve,
     Revoke,
+    RouteAllow,
+    RouteBlock,
     Hold,
     Start,
     Launch,
@@ -226,7 +228,15 @@ fn project(mut events: Vec<Event>) -> Result<(Vec<Observation>, Coverage)> {
                 ensure!(approved == (kind == "github.admitted"), "event {}: inconsistent approval decision", event.id);
                 if approved { Op::Approve } else { Op::Revoke }
             }
-            "github.launch_held" => Op::Hold,
+            "routing.selected" | "routing.blocked" => {
+                let permitted = data
+                    .pointer("/routing/permitted")
+                    .and_then(|v| v.as_bool())
+                    .with_context(|| format!("event {}: missing routing decision", event.id))?;
+                ensure!(permitted == (kind == "routing.selected"), "event {}: inconsistent routing decision", event.id);
+                if permitted { Op::RouteAllow } else { Op::RouteBlock }
+            }
+            "github.launch_held" | "routing.launch_held" => Op::Hold,
             "task.starting" => Op::Start,
             "session.launched" => Op::Launch,
             "session.crashed" => Op::Crash,
