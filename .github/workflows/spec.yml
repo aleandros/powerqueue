@@ -60,7 +60,9 @@ jobs:
         if: always()
         with:
           name: quint-traces
+          include-hidden-files: true
           path: |
             spec/.generated/*.itf.json
             spec/.generated/*.coverage.json
+            spec/.generated/*.qnt
           if-no-files-found: ignore

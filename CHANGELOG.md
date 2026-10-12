@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Make the multi-project cleanup test wait for transcript usage collection,
   avoiding a timing race when cleanup finishes before usage is recorded.
+- Record crash retry deadlines for formal replay, so delayed event logging
+  cannot make an on-time restart appear premature.
 
 ## [0.15.0] - 2026-10-12
 

@@ -260,6 +260,9 @@ fn project(mut events: Vec<Event>) -> Result<(Vec<Observation>, Coverage)> {
             maximum = positive(event, "max_attempts")?;
         }
         match op {
+            // The transition's clock precedes log persistence. Adding backoff
+            // to the log timestamp can falsely reject an on-time restart.
+            Op::Crash if event.data.get("retry_at").is_some() => until = deadline(event, "retry_at", origin)?,
             Op::Crash => {
                 let captures =
                     backoff.captures(&event.message).with_context(|| format!("event {}: missing crash backoff", event.id))?;

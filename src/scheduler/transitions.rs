@@ -723,7 +723,7 @@ pub fn on_crash(
     // watcher relaunched the task do not count.
     let base = task.review_relaunch().and(task.review.as_ref()).map_or(0, |r| r.attempt_base);
     let used = attempt.saturating_sub(base);
-    let data = serde_json::json!({ "reason": reason, "exit_status": exit_status, "attempt": attempt, "max_attempts": max, "pane_tail": pane_tail });
+    let mut data = serde_json::json!({ "reason": reason, "exit_status": exit_status, "attempt": attempt, "max_attempts": max, "pane_tail": pane_tail });
     if used >= max {
         task.state = TaskState::Failed;
         task.completed_at = Some(now);
@@ -746,6 +746,7 @@ pub fn on_crash(
         let backoff = Duration::seconds(cfg.backoff_for_attempt(used) as i64);
         task.state = TaskState::Crashed;
         task.not_before = Some(now + backoff);
+        data["retry_at"] = serde_json::json!(task.not_before);
         effects.push(Effect::log(
             EventLevel::Warn,
             "session.crashed",
@@ -1626,6 +1627,7 @@ mod tests {
                 assert_eq!(kind, "session.crashed");
                 assert_eq!(data["pane_tail"], "boom");
                 assert_eq!(data["exit_status"], 1);
+                assert_eq!(data["retry_at"], serde_json::json!(t.not_before));
             }
             other => panic!("{other:?}"),
         }

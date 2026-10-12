@@ -201,6 +201,11 @@ The adapter requires the full application event envelope (including UUID task
 IDs and event level), timezone-bearing RFC 3339 timestamps, and positive integer
 attempts and limits. It retains microsecond truncation before converting to
 coarse seconds; timestamp fields in coverage reports use normalized UTC.
+Crash replay uses the recorded `retry_at` deadline, since event persistence can
+lag the transition's clock. Older events without that field fall back to the
+logged timestamp plus the message's backoff duration; logging delays can make
+that approximation reject an otherwise valid restart. CI retains generated
+replay schedules alongside coverage reports and counterexamples for diagnosis.
 
 ## Operational validation
 

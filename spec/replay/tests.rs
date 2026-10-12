@@ -192,6 +192,19 @@ fn crash_backoff_is_required_and_overflow_checked() {
 }
 
 #[test]
+fn crash_uses_recorded_deadline_instead_of_log_time() {
+    let mut row = crash(3);
+    // The transition ran at second 3; its event was persisted at second 4.
+    row.data["retry_at"] = json!(event(13, "").timestamp);
+    let (observations, _) = project(with_tail(vec![row.clone()])).unwrap();
+    assert_eq!(observations[3].until, 12, "deadline is relative to creation at second 1");
+    for invalid in [Value::Null, json!("not a date"), json!("2026-01-01T00:00:13")] {
+        row.data["retry_at"] = invalid;
+        rejects(with_tail(vec![row.clone()]), "timestamp");
+    }
+}
+
+#[test]
 fn clock_regression_including_stutters_is_rejected() {
     for kind in ["task.completed", "session.started"] {
         let row = Event { timestamp: event(1, "").timestamp, ..event(4, kind) };
@@ -312,6 +325,17 @@ fn quint_checks_backoff_boundary() {
     for (seconds, success) in [(5, false), (13, false), (14, true), (15, true)] {
         let restart = Event { timestamp: event(seconds, "").timestamp, ..payload(5, "task.starting", json!({"attempt": 2})) };
         check_trace(with_tail(vec![crash(3), restart]), success);
+    }
+}
+
+#[test]
+#[ignore = "requires Quint"]
+fn quint_checks_recorded_crash_deadline_despite_delayed_logging() {
+    let mut row = crash(3);
+    row.data["retry_at"] = json!(event(13, "").timestamp);
+    for (seconds, success) in [(12, false), (13, true), (14, true)] {
+        let restart = Event { timestamp: event(seconds, "").timestamp, ..payload(5, "task.starting", json!({"attempt": 2})) };
+        check_trace(with_tail(vec![row.clone(), restart]), success);
     }
 }
 
