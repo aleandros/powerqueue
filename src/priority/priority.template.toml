@@ -1,0 +1,48 @@
+# Executable policy. Keep optional prose in PRIORITY.md.
+version = 1
+default_criticality = "normal"
+[[criticality]]
+level = "critical"
+all = [{ field = "priority", op = "eq", value = "urgent" }]
+[[criticality]]
+level = "critical"
+all = [{ field = "label", op = "eq", value = "incident" }]
+[[criticality]]
+level = "critical"
+all = [{ field = "label", op = "eq", value = "security" }]
+[[criticality]]
+level = "high"
+all = [{ field = "priority", op = "eq", value = "high" }]
+[[criticality]]
+level = "high"
+all = [{ field = "label", op = "eq", value = "customer" }]
+[[criticality]]
+level = "normal"
+all = [{ field = "priority", op = "eq", value = "normal" }]
+[[criticality]]
+level = "low"
+all = [{ field = "label", op = "eq", value = "chore" }]
+[[criticality]]
+level = "low"
+all = [{ field = "label", op = "eq", value = "docs" }]
+[[scoring]]
+delta = 40.0
+all = [{ field = "label", op = "eq", value = "customer" }]
+[[scoring]]
+delta = 20.0
+all = [{ field = "priority", op = "eq", value = "high" }]
+[[scoring]]
+delta = -30.0
+all = [{ field = "estimate", op = "gt", value = 8.0 }]
+[[scoring]]
+delta = 10.0
+all = [{ field = "source", op = "eq", value = "manual" }]
+[models]
+critical = ["fable"]
+high = ["opus"]
+normal = ["sonnet"]
+low = ["sonnet"]
+[jev]
+enabled = false
+question = "How important is it to ship this ticket this week for a small product team?"
+levels = ["can wait indefinitely", "nice to have", "important this week", "blocking customers or revenue"]

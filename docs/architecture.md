@@ -18,7 +18,7 @@ src/
   store/             SQLite (rusqlite, WAL); schema.sql; all queries
   linear/            GraphQL client; issue → task sync
   github/            REST issue client; GitHub intake and synchronization
-  priority/          PRIORITY.md parser/evaluator; file watcher
+  priority/          priority.toml parser/evaluator; file watcher
   jev.rs             Jev "score" client (optional)
 github.rs          `gh api graphql` PR status (state, mergeability, checks, threads)
   budget/            period clock, ledger, estimator, policy (pure, plain data in and out);
@@ -135,7 +135,7 @@ overstated or that the code is wrong.
                  ┌──────────────┐  fetch_issues   ┌───────────────┐
    Linear API ◀──┤ linear::sync ├────────────────▶│  tasks table  │◀── powerqueue add
                  └──────────────┘                 └──────┬────────┘
-                                                         │ evaluate (PRIORITY.md, Jev)
+                                                         │ evaluate (priority.toml, Jev)
                                                          ▼
                                                   score, criticality, model pref
                                                          │ pick_next
@@ -208,7 +208,7 @@ stateDiagram-v2
     [*] --> queued
     queued --> starting: slot + model
     queued --> throttled: no eligible tier
-    queued --> paused: task pause / PRIORITY.md skip
+    queued --> paused: task pause / priority.toml skip
     queued --> blocked: pending `blocked by` issue / parent of sub-issues
     blocked --> queued: blockers Done/Canceled or PR merged
     blocked --> completed: parent closed, every sub-issue done
@@ -319,7 +319,7 @@ still runs):
 2. poll enabled Linear and GitHub issue sources on their own intervals and
    backoff schedules; synchronization creates, updates and cancels tasks
    (running tasks are never cancelled by sync);
-3. reload `PRIORITY.md` if the watcher flagged a change (parse errors keep the
+3. reload `priority.toml` if the watcher flagged a change (parse errors keep the
    previous rules); re-score open tasks that have no live session, including
    newly imported tasks, applying `skip` overrides as `paused`;
 4. drain `hook_events`; `interpret_hook` maps each payload to an outcome and
@@ -410,9 +410,10 @@ fragile across UI changes and could not distinguish a rate limit from a
 crash. The transcript JSONL is read only for token usage, where it is the
 authoritative source, and pane capture is kept for humans (`task output`).
 
-**Markdown for rules.** `PRIORITY.md` can be edited in any editor, reviewed
+**Typed TOML for executable policy.** `priority.toml` can be edited in any editor, reviewed
 in a pull request, and read by the agent itself. Live reload makes the edit
-loop immediate.
+loop immediate. Optional Markdown records intent; only TOML is executable.
+The retired Markdown parser is used solely by explicit migration.
 
 **Weighted tokens, not dollars.** Subscriptions are capped in usage, not
 spend, and the cap is unpublished. Pacing on a weighted token model whose

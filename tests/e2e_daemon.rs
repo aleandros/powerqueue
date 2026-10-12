@@ -160,7 +160,7 @@ push_branch = false
             claude_home = root.path().join("claude").display(),
         );
         std::fs::write(home.join("config/config.toml"), config).unwrap();
-        std::fs::write(home.join("config/PRIORITY.md"), powerqueue::priority::template()).unwrap();
+        std::fs::write(home.join("config/priority.toml"), powerqueue::priority::template()).unwrap();
         Some(Self { root, socket, daemon: None, vars: Vec::new() })
     }
 
@@ -638,8 +638,8 @@ fn committed_overrides_reach_the_daemon_after_a_fetch() {
     };
     let repo = env.root.path().join("repo");
     std::fs::create_dir_all(repo.join("docs")).unwrap();
-    std::fs::write(repo.join(".powerqueue.toml"), "priority_file = \"docs/PRIORITY.md\"\n").unwrap();
-    std::fs::write(repo.join("docs/PRIORITY.md"), "## Low\n- source: manual\n").unwrap();
+    std::fs::write(repo.join(".powerqueue.toml"), "priority_file = \"docs/priority.toml\"\n").unwrap();
+    std::fs::write(repo.join("docs/priority.toml"), "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"low\"\nall = [{ field = \"source\", op = \"eq\", value = \"manual\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "config"]);
     let bare = env.root.path().join("origin.git");
@@ -656,15 +656,18 @@ fn committed_overrides_reach_the_daemon_after_a_fetch() {
     // Merged upstream only: the main checkout's working tree still says low.
     let other = env.root.path().join("other");
     git(env.root.path(), &["clone", "-q", &bare.to_string_lossy(), &other.to_string_lossy()]);
-    std::fs::write(other.join("docs/PRIORITY.md"), "## Critical\n- source: manual\n").unwrap();
-    std::fs::write(other.join(".powerqueue.toml"), "priority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 7\n")
+    std::fs::write(other.join("docs/priority.toml"), "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"critical\"\nall = [{ field = \"source\", op = \"eq\", value = \"manual\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap();
+    std::fs::write(other.join(".powerqueue.toml"), "priority_file = \"docs/priority.toml\"\n[scheduler]\nmax_concurrent = 7\n")
         .unwrap();
     git(&other, &["add", "."]);
     git(&other, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "critical"]);
     git(&other, &["push", "-q", "origin", "main"]);
     let v = env.wait_for_show(&key, |v| v["task"]["criticality"] == "critical");
     assert_eq!(v["task"]["criticality"], "critical", "show: {v}\nlog:\n{}", env.daemon_log());
-    assert_eq!(std::fs::read_to_string(repo.join("docs/PRIORITY.md")).unwrap(), "## Low\n- source: manual\n");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("docs/priority.toml")).unwrap(),
+        "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"low\"\nall = [{ field = \"source\", op = \"eq\", value = \"manual\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n"
+    );
     let events = env.run_ok(&["--json", "logs", "--events", "-n", "200"]);
     let events: serde_json::Value = serde_json::from_str(&events).unwrap();
     let reloaded = events
@@ -703,7 +706,7 @@ fn crash_resume_in_project(multi: bool) {
     assert_eq!(st, "completed", "daemon log:\n{}", env.daemon_log());
     let v = env.wait_for_show(&key, |v| has_event(v, "cleanup.done"));
     assert_eq!(v["task"]["attempts"].as_u64(), Some(2));
-    assert_eq!(v["task"]["criticality"].as_str(), Some("high"), "label customer => high per PRIORITY.md");
+    assert_eq!(v["task"]["criticality"].as_str(), Some("high"), "label customer => high per priority.toml");
     let kinds: Vec<&str> = v["events"].as_array().unwrap().iter().filter_map(|e| e["kind"].as_str()).collect();
     assert!(kinds.contains(&"session.crashed"), "{kinds:?}");
     let launched: Vec<&str> = v["events"]

@@ -1,10 +1,7 @@
-//! Parser and evaluator for `PRIORITY.md`.
+//! Shared priority evaluation types and the retired Markdown migration parser.
 //!
-//! The parser is line based: only `## Heading` lines and `- bullet` lines
-//! matter; prose, `# h1` headings, blank lines and HTML comments are ignored.
-//! Fatal problems (a rule that cannot be understood) are reported with their
-//! line number; cosmetic ones (unknown sections, repeated settings) become
-//! warnings on the parsed document.
+//! Runtime parsing is the strict TOML schema in `policy`; `parse_legacy` is
+//! crate-private and called only by explicit migration and legacy regression tests.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -21,14 +18,14 @@ use crate::domain::{Criticality, ModelTier, Task, TaskSource};
 
 /// A parse problem with a line number, surfaced by `priority check` and `doctor`.
 #[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
-#[error("PRIORITY.md line {line}: {message}")]
+#[error("priority policy line {line}: {message}")]
 pub struct RuleError {
     pub line: usize,
     pub message: String,
 }
 
 impl RuleError {
-    fn new(line: usize, message: impl Into<String>) -> Self {
+    pub(super) fn new(line: usize, message: impl Into<String>) -> Self {
         Self { line, message: message.into() }
     }
 }
@@ -80,7 +77,7 @@ pub struct Rule {
     pub conditions: Vec<Condition>,
 }
 
-/// `+N if <conditions>` / `-N if <conditions>` under `## Scoring`.
+/// An additive scoring rule: every condition must match.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScoringRule {
     pub line: usize,
@@ -88,8 +85,8 @@ pub struct ScoringRule {
     pub conditions: Vec<Condition>,
 }
 
-/// `if <conditions>: <model> [| <model>...]` under `## Models`: when every
-/// condition holds, these models win over the criticality row.
+/// Conditional model preference: when every condition holds, these models
+/// win over the criticality row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelRule {
     pub line: usize,
@@ -104,7 +101,7 @@ impl fmt::Display for ModelRule {
     }
 }
 
-/// Per-ticket pin under `## Overrides`.
+/// One per-task override action.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Override {
     Criticality(Criticality),
@@ -126,8 +123,9 @@ impl fmt::Display for Override {
     }
 }
 
-/// `## Jev` settings.
+/// Optional Jev scoring settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct JevSection {
     pub enabled: bool,
     pub question: String,
@@ -157,15 +155,15 @@ pub struct PriorityRules {
     pub scoring: Vec<ScoringRule>,
     /// Keyed by lower-cased task key.
     pub overrides: BTreeMap<String, Vec<Override>>,
-    /// `## Models`: preferred models per criticality, most wanted first.
+    /// Preferred models per criticality, most wanted first.
     /// Alternatives may belong to different providers.
     pub models: BTreeMap<Criticality, Vec<ModelTier>>,
-    /// `## Models` conditional rows (`if label: model/fable: fable`), in
-    /// file order; the first that matches beats the criticality row.
+    /// Conditional model rows in file order; the first match beats the
+    /// criticality row.
     #[serde(default)]
     pub model_rules: Vec<ModelRule>,
     pub jev: JevSection,
-    /// Non-fatal problems found while parsing (unknown fields, odd lines).
+    /// Legacy migration warnings; strict TOML rejects invalid policy data.
     pub warnings: Vec<RuleError>,
 }
 
@@ -191,12 +189,12 @@ pub struct Evaluation {
     pub score: f64,
     /// The first entry of `models` (kept for callers that want one model).
     pub model: Option<ModelTier>,
-    /// Preferred models, most wanted first: the `## Overrides` model list,
-    /// else the first matching `## Models` `if` row, else the `## Models`
+    /// Preferred models, most wanted first: the `overrides` model list,
+    /// else the first matching `model_rules` row, else the `models`
     /// entry for the criticality, else empty. The scheduler hands this list
     /// to the budget policy.
     pub models: Vec<ModelTier>,
-    /// Which line chose `models`: `## Overrides`, `if <conditions>` or
+    /// Which line chose `models`: `overrides`, `if <conditions>` or
     /// `<criticality> row`; `None` when `models` is empty.
     #[serde(default)]
     pub model_source: Option<String>,
@@ -209,10 +207,10 @@ pub struct Evaluation {
 pub const MAX_AGE_BOOST: f64 = 200.0;
 
 /// Fields a condition may reference.
-const FIELDS: [&str; 11] =
+pub(super) const FIELDS: [&str; 11] =
     ["label", "priority", "estimate", "project", "cycle", "cycle_number", "team", "title", "description", "source", "key"];
 /// Fields that support `>` / `<`.
-const NUMERIC_FIELDS: [&str; 3] = ["priority", "estimate", "cycle_number"];
+pub(super) const NUMERIC_FIELDS: [&str; 3] = ["priority", "estimate", "cycle_number"];
 /// Values `cycle` may be compared with (the status word stored on the task).
 const CYCLE_WORDS: [&str; 4] = ["active", "next", "past", "future"];
 
@@ -240,7 +238,7 @@ impl PriorityRules {
 
     /// Parse the Markdown document. Fatal errors (unparseable rules) are
     /// returned; recoverable issues land in `warnings`.
-    pub fn parse(markdown: &str) -> Result<Self, Vec<RuleError>> {
+    pub(crate) fn parse_legacy(markdown: &str) -> Result<Self, Vec<RuleError>> {
         let mut rules = PriorityRules::default();
         let mut errors: Vec<RuleError> = Vec::new();
         let mut section: Option<Section> = None;
@@ -356,15 +354,11 @@ impl PriorityRules {
         if errors.is_empty() { Ok(rules) } else { Err(errors) }
     }
 
-    /// Evaluate a task. `jev_normalized` (0..=1) and `jev_weight` fold an
-    /// optional Jev score into the result; `age_boost_per_hour` rewards
-    /// waiting tasks so nothing starves (capped at [`MAX_AGE_BOOST`]).
-    ///
-    /// Precedence: `## Overrides` (skip / criticality / model) beat the
-    /// criticality sections, which are tried in order Critical → High →
-    /// Normal → Low; the first matching rule wins; otherwise `## Default`.
-    /// Models: `## Overrides`, then the first matching `## Models` `if`
-    /// row, then the `## Models` row for the criticality.
+    /// Evaluate a task with optional normalized Jev scoring and an age boost
+    /// capped at [`MAX_AGE_BOOST`]. Task overrides win over classification;
+    /// criticality is tried Critical → High → Normal → Low. All matching
+    /// scoring deltas add. Models come from the task override, first matching
+    /// conditional preference, or effective criticality's model list.
     pub fn evaluate(
         &self,
         task: &Task,
@@ -397,8 +391,8 @@ impl PriorityRules {
                     }
                     Override::Model(m) => {
                         models = m.clone();
-                        model_source = Some("## Overrides".to_string());
-                        reasons.push(format!("model {} from ## Overrides", fmt_models(m)));
+                        model_source = Some("overrides".to_string());
+                        reasons.push(format!("model {} from overrides", fmt_models(m)));
                     }
                 }
             }
@@ -456,7 +450,7 @@ impl PriorityRules {
         {
             models = rule.models.clone();
             let source = format!("if {}", fmt_conditions(&rule.conditions));
-            reasons.push(format!("model {} from ## Models line {} ({source})", fmt_models(&models), rule.line));
+            reasons.push(format!("model {} from models line {} ({source})", fmt_models(&models), rule.line));
             model_source = Some(source);
         }
 
@@ -465,14 +459,14 @@ impl PriorityRules {
         {
             models = m.clone();
             model_source = Some(format!("{criticality} row"));
-            reasons.push(format!("model {} from ## Models", fmt_models(m)));
+            reasons.push(format!("model {} from models", fmt_models(m)));
         }
 
         Evaluation { criticality, score, model: models.first().cloned(), models, model_source, skip, reasons }
     }
 
     /// Models the rules prefer for a criticality, most wanted first; empty
-    /// when `## Models` says nothing about it.
+    /// when `models` says nothing about it.
     pub fn model_for(&self, criticality: Criticality) -> &[ModelTier] {
         self.models.get(&criticality).map(Vec::as_slice).unwrap_or(&[])
     }
@@ -621,7 +615,7 @@ fn compile_regex(pattern: &str) -> Option<Regex> {
     })
 }
 
-fn build_regex(pattern: &str) -> Result<Regex, regex::Error> {
+pub(super) fn build_regex(pattern: &str) -> Result<Regex, regex::Error> {
     regex::RegexBuilder::new(pattern).case_insensitive(true).size_limit(1 << 20).build()
 }
 
@@ -739,7 +733,7 @@ fn parse_condition(text: &str, line: usize) -> Result<Condition, RuleError> {
 }
 
 /// Equality values on numeric fields must be parseable now, not at evaluation.
-fn validate_value(field: &str, value: &str, line: usize) -> Result<(), RuleError> {
+pub(super) fn validate_value(field: &str, value: &str, line: usize) -> Result<(), RuleError> {
     match field {
         "priority" | "estimate" | "cycle_number" => parse_number_for(field, value, line).map(|_| ()),
         "cycle" => {
@@ -1025,14 +1019,14 @@ mod tests {
     }
 
     fn parse_ok(md: &str) -> PriorityRules {
-        match PriorityRules::parse(md) {
+        match PriorityRules::parse_legacy(md) {
             Ok(r) => r,
             Err(errs) => panic!("unexpected parse errors: {errs:?}"),
         }
     }
 
     fn parse_err(md: &str) -> Vec<RuleError> {
-        match PriorityRules::parse(md) {
+        match PriorityRules::parse_legacy(md) {
             Ok(r) => panic!("expected errors, got {r:?}"),
             Err(errs) => errs,
         }
@@ -1044,7 +1038,7 @@ mod tests {
 
     #[test]
     fn parses_template_without_errors_or_warnings() {
-        let rules = parse_ok(crate::priority::template());
+        let rules = parse_ok(include_str!("PRIORITY.template.md"));
         assert_eq!(rules.sections[&Criticality::Critical].len(), 3);
         assert_eq!(rules.sections[&Criticality::High].len(), 2);
         assert_eq!(rules.sections[&Criticality::Normal].len(), 1);
@@ -1177,7 +1171,7 @@ mod tests {
         let e2 = eval(&rules, &t2);
         assert_eq!(e2.criticality, Criticality::Critical);
         assert_eq!(e2.model, Some(ModelTier::opus()));
-        assert!(e2.reasons.contains(&"model opus from ## Overrides".to_string()));
+        assert!(e2.reasons.contains(&"model opus from overrides".to_string()));
 
         let e3 = eval(&rules, &linear_task("ENG-3"));
         assert!(e3.skip);
@@ -1194,7 +1188,7 @@ mod tests {
         t.linear_priority = Some(2);
         let e = eval(&rules, &t);
         assert_eq!(e.model, Some(ModelTier::opus()));
-        assert!(e.reasons.contains(&"model opus from ## Models".to_string()));
+        assert!(e.reasons.contains(&"model opus from models".to_string()));
         t.linear_priority = Some(3);
         assert_eq!(eval(&rules, &t).model, Some(ModelTier::sonnet()));
         let no_models = parse_ok("## High\n- priority: high\n");
@@ -1216,10 +1210,10 @@ mod tests {
         let e = eval(&rules, &t);
         assert_eq!(e.models, vec![ModelTier::fable(), ModelTier::new("gpt-6.1-sol")]);
         assert_eq!(e.model, Some(ModelTier::fable()), "`model` is the first alternative");
-        assert!(e.reasons.contains(&"model fable | gpt-6.1-sol from ## Models".to_string()), "{:?}", e.reasons);
+        assert!(e.reasons.contains(&"model fable | gpt-6.1-sol from models".to_string()), "{:?}", e.reasons);
         let e = eval(&rules, &linear_task("ENG-5"));
         assert_eq!(e.models, vec![ModelTier::new("gpt-6-astra"), ModelTier::sonnet()]);
-        assert!(e.reasons.contains(&"model gpt-6-astra | sonnet from ## Overrides".to_string()), "{:?}", e.reasons);
+        assert!(e.reasons.contains(&"model gpt-6-astra | sonnet from overrides".to_string()), "{:?}", e.reasons);
         assert_eq!(rules.overrides["eng-5"][0].to_string(), "model = gpt-6-astra | sonnet");
         let text = rules.describe();
         assert!(text.contains("critical: fable | gpt-6.1-sol"), "{text}");
@@ -1304,7 +1298,7 @@ mod tests {
         assert_eq!(e.criticality, Criticality::High);
         assert_eq!(e.models, vec![ModelTier::fable()]);
         assert_eq!(e.model_source.as_deref(), Some("if label: model/fable"));
-        assert!(e.reasons.contains(&"model fable from ## Models line 8 (if label: model/fable)".to_string()), "{:?}", e.reasons);
+        assert!(e.reasons.contains(&"model fable from models line 8 (if label: model/fable)".to_string()), "{:?}", e.reasons);
 
         t.labels = vec!["model/sonnet".into()];
         let e = eval(&rules, &t);
@@ -1315,13 +1309,13 @@ mod tests {
         let e = eval(&rules, &t);
         assert_eq!(e.models, vec![ModelTier::opus()], "a loose `fable` label is not `model/fable`");
         assert_eq!(e.model_source.as_deref(), Some("high row"));
-        assert!(e.reasons.contains(&"model opus from ## Models".to_string()), "{:?}", e.reasons);
+        assert!(e.reasons.contains(&"model opus from models".to_string()), "{:?}", e.reasons);
 
         let mut t9 = linear_task("ENG-9");
         t9.labels = vec!["model/fable".into()];
         let e = eval(&rules, &t9);
         assert_eq!(e.models, vec![ModelTier::haiku()], "## Overrides beats conditional rows");
-        assert_eq!(e.model_source.as_deref(), Some("## Overrides"));
+        assert_eq!(e.model_source.as_deref(), Some("overrides"));
 
         let e = eval(&parse_ok("## High\n- priority: high\n"), &t);
         assert!(e.models.is_empty());
@@ -1433,7 +1427,7 @@ mod tests {
         assert!(errs[4].message.contains("invalid regex"));
         assert!(errs[5].message.contains("criticality"));
         assert!(errs[6].message.contains("source"));
-        assert_eq!(errs[0].to_string(), format!("PRIORITY.md line 3: {}", errs[0].message));
+        assert_eq!(errs[0].to_string(), format!("priority policy line 3: {}", errs[0].message));
     }
 
     #[test]
@@ -1473,7 +1467,7 @@ mod tests {
 
     #[test]
     fn describe_is_readable() {
-        let rules = parse_ok(crate::priority::template());
+        let rules = parse_ok(include_str!("PRIORITY.template.md"));
         let text = rules.describe();
         assert!(text.contains("Critical (3 rules)"));
         assert!(text.contains("label: incident"));
@@ -1524,7 +1518,7 @@ mod tests {
         let path = dir.path().join("PRIORITY.md");
         let err = PriorityRules::load(&path).unwrap_err();
         assert!(err.to_string().contains("cannot read"));
-        std::fs::write(&path, "## High\n- nonsense\n").unwrap();
+        std::fs::write(&path, "version = 1\nunknown = true\n").unwrap();
         let err = PriorityRules::load(&path).unwrap_err().to_string();
         assert!(err.contains("line 2"), "{err}");
         std::fs::write(&path, crate::priority::template()).unwrap();

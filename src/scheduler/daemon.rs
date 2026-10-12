@@ -154,6 +154,7 @@ struct RuntimeState {
     project_fetches: HashMap<String, ProjectFetch>,
     rules: PriorityRules,
     rules_loaded: bool,
+    rules_ready: bool,
     rules_missing_logged: bool,
     watcher: Option<RulesWatcher>,
     watcher_failed: bool,
@@ -243,6 +244,7 @@ impl Daemon {
             project_fetches: HashMap::new(),
             rules: PriorityRules::default(),
             rules_loaded: false,
+            rules_ready: false,
             rules_missing_logged: false,
             watcher: None,
             watcher_failed: false,
@@ -671,7 +673,7 @@ impl Daemon {
         self.rt.linear_warned = false;
         self.rt.jev = None;
         self.rt.rules_loaded = false;
-        self.rt.project_rules.clear();
+        // Keep the last valid policies across explicit config reloads.
         self.rt.watcher = None;
         self.rt.watcher_failed = false;
         self.cfg = cfg;
@@ -706,13 +708,16 @@ impl Daemon {
                 Ok(w) => self.rt.watcher = Some(w),
                 Err(e) => {
                     self.rt.watcher_failed = true;
-                    tracing::warn!(path = %path.display(), error = %format!("{e:#}"), "cannot watch PRIORITY.md; use `powerqueue run` restart or Reload to pick up changes");
+                    tracing::warn!(path = %path.display(), error = %format!("{e:#}"), "cannot watch priority.toml; use `powerqueue run` restart or Reload to pick up changes");
                 }
             }
         }
-        let changed = !self.rt.rules_loaded || self.rt.watcher.as_mut().is_some_and(|w| w.take_changed());
+        let changed = !self.rt.rules_ready || !self.rt.rules_loaded || self.rt.watcher.as_mut().is_some_and(|w| w.take_changed());
         if changed {
             self.load_rules(&source);
+        }
+        if !self.rt.rules_ready {
+            bail!("no valid priority policy; repair or migrate {source}");
         }
 
         let tasks = self.store.list_open_tasks()?;
@@ -808,12 +813,28 @@ impl Daemon {
         let tasks = self.store.list_open_tasks()?;
         for id in self.cfg.project_ids() {
             let resolved = self.cfg.for_project(&id, &self.paths).and_then(|cfg| {
-                let rules = if !cfg.priority.live_reload
+                let rules = if self.rt.rules_loaded
+                    && !cfg.priority.live_reload
                     && let Some(rules) = previous_rules.get(&id)
                 {
                     rules.clone()
                 } else {
-                    crate::projects::load_rules(&cfg, &self.paths)?
+                    let source = cfg.rules_source(&self.paths);
+                    match PriorityRules::from_source(&source) {
+                        Ok(Some(rules)) => rules,
+                        Ok(None) if !previous_rules.contains_key(&id) => PriorityRules::default(),
+                        result => {
+                            let error = match result {
+                                Err(e) => format!("{e:#}"),
+                                _ => format!("{source} is missing"),
+                            };
+                            self.project_error(&id, &format!("{error}; keeping the last valid policy, if available"));
+                            let Some(previous) = previous_rules.get(&id) else {
+                                bail!("no valid policy for project {id}: {error}");
+                            };
+                            previous.clone()
+                        }
+                    }
                 };
                 Ok((cfg, rules))
             });
@@ -841,8 +862,19 @@ impl Daemon {
                 let effects = transitions::on_evaluation(&mut task, &eval);
                 self.commit(&before, &mut task, None, effects).await?;
             }
+            if previous_rules.get(&id) != Some(&rules) {
+                self.log(
+                    None,
+                    None,
+                    EventLevel::Info,
+                    "rules.loaded",
+                    &format!("loaded policy for project {id}"),
+                    serde_json::json!({"project": id}),
+                );
+            }
             self.rt.project_rules.insert(id, rules);
         }
+        self.rt.rules_loaded = true;
         Ok(())
     }
 
@@ -860,11 +892,14 @@ impl Daemon {
                         None,
                         EventLevel::Warn,
                         "rules.missing",
-                        &format!("{shown} does not exist; using default rules"),
+                        &format!("{shown} does not exist; keeping the last valid policy (built-in defaults on first load)"),
                         serde_json::json!({ "path": path, "rev": source.rev() }),
                     );
                 }
-                self.rt.rules = PriorityRules::default();
+                if !self.rt.rules_ready {
+                    self.rt.rules = PriorityRules::default();
+                    self.rt.rules_ready = true;
+                }
                 return;
             }
             Err(e) => {
@@ -894,6 +929,7 @@ impl Daemon {
                     serde_json::json!({ "path": path, "rev": source.rev(), "warnings": warnings }),
                 );
                 self.rt.rules = rules;
+                self.rt.rules_ready = true;
             }
             Err(errors) => {
                 let errors: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
@@ -2973,6 +3009,9 @@ impl Daemon {
     }
 
     async fn launch_tasks(&mut self, now: DateTime<Utc>) -> Result<()> {
+        if self.cfg.projects.is_empty() && !self.rt.rules_ready {
+            bail!("no valid priority policy; run `powerqueue priority check` and repair or migrate it");
+        }
         if let Some(pause) = self.store.scheduling_pause()? {
             tracing::debug!(since = %pause.since, "scheduling paused; launching nothing");
             return Ok(());
@@ -3706,6 +3745,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_reload_keeps_last_valid_rules_for_machine_and_projects() {
+        use crate::projects::ProjectConfig;
+        use crate::secrets::FileBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        paths.ensure().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let secrets = Secrets::with_backend(Box::new(FileBackend::new(paths.secrets_file())));
+        let mut cfg = Config::default();
+        cfg.linear.enabled = false;
+        cfg.priority.live_reload = false;
+        let path = paths.priority_file();
+        std::fs::write(&path, "version = 1\ndefault_criticality = 'high'\n").unwrap();
+        let mut daemon = Daemon::new(cfg.clone(), paths.clone(), store.clone(), secrets).unwrap();
+        daemon.refresh_rules(Utc::now()).await.unwrap();
+        std::fs::write(&path, "version = 1\nunknown = true\n").unwrap();
+        daemon.rt.rules_loaded = false;
+        daemon.refresh_rules(Utc::now()).await.unwrap();
+        assert_eq!(daemon.rt.rules.default_criticality, crate::domain::Criticality::High);
+        assert_eq!(store.count_events_of_kind("rules.invalid", daemon.started_at - Duration::seconds(1)).unwrap(), 1);
+        std::fs::remove_file(&path).unwrap();
+        daemon.rt.rules_loaded = false;
+        daemon.refresh_rules(Utc::now()).await.unwrap();
+        assert_eq!(daemon.rt.rules.default_criticality, crate::domain::Criticality::High);
+
+        for id in ["api", "web"] {
+            let checkout = dir.path().join(id);
+            std::fs::create_dir_all(&checkout).unwrap();
+            std::fs::write(checkout.join(".powerqueue.toml"), "priority_file = 'priority.toml'\n").unwrap();
+            std::fs::write(checkout.join("priority.toml"), "version = 1\ndefault_criticality = 'low'\n").unwrap();
+            let mut project = ProjectConfig::default();
+            project.repo.path = checkout.display().to_string();
+            cfg.projects.insert(id.into(), project);
+        }
+        cfg.priority.live_reload = true;
+        cfg.save(&paths).unwrap();
+        daemon.reload_config().unwrap();
+        daemon.refresh_rules(Utc::now()).await.unwrap();
+        std::fs::write(dir.path().join("api/priority.toml"), "version = 1\nunknown = true\n").unwrap();
+        std::fs::write(dir.path().join("web/priority.toml"), "version = 1\ndefault_criticality = 'critical'\n").unwrap();
+        // Explicit configuration reload must not erase cached project policies.
+        daemon.reload_config().unwrap();
+        daemon.refresh_rules(Utc::now()).await.unwrap();
+        assert_eq!(daemon.rt.project_rules["api"].default_criticality, crate::domain::Criticality::Low);
+        assert_eq!(daemon.rt.project_rules["web"].default_criticality, crate::domain::Criticality::Critical);
+        assert!(store.count_events_of_kind("project.error", daemon.started_at - Duration::seconds(1)).unwrap() > 0);
+        std::fs::remove_file(dir.path().join("api/priority.toml")).unwrap();
+        daemon.refresh_rules(Utc::now()).await.unwrap();
+        assert_eq!(daemon.rt.project_rules["api"].default_criticality, crate::domain::Criticality::Low);
+        std::fs::write(dir.path().join("api/priority.toml"), "version = 1\ndefault_criticality = 'high'\n").unwrap();
+        daemon.refresh_rules(Utc::now()).await.unwrap();
+        assert_eq!(daemon.rt.project_rules["api"].default_criticality, crate::domain::Criticality::High);
+    }
+
+    #[tokio::test]
+    async fn invalid_initial_policy_never_admits_launches() {
+        use crate::secrets::FileBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        paths.ensure().unwrap();
+        std::fs::write(paths.priority_file(), "## Critical\n- source: manual\n").unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let secrets = Secrets::with_backend(Box::new(FileBackend::new(paths.secrets_file())));
+        let mut daemon = Daemon::new(Config::default(), paths.clone(), store, secrets).unwrap();
+        assert!(daemon.refresh_rules(Utc::now()).await.is_err());
+        assert!(daemon.launch_tasks(Utc::now()).await.is_err());
+        std::fs::write(paths.priority_file(), "version = 1\n").unwrap();
+        daemon.refresh_rules(Utc::now()).await.unwrap();
+        assert!(daemon.rt.rules_ready);
+    }
+
+    #[tokio::test]
     async fn rescore_refreshes_reasons_when_only_the_model_changes() {
         use crate::domain::{Criticality, Task, TaskSource};
         use crate::secrets::FileBackend;
@@ -3718,7 +3829,7 @@ mod tests {
         cfg.priority.live_reload = false;
         let rules_path = cfg.priority_file(&paths);
         std::fs::create_dir_all(rules_path.parent().unwrap()).unwrap();
-        std::fs::write(&rules_path, "## High\n- source: manual\n\n## Models\n- high: opus\n").unwrap();
+        std::fs::write(&rules_path, "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"high\"\nall = [{ field = \"source\", op = \"eq\", value = \"manual\" }]\n[models]\nhigh = [\"opus\"]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap();
         let mut daemon = Daemon::new(cfg, paths, store.clone(), secrets).unwrap();
         let mut task = Task::new("LBL-1", "Grouped", TaskSource::Manual);
         task.labels = vec!["model/fable".into()];
@@ -3727,17 +3838,17 @@ mod tests {
 
         daemon.refresh_rules(Utc::now()).await.unwrap();
         let stored = store.get_task(task.id).unwrap().unwrap();
-        assert!(stored.score_reasons.contains(&"model opus from ## Models".to_string()), "{:?}", stored.score_reasons);
+        assert!(stored.score_reasons.contains(&"model opus from models".to_string()), "{:?}", stored.score_reasons);
 
         // Same criticality and score; only the model row changes.
-        std::fs::write(&rules_path, "## High\n- source: manual\n\n## Models\n- if label: model/fable: fable\n- high: opus\n")
+        std::fs::write(&rules_path, "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"high\"\nall = [{ field = \"source\", op = \"eq\", value = \"manual\" }]\n[[model_rules]]\nmodels = [\"fable\"]\nall = [{ field = \"label\", op = \"eq\", value = \"model/fable\" }]\n[models]\nhigh = [\"opus\"]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n")
             .unwrap();
         daemon.rt.rules_loaded = false;
         daemon.refresh_rules(Utc::now()).await.unwrap();
         let stored = store.get_task(task.id).unwrap().unwrap();
         assert_eq!(stored.criticality, Criticality::High);
         assert!(
-            stored.score_reasons.contains(&"model fable from ## Models line 5 (if label: model/fable)".to_string()),
+            stored.score_reasons.contains(&"model fable from models line 6 (if label: model/fable)".to_string()),
             "{:?}",
             stored.score_reasons
         );
@@ -3958,6 +4069,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let (mut daemon, _mock, _server) = dependency_daemon(&store, dir.path()).await;
         let now = Utc::now();
+        daemon.refresh_rules(now).await.unwrap();
         let mut task = Task::new("PAUSE-1", "queued work", TaskSource::Manual);
         task.criticality = Criticality::Critical;
         store.insert_task(&task).unwrap();
@@ -4001,6 +4113,7 @@ mod tests {
         let (mut daemon, _mock, _server) = dependency_daemon(&store, dir.path()).await;
         daemon.cfg.scheduler.max_concurrent = 1;
         let now = Utc::now();
+        daemon.refresh_rules(now).await.unwrap();
         for (key, score) in [("SLOT-1", 2.0), ("SLOT-2", 1.0)] {
             let mut task = Task::new(key, "queued work", TaskSource::Manual);
             task.criticality = Criticality::Critical;
@@ -4089,7 +4202,7 @@ mod tests {
         // Every mock issue has Linear priority 2 (high).
         let rules_path = daemon.cfg.priority_file(&daemon.paths);
         std::fs::create_dir_all(rules_path.parent().unwrap()).unwrap();
-        std::fs::write(&rules_path, "## Critical\n- priority: high\n\n## Models\n- critical: fable\n").unwrap();
+        std::fs::write(&rules_path, "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"critical\"\nall = [{ field = \"priority\", op = \"eq\", value = \"high\" }]\n[models]\ncritical = [\"fable\"]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap();
         daemon.rt.force_sync = true;
         let before = Utc::now() - Duration::seconds(1);
         daemon.tick().await.unwrap();
@@ -4587,9 +4700,9 @@ mod tests {
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(repo.join("docs")).unwrap();
         git_in(&repo, &["init", "-q", "-b", "main"]);
-        std::fs::write(repo.join(REPO_CONFIG_FILE), "priority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 3\n")
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "priority_file = \"docs/priority.toml\"\n[scheduler]\nmax_concurrent = 3\n")
             .unwrap();
-        std::fs::write(repo.join("docs/PRIORITY.md"), "## High\n- source: manual\n").unwrap();
+        std::fs::write(repo.join("docs/priority.toml"), "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"high\"\nall = [{ field = \"source\", op = \"eq\", value = \"manual\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap();
         git_in(&repo, &["add", "."]);
         git_in(&repo, &["commit", "-qm", "config"]);
         // A bare origin and a second clone: "upstream" is what lands there.
@@ -4624,7 +4737,10 @@ mod tests {
 
         // Merged upstream while the daemon was down: the first check's fetch
         // brings it, and it counts as a change from what was loaded.
-        upstream(&[(REPO_CONFIG_FILE, "priority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 4\n")], "while down");
+        upstream(
+            &[(REPO_CONFIG_FILE, "priority_file = \"docs/priority.toml\"\n[scheduler]\nmax_concurrent = 4\n")],
+            "while down",
+        );
         daemon.refresh_overrides(now).await.unwrap();
         assert_eq!(daemon.cfg.scheduler.max_concurrent, 4, "the first check compares against what was loaded");
         assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 1);
@@ -4634,7 +4750,13 @@ mod tests {
         assert!(daemon.rt.watcher.is_none(), "committed rules are polled, not watched");
 
         // Only the rules change upstream: the rules reload, the config does not.
-        upstream(&[("docs/PRIORITY.md", "## High\n- source: manual\n## Low\n- label: chore\n")], "rules");
+        upstream(
+            &[(
+                "docs/priority.toml",
+                "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"high\"\nall = [{ field = \"source\", op = \"eq\", value = \"manual\" }]\n[[criticality]]\nlevel = \"low\"\nall = [{ field = \"label\", op = \"eq\", value = \"chore\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n",
+            )],
+            "rules",
+        );
         daemon.refresh_overrides(now).await.unwrap();
         assert!(daemon.rt.rules_loaded, "throttled: nothing is checked within OVERRIDES_CHECK_SECS");
         now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
@@ -4645,7 +4767,10 @@ mod tests {
         assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 1, "rules only: no config reload");
 
         // The config changes upstream: full reload with the keys named.
-        upstream(&[(REPO_CONFIG_FILE, "priority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 5\n")], "concurrency");
+        upstream(
+            &[(REPO_CONFIG_FILE, "priority_file = \"docs/priority.toml\"\n[scheduler]\nmax_concurrent = 5\n")],
+            "concurrency",
+        );
         now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
         daemon.refresh_overrides(now).await.unwrap();
         assert_eq!(daemon.cfg.scheduler.max_concurrent, 5);
@@ -4660,7 +4785,7 @@ mod tests {
         let config_file = daemon.paths.config_file();
         let good_config = std::fs::read_to_string(&config_file).unwrap();
         std::fs::write(&config_file, "[scheduler\n").unwrap();
-        upstream(&[(REPO_CONFIG_FILE, "priority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 6\n")], "racing");
+        upstream(&[(REPO_CONFIG_FILE, "priority_file = \"docs/priority.toml\"\n[scheduler]\nmax_concurrent = 6\n")], "racing");
         now += Duration::seconds(OVERRIDES_CHECK_SECS + 1);
         daemon.refresh_overrides(now).await.unwrap();
         assert_eq!(daemon.cfg.scheduler.max_concurrent, 5);
@@ -4698,7 +4823,7 @@ mod tests {
         upstream(
             &[(
                 REPO_CONFIG_FILE,
-                "default_branch = \"feature\"\npriority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 6\n",
+                "default_branch = \"feature\"\npriority_file = \"docs/priority.toml\"\n[scheduler]\nmax_concurrent = 6\n",
             )],
             "override default branch",
         );
@@ -4711,7 +4836,7 @@ mod tests {
         upstream(
             &[(
                 REPO_CONFIG_FILE,
-                "default_branch = \"feature\"\npriority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 7\n",
+                "default_branch = \"feature\"\npriority_file = \"docs/priority.toml\"\n[scheduler]\nmax_concurrent = 7\n",
             )],
             "still on main",
         );

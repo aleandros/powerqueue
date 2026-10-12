@@ -556,7 +556,7 @@ impl PromptConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PriorityConfig {
-    /// Path to the rules file. Defaults to `<config_dir>/PRIORITY.md`.
+    /// Path to the rules file. Defaults to `<config_dir>/priority.toml`.
     pub file: Option<String>,
     /// Watch the file and re-score tasks on change.
     pub live_reload: bool,
@@ -1352,7 +1352,7 @@ impl Default for LoggingConfig {
 }
 
 /// `powerqueue tune`: a headless Claude Code session that edits drafts of
-/// `PRIORITY.md` and `config.toml` from a plain-language request.
+/// `priority.toml` and `config.toml` from a plain-language request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TuneConfig {
@@ -1537,12 +1537,23 @@ pub enum RulesSource {
 
 impl RulesSource {
     /// Read the rules text: `Ok(None)` when the file does not exist (on disk
-    /// or in the commit), an error when git fails or the file is unreadable.
+    /// or in the commit). Errors on unreadable sources, git failures, or an
+    /// unmigrated legacy default beside a missing `priority.toml`.
     pub fn read(&self) -> Result<Option<String>> {
         match self {
             Self::File(path) => match std::fs::read_to_string(path) {
                 Ok(t) => Ok(Some(t)),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if path.file_name().is_some_and(|n| n == "priority.toml") && path.with_file_name("PRIORITY.md").exists() {
+                        bail!(
+                            "{} is a legacy policy; run `powerqueue priority migrate --from {} --to {}` and update configured policy paths; Markdown prose alone is not executable",
+                            path.with_file_name("PRIORITY.md").display(),
+                            path.with_file_name("PRIORITY.md").display(),
+                            path.display()
+                        );
+                    }
+                    Ok(None)
+                }
                 Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
             },
             Self::Committed { repo, rev, path } => crate::worktree::Repo::new(repo)
@@ -1567,7 +1578,7 @@ impl RulesSource {
         }
     }
 
-    /// `/x/PRIORITY.md` or `/repo/docs/PRIORITY.md (origin/main)`.
+    /// `/x/priority.toml` or `/repo/docs/priority.toml (origin/main)`.
     pub fn describe(&self) -> String {
         match self.rev() {
             Some(rev) => format!("{} ({rev})", self.path().display()),
@@ -1908,7 +1919,7 @@ impl Config {
 
     /// The rules file as a path: `priority.file` (or the repo's
     /// `priority_file`, resolved against the checkout), else
-    /// `<config_dir>/PRIORITY.md`. With overrides read from a commit the
+    /// `<config_dir>/priority.toml`. With overrides read from a commit the
     /// daemon reads the rules from that commit instead; see
     /// [`Config::rules_source`].
     pub fn priority_file(&self, paths: &Paths) -> PathBuf {
@@ -2419,11 +2430,11 @@ mod tests {
 
     #[test]
     fn repo_relative_paths_are_normalised_or_rejected() {
-        assert_eq!(normalize_repo_relative("docs/PRIORITY.md").unwrap(), "docs/PRIORITY.md");
-        assert_eq!(normalize_repo_relative("./docs/./PRIORITY.md").unwrap(), "docs/PRIORITY.md");
-        assert_eq!(normalize_repo_relative("docs//PRIORITY.md").unwrap(), "docs/PRIORITY.md");
-        assert_eq!(normalize_repo_relative("docs\\PRIORITY.md").unwrap(), "docs/PRIORITY.md");
-        let err = normalize_repo_relative("../shared/PRIORITY.md").unwrap_err().to_string();
+        assert_eq!(normalize_repo_relative("docs/priority.toml").unwrap(), "docs/priority.toml");
+        assert_eq!(normalize_repo_relative("./docs/./priority.toml").unwrap(), "docs/priority.toml");
+        assert_eq!(normalize_repo_relative("docs//priority.toml").unwrap(), "docs/priority.toml");
+        assert_eq!(normalize_repo_relative("docs\\priority.toml").unwrap(), "docs/priority.toml");
+        let err = normalize_repo_relative("../shared/priority.toml").unwrap_err().to_string();
         assert!(err.contains("leaves the repository"), "{err}");
         assert!(normalize_repo_relative("./").is_err());
 
@@ -2433,12 +2444,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        std::fs::write(repo.join(REPO_CONFIG_FILE), "priority_file = \"./docs//PRIORITY.md\"\n").unwrap();
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "priority_file = \"./docs//priority.toml\"\n").unwrap();
         let mut cfg = Config::default();
         cfg.repo.path = repo.display().to_string();
         cfg.apply_repo_overrides(&repo).unwrap();
-        assert_eq!(cfg.overrides.priority_file_in_repo.as_deref(), Some("docs/PRIORITY.md"));
-        std::fs::write(repo.join(REPO_CONFIG_FILE), "priority_file = \"../queue/PRIORITY.md\"\n").unwrap();
+        assert_eq!(cfg.overrides.priority_file_in_repo.as_deref(), Some("docs/priority.toml"));
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "priority_file = \"../queue/priority.toml\"\n").unwrap();
         let mut cfg = Config::default();
         cfg.repo.path = repo.display().to_string();
         let err = cfg.apply_repo_overrides(&repo).unwrap_err();
@@ -2671,7 +2682,7 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::write(
             repo.join(REPO_CONFIG_FILE),
-            r#"priority_file = "docs/agent/PRIORITY.md"
+            r#"priority_file = "docs/agent/priority.toml"
 
 [linear]
 excluded_labels = ["agent/skip"]
@@ -2710,8 +2721,8 @@ restart_backoff_secs = [5, 10]
         assert_eq!(cfg.scheduler.max_concurrent, 3);
         assert_eq!(cfg.scheduler.restart_backoff_secs, vec![5, 10]);
         assert_eq!(cfg.scheduler.max_attempts, 3);
-        assert_eq!(cfg.priority_file(&paths), repo.join("docs/agent/PRIORITY.md"));
-        assert_eq!(cfg.overrides.priority_file_in_repo.as_deref(), Some("docs/agent/PRIORITY.md"));
+        assert_eq!(cfg.priority_file(&paths), repo.join("docs/agent/priority.toml"));
+        assert_eq!(cfg.overrides.priority_file_in_repo.as_deref(), Some("docs/agent/priority.toml"));
         assert_eq!(cfg.overrides.rev, None);
         assert_eq!(cfg.overrides.origin(), "working tree");
         assert_eq!(
@@ -2736,18 +2747,23 @@ restart_backoff_secs = [5, 10]
         assert!(!cfg.overrides.sets("scheduler.max_attempts"));
         assert!(!cfg.overrides.sets("linear.endpoint"));
         // In the working tree the rules are a plain file.
-        assert_eq!(cfg.rules_source(&paths), RulesSource::File(repo.join("docs/agent/PRIORITY.md")));
+        assert_eq!(cfg.rules_source(&paths), RulesSource::File(repo.join("docs/agent/priority.toml")));
         assert_eq!(cfg.read_rules_text(&paths).unwrap(), None);
         std::fs::create_dir_all(repo.join("docs/agent")).unwrap();
-        std::fs::write(repo.join("docs/agent/PRIORITY.md"), "## Low\n- label: chore\n").unwrap();
-        assert_eq!(cfg.read_rules_text(&paths).unwrap().as_deref(), Some("## Low\n- label: chore\n"));
+        std::fs::write(repo.join("docs/agent/priority.toml"), "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"low\"\nall = [{ field = \"label\", op = \"eq\", value = \"chore\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap();
+        assert_eq!(
+            cfg.read_rules_text(&paths).unwrap().as_deref(),
+            Some(
+                "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"low\"\nall = [{ field = \"label\", op = \"eq\", value = \"chore\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n"
+            )
+        );
 
         // Host concerns stay global.
         for bad in ["[linear]\nendpoint = 'http://x'\n", "[scheduler]\ngh_binary = 'gh'\n", "[budget]\nsafety_margin = 0.1\n"] {
             assert!(toml::from_str::<RepoOverrides>(bad).is_err(), "{bad} must be rejected");
         }
         // An absolute priority_file is never read from a commit.
-        let abs = dir.path().join("elsewhere/PRIORITY.md");
+        let abs = dir.path().join("elsewhere/priority.toml");
         std::fs::write(repo.join(REPO_CONFIG_FILE), format!("priority_file = '{}'\n", abs.display())).unwrap();
         let mut cfg = Config::default();
         cfg.repo.path = repo.display().to_string();
@@ -2839,13 +2855,13 @@ restart_backoff_secs = [5, 10]
         assert!(err.contains("default-branch"), "{err}");
 
         // Committed on main: the working tree copy (7) is ignored.
-        std::fs::write(repo.join(REPO_CONFIG_FILE), "priority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 3\n")
+        std::fs::write(repo.join(REPO_CONFIG_FILE), "priority_file = \"docs/priority.toml\"\n[scheduler]\nmax_concurrent = 3\n")
             .unwrap();
-        std::fs::write(repo.join("docs/PRIORITY.md"), "## High\n- source: manual\n").unwrap();
+        std::fs::write(repo.join("docs/priority.toml"), "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"high\"\nall = [{ field = \"source\", op = \"eq\", value = \"manual\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap();
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-qm", "config"]);
         std::fs::write(repo.join(REPO_CONFIG_FILE), "[scheduler]\nmax_concurrent = 7\n").unwrap();
-        std::fs::write(repo.join("docs/PRIORITY.md"), "## Low\n- source: manual\n").unwrap();
+        std::fs::write(repo.join("docs/priority.toml"), "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"low\"\nall = [{ field = \"source\", op = \"eq\", value = \"manual\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap();
         let mut local = cfg.clone();
         local.apply_repo_overrides(&repo).unwrap();
         assert_eq!(local.scheduler.max_concurrent, 3);
@@ -2853,10 +2869,15 @@ restart_backoff_secs = [5, 10]
         assert_eq!(local.overrides.keys, vec!["priority.file".to_string(), "scheduler.max_concurrent".to_string()]);
         assert_eq!(
             local.rules_source(&paths),
-            RulesSource::Committed { repo: repo.clone(), rev: "main".into(), path: "docs/PRIORITY.md".into() }
+            RulesSource::Committed { repo: repo.clone(), rev: "main".into(), path: "docs/priority.toml".into() }
         );
-        assert_eq!(local.read_rules_text(&paths).unwrap().as_deref(), Some("## High\n- source: manual\n"));
-        assert_eq!(local.priority_file(&paths), repo.join("docs/PRIORITY.md"));
+        assert_eq!(
+            local.read_rules_text(&paths).unwrap().as_deref(),
+            Some(
+                "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"high\"\nall = [{ field = \"source\", op = \"eq\", value = \"manual\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n"
+            )
+        );
+        assert_eq!(local.priority_file(&paths), repo.join("docs/priority.toml"));
 
         // With origin/main ahead of the local branch, origin/main wins.
         let bare = dir.path().join("origin.git");

@@ -159,7 +159,7 @@ the same subset as `[claude]`.
 - `Policy::decide(task, prediction, preferred: &[ModelTier]) -> Decision`:
   candidates = enabled providers in `provider_order` × their enabled models
   by rank; preference list from the hard override (`task.model_override`,
-  never crosses providers), else the rules (`## Models` lists), else
+  never crosses providers), else the rules (`[models]` lists), else
   criticality defaults; each preferred model is tried through its downgrade
   chain; if nothing in the list is eligible and it was not a hard override,
   the first eligible candidate in provider order wins. `retry_at` is the
@@ -252,9 +252,9 @@ pub fn agent_for(p: Provider) -> &'static dyn AgentCli;
   period/window and cooldown), compact per-provider summary in the header,
   `next <model>` hint.
 - `task model <task> <model>` / `add --model` accept any provider's model
-  (warn when its provider is disabled). PRIORITY.md `## Models` accepts
-  alternatives: `critical: fable | gpt-6.1-sol`; overrides accept
-  `KEY: model = fable | gpt-6.1-sol`.
+  (warn when its provider is disabled). `priority.toml` `[models]` accepts arrays such as
+  `critical = ["fable", "gpt-6.1-sol"]`; `[[overrides]]` accepts the same
+  array through its `models` key.
 - `init` asks "Also run tasks on Codex (needs `codex login`)?" and "...on
   Google Antigravity (`agy`)?" when the binaries are on PATH, enabling the
   provider and probing once to seed the ledger. `init --reconfigure` covers

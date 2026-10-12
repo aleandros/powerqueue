@@ -50,7 +50,7 @@ const frames = [
     html:
       '<span class="k">$</span> powerqueue run\n' +
       '<span class="b">powerqueue</span> repo ~/code/app | linear ENG | max 2 concurrent | tmux session powerqueue\n' +
-      '<span class="d">INFO</span> loaded ~/.config/powerqueue/PRIORITY.md (0 warnings)\n' +
+      '<span class="d">INFO</span> loaded ~/.config/powerqueue/priority.toml (0 warnings)\n' +
       '<span class="d">INFO</span> linear sync: <span class="g">+3 new</span> · 0 updated · 0 closed\n' +
       '<span class="d">INFO</span> <span class="y">ENG-412</span> critical → <span class="p">fable</span> (incident label, period 18% elapsed)\n' +
       '<span class="d">INFO</span> created worktree …/worktrees/app/eng-412 on <span class="c">pq/eng-412</span>\n' +

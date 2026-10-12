@@ -30,8 +30,8 @@ use super::lifecycle::{pick_next, worktree_dir};
 use super::transitions::{Effect, LinearTarget};
 
 /// The rules' preference list for a task, most wanted first: the per-task
-/// override line (`KEY: model = ...`), else the first matching `## Models`
-/// `if` row, else the `## Models` entry for its criticality. Empty when the
+/// override models, else the first matching `model_rules`
+/// row, else the `models` entry for its criticality. Empty when the
 /// rules say nothing. (`task.model_override` is read by the policy itself.)
 pub fn preferred_models(rules: &PriorityRules, task: &Task, now: DateTime<Utc>) -> Vec<ModelTier> {
     let evaluated = rules.evaluate(task, now, None, 0.0, 0.0).models;
@@ -134,7 +134,7 @@ impl LaunchPlanner {
     fn decide(&mut self, ctx: LaunchContext<'_>, task: Task, now: DateTime<Utc>) -> Candidate {
         self.considered.insert(task.id);
         let prediction = self.estimator.predict(&task);
-        // Rules express a *preference* (`## Models`, `KEY: model = x`); only
+        // Rules express a *preference* (`models`, task override models); only
         // `task model <tier>` on the CLI is a hard override. Either way the
         // policy may still downgrade when the tier is out of budget.
         let preferred = preferred_models(ctx.rules, &task, now);
@@ -837,8 +837,8 @@ mod properties {
         missing.score = 10.0;
         let cfg = Config::default();
         let rules = [
-            ("api".into(), PriorityRules::parse("## Models\n- normal: haiku\n").unwrap()),
-            ("web".into(), PriorityRules::parse("## Models\n- normal: sonnet\n").unwrap()),
+            ("api".into(), PriorityRules::parse("version = 1\ndefault_criticality = \"normal\"\n[models]\nnormal = [\"haiku\"]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap()),
+            ("web".into(), PriorityRules::parse("version = 1\ndefault_criticality = \"normal\"\n[models]\nnormal = [\"sonnet\"]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap()),
         ]
         .into_iter()
         .collect();

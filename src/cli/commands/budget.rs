@@ -285,7 +285,7 @@ fn decision_why(d: &crate::budget::Decision) -> String {
 /// is reserved before the next one is judged), followed by the tasks that
 /// pass skips (waiting on a dependency, or a retry time still ahead). Each
 /// task gets its own prediction and the rules' preferred models (`task
-/// model` overrides are read by the policy itself). Fails when PRIORITY.md
+/// model` overrides are read by the policy itself). Fails when priority.toml
 /// cannot be parsed or the store cannot be read.
 fn queued_decisions(
     cfg: &Config,

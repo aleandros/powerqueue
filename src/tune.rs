@@ -6,11 +6,11 @@
 //! use sonnet", "run three tasks at once"), and powerqueue:
 //!
 //! 1. creates a *draft directory* under `<state>/tune/<id>/` holding copies
-//!    of `PRIORITY.md` and `config.toml` (plus the untouched originals in
+//!    of `priority.toml` and `config.toml` (plus the untouched originals in
 //!    `original/`), a `CONTEXT.md` with the current queue, tasks and budget,
 //!    and the full prompt it sends;
 //! 2. runs `claude -p` in that directory with the request, the grammar of
-//!    `PRIORITY.md`, the config reference and permission to run the read-only
+//!    `priority.toml`, the config reference and permission to run the read-only
 //!    `powerqueue priority check/simulate --file` and `config validate
 //!    --file` commands against the drafts;
 //! 3. validates what came back, shows the diff and the simulated queue with
@@ -36,7 +36,7 @@ use crate::paths::Paths;
 use crate::priority::PriorityRules;
 
 /// Name of the rules draft inside a draft directory.
-pub const PRIORITY_FILE: &str = "PRIORITY.md";
+pub const PRIORITY_FILE: &str = "priority.toml";
 /// Name of the config draft inside a draft directory.
 pub const CONFIG_FILE: &str = "config.toml";
 /// Sub-directory holding the untouched copies of the live files.
@@ -122,8 +122,8 @@ pub struct DraftMeta {
     /// Live paths the drafts stand for, so `--apply` and `--undo` know where to write.
     pub live_priority: PathBuf,
     pub live_config: PathBuf,
-    /// Whether the live `PRIORITY.md` existed when the draft was made (if
-    /// not, `original/PRIORITY.md` is absent and `--undo` deletes the file).
+    /// Whether the live `priority.toml` existed when the draft was made (if
+    /// not, `original/priority.toml` is absent and `--undo` deletes the file).
     pub had_priority: bool,
     /// The agent's final message.
     #[serde(default)]
@@ -323,7 +323,7 @@ pub fn atomic_write(path: &Path, text: &str, private: bool) -> Result<()> {
 /// One file of a draft compared with the live file it stands for.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FileChange {
-    /// `PRIORITY.md` or `config.toml`.
+    /// `priority.toml` or `config.toml`.
     pub name: String,
     /// Where the draft goes when applied.
     pub live: PathBuf,
@@ -541,7 +541,7 @@ pub fn build_prompt(instruction: &str, scope: TuneScope, context_md: &str, repo_
     p.push_str("\n\n## Files you may edit (current directory)\n\n");
     if scope.includes_priority() {
         p.push_str(
-            "- `PRIORITY.md` — the priority rules: criticality, score, skips and preferred models per task (grammar below).\n",
+            "- `priority.toml` — the priority rules: criticality, score, skips and preferred models per task (grammar below).\n",
         );
     }
     if scope.includes_config() {
@@ -551,9 +551,9 @@ pub fn build_prompt(instruction: &str, scope: TuneScope, context_md: &str, repo_
         TuneScope::Priority => {
             p.push_str("`config.toml` is present for reference only; the user asked for rule changes, so leave it untouched.\n")
         }
-        TuneScope::Config => {
-            p.push_str("`PRIORITY.md` is present for reference only; the user asked for config changes, so leave it untouched.\n")
-        }
+        TuneScope::Config => p.push_str(
+            "`priority.toml` is present for reference only; the user asked for config changes, so leave it untouched.\n",
+        ),
         TuneScope::All => {}
     }
     p.push_str(
@@ -564,9 +564,9 @@ pub fn build_prompt(instruction: &str, scope: TuneScope, context_md: &str, repo_
          `powerqueue budget set-*`, `powerqueue reset`, git, package managers).\n\n",
     );
     p.push_str("## How to verify\n\n");
-    p.push_str("- `powerqueue priority check --file PRIORITY.md` — parse errors and warnings with line numbers.\n");
+    p.push_str("- `powerqueue priority check --file priority.toml` — parse errors and warnings with line numbers.\n");
     p.push_str(
-        "- `powerqueue priority simulate --file PRIORITY.md --config config.toml --reasons` — the resulting queue \
+        "- `powerqueue priority simulate --file priority.toml --config config.toml --reasons` — the resulting queue \
          order, the model each task would get and every rule that fired (add `--no-budget` to rank without the \
          budget policy, `-a` to include finished tasks).\n",
     );
@@ -577,10 +577,10 @@ pub fn build_prompt(instruction: &str, scope: TuneScope, context_md: &str, repo_
     );
     p.push_str("## Guidelines\n\n");
     p.push_str(
-        "- Make the smallest change that achieves the request. A rule (`## Critical`, `## Scoring`, ...) when the \
-         user describes a kind of task (\"bugs\", \"label x\", \"project y\"); an entry in `## Overrides` when they \
+        "- Make the smallest change that achieves the request. A rule (`[[criticality]]`, `[[scoring]]`, ...) when the \
+         user describes a kind of task (\"bugs\", \"label x\", \"project y\"); an entry in `[[overrides]]` when they \
          name one ticket.\n\
-         - Ordering, criticality, skipping and model preference belong in `PRIORITY.md`; concurrency, budgets, \
+         - Ordering, criticality, skipping and model preference belong in `priority.toml`; concurrency, budgets, \
          pacing, cleanup and provider settings belong in `config.toml`.\n\
          - Keep comments, structure and formatting; adjust or append rather than rewrite.\n\
          - Never change `repo.path`, `linear.*` identifiers, paths or anything the request does not mention.\n\
@@ -600,7 +600,7 @@ pub fn build_prompt(instruction: &str, scope: TuneScope, context_md: &str, repo_
         p.push_str(overrides.trim_end());
         p.push_str("\n```\n");
     }
-    p.push_str("\n---\n\n# Reference: PRIORITY.md grammar\n\n");
+    p.push_str("\n---\n\n# Reference: priority.toml schema\n\n");
     p.push_str(priority_reference().trim_end());
     p.push_str("\n\n---\n\n# Reference: config.toml\n\n");
     p.push_str(config_reference().trim_end());
@@ -878,14 +878,23 @@ mod tests {
     #[test]
     fn create_load_list_and_resolve() {
         let (_tmp, paths) = paths();
-        let d1 = make_draft(&paths, "20260101T000000Z-aaaaaa", Some("## Low\n- label: chore\n"));
+        let d1 = make_draft(
+            &paths,
+            "20260101T000000Z-aaaaaa",
+            Some(
+                "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"low\"\nall = [{ field = \"label\", op = \"eq\", value = \"chore\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n",
+            ),
+        );
         assert_eq!(d1.meta.status, DraftStatus::Running);
         assert!(d1.meta.had_priority);
-        assert_eq!(std::fs::read_to_string(d1.original_path(PRIORITY_FILE)).unwrap(), "## Low\n- label: chore\n");
+        assert_eq!(
+            std::fs::read_to_string(d1.original_path(PRIORITY_FILE)).unwrap(),
+            "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"low\"\nall = [{ field = \"label\", op = \"eq\", value = \"chore\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n"
+        );
         let mut d2 = make_draft(&paths, "20260101T000001Z-bbbbbb", None);
         assert!(!d2.meta.had_priority);
         assert!(!d2.original_path(PRIORITY_FILE).exists());
-        assert!(std::fs::read_to_string(d2.priority_path()).unwrap().contains("## Critical"));
+        assert!(std::fs::read_to_string(d2.priority_path()).unwrap().contains("[[criticality]]"));
 
         let list = Draft::list(&paths).unwrap();
         assert_eq!(list.iter().map(|d| d.meta.id.as_str()).collect::<Vec<_>>(), [d1.meta.id.as_str(), d2.meta.id.as_str()]);
@@ -913,12 +922,12 @@ mod tests {
         let ch = changes(&draft).unwrap();
         assert_eq!(ch.len(), 2);
         let prio = ch.iter().find(|c| c.name == PRIORITY_FILE).unwrap();
-        assert!(prio.changed, "a missing live PRIORITY.md vs the template counts as a change");
+        assert!(prio.changed, "a missing live priority.toml vs the template counts as a change");
         assert!(prio.before.is_none());
         assert!(!ch.iter().find(|c| c.name == CONFIG_FILE).unwrap().changed);
 
         // The agent edits both drafts.
-        std::fs::write(draft.priority_path(), "## Overrides\n- INC-1: critical\n").unwrap();
+        std::fs::write(draft.priority_path(), "version = 1\ndefault_criticality = \"normal\"\n[[overrides]]\nkey = \"inc-1\"\ncriticality = \"critical\"\nskip = false\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap();
         std::fs::write(draft.config_path(), "[repo]\npath = \"/tmp/repo\"\n\n[scheduler]\nmax_concurrent = 3\n").unwrap();
         let valid = validate(&paths, &draft).unwrap();
         assert_eq!(valid.config.scheduler.max_concurrent, 3);
@@ -950,7 +959,7 @@ mod tests {
         let touched = undo(&mut draft).unwrap();
         assert_eq!(touched.len(), 2);
         assert_eq!(draft.meta.status, DraftStatus::Undone);
-        assert!(!paths.priority_file().exists(), "PRIORITY.md did not exist before, so undo removes it");
+        assert!(!paths.priority_file().exists(), "priority.toml did not exist before, so undo removes it");
         assert_eq!(std::fs::read_to_string(paths.config_file()).unwrap(), "[repo]\npath = \"/tmp/repo\"\n");
         assert!(undo(&mut draft).is_err(), "cannot undo twice");
     }
@@ -959,11 +968,11 @@ mod tests {
     fn validate_reports_every_problem() {
         let (_tmp, paths) = paths();
         let draft = make_draft(&paths, "20260101T000000Z-dddddd", None);
-        std::fs::write(draft.priority_path(), "## Critical\n- bogus: x\n").unwrap();
+        std::fs::write(draft.priority_path(), "version = 1\nunknown = true\n").unwrap();
         std::fs::write(draft.config_path(), "[repo]\npath = \"/tmp/repo\"\n[scheduler]\nmax_concurrent = 0\n").unwrap();
         let problems = validate(&paths, &draft).err().unwrap();
         assert_eq!(problems.len(), 2, "{problems:?}");
-        assert!(problems[0].starts_with("PRIORITY.md line 2:"), "{problems:?}");
+        assert!(problems[0].starts_with("priority.toml line 2:"), "{problems:?}");
         assert!(problems[1].contains("scheduler.max_concurrent"), "{problems:?}");
         std::fs::write(draft.config_path(), "not toml at all [[[").unwrap();
         let problems = validate(&paths, &draft).err().unwrap();
@@ -1026,15 +1035,19 @@ mod tests {
 
     #[test]
     fn unified_diff_has_headers_and_markers() {
-        let d = unified_diff("PRIORITY.md", "## Low\n- label: chore\n", "## Low\n- label: chore\n- label: docs\n");
-        assert!(d.starts_with("--- a/PRIORITY.md\n+++ b/PRIORITY.md\n@@"));
-        assert!(d.contains("\n+- label: docs\n"));
+        let d = unified_diff(
+            "priority.toml",
+            "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"low\"\nall = [{ field = \"label\", op = \"eq\", value = \"chore\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n",
+            "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"low\"\nall = [{ field = \"label\", op = \"eq\", value = \"chore\" }]\n[[criticality]]\nlevel = \"low\"\nall = [{ field = \"label\", op = \"eq\", value = \"docs\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n",
+        );
+        assert!(d.starts_with("--- a/priority.toml\n+++ b/priority.toml\n@@"));
+        assert!(d.contains("+all = [{ field = \"label\", op = \"eq\", value = \"docs\" }]"));
         assert_eq!(unified_diff("x", "same\n", "same\n"), "");
     }
 
     #[test]
     fn references_are_embedded() {
-        assert!(priority_reference().starts_with("# PRIORITY.md: the rules grammar"));
+        assert!(priority_reference().starts_with("# priority.toml: typed executable policy"));
         let cfg = config_reference();
         assert!(cfg.starts_with("# Configuration"), "{}", &cfg[..60]);
         assert!(cfg.contains("## `[scheduler]`"));
@@ -1048,10 +1061,10 @@ mod tests {
         let p = build_prompt("INC-1 first", TuneScope::Priority, "## Queue\n(empty)\n", Some("setup = [\"make\"]"));
         assert!(p.contains("## The request\n\nINC-1 first\n"));
         assert!(p.contains("`config.toml` is present for reference only"));
-        assert!(p.contains("priority simulate --file PRIORITY.md --config config.toml --reasons"));
+        assert!(p.contains("priority simulate --file priority.toml --config config.toml --reasons"));
         assert!(p.contains("## Queue\n(empty)"));
         assert!(p.contains("setup = [\"make\"]"));
-        assert!(p.contains("# Reference: PRIORITY.md grammar"));
+        assert!(p.contains("# Reference: priority.toml schema"));
         assert!(p.contains("# Reference: config.toml"));
         let p = build_prompt("x", TuneScope::All, "", None);
         assert!(!p.contains("reference only"));
@@ -1085,9 +1098,9 @@ mod tests {
         assert!(path.starts_with("/opt/pq/bin"), "{path}");
 
         let out = parse_agent_output(
-            r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":1234,"num_turns":3,"result":"Changed PRIORITY.md","session_id":"abc","total_cost_usd":0.05}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":1234,"num_turns":3,"result":"Changed priority.toml","session_id":"abc","total_cost_usd":0.05}"#,
         );
-        assert_eq!(out.result, "Changed PRIORITY.md");
+        assert_eq!(out.result, "Changed priority.toml");
         assert_eq!(out.report.num_turns, Some(3));
         assert_eq!(out.report.session_id.as_deref(), Some("abc"));
         assert!(!out.report.is_error);

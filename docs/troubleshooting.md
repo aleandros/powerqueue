@@ -122,8 +122,8 @@ Fixes:
   (`powerqueue add`) still work.
 - Tasks exist but stay `queued`: slots are full (`scheduler.max_concurrent`),
   or every tier is throttled (see below). A task that is `paused` with the
-  last error `skipped by PRIORITY.md` has a `KEY: skip` line in
-  `## Overrides` (`powerqueue task explain ENG-123`).
+  last error `skipped by PRIORITY.md` (the persisted compatibility marker) has a `[[overrides]]` row with `skip = true` in
+  `priority.toml` (`powerqueue task explain ENG-123`).
 - Tasks are `blocked`: the issue is `blocked by` another one that is not
   Done/Canceled in Linear and whose PR is not merged yet, or it has
   sub-issues (a parent is never run; it is closed once they are all done).
@@ -281,7 +281,7 @@ Fixes:
   `budget clear-limits` once `/usage` confirms the window reset.
 - Only Fable/Opus are preferred and both are reserved: lower
   `min_criticality`, lower `relax_after_fraction`, or let the policy choose by
-  removing the `## Models` line.
+  removing the model preference.
 - Too many parallel sessions drain the window: lower
   `scheduler.max_concurrent`.
 
@@ -370,7 +370,7 @@ powerqueue reset                  # asks, then does it (-y skips the prompt)
 when it will not go), kills the task windows and the `powerqueue` tmux
 session, removes every task worktree and stray directory under the worktree
 root, deletes `state/tasks/*` and empties every table of the database. It
-never touches `config.toml`, secrets, `PRIORITY.md` or the logs, and nothing
+never touches `config.toml`, secrets, `priority.toml` or the logs, and nothing
 outside the worktree root, the task state directory and the database is
 deleted.
 
@@ -452,7 +452,7 @@ Fixes:
   (`budget show` lists disabled providers at the end).
 - It is enabled but comes later in `budget.provider_order`: a provider is
   only a fallback for tasks whose preferences it does not match. Put it
-  first, or name its models in `PRIORITY.md` (`critical: gpt-6.1-sol | fable`).
+  first, or name its models in `priority.toml` (`critical = ["gpt-6.1-sol", "fable"]`).
 - The task has a hard override (`task model <task> opus`): it never crosses
   providers. Clear it with `task model <task> auto`.
 - Every model of the provider is disabled or has `share = 0`, or its
@@ -495,7 +495,7 @@ warns about tune drafts.
   Common causes: `claude` not logged in (`claude auth status`), the model in
   `tune.model` / `-m` not available on your plan, a nested session refusing to
   start, or a slow run hitting `tune.timeout_secs` (default 600 s).
-- `invalid:`: Claude wrote something `PRIORITY.md` or `config.toml` cannot
+- `invalid:`: Claude wrote something `priority.toml` or `config.toml` cannot
   parse; the problems are listed with line numbers. The live files were not
   touched. Fix the draft by hand and `powerqueue tune --apply <dir>`, or
   re-run with a more specific request.
@@ -516,7 +516,7 @@ directory to silence `doctor`.
 
 | What | Path |
 |------|------|
-| config, PRIORITY.md, secrets.toml | `~/.config/powerqueue/` |
+| config, priority.toml, secrets.toml | `~/.config/powerqueue/` |
 | database | `~/.local/share/powerqueue/powerqueue.db` (+ `-wal`, `-shm`) |
 | worktrees | `~/.local/share/powerqueue/worktrees/<repo>/<slug>` |
 | logs | `~/.local/state/powerqueue/logs/powerqueue.log.<date>` |
@@ -608,3 +608,7 @@ there is no fixed conversion from "1M weighted tokens" to Claude's "27%".
 The same message id is counted once even if its content spans several transcript
 lines or the daemon restarts. Provider quota percentages appear separately in
 `powerqueue budget` when an observed usage probe is available.
+
+Legacy `PRIORITY.md` policies must be migrated explicitly; see
+[policy migration and reload recovery](priority.md#migration-from-markdown).
+Invalid reloads retain the last valid policy until repaired.

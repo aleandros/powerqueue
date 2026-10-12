@@ -1,4 +1,4 @@
-//! Live reload of `PRIORITY.md`.
+//! Live reload of `priority.toml`.
 //!
 //! Editors usually save by writing a temporary file and renaming it over the
 //! original, which replaces the inode. Watching the file itself would
@@ -100,18 +100,18 @@ mod tests {
     #[test]
     fn reports_a_change_once() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("PRIORITY.md");
+        let path = dir.path().join("priority.toml");
         let mut w = RulesWatcher::new(&path).unwrap();
         assert!(!w.take_changed(), "nothing happened yet");
 
-        std::fs::write(&path, "## Low\n- label: chore\n").unwrap();
+        std::fs::write(&path, "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"low\"\nall = [{ field = \"label\", op = \"eq\", value = \"chore\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap();
         std::thread::sleep(Duration::from_millis(1200));
         assert!(w.take_changed(), "creation must be reported");
         assert!(!w.take_changed(), "edge-triggered: second call is false");
 
         // Atomic replace, as editors do it.
-        let tmp = dir.path().join("PRIORITY.md.tmp");
-        std::fs::write(&tmp, "## High\n- label: x\n").unwrap();
+        let tmp = dir.path().join("priority.toml.tmp");
+        std::fs::write(&tmp, "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"high\"\nall = [{ field = \"label\", op = \"eq\", value = \"x\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap();
         std::thread::sleep(Duration::from_millis(50));
         std::fs::rename(&tmp, &path).unwrap();
         std::thread::sleep(Duration::from_millis(1200));
@@ -122,7 +122,7 @@ mod tests {
     #[test]
     fn tolerates_missing_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("missing").join("PRIORITY.md");
+        let path = dir.path().join("missing").join("priority.toml");
         let mut w = RulesWatcher::new(&path).unwrap();
         assert!(!w.take_changed());
         assert_eq!(w.path(), path.as_path());

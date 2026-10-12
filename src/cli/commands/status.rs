@@ -296,7 +296,7 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
     }
     println!("{table}");
     if rows.iter().any(|r| r.task.model_override.is_some()) {
-        println!("{}", "* model forced by the user or PRIORITY.md".if_supports_color(Stream::Stdout, |t| t.dimmed()));
+        println!("{}", "* model forced by the user or priority.toml".if_supports_color(Stream::Stdout, |t| t.dimmed()));
     }
     Ok(0)
 }

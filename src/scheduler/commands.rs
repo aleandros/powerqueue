@@ -195,7 +195,7 @@ pub fn on_pause(task: &mut Task, live: bool) -> Vec<Effect> {
 /// `task resume` of a paused or `needs_attention` task: back to `running`
 /// when its session is still alive (`live`), to `in_review` when it was
 /// parked by the PR watcher (with a fresh staleness clock), else `queued`.
-/// A PRIORITY.md skip marker is cleared. Other states are left alone.
+/// A priority.toml skip marker is cleared. Other states are left alone.
 pub fn on_resume(task: &mut Task, live: bool, now: DateTime<Utc>) -> Vec<Effect> {
     if !matches!(task.state, TaskState::Paused | TaskState::NeedsAttention) {
         return Vec::new();

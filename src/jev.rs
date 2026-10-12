@@ -22,7 +22,7 @@ pub struct JevQuestion {
 }
 
 impl JevQuestion {
-    /// Build the question from the `## Jev` section of `PRIORITY.md`.
+    /// Build the question from the `## Jev` section of `priority.toml`.
     pub fn from_section(section: &JevSection) -> Self {
         Self { instructions: section.question.clone(), levels: section.levels.clone() }
     }

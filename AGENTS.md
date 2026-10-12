@@ -25,7 +25,7 @@ src/
   logging.rs         tracing: stderr + rotating JSON file
   store/             SQLite (rusqlite, WAL): tasks, sessions, usage, resource_samples, events, commands, hook_events, kv, jev_scores
   linear/            GraphQL client + issue→task sync
-  priority/          PRIORITY.md parser/evaluator + live reload
+  priority/          priority.toml parser/evaluator + live reload
   jev.rs             TypeSafe Jev "score" client (optional scoring)
   github.rs          `gh api graphql` PR status for the PR watcher
   github/            REST issue client, intake and sync

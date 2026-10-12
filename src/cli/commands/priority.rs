@@ -1,4 +1,4 @@
-//! `powerqueue priority ...`: show, check, edit, explain and simulate `PRIORITY.md`.
+//! `powerqueue priority ...`: show, check, edit, explain and simulate `priority.toml`.
 //!
 //! [`simulate_with`] and [`render_simulation`] are shared with `powerqueue
 //! tune`, which simulates a draft rules file against a draft config.
@@ -22,29 +22,56 @@ use crate::store::Store;
 /// Dispatch a `priority` subcommand. Returns the exit code.
 pub fn run(ctx: &mut Context, cmd: PriorityCommand) -> Result<i32> {
     match cmd {
-        PriorityCommand::Show => show(ctx),
+        PriorityCommand::Migrate { from, to } => {
+            use std::io::Write;
+            let markdown = std::fs::read_to_string(&from).with_context(|| format!("read {}", from.display()))?;
+            let (text, warnings) = crate::priority::migration::migrate(&markdown)?;
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&to)
+                .with_context(|| format!("create {} (migration never overwrites files)", to.display()))?;
+            output.write_all(text.as_bytes()).with_context(|| format!("write {}", to.display()))?;
+            if ctx.json {
+                println!("{}", serde_json::json!({"from": from, "to": to, "warnings": warnings}));
+            } else {
+                print_problems(&warnings, "warning");
+                println!(
+                    "Migrated {} to {}. Update priority.file / priority_file to this path; retain Markdown as optional intent only.",
+                    from.display(),
+                    to.display()
+                );
+            }
+            Ok(0)
+        }
+        PriorityCommand::Show(args) => show(ctx, args.project.as_deref()),
         PriorityCommand::Check(args) => check(ctx, &args),
-        PriorityCommand::Edit => edit(ctx),
+        PriorityCommand::Edit(args) => edit(ctx, args.project.as_deref()),
         PriorityCommand::Explain(task) => explain(ctx, &task),
         PriorityCommand::Simulate(args) => simulate(ctx, args),
-        PriorityCommand::Path => {
-            println!("{}", rules_path(ctx)?.display());
+        PriorityCommand::Path(args) => {
+            println!("{}", rules_path(ctx, args.project.as_deref())?.display());
             Ok(0)
         }
     }
 }
 
-/// Resolved location of `PRIORITY.md` (config, the repo's `priority_file`,
+/// Resolved location of `priority.toml` (config, the repo's `priority_file`,
 /// or the default), as a path in the checkout.
-fn rules_path(ctx: &mut Context) -> Result<PathBuf> {
-    Ok(live_source(ctx)?.path())
+fn rules_path(ctx: &mut Context, project: Option<&str>) -> Result<PathBuf> {
+    Ok(live_source(ctx, project)?.path())
 }
 
 /// Where the live rules come from: the file, or the committed copy when the
 /// repository's `.powerqueue.toml` is read from the default branch.
-fn live_source(ctx: &mut Context) -> Result<RulesSource> {
+fn live_source(ctx: &mut Context, project: Option<&str>) -> Result<RulesSource> {
     let paths = ctx.paths.clone();
-    Ok(ctx.config_or_default()?.rules_source(&paths))
+    let cfg = ctx.config_or_default()?.clone();
+    let cfg = match project {
+        Some(id) => cfg.for_project(id, &paths)?,
+        None => cfg,
+    };
+    Ok(cfg.rules_source(&paths))
 }
 
 fn missing_message(path: &Path) -> String {
@@ -119,8 +146,8 @@ fn print_problems(problems: &[RuleError], level: &str) {
     }
 }
 
-fn show(ctx: &mut Context) -> Result<i32> {
-    let source = live_source(ctx)?;
+fn show(ctx: &mut Context, project: Option<&str>) -> Result<i32> {
+    let source = live_source(ctx, project)?;
     let rules = match parse_source(ctx, &source, true)? {
         Parsed::Rules(r) => *r,
         Parsed::Missing => return Ok(0),
@@ -148,7 +175,7 @@ fn check(ctx: &mut Context, args: &CheckArgs) -> Result<i32> {
             }
             RulesSource::File(p.clone())
         }
-        None => live_source(ctx)?,
+        None => live_source(ctx, args.project.as_deref())?,
     };
     let Parsed::Rules(rules) = parse_source(ctx, &source, true)? else {
         return Ok(1);
@@ -199,7 +226,7 @@ fn with_model_source(models: String, source: Option<&str>) -> String {
 
 /// A note when the budget reserves `model` for tasks more critical than
 /// `task` (or, with `None`, for anything above `low`): a preference from
-/// `PRIORITY.md` does not lift that reservation, so the policy runs a
+/// `priority.toml` does not lift that reservation, so the policy runs a
 /// downgrade until it relaxes late in the period.
 fn reservation_note(cfg: &Config, model: &ModelTier, task: Option<Criticality>) -> Option<String> {
     let budget = cfg.budget.model_budget(model)?;
@@ -219,7 +246,7 @@ fn print_note(msg: &str) {
     println!("{} {msg}", "note:".if_supports_color(Stream::Stdout, |t| t.style(owo_colors::Style::new().yellow().bold())));
 }
 
-/// The `## Models` preference lists: conditional `if` rows in file order
+/// The model preference lists: conditional `if` rows in file order
 /// (first match wins), then one line per criticality that has one.
 fn print_model_lists(rules: &PriorityRules) {
     for r in &rules.model_rules {
@@ -233,8 +260,8 @@ fn print_model_lists(rules: &PriorityRules) {
     }
 }
 
-fn edit(ctx: &mut Context) -> Result<i32> {
-    let source = live_source(ctx)?;
+fn edit(ctx: &mut Context, project: Option<&str>) -> Result<i32> {
+    let source = live_source(ctx, project)?;
     let path = source.path();
     if let Some(rev) = source.rev() {
         println!(
@@ -244,6 +271,8 @@ fn edit(ctx: &mut Context) -> Result<i32> {
         );
     }
     if !path.exists() {
+        // Detect an unmigrated legacy default before creating a fresh template.
+        source.read()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         }
@@ -265,16 +294,17 @@ fn edit(ctx: &mut Context) -> Result<i32> {
     if !status.success() {
         bail!("editor `{editor}` exited with {status}");
     }
-    check(ctx, &CheckArgs::default())
+    check(ctx, &CheckArgs { project: project.map(str::to_owned), ..CheckArgs::default() })
 }
 
 fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
-    let source = live_source(ctx)?;
-    let path = source.path();
-    let full_cfg = ctx.config_or_default()?.clone();
-    let cfg = full_cfg.priority.clone();
     let store = ctx.store()?.clone();
     let task = store.find_task(&task_ref.task)?.ok_or_else(|| anyhow!("no task matches `{}`", task_ref.task))?;
+    let machine = ctx.config_or_default()?.clone();
+    let full_cfg = machine.for_task(&task, &ctx.paths)?;
+    let source = full_cfg.rules_source(&ctx.paths);
+    let path = source.path();
+    let cfg = full_cfg.priority.clone();
     let rules = match PriorityRules::from_source(&source)? {
         Some(rules) => rules,
         None => {
@@ -349,7 +379,7 @@ pub struct SimRow {
     pub score: f64,
     pub skip: bool,
     pub preferred_models: Vec<ModelTier>,
-    /// Which `PRIORITY.md` line chose `preferred_models` (see
+    /// Which `priority.toml` line chose `preferred_models` (see
     /// [`crate::priority::Evaluation::model_source`]).
     pub model_source: Option<String>,
     /// What the budget policy would run (None = throttled or `--no-budget`).
@@ -385,7 +415,7 @@ pub struct Simulation {
 fn simulate(ctx: &mut Context, args: SimulateArgs) -> Result<i32> {
     let source = match &args.file {
         Some(p) => RulesSource::File(p.clone()),
-        None => live_source(ctx)?,
+        None => live_source(ctx, args.project.as_deref())?,
     };
     let path = source.path();
     let cfg = match &args.config {
@@ -456,6 +486,10 @@ pub fn simulate_with(
             tasks.push(task);
         }
     }
+    if let Some(id) = &args.project {
+        cfg.for_project(id, &ctx.paths)?;
+        tasks.retain(|t| &t.execution_project == id);
+    }
     let draft = args.file.is_some() || args.config.is_some();
     if tasks.is_empty() {
         return Ok(Simulation {
@@ -472,10 +506,21 @@ pub fn simulate_with(
     let stored_order = ranked(&tasks, now);
 
     // Re-score every task with the rules under test.
-    let jev_enabled = rules.jev.enabled && cfg.priority.jev.enabled;
+    let mut policies = std::collections::BTreeMap::new();
     let mut evaluated: Vec<Evaluation> = Vec::with_capacity(tasks.len());
     let mut simulated_tasks: Vec<Task> = Vec::with_capacity(tasks.len());
     for task in &tasks {
+        if !policies.contains_key(&task.execution_project) {
+            let effective = cfg.for_task(task, &ctx.paths)?;
+            let policy = if args.file.is_some() || cfg.projects.is_empty() {
+                rules.clone()
+            } else {
+                crate::projects::load_rules(&effective, &ctx.paths)?
+            };
+            policies.insert(task.execution_project.clone(), (effective, policy));
+        }
+        let (effective, rules) = &policies[&task.execution_project];
+        let jev_enabled = rules.jev.enabled && effective.priority.jev.enabled;
         let jev = if jev_enabled && !new_keys.contains(&task.key) {
             store.jev_cached(task.id)?.map(|c| {
                 let n = rules.jev.levels.len().max(2) as f64;
@@ -484,7 +529,7 @@ pub fn simulate_with(
         } else {
             None
         };
-        let eval = rules.evaluate(task, now, jev, cfg.priority.jev.weight, cfg.priority.age_boost_per_hour);
+        let eval = rules.evaluate(task, now, jev, effective.priority.jev.weight, effective.priority.age_boost_per_hour);
         let mut simulated = task.clone();
         simulated.criticality = eval.criticality;
         simulated.score = eval.score;

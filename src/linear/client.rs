@@ -125,7 +125,7 @@ impl CycleStatus {
         }
     }
 
-    /// Lower-case word as used in `PRIORITY.md` (`cycle: active`).
+    /// Lower-case word as used in `priority.toml` (`cycle: active`).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Active => "active",

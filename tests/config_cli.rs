@@ -235,10 +235,10 @@ fn repo_overrides_are_attributed_validated_and_read_from_the_default_branch() {
     std::fs::create_dir_all(repo.path().join("docs")).unwrap();
     std::fs::write(
         repo.path().join(".powerqueue.toml"),
-        "priority_file = \"docs/PRIORITY.md\"\n[linear]\nexcluded_labels = [\"agent/skip\"]\n[scheduler]\nmax_concurrent = 3\n",
+        "priority_file = \"docs/priority.toml\"\n[linear]\nexcluded_labels = [\"agent/skip\"]\n[scheduler]\nmax_concurrent = 3\n",
     )
     .unwrap();
-    std::fs::write(repo.path().join("docs/PRIORITY.md"), "## High\n- source: manual\n").unwrap();
+    std::fs::write(repo.path().join("docs/priority.toml"), "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"high\"\nall = [{ field = \"source\", op = \"eq\", value = \"manual\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap();
 
     // show: header names the keys, lines are marked, JSON carries the attribution.
     pq(home.path())
@@ -259,7 +259,7 @@ fn repo_overrides_are_attributed_validated_and_read_from_the_default_branch() {
         .assert()
         .success()
         .stdout(predicate::str::contains("(working tree) is valid and sets priority.file, linear.excluded_labels"));
-    pq(home.path()).args(["priority", "path"]).assert().success().stdout(predicate::str::contains("docs/PRIORITY.md"));
+    pq(home.path()).args(["priority", "path"]).assert().success().stdout(predicate::str::contains("docs/priority.toml"));
     pq(home.path()).args(["priority", "check"]).assert().success().stdout(predicate::str::contains("1 rule(s)"));
 
     // A bad value set by the repo fails validation.
@@ -273,13 +273,13 @@ fn repo_overrides_are_attributed_validated_and_read_from_the_default_branch() {
     // default-branch: the committed file counts, the working tree does not.
     std::fs::write(
         repo.path().join(".powerqueue.toml"),
-        "priority_file = \"docs/PRIORITY.md\"\n[scheduler]\nmax_concurrent = 3\n",
+        "priority_file = \"docs/priority.toml\"\n[scheduler]\nmax_concurrent = 3\n",
     )
     .unwrap();
     git(repo.path(), &["add", "."]);
     git(repo.path(), &["commit", "-qm", "config"]);
     std::fs::write(repo.path().join(".powerqueue.toml"), "[scheduler]\nmax_concurrent = 8\n").unwrap();
-    std::fs::write(repo.path().join("docs/PRIORITY.md"), "## Low\n- source: manual\n## Low\n- label: x\n").unwrap();
+    std::fs::write(repo.path().join("docs/priority.toml"), "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"low\"\nall = [{ field = \"source\", op = \"eq\", value = \"manual\" }]\n[[criticality]]\nlevel = \"low\"\nall = [{ field = \"label\", op = \"eq\", value = \"x\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap();
     pq(home.path()).args(["config", "set", "repo.overrides_from", "default-branch"]).assert().success();
     pq(home.path())
         .args(["config", "show"])
@@ -291,7 +291,7 @@ fn repo_overrides_are_attributed_validated_and_read_from_the_default_branch() {
         .args(["priority", "check"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("docs/PRIORITY.md (main): 1 rule(s)"));
+        .stdout(predicate::str::contains("docs/priority.toml (main): 1 rule(s)"));
     pq(home.path()).args(["priority", "show"]).assert().success().stdout(predicate::str::contains("(main)"));
     pq(home.path()).args(["config", "validate"]).assert().success().stdout(predicate::str::contains("(main) is valid"));
     pq(home.path())

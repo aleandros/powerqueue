@@ -74,7 +74,7 @@ isolated instances run.
 
 | What | Where |
 |------|-------|
-| config, `PRIORITY.md`, `secrets.toml` | `~/.config/powerqueue/` |
+| config, `priority.toml`, `secrets.toml` | `~/.config/powerqueue/` |
 | database, worktrees | `~/.local/share/powerqueue/{powerqueue.db,worktrees/}` |
 | logs, per-task dirs, lock/pid | `~/.local/state/powerqueue/{logs/,tasks/,daemon.lock,daemon.pid}` |
 | service unit | `~/.config/systemd/user/powerqueue.service` (Linux), `~/Library/LaunchAgents/dev.powerqueue.plist` (macOS) |

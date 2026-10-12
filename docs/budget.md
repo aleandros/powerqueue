@@ -228,7 +228,7 @@ provider: providers in `provider_order`, each provider's models most capable
 
 1. `task.model_override` (set only by `task model <model>` and `add
    --model`): a *hard* override. Reason: `model override: gpt-6-astra`.
-2. The PRIORITY.md preference list (`KEY: model = x` override, then `##
+2. The priority.toml preference list (`[[overrides]]` models override, then `##
    Models` for the criticality), most wanted first. Reason: `preferred by
    rules: fable | gpt-6.1-sol`.
 3. The criticality default: `budget.default_model` for `normal`,
@@ -409,8 +409,8 @@ weighted budget, window 12M.
 ### Monday morning, incident ticket
 
 - Elapsed fraction 0.05. Ledger: Fable 0 of 20M spent, window empty.
-- Ticket `ENG-900`, label `incident` → `## Critical` → criticality `critical`,
-  `## Models` says `critical: fable`. Preferred tier: Fable.
+- Ticket `ENG-900`, label `incident` → a criticality rule → criticality `critical`,
+  `[models]` says `critical = ["fable"]`. Preferred tier: Fable.
 - Estimator: bucket `label=incident (n=3)`, prediction 600k weighted tokens.
 - Fable: no cooldown; `critical` meets `min_criticality`; 600k × 5 = 3M fits
   the 19M available (20M × 0.95), pushes the period to 4% and fits the 12M
@@ -420,8 +420,7 @@ weighted budget, window 12M.
   used`, `fable: eligible; 0% of its budget spent at 5% of the period`, ...,
   `preferred by rules: fable`, `preferred fable is eligible`.
 
-With Codex enabled too and `## Models` saying `critical: fable |
-gpt-6.1-sol`, a Claude rate limit (`fable: rate limited until … (claude
+With Codex enabled too and `[models]` saying `critical = ["fable", "gpt-6.1-sol"]`, a Claude rate limit (`fable: rate limited until … (claude
 account-wide)`) would send the same ticket to `gpt-6.1-sol` (`preferred fable
 not eligible and no cheaper tier is`, `preferred gpt-6.1-sol is eligible`).
 
@@ -433,8 +432,8 @@ reason `preferred fable not eligible; downgraded to opus`.
 ### Friday evening, backlog chore
 
 - Friday 18:00 → elapsed 0.68. Fable has spent 4M of 20M (20%, under-paced).
-- Ticket `ENG-912`, label `chore` → `## Low` → `low`; the template's
-  `## Models` says `low: sonnet` (without that line `budget.low_model`
+- Ticket `ENG-912`, label `chore` → a low criticality rule → `low`; the template's
+  `[models]` says `low = ["sonnet"]` (without that line `budget.low_model`
   applies, which is Sonnet too).
 - Fable: `low` is below `critical`; relaxed since 0.68 ≥ 0.5 and Fable is
   under-paced, so one level lower, `high`, qualifies. `low` is three levels
@@ -454,7 +453,7 @@ reason `preferred fable not eligible; downgraded to opus`.
 
 To let chores soak up leftover Fable on weekends, set
 `budget.providers.claude.models.fable.min_criticality = "high"` or add a scoring rule that
-raises the chore to `normal` on Fridays (edit PRIORITY.md; it reloads live).
+raises the chore to `normal` on Fridays (edit priority.toml; it reloads live).
 
 ## Tuning with `doctor`
 

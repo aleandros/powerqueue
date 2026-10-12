@@ -28,7 +28,7 @@
 //!    the model is reserved for is never capped by the share.
 //!
 //! Choice: the preference list is the hard override (`task.model_override`)
-//! when set, else the rules' list (`PRIORITY.md`, in order), else the
+//! when set, else the rules' list (`priority.toml`, in order), else the
 //! criticality default (`default_model` for normal, `low_model` for low,
 //! none for critical/high). Each preferred model is tried through its
 //! downgrade chain. When nothing in the list is eligible and the list was not

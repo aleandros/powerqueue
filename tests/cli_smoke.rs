@@ -159,8 +159,8 @@ fn conditional_model_rows_are_reported_by_priority_commands() {
     let repo = tempfile::tempdir().unwrap();
     write_minimal_config(home.path(), repo.path());
     std::fs::write(
-        home.path().join("config").join("PRIORITY.md"),
-        "## High\n- source: manual\n\n## Models\n- if label: model/fable: fable\n- high: opus\n",
+        home.path().join("config").join("priority.toml"),
+        "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"high\"\nall = [{ field = \"source\", op = \"eq\", value = \"manual\" }]\n[[model_rules]]\nmodels = [\"fable\"]\nall = [{ field = \"label\", op = \"eq\", value = \"model/fable\" }]\n[models]\nhigh = [\"opus\"]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n",
     )
     .unwrap();
     pq(home.path()).args(["add", "Grouped", "--key", "G-1", "--label", "model/fable"]).assert().success();
@@ -181,9 +181,9 @@ fn conditional_model_rows_are_reported_by_priority_commands() {
         .args(["priority", "check"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("models line 5: if label: model/fable → fable"))
+        .stdout(predicate::str::contains("models line 6: if label: model/fable → fable"))
         .stdout(predicate::str::contains("1 model if-row(s)"))
-        .stdout(predicate::str::contains("note: line 5: fable is reserved for critical tasks"));
+        .stdout(predicate::str::contains("note: line 6: fable is reserved for critical tasks"));
     pq(home.path()).args(["priority", "explain", "G-1"]).assert().success().stdout(
         predicate::str::contains("fable is reserved for critical tasks").and(predicate::str::contains("this task is high")),
     );
@@ -305,7 +305,7 @@ fn priority_simulate_json_is_one_document_without_a_rules_file() {
     let home = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
     write_minimal_config(home.path(), repo.path());
-    let _ = std::fs::remove_file(home.path().join("config").join("PRIORITY.md"));
+    let _ = std::fs::remove_file(home.path().join("config").join("priority.toml"));
     pq(home.path()).args(["add", "Something", "-k", "X-1"]).assert().success();
     let out = pq(home.path()).args(["--json", "priority", "simulate", "--no-budget"]).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -326,8 +326,8 @@ fn priority_simulate_ranks_without_writing() {
     let repo = tempfile::tempdir().unwrap();
     write_minimal_config(home.path(), repo.path());
     std::fs::write(
-        home.path().join("config").join("PRIORITY.md"),
-        "## Critical\n- label: incident\n\n## Low\n- label: chore\n\n## Overrides\n- manual-skip: skip\n\n## Models\n- critical: fable\n- low: sonnet\n",
+        home.path().join("config").join("priority.toml"),
+        "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"critical\"\nall = [{ field = \"label\", op = \"eq\", value = \"incident\" }]\n[[criticality]]\nlevel = \"low\"\nall = [{ field = \"label\", op = \"eq\", value = \"chore\" }]\n[[overrides]]\nkey = \"manual-skip\"\nskip = true\n[models]\ncritical = [\"fable\"]\nlow = [\"sonnet\"]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n",
     )
     .unwrap();
     for (title, key, label) in
@@ -345,7 +345,7 @@ fn priority_simulate_ranks_without_writing() {
         .stdout(predicate::str::contains("normal → critical"))
         .stdout(predicate::str::contains("normal → low"))
         .stdout(predicate::str::contains("skip"))
-        .stdout(predicate::str::contains("matched rule at line 2 (label: incident)"));
+        .stdout(predicate::str::contains("matched rule at line 3 (label: incident)"));
 
     // JSON: ranking order and the policy's model.
     let out = pq(home.path()).args(["--json", "priority", "simulate"]).output().unwrap();
@@ -369,7 +369,7 @@ fn priority_simulate_ranks_without_writing() {
 
     // A draft file is used instead of the live one, and a missing draft is an error.
     let draft = home.path().join("draft.md");
-    std::fs::write(&draft, "## High\n- label: chore\n").unwrap();
+    std::fs::write(&draft, "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"high\"\nall = [{ field = \"label\", op = \"eq\", value = \"chore\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap();
     pq(home.path())
         .args(["priority", "simulate", "--file", draft.to_str().unwrap(), "--no-budget", "-n", "1"])
         .assert()
