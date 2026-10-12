@@ -33,11 +33,18 @@
 //! unconsidered while a slot is free (bounded progress), and that the
 //! order the store lists the tasks in does not change the pass.
 //!
+//! Projects have independent model preferences, availability and checkout revisions.
+//! Reassignment and checkout checks interleave with lifecycle operations; rejected
+//! commands preserve the entire task/session. Configuration changes cannot rewrite
+//! bindings or other tasks, missing projects cannot launch, and mismatched bindings
+//! consume no slot or reservation. A separate SQLite model interleaves saved
+//! candidates, reassignment and conditional launch claims for two tasks.
+//!
 //! The ops are generated without preconditions and skipped when one does
 //! not hold, which keeps the generator simple and lets shrinking drop any
 //! op.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
 use proptest::collection::vec;
@@ -64,6 +71,10 @@ enum Op {
     Cancel,
     Retry,
     SetModel(Option<ModelTier>),
+    SetProject(String),
+    CheckBinding {
+        changed: bool,
+    },
     /// The policy found no model (`Decision.model == None`).
     Throttle(Decision),
     /// The policy chose a model: `on_starting`.
@@ -131,6 +142,8 @@ fn task_op() -> impl Strategy<Value = Op> {
         1 => Just(Op::Cancel),
         3 => Just(Op::Retry),
         1 => prop::option::of(claude_model()).prop_map(Op::SetModel),
+        4 => execution_project().prop_map(Op::SetProject),
+        2 => any::<bool>().prop_map(|changed| Op::CheckBinding { changed }),
         8 => hook_outcome().prop_map(Op::Hook),
         6 => (session_probe(), any::<bool>(), pane_tail(), prop::option::of(60i64..7200))
             .prop_map(|(probe, nudged, pane_tail, cooldown_secs)| Op::Probe { probe, nudged, pane_tail, cooldown_secs }),
@@ -193,7 +206,7 @@ impl TaskWorld {
         // no other daemon call sees the task between `on_starting` and the
         // launch or the crash that prevents it. The CLI's direct writes run
         // in another process and do see it; they must refuse (checked).
-        let direct = matches!(op, Op::Complete(_) | Op::HandOff(_) | Op::Block(_));
+        let direct = matches!(op, Op::Complete(_) | Op::HandOff(_) | Op::Block(_) | Op::SetProject(_) | Op::CheckBinding { .. });
         if self.start.is_some() && !direct && !matches!(op, Op::Claim | Op::LaunchFailed(_) | Op::Launched { .. }) {
             return None;
         }
@@ -203,13 +216,25 @@ impl TaskWorld {
             Op::Cancel => Some(commands::on_cancel(&mut self.task, self.session.as_mut(), now)),
             Op::Retry => Some(commands::on_retry(&mut self.task, self.session.as_mut(), now)),
             Op::SetModel(m) => Some(commands::on_set_model(&mut self.task, m.clone())),
+            Op::SetProject(project) => {
+                Some(commands::on_set_project(&mut self.task, project, self.session.is_some()).unwrap_or_default())
+            }
+            Op::CheckBinding { changed } => {
+                let bound = self.task.execution_repo.clone()?;
+                let checkout = if *changed { format!("{bound}/moved") } else { bound };
+                Some(commands::bind_project(&mut self.task, &checkout).unwrap_or_default())
+            }
             Op::Throttle(d) => self.can_start(now).then(|| launch::on_throttled(&mut self.task, d, now)),
             Op::Start(model, d) => {
                 if !self.can_start(now) {
                     return None;
                 }
                 let resuming = self.task.review_relaunch().is_some();
-                let checkout = format!("/repos/{}", self.task.execution_project);
+                let checkout = if cfg.repo.path.is_empty() {
+                    format!("/repos/{}", self.task.execution_project)
+                } else {
+                    cfg.repo.path.clone()
+                };
                 let mut effects = commands::bind_project(&mut self.task, &checkout).expect("same checkout");
                 let root = std::path::PathBuf::from("/wt").join(&self.task.execution_project);
                 let start = launch::on_starting(&mut self.task, model, d, cfg, &root, resuming);
@@ -410,7 +435,34 @@ fn check(
     effects: &[Effect],
 ) -> Result<(), TestCaseError> {
     let (b, a) = (&before.task, &after.task);
-    prop_assert_eq!(&a.execution_project, &b.execution_project, "execution project changed in a lifecycle transition");
+    if let Op::SetProject(project) = op {
+        let eligible = before.session.is_none()
+            && b.execution_repo.is_none()
+            && b.attempts == 0
+            && b.started_at.is_none()
+            && b.branch.is_none()
+            && b.worktree_path.is_none()
+            && b.review.is_none()
+            && b.pr_url.is_none()
+            && matches!(
+                b.state,
+                TaskState::Queued | TaskState::Paused | TaskState::Blocked | TaskState::Throttled | TaskState::NeedsAttention
+            );
+        let mut expected = b.clone();
+        if eligible {
+            expected.execution_project = project.clone();
+        }
+        prop_assert_eq!(a, &expected, "reassignment changed history or bypassed its guard");
+        prop_assert_eq!(&before.session, &after.session);
+        prop_assert_eq!(effects.is_empty(), !eligible || &b.execution_project == project);
+    } else {
+        prop_assert_eq!(&a.execution_project, &b.execution_project, "execution project changed in a lifecycle transition");
+    }
+    if matches!(op, Op::CheckBinding { .. }) {
+        prop_assert_eq!(a, b, "checking or rejecting a checkout changed the task");
+        prop_assert_eq!(&before.session, &after.session);
+        prop_assert!(effects.is_empty());
+    }
     if let Some(bound) = &b.execution_repo {
         prop_assert_eq!(a.execution_repo.as_ref(), Some(bound), "checkout changed on retry/review");
     }
@@ -436,10 +488,11 @@ fn check(
 
     // A launch under way is never interrupted: `start_task` persists
     // `running` when it ends, so a direct write landing in between would
-    // be lost. Only the launch's own steps apply.
+    // be lost. Only the launch's own steps change it; project commands refuse
+    // or confirm the existing binding without modifying it.
     if before.start.is_some() {
         prop_assert!(
-            matches!(op, Op::Claim | Op::LaunchFailed(_) | Op::Launched { .. }),
+            matches!(op, Op::Claim | Op::LaunchFailed(_) | Op::Launched { .. } | Op::SetProject(_) | Op::CheckBinding { .. }),
             "{}",
             ctx("applied to a task the daemon is launching")
         );
@@ -596,6 +649,7 @@ enum DaemonOp {
         task: usize,
         weighted: f64,
     },
+    ProjectSettings(String, (bool, bool, ModelTier)),
     PauseScheduling,
     ResumeScheduling,
     Tick(i64),
@@ -606,6 +660,7 @@ fn daemon_op() -> impl Strategy<Value = DaemonOp> {
         40 => (0usize..4, task_op()).prop_map(|(i, op)| DaemonOp::Task(i, op)),
         20 => vec(launch_outcome(), 0..4).prop_map(DaemonOp::LaunchPass),
         4 => (0usize..4, 0u64..2_000_000).prop_map(|(task, w)| DaemonOp::SpendRecorded { task, weighted: w as f64 }),
+        5 => (execution_project(), execution_project_settings()).prop_map(|(id, settings)| DaemonOp::ProjectSettings(id, settings)),
         1 => Just(DaemonOp::PauseScheduling),
         2 => Just(DaemonOp::ResumeScheduling),
         6 => (1i64..3 * 3600).prop_map(DaemonOp::Tick),
@@ -627,7 +682,8 @@ struct Pass {
 #[derive(Debug, Clone)]
 struct DaemonWorld {
     cfg: Config,
-    rules: PriorityRules,
+    rules: HashMap<String, PriorityRules>,
+    checkouts: HashMap<String, String>,
     now: DateTime<Utc>,
     tasks: Vec<TaskWorld>,
     /// The stored usage (what `Ledgers::load` returns at the next pass).
@@ -638,12 +694,27 @@ struct DaemonWorld {
 }
 
 impl DaemonWorld {
+    fn set_project(&mut self, id: &str, (available, moved, model): &(bool, bool, ModelTier)) {
+        self.checkouts.insert(id.into(), format!("/{}/{id}", if *moved { "moved" } else { "repos" }));
+        if *available {
+            let rules = PriorityRules::parse(&format!("## Models\n- normal: {}\n- critical: {}\n", model.alias(), model.alias()))
+                .expect("generated model rules");
+            self.rules.insert(id.into(), rules);
+        } else {
+            self.rules.remove(id);
+        }
+    }
+
     fn live_count(&self) -> u32 {
         self.tasks.iter().filter(|t| t.session_live()).count() as u32
     }
 
     fn ready(&self) -> Vec<TaskId> {
-        self.tasks.iter().filter(|t| t.can_start(self.now)).map(|t| t.task.id).collect()
+        self.tasks
+            .iter()
+            .filter(|t| t.can_start(self.now) && self.rules.contains_key(&t.task.execution_project))
+            .map(|t| t.task.id)
+            .collect()
     }
 
     /// Whether two ready tasks are indistinguishable to `pick_next` (same
@@ -705,7 +776,9 @@ impl DaemonWorld {
     fn step(&mut self, step: usize, idx: usize, op: &Op) -> Result<Option<Vec<Effect>>, TestCaseError> {
         let now = self.now;
         let before = self.tasks[idx].clone();
-        let Some(effects) = self.tasks[idx].apply(&self.cfg, now, op) else { return Ok(None) };
+        let mut cfg = self.cfg.clone();
+        cfg.repo.path = self.checkouts[&before.task.execution_project].clone();
+        let Some(effects) = self.tasks[idx].apply(&cfg, now, op) else { return Ok(None) };
         check(step, op, &self.cfg, &before, &self.tasks[idx], &effects)?;
         self.carry_out(&effects);
         // A stale or timed-out pane waiting for a usage reset put the
@@ -743,12 +816,13 @@ impl DaemonWorld {
         let margin = (1.0 - self.cfg.budget.safety_margin).max(0.0);
         let mut planner = LaunchPlanner::new(self.estimator.clone(), self.ledgers.clone(), candidates, slots);
         let mut outcomes = outcomes.iter();
-        loop {
-            let project_rules = self.tasks.iter().map(|t| (t.task.execution_project.clone(), self.rules.clone())).collect();
-            let Some(candidate) = planner.next_for_projects(&self.cfg.budget, &project_rules, &self.rate_limits, now) else {
-                break;
-            };
+        while let Some(candidate) = planner.next_for_projects(&self.cfg.budget, &self.rules, &self.rate_limits, now) {
             let idx = self.tasks.iter().position(|t| t.task.id == candidate.task.id).expect("a candidate is one of the tasks");
+            prop_assert_eq!(
+                &candidate.preferred,
+                &launch::preferred_models(&self.rules[&candidate.task.execution_project], &candidate.task, now),
+                "wrong project's policy"
+            );
             let what = format!(
                 "step {step} pass: {} ({:?}, score {}) decided {:?}",
                 candidate.task.key, candidate.task.state, candidate.task.score, candidate.decision.model
@@ -766,6 +840,15 @@ impl DaemonWorld {
                     prop_assert_eq!((task.state, task.not_before), (TaskState::Throttled, Some(retry_at)), "{}", what);
                 }
                 Some(model) => {
+                    let task = &self.tasks[idx].task;
+                    let checkout = &self.checkouts[&task.execution_project];
+                    if task.execution_repo.as_ref().is_some_and(|bound| bound != checkout) {
+                        // The shell rejects this before on_starting or any repository operation.
+                        let mut rejected = task.clone();
+                        prop_assert!(commands::bind_project(&mut rejected, checkout).is_err());
+                        prop_assert_eq!(&rejected, task);
+                        continue;
+                    }
                     let started = self.step(step, idx, &Op::Start(model, candidate.decision.clone()))?;
                     prop_assert!(started.is_some(), "{what}: the start was refused");
                     prop_assert!(self.step(step, idx, &Op::Claim)?.is_some(), "{what}: the claim was refused");
@@ -863,6 +946,10 @@ impl DaemonWorld {
                 ledger.add_spend(&tier, *weighted);
                 Ok(true)
             }
+            DaemonOp::ProjectSettings(id, settings) => {
+                self.set_project(id, settings);
+                Ok(true)
+            }
             DaemonOp::PauseScheduling => {
                 self.scheduling_paused = true;
                 Ok(true)
@@ -947,26 +1034,49 @@ fn daemon_task() -> impl Strategy<Value = TaskWorld> {
 }
 
 fn daemon_world() -> impl Strategy<Value = DaemonWorld> {
-    (vec(daemon_task(), 1..=4), scheduler_config(), budget_config(), ledgers(), rate_limits(), 1u32..=3).prop_map(
-        |(mut tasks, scheduler, budget, ledgers, rate_limits, max_concurrent)| {
+    (
+        vec(daemon_task(), 1..=4),
+        scheduler_config(),
+        budget_config(),
+        ledgers(),
+        rate_limits(),
+        1u32..=3,
+        prop::array::uniform3(execution_project_settings()),
+    )
+        .prop_map(|(mut tasks, scheduler, budget, ledgers, rate_limits, max_concurrent, projects)| {
             let mut seen = HashSet::new();
             tasks.retain(|t| seen.insert(t.task.id));
             let cfg = Config { scheduler: SchedulerConfig { max_concurrent, ..scheduler }, budget, ..Config::default() };
-            DaemonWorld {
+            let mut world = DaemonWorld {
                 cfg,
-                rules: PriorityRules::default(),
+                rules: HashMap::new(),
+                checkouts: HashMap::new(),
                 now: origin(),
                 tasks,
                 ledgers,
                 rate_limits,
                 estimator: Estimator::from_summaries(&[]),
                 scheduling_paused: false,
+            };
+            for (id, settings) in ["default", "api", "web"].into_iter().zip(projects) {
+                world.set_project(id, &settings);
             }
-        },
-    )
+            world
+        })
 }
 
 fn check_daemon(step: usize, op: &DaemonOp, before: &DaemonWorld, after: &DaemonWorld) -> Result<(), TestCaseError> {
+    for (idx, (b, a)) in before.tasks.iter().zip(&after.tasks).enumerate() {
+        let may_change = match op {
+            DaemonOp::Task(target, _) => idx == target % before.tasks.len(),
+            DaemonOp::LaunchPass(_) => before.rules.contains_key(&b.task.execution_project),
+            _ => false,
+        };
+        if !may_change {
+            prop_assert_eq!(&a.task, &b.task, "another task or project configuration changed this task");
+            prop_assert_eq!(&a.session, &b.session);
+        }
+    }
     let max = after.cfg.scheduler.max_concurrent;
     let (live_before, live_after) = (before.live_count(), after.live_count());
     // Sessions only start through a pass, which never goes beyond
@@ -1000,6 +1110,53 @@ proptest! {
                 continue;
             }
             check_daemon(step, op, &before, &world)?;
+        }
+    }
+}
+
+proptest! {
+    /// Interleave two task rows and two readers with the real SQLite guards.
+    /// A saved candidate may outlive several reassignments before its launch claim.
+    #[test]
+    fn stale_project_candidates_cannot_claim_another_repository(
+        ops in vec((0u8..3, 0usize..2, execution_project()), 1..50)
+    ) {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut rows: Vec<_> = ["A", "B"].into_iter().map(|key| {
+            let mut task = Task::new(key, key, TaskSource::Manual);
+            task.project = Some("independent source project".into());
+            store.insert_task(&task).unwrap();
+            store.get_task(task.id).unwrap().unwrap()
+        }).collect();
+        let mut snapshots = rows.clone();
+        for (op, idx, target) in ops {
+            let mut expected = rows.clone();
+            match op {
+                0 => snapshots[idx] = rows[idx].clone(),
+                1 => {
+                    let accepted = rows[idx].state == TaskState::Queued;
+                    prop_assert_eq!(store.set_execution_project(rows[idx].id, &rows[idx].execution_project, &target).is_ok(), accepted);
+                    if accepted { expected[idx].execution_project = target; }
+                }
+                _ => {
+                    let saved = &snapshots[idx];
+                    if saved.state != TaskState::Queued { continue; }
+                    let mut starting = saved.clone();
+                    starting.state = TaskState::Starting;
+                    starting.model = Some(ModelTier::sonnet());
+                    let accepted = rows[idx].state == saved.state && rows[idx].execution_project == saved.execution_project;
+                    prop_assert_eq!(store.claim_task_start(saved, &starting).unwrap(), accepted);
+                    if accepted {
+                        expected[idx].state = TaskState::Starting;
+                        expected[idx].model = starting.model;
+                    }
+                }
+            }
+            for i in 0..rows.len() {
+                rows[i] = store.get_task(rows[i].id).unwrap().unwrap();
+                expected[i].updated_at = rows[i].updated_at;
+                prop_assert_eq!(&rows[i], &expected[i], "claim/reassignment changed another field or task");
+            }
         }
     }
 }

@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Testing: extend the Rust daemon model with project reassignment, independent
+  policies, unavailable/moved checkouts, and stale SQLite launch claims. Extend
+  Quint with execution-project ownership invariants and a finite model of the
+  reassignment/launch race, including both models in the simulation checks.
 - Testing: replace the Python Quint replay adapter with a Rust Cargo example,
   reusing application event types and preserving anonymized schedules, coverage
   reports, task-prefix cutoffs and invalid-schedule checks. Projection tests run
