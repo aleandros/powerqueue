@@ -91,6 +91,7 @@ pub fn create_task(store: &Store, req: &NewTask) -> Result<Task> {
             "model_override": task.model_override,
             "labels": task.labels,
             "state": task.state,
+            "execution_project": task.execution_project,
         }),
     )?;
     tracing::debug!(task = %task.key, "manual task created");
@@ -109,7 +110,11 @@ pub fn run(ctx: &mut Context, args: AddArgs) -> Result<i32> {
         Some(d) => d.to_string(),
         None => String::new(),
     };
-    ctx.config_cloned()?.for_project(&args.project, &ctx.paths)?;
+    let cfg = ctx.config_cloned()?;
+    if !cfg.project_ids().contains(&args.project) {
+        bail!("unknown execution project `{}`; register it or select a registered project with --project", args.project);
+    }
+    cfg.for_project(&args.project, &ctx.paths)?;
     let req = NewTask {
         execution_project: Some(args.project),
         title: args.title,
@@ -140,6 +145,7 @@ pub fn run(ctx: &mut Context, args: AddArgs) -> Result<i32> {
         state
     );
     println!("  {}", task.title);
+    println!("  project: {}", task.execution_project);
     if let Some(m) = &task.model_override {
         println!(
             "  {}",

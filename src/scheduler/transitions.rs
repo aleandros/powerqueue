@@ -71,8 +71,21 @@ pub enum Effect {
     ForgetAnswer,
 }
 
-/// Record source admission without interrupting an active session or changing its state.
-/// Repeated identical decisions do not generate duplicate events.
+/// Deny admission when the source mapping conflicts with the saved project.
+/// Never retarget work or interrupt an active session; identical decisions are quiet.
+pub fn on_github_source_admission(task: &mut Task, admission: crate::domain::GitHubAdmission, project: &str) -> Vec<Effect> {
+    let admission = if task.execution_project == project {
+        admission
+    } else {
+        crate::domain::GitHubAdmission::denied(format!(
+            "source maps to project `{project}` but task retains `{}`; restore the mapping or deliberately reassign unstarted work",
+            task.execution_project
+        ))
+    };
+    on_github_admission(task, admission)
+}
+
+/// Record an approval decision, logging changes and preserving execution state.
 pub fn on_github_admission(task: &mut Task, admission: crate::domain::GitHubAdmission) -> Vec<Effect> {
     if task.github_admission.as_ref() == Some(&admission) {
         return Vec::new();
@@ -2114,6 +2127,18 @@ mod properties {
     }
 
     proptest! {
+        #[test]
+        fn source_routing_never_retargets_work(mut task in github_task(), matches in any::<bool>(), approved in any::<bool>()) {
+            let before = task.clone();
+            let project = if matches { task.execution_project.clone() } else { format!("{}-other", task.execution_project) };
+            let admission = crate::domain::GitHubAdmission { approved, reason: "verified".into() };
+            on_github_source_admission(&mut task, admission.clone(), &project);
+            prop_assert_eq!(task.execution_approved(), matches && approved);
+            prop_assert!(on_github_source_admission(&mut task, admission, &project).is_empty());
+            task.github_admission = before.github_admission.clone();
+            prop_assert_eq!(task, before);
+        }
+
         #[test]
         fn holding_revoked_setup_preserves_artifacts(mut task in github_task()) {
             task.github_admission = Some(crate::domain::GitHubAdmission::denied("revoked"));

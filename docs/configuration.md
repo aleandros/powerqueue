@@ -71,9 +71,9 @@ existing tasks with execution history are pinned to its canonical path. A task
 is otherwise pinned before its first repository operation. Retry, daemon
 restart and PR review preserve that binding and existing worktree paths.
 You may use `[projects.default.repo]` instead of `[repo]`, but cannot configure
-both. Register `default` even if you mainly use other projects: existing source
-intake and dashboard additions still select it. Automatic source routing is
-separate from execution registration.
+both. Register `default` even if you mainly use other projects: Linear intake,
+dashboard additions, and `add` without `--project` still select it. GitHub sources
+select their configured `execution_project` (also `default` when omitted).
 
 `powerqueue task project <task> <id>` deliberately reassigns an unstarted task,
 validates the target, and logs `task.project_set`. It refuses a task with a
@@ -144,9 +144,9 @@ anything else uses the explicit `codex:<name>` form.
 
 ## `[github]`
 
-GitHub Issues and Linear can feed the same queue independently. Source intake
-currently selects the `default` execution project: set `github.repository` to
-the `owner/repo` corresponding to that checkout. For a GitHub-only installation, start with `powerqueue init --no-linear`
+GitHub Issues and Linear can feed the same queue independently. Each GitHub
+source maps an `owner/repo` to a registered execution project. The source repository
+need not be the execution checkout. For a GitHub-only installation, start with `powerqueue init --no-linear`
 and add this to `config.toml`:
 
 ```toml
@@ -172,7 +172,9 @@ Intake uses the [GitHub Issues REST API](https://docs.github.com/en/rest/issues/
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `enabled` | `false` | enable daemon intake and lifecycle updates |
-| `repository` | `""` | explicit `owner/repo`; required when enabled or using GitHub helpers |
+| `repository` | `""` | explicit source `owner/repo`; required when enabled or using GitHub helpers |
+| `execution_project` | `"default"` | registered execution project ID; never inferred from labels or issue text |
+| `token_env` | unset | source-specific token environment variable; if set, missing/empty values fail without falling back to the global token |
 | `required_labels` | `["agent:ready"]` | configurable execution approval labels; **all** require current label-application events; cannot be empty when enabled |
 | `trusted_approvers` | `[]` | optional GitHub login allowlist (case insensitive); every effective approval event must be by an allowed actor; empty allows any verifiable actor |
 | `excluded_labels` | `["no-agent"]` | ignore issues with any listed label during intake |
@@ -185,6 +187,67 @@ Intake uses the [GitHub Issues REST API](https://docs.github.com/en/rest/issues/
 | `poll_interval_secs` | `60` | polling interval, 1–86400 seconds (minimum effective interval: 5 seconds) |
 | `max_issues` | `100` | cap raw entries scanned per poll before PR/excluded-label filtering; locally finished tasks do not count; raise it for larger intake queues |
 | `endpoint` | `https://api.github.com` | REST API base URL; supports Enterprise `/api/v3` and test servers |
+
+### Multiple GitHub sources
+
+Keep `[github]` for the original source and add `[[github_sources]]` tables, or
+configure all sources in that array (default `[]`). Each entry supports every
+key above, with independent defaults, filters, approval rules, credentials,
+polling interval and lifecycle settings. Enable each source explicitly:
+
+```toml
+[github]
+enabled = true
+repository = "acme/web-issues"
+execution_project = "default"
+
+[[github_sources]]
+enabled = true
+repository = "acme/api-issues"
+execution_project = "api" # register [projects.api.repo] as shown above
+required_labels = ["agent:ready", "team:api"]
+trusted_approvers = ["api-maintainer"]
+token_env = "POWERQUEUE_API_GITHUB_TOKEN"
+done_label = "agent:review"
+post_comments = false
+```
+
+`token_env` stores only the variable name in TOML. Make that variable available
+in the daemon's environment as well as your interactive shell. Omit it to use
+`GITHUB_TOKEN` or the existing stored GitHub token. A source with read access may
+import while another source uses write access for comments, labels and closure.
+Failed writes are reported and need manual reconciliation. Failed credentials,
+access, polling and rate limits affect only that source; a missing issue or failed
+request never counts as confirmed closure in any repository.
+
+Repositories are matched case insensitively. Configure each `owner/repo` only
+once, including across API hosts: task identity is `owner/repo#number`, so the
+same identity on two hosts is rejected rather than merged. Duplicate mappings
+and unregistered project IDs are configuration errors. Different repositories
+can have the same issue number, and several sources can target the same project.
+
+`github test` and `github sync` visit every configured source, including disabled
+sources for explicit previews. Successful sources continue when another fails;
+errors identify the repository and the command exits nonzero. `sync --apply` may
+therefore import successful sources while reporting errors for others. JSON keeps
+`fetched` and `changes`, and adds `sources` and `errors`; preview rows show the
+saved execution project. `task show` exposes source identity, saved project and
+admission, and `doctor` reports each source's access and routing conflicts.
+
+**Migration:** existing `[github]` configurations and stored tokens need no
+changes. Omitted `execution_project` means `default`; existing task assignments
+are preserved. Routing applies when a task is created. Later mapping changes do
+not retarget queued, running, retried or review tasks. A mismatch blocks future
+launches and appears in admission diagnostics. Restore the mapping or deliberately
+reassign unstarted tasks using `task project`; started work stays bound to its
+original project. Source lifecycle writes still target the original issue when
+that source remains configured and enabled. Removing or disabling a source blocks
+launches and reports skipped lifecycle writes.
+
+Manual `add --project ID` validates registration. Omitting `--project` always
+selects `default`, even with multiple projects; it never guesses from the current
+directory or source metadata. An unknown ID fails without creating a task.
+Linear routing is unchanged: Linear intake continues to select `default`.
 
 Task keys are `owner/repo#123`; use quoted keys in commands, for example
 `powerqueue task show 'owner/repo#123'`. Priority rules accept `source: github` and
@@ -657,7 +720,8 @@ replace the global value (lists are not merged), `instructions` and
 `prompt_template` and `priority_file` (relative to the repo root) replace
 `prompt.template` and `priority.file`. Secrets, `[budget]`, `[repo]` (except
 `setup`, `default_branch` and `branch_template`), `[tmux]`, `[logging]`,
-`[tune]`, `linear.endpoint`, `github.endpoint` and `scheduler.gh_binary` stay
+`[tune]`, `linear.endpoint`, `github.endpoint`, `github.execution_project`,
+`github.token_env`, `github_sources` and `scheduler.gh_binary` stay
 global: they describe the host, not the project. Unknown keys are rejected,
 and the daemon then keeps its previous configuration (event
 `daemon.reload_failed`; `config validate` and `doctor` show the problem).
@@ -679,7 +743,7 @@ assignee = "me"
 post_comments = "questions"
 done_state = ""              # "" clears a state the global config set
 
-[github]                     # everything in [github] but endpoint
+[github]                     # source settings except endpoint, execution_project and token_env
 required_labels = ["agent:ready"]
 
 [scheduler]                  # everything in [scheduler] but gh_binary

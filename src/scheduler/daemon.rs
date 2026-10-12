@@ -18,7 +18,7 @@ use tokio::sync::Notify;
 use crate::budget::{
     Decision, Estimator, Ledgers, PeriodClock, RATE_LIMITS_KEY, RateLimitState, load_observed, probe_all, tier_weight,
 };
-use crate::config::{Config, OverridesSource, REPO_CONFIG_FILE, RulesSource};
+use crate::config::{Config, GitHubConfig, OverridesSource, REPO_CONFIG_FILE, RulesSource};
 use crate::domain::{
     BRANCH_CREATED_EVENT, DaemonCommand, EventLevel, ModelTier, Provider, SCHEDULING_PAUSE_KEY, SchedulingPause, Session,
     SessionState, Task, TaskId, TaskSource, TaskState, is_closed_state_type,
@@ -160,7 +160,7 @@ struct RuntimeState {
     readers: HashMap<uuid::Uuid, TranscriptReader>,
     nudged: HashSet<uuid::Uuid>,
     rate_limits: RateLimitState,
-    github: GitHubRuntime,
+    github: HashMap<String, GitHubRuntime>,
     linear: Option<LinearClient>,
     linear_warned: bool,
     last_linear_poll: Option<DateTime<Utc>>,
@@ -249,7 +249,7 @@ impl Daemon {
             readers: HashMap::new(),
             nudged: HashSet::new(),
             rate_limits,
-            github: GitHubRuntime::default(),
+            github: HashMap::new(),
             linear: None,
             linear_warned: false,
             last_linear_poll: None,
@@ -666,7 +666,7 @@ impl Daemon {
         self.rt.tmux = Tmux::new(&cfg.tmux.binary, cfg.tmux.socket_name.clone());
         self.rt.repo = Repo::new(cfg.repo_path());
         self.rt.launcher = Launcher::new(self.paths.clone(), self.rt.tmux.clone())?;
-        self.rt.github = GitHubRuntime::default();
+        self.rt.github.clear();
         self.rt.linear = None;
         self.rt.linear_warned = false;
         self.rt.jev = None;
@@ -1551,8 +1551,8 @@ impl Daemon {
         body: String,
         kind: CommentKind,
     ) -> Option<Option<crate::linear::IssueComment>> {
-        if matches!(&task.source, TaskSource::GitHub { .. }) {
-            if !self.cfg.github.post_comments {
+        if let TaskSource::GitHub { repository, .. } = &task.source {
+            if !self.cfg.github_source(repository).is_ok_and(|s| s.post_comments) {
                 return None;
             }
             self.update_github(task, None, Some(body)).await.then_some(None)
@@ -1636,7 +1636,7 @@ impl Daemon {
     async fn post_question(&mut self, task: &Task, session_id: uuid::Uuid, text: &str, reason: Option<&str>, confirmed: bool) {
         let allowed = match &task.source {
             TaskSource::Linear { .. } => self.cfg.linear.post_comments.questions(),
-            TaskSource::GitHub { .. } => self.cfg.github.post_comments,
+            TaskSource::GitHub { repository, .. } => self.cfg.github_source(repository).is_ok_and(|s| s.post_comments),
             TaskSource::Manual => false,
         };
         if !allowed {
@@ -1869,60 +1869,71 @@ impl Daemon {
 
     // -------------------------------------------------------------- github
 
-    fn github_client(&mut self) -> Option<GitHubClient> {
-        if self.offline || !self.cfg.github.enabled {
+    fn github_client(&mut self, cfg: &GitHubConfig) -> Option<GitHubClient> {
+        if self.offline || !cfg.enabled {
             return None;
         }
-        if self.rt.github.client.is_none() {
-            let result =
-                self.secrets.require(SecretKind::GitHubToken).and_then(|key| GitHubClient::new(&self.cfg.github.endpoint, key));
+        let state = self.rt.github.entry(cfg.repository.to_ascii_lowercase()).or_default();
+        if state.client.is_none() {
+            let result = cfg.token(&self.secrets).and_then(|(key, _)| GitHubClient::new(&cfg.endpoint, key));
             match result {
-                Ok(client) => self.rt.github.client = Some(client),
-                Err(e) if !self.rt.github.warned => {
-                    self.rt.github.warned = true;
+                Ok(client) => state.client = Some(client),
+                Err(e) if !state.warned => {
+                    state.warned = true;
                     self.log(
                         None,
                         None,
                         EventLevel::Warn,
                         "github.unavailable",
-                        &format!("{e:#}; run `powerqueue secrets set github` and check github.endpoint"),
-                        serde_json::json!({}),
+                        &format!("GitHub source {}: {e:#}", cfg.repository),
+                        serde_json::json!({"repository": cfg.repository}),
                     );
                 }
                 Err(_) => {}
             }
         }
-        self.rt.github.client.clone()
+        self.rt.github.get(&cfg.repository.to_ascii_lowercase()).and_then(|s| s.client.clone())
+    }
+
+    fn github_backoff(&self, repository: &str, now: DateTime<Utc>) -> bool {
+        self.rt.github.get(&repository.to_ascii_lowercase()).and_then(|s| s.next_allowed).is_some_and(|at| now < at)
     }
 
     async fn refresh_github_admission(&mut self, task: &mut Task) -> Result<bool> {
         use crate::domain::GitHubAdmission;
         let TaskSource::GitHub { repository, number, .. } = &task.source else { return Ok(true) };
-        let admission = if !self.cfg.github.enabled || self.offline {
-            GitHubAdmission::denied("GitHub approval verification disabled or offline")
-        } else if !repository.eq_ignore_ascii_case(&self.cfg.github.repository) {
-            GitHubAdmission::denied("task repository does not match github.repository")
-        } else if self.rt.github.next_allowed.is_some_and(|at| Utc::now() < at) {
-            GitHubAdmission::denied("GitHub approval unavailable during API backoff")
-        } else if let Some(client) = self.github_client() {
-            let result = async {
-                let issue = client.get_issue(repository, *number).await?;
-                // A changed prompt must first go through sync and priority evaluation.
-                if issue.title != task.title || issue.body.as_deref().unwrap_or_default() != task.description {
-                    return Ok(GitHubAdmission::denied("issue title/body changed; sync and reapproval required"));
-                }
-                client.admission(&self.cfg.github, &issue).await
+        let source = self.cfg.github_source(repository).cloned();
+        let admission = match source {
+            Err(error) => GitHubAdmission::denied(format!("{error:#}")),
+            Ok(_) if self.offline => GitHubAdmission::denied("GitHub approval verification disabled or offline"),
+            Ok(cfg) if cfg.execution_project != task.execution_project => GitHubAdmission::denied(format!(
+                "source maps to project `{}` but task retains `{}`; restore the mapping or deliberately reassign unstarted work",
+                cfg.execution_project, task.execution_project
+            )),
+            Ok(_) if self.github_backoff(repository, Utc::now()) => {
+                GitHubAdmission::denied("GitHub approval unavailable during API backoff")
             }
-            .await;
-            match result {
-                Ok(admission) => admission,
-                Err(error) => {
-                    self.github_failure(&error);
-                    GitHubAdmission::denied(format!("GitHub approval unavailable: {error:#}"))
+            Ok(cfg) => {
+                if let Some(client) = self.github_client(&cfg) {
+                    let result = async {
+                        let issue = client.get_issue(repository, *number).await?;
+                        if issue.title != task.title || issue.body.as_deref().unwrap_or_default() != task.description {
+                            return Ok(GitHubAdmission::denied("issue title/body changed; sync and reapproval required"));
+                        }
+                        client.admission(&cfg, &issue).await
+                    }
+                    .await;
+                    match result {
+                        Ok(admission) => admission,
+                        Err(error) => {
+                            self.github_failure(&cfg, &error);
+                            GitHubAdmission::denied(format!("GitHub approval unavailable: {error:#}"))
+                        }
+                    }
+                } else {
+                    GitHubAdmission::denied("GitHub approval unavailable; check credentials")
                 }
             }
-        } else {
-            GitHubAdmission::denied("GitHub approval unavailable; check credentials")
         };
         let before = task.clone();
         let effects = transitions::on_github_admission(task, admission);
@@ -1934,33 +1945,50 @@ impl Daemon {
     }
 
     async fn poll_github(&mut self, now: DateTime<Utc>) -> Result<()> {
-        let interval = Duration::seconds(self.cfg.github.poll_interval_secs.clamp(5, 86400) as i64);
-        if self.rt.github.next_allowed.is_some_and(|t| now < t)
-            || (!self.rt.force_sync && self.rt.github.last_poll.is_some_and(|t| now - t < interval))
-        {
+        if self.offline {
             return Ok(());
         }
-        let Some(client) = self.github_client() else { return Ok(()) };
-        self.rt.github.last_poll = Some(now);
-        let plan = match plan_sync(&self.store, &self.cfg.github, &client).await {
-            Ok(plan) => plan,
-            Err(error) => {
-                self.github_failure(&error);
-                return Ok(());
+        let sources: Vec<_> = self.cfg.github_sources().into_iter().filter(|s| s.enabled).cloned().collect();
+        for cfg in sources {
+            if let Err(error) = self.cfg.github_source(&cfg.repository) {
+                self.github_failure(&cfg, &error);
+                continue;
             }
-        };
-        apply_plan(&self.store, &plan)?;
-        self.rt.github.backoff = Duration::zero();
-        self.rt.github.next_allowed = None;
-        if !plan.changes.is_empty() {
-            self.log(
-                None,
-                None,
-                EventLevel::Info,
-                "github.sync",
-                &format!("GitHub sync: {} queue changes", plan.changes.len()),
-                serde_json::json!({"fetched": plan.fetched, "changes": plan.changes.len()}),
-            );
+            let key = cfg.repository.to_ascii_lowercase();
+            let interval = Duration::seconds(cfg.poll_interval_secs.clamp(5, 86400) as i64);
+            let state = self.rt.github.entry(key.clone()).or_default();
+            if state.next_allowed.is_some_and(|t| now < t)
+                || (!self.rt.force_sync && state.last_poll.is_some_and(|t| now - t < interval))
+            {
+                continue;
+            }
+            state.last_poll = Some(now);
+            let Some(client) = self.github_client(&cfg) else { continue };
+            let result = async {
+                let plan = plan_sync(&self.store, &cfg, &client).await?;
+                apply_plan(&self.store, &plan)?;
+                anyhow::Ok(plan)
+            }
+            .await;
+            match result {
+                Ok(plan) => {
+                    let state = self.rt.github.entry(key).or_default();
+                    state.backoff = Duration::zero();
+                    state.next_allowed = None;
+                    if !plan.changes.is_empty() {
+                        self.log(
+                            None,
+                            None,
+                            EventLevel::Info,
+                            "github.sync",
+                            &format!("GitHub {}: {} queue changes", cfg.repository, plan.changes.len()),
+                            serde_json::json!({"repository": cfg.repository, "execution_project": cfg.execution_project,
+                                "fetched": plan.fetched, "changes": plan.changes.len()}),
+                        );
+                    }
+                }
+                Err(error) => self.github_failure(&cfg, &error),
+            }
         }
         Ok(())
     }
@@ -2033,22 +2061,22 @@ impl Daemon {
         Ok(())
     }
 
-    fn github_failure(&mut self, error: &anyhow::Error) {
-        let base = Duration::seconds(self.cfg.github.poll_interval_secs.clamp(5, 3600) as i64);
-        self.rt.github.backoff =
-            if self.rt.github.backoff.is_zero() { base } else { (self.rt.github.backoff * 2).min(Duration::hours(1)) };
-        let mut next = Utc::now() + self.rt.github.backoff;
+    fn github_failure(&mut self, cfg: &GitHubConfig, error: &anyhow::Error) {
+        let state = self.rt.github.entry(cfg.repository.to_ascii_lowercase()).or_default();
+        let base = Duration::seconds(cfg.poll_interval_secs.clamp(5, 3600) as i64);
+        state.backoff = if state.backoff.is_zero() { base } else { (state.backoff * 2).min(Duration::hours(1)) };
+        let mut next = Utc::now() + state.backoff;
         if let Some(limit) = error.downcast_ref::<crate::github::client::RateLimited>() {
             next = next.max(limit.retry_at);
         }
-        self.rt.github.next_allowed = Some(self.rt.github.next_allowed.map_or(next, |old| old.max(next)));
+        state.next_allowed = Some(state.next_allowed.map_or(next, |old| old.max(next)));
         self.log(
             None,
             None,
             EventLevel::Warn,
             "github.error",
-            &format!("{error:#}; GitHub calls paused until {next}"),
-            serde_json::json!({"retry_at": next}),
+            &format!("GitHub {}: {error:#}; source calls paused until {next}", cfg.repository),
+            serde_json::json!({"repository": cfg.repository, "retry_at": next}),
         );
     }
 
@@ -2062,23 +2090,42 @@ impl Daemon {
 
     async fn update_github(&mut self, task: &Task, target: Option<LinearTarget>, comment: Option<String>) -> bool {
         let TaskSource::GitHub { repository, number, .. } = &task.source else { return false };
-        // Configuration changes must not mutate issues in a previously configured repository.
-        if !repository.eq_ignore_ascii_case(&self.cfg.github.repository) {
-            return false;
-        }
-        if self.rt.github.next_allowed.is_some_and(|t| Utc::now() < t) {
+        let cfg = match self.cfg.github_source(repository).cloned() {
+            Ok(cfg) => cfg,
+            Err(error) => {
+                self.log(
+                    Some(task.id),
+                    None,
+                    EventLevel::Warn,
+                    "github.update_skipped",
+                    &format!("GitHub lifecycle update skipped: {error:#}"),
+                    serde_json::json!({"repository": repository}),
+                );
+                return false;
+            }
+        };
+        if self.github_backoff(repository, Utc::now()) {
             self.log(
                 Some(task.id),
                 None,
                 EventLevel::Warn,
                 "github.update_skipped",
                 "GitHub lifecycle update skipped during API backoff; update the issue manually",
-                serde_json::json!({}),
+                serde_json::json!({"repository": repository}),
             );
             return false;
         }
-        let Some(client) = self.github_client() else { return false };
-        let cfg = self.cfg.github.clone();
+        let Some(client) = self.github_client(&cfg) else {
+            self.log(
+                Some(task.id),
+                None,
+                EventLevel::Warn,
+                "github.update_skipped",
+                "GitHub lifecycle update unavailable; check source credentials and offline mode",
+                serde_json::json!({"repository": repository}),
+            );
+            return false;
+        };
         let label = match target {
             Some(LinearTarget::InProgress) => cfg.in_progress_label.as_deref(),
             Some(LinearTarget::Done) => cfg.done_label.as_deref(),
@@ -2123,7 +2170,7 @@ impl Daemon {
                 &format!("GitHub lifecycle update failed: {error:#}; update the issue manually"),
                 serde_json::json!({}),
             );
-            self.github_failure(&error);
+            self.github_failure(&cfg, &error);
             return false;
         }
         true
@@ -3382,6 +3429,7 @@ mod tests {
         secrets.set(SecretKind::GitHubToken, "test-token").unwrap();
         let mut cfg = Config::default();
         cfg.linear.enabled = false;
+        cfg.repo.path = dir.display().to_string();
         cfg.github.enabled = true;
         cfg.github.repository = "acme/app".into();
         cfg.github.endpoint = endpoint.into();
@@ -3422,7 +3470,9 @@ mod tests {
             match mode {
                 "offline" => daemon.offline = true,
                 "disabled" => daemon.cfg.github.enabled = false,
-                "backoff" => daemon.rt.github.next_allowed = Some(Utc::now() + Duration::minutes(10)),
+                "backoff" => {
+                    daemon.rt.github.entry("acme/app".into()).or_default().next_allowed = Some(Utc::now() + Duration::minutes(10))
+                }
                 "wrong-repository" => daemon.cfg.github.repository = "other/repo".into(),
                 _ => {}
             }
@@ -3460,9 +3510,98 @@ mod tests {
         daemon.poll_linear(Utc::now()).await.unwrap();
         assert!(daemon.rt.force_sync, "Linear must not consume the shared sync request");
         daemon.poll_github(Utc::now()).await.unwrap();
-        assert!(daemon.rt.github.next_allowed.unwrap() > Utc::now() + Duration::seconds(590));
+        assert!(daemon.rt.github["acme/app"].next_allowed.unwrap() > Utc::now() + Duration::seconds(590));
         daemon.poll_github(Utc::now()).await.unwrap();
         assert_eq!(server.received_requests().await.unwrap().len(), 1, "force sync must respect GitHub rate limits");
+    }
+
+    #[tokio::test]
+    async fn github_sources_isolate_polling_admission_and_lifecycle_settings() {
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut daemon = github_daemon(dir.path(), &server.uri());
+        let mut project = crate::projects::ProjectConfig::default();
+        project.repo.path = dir.path().display().to_string();
+        daemon.cfg.projects.insert("api".into(), project);
+        daemon.cfg.github_sources.push(GitHubConfig {
+            enabled: true,
+            repository: "acme/api".into(),
+            execution_project: "api".into(),
+            endpoint: server.uri(),
+            done_label: Some("api:done".into()),
+            close_on_complete: true,
+            post_comments: false,
+            ..Default::default()
+        });
+        daemon.rt.github.entry("acme/api".into()).or_default().client =
+            Some(GitHubClient::new(&server.uri(), "api-token".into()).unwrap());
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/app/issues"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "600"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let issue = serde_json::json!({"number":1, "title":"API work", "body":"", "state":"open",
+            "html_url":"https://github.com/acme/api/issues/1", "labels":[{"name":"agent:ready"}],
+            "created_at":"2026-09-01T12:00:00Z", "updated_at":"2026-09-01T12:01:00Z"});
+        for (url, value) in [("/repos/acme/api/issues", serde_json::json!([issue.clone()])), ("/repos/acme/api/issues/1", issue)]
+        {
+            Mock::given(method("GET"))
+                .and(path(url))
+                .and(header("authorization", "Bearer api-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(value))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(header("authorization", "Bearer api-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":{"repository":{"issue":{
+                "title":"API work", "body":"", "state":"OPEN", "updatedAt":"2026-09-01T12:01:00Z", "lastEditedAt":null,
+                "timelineItems":{"nodes":[{"__typename":"LabeledEvent", "id":"approval", "createdAt":"2026-09-01T12:01:00Z",
+                    "actor":{"login":"maintainer"}, "label":{"name":"agent:ready"}}],
+                    "pageInfo":{"hasNextPage":false, "endCursor":null}}
+            }}}})))
+            .mount(&server)
+            .await;
+        daemon.rt.force_sync = true;
+        daemon.poll_github(Utc::now()).await.unwrap();
+        daemon.poll_github(Utc::now()).await.unwrap();
+        let mut task = daemon.store.get_task_by_key("acme/api#1").unwrap().unwrap();
+        assert_eq!(task.execution_project, "api");
+        assert!(daemon.refresh_github_admission(&mut task).await.unwrap(), "source A backoff cannot block B");
+        assert_eq!(daemon.store.list_tasks().unwrap().len(), 1);
+        assert!(daemon.github_backoff("ACME/APP", Utc::now()));
+        assert!(!daemon.github_backoff("acme/api", Utc::now()));
+        Mock::given(method("POST"))
+            .and(path("/repos/acme/api/issues/1/labels"))
+            .and(header("authorization", "Bearer api-token"))
+            .and(body_partial_json(serde_json::json!({"labels":["api:done"]})))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/acme/api/issues/1"))
+            .and(header("authorization", "Bearer api-token"))
+            .and(body_partial_json(serde_json::json!({"state":"closed"})))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(daemon.update_github(&task, Some(LinearTarget::Done), Some("not posted".into())).await);
+        assert!(!server.received_requests().await.unwrap().iter().any(|r| r.url.path().ends_with("/comments")));
+        daemon.cfg.github_sources[0].execution_project = "default".into();
+        assert!(!daemon.refresh_github_admission(&mut task).await.unwrap());
+        assert_eq!(task.execution_project, "api");
+        assert!(task.github_admission.as_ref().unwrap().reason.contains("task retains"));
+        daemon.cfg.github_sources.clear();
+        assert!(!daemon.refresh_github_admission(&mut task).await.unwrap());
+        assert!(!daemon.update_github(&task, Some(LinearTarget::Done), None).await);
+        assert!(daemon.store.events_for_task(task.id, 30).unwrap().iter().any(|e| e.kind == "github.update_skipped"));
     }
 
     #[tokio::test]

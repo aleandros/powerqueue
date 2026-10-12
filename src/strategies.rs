@@ -612,6 +612,12 @@ pub fn admission_decision() -> impl Strategy<Value = crate::domain::GitHubAdmiss
     ])
 }
 
+/// A source sync's configured destination and independently verified approval.
+/// Missing destinations conflict with every registered task project in the model.
+pub fn source_routing_decision() -> impl Strategy<Value = (String, crate::domain::GitHubAdmission)> {
+    (prop_oneof![4 => execution_project(), 1 => Just("missing".into())], admission_decision())
+}
+
 /// Mix ordinary tasks and GitHub tasks with missing, denied or verified admission.
 pub fn with_source_admission(task: Task) -> impl Strategy<Value = Task> {
     (any::<bool>(), prop::option::of(admission_decision())).prop_map(move |(github, admission)| {

@@ -41,7 +41,7 @@ Global flags work on every command.
 
 | Command | What it does |
 |---------|--------------|
-| `add "title" [-d DESC\|-] [-c CRIT] [-m MODEL] [-k KEY] [-l LABEL]... [--paused] [--project ID]` | enqueue a manual task in the execution project (default `default`); `-d -` reads stdin |
+| `add "title" [-d DESC\|-] [-c CRIT] [-m MODEL] [-k KEY] [-l LABEL]... [--paused] [--project ID]` | enqueue a manual task in a registered execution project; omitted `--project` always selects `default`, unknown IDs fail; `-d -` reads stdin |
 | `task project <task> <id>` | reassign an unstarted task to a registered execution project; refuses tasks with previous execution history; validates again when the daemon applies the command |
 | `task show <task>` | details and timeline |
 | `task list [-a]` | same as `status` |
@@ -98,8 +98,8 @@ state machine allows it. `complete` and `block` always write directly.
 | `linear states <team>` | workflow states of a team |
 | `linear test` | verify the key (prints the viewer) |
 | `linear sync [--apply]` | fetch queued issues and print what would change; `--apply` applies it |
-| `github test` | check token access to the configured GitHub repository |
-| `github sync [--apply]` | preview GitHub intake, approval decisions/revocations, metadata updates and confirmed closures; `--apply` updates the local queue; supports `--json` |
+| `github test` | check token access to each configured GitHub source; report per-source errors with a nonzero exit |
+| `github sync [--apply]` | preview all GitHub sources with their execution projects, approval decisions/revocations, metadata updates and confirmed closures; `--apply` imports successful sources even if another fails; per-source errors cause a nonzero exit; `--json` includes `sources` and `errors` |
 
 ## Config and secrets
 

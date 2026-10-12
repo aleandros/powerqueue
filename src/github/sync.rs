@@ -2,14 +2,14 @@
 
 use std::collections::HashSet;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::Serialize;
 
 use super::client::{GitHubClient, GitHubIssue};
 use crate::config::GitHubConfig;
 use crate::domain::{EventLevel, Task, TaskSource, TaskState};
-use crate::scheduler::transitions::{Effect, on_github_admission, on_github_closed};
+use crate::scheduler::transitions::{Effect, on_github_closed, on_github_source_admission};
 use crate::store::Store;
 
 /// One planned local queue change. The task is the complete updated snapshot.
@@ -22,6 +22,7 @@ pub struct Change {
 /// A preview which can be applied without fetching a different remote snapshot.
 #[derive(Debug, Default, Serialize)]
 pub struct SyncPlan {
+    pub execution_project: String,
     pub fetched: usize,
     pub changes: Vec<Change>,
 }
@@ -70,10 +71,11 @@ pub async fn plan_sync(store: &Store, cfg: &GitHubConfig, client: &GitHubClient)
         })
         .collect();
     let issues = client.fetch_issues_ignoring(cfg, &finished).await?;
-    let mut plan = SyncPlan { fetched: issues.len(), changes: Vec::new() };
+    let mut plan = SyncPlan { execution_project: cfg.execution_project.clone(), fetched: issues.len(), changes: Vec::new() };
     let mut reconciled = HashSet::new();
     for issue in &issues {
         let mut fresh = task_from_issue(&cfg.repository, issue);
+        fresh.execution_project = cfg.execution_project.clone();
         let admission = client.admission(cfg, issue).await?;
         reconciled.insert(issue.number);
         match store.get_task_by_key(&fresh.key)? {
@@ -88,12 +90,18 @@ pub async fn plan_sync(store: &Store, cfg: &GitHubConfig, client: &GitHubClient)
             {
                 let before = task.clone();
                 update_issue(&mut task, issue);
-                on_github_admission(&mut task, admission);
+                on_github_source_admission(&mut task, admission, &cfg.execution_project);
                 if task != before {
                     plan.changes.push(Change { action: "update", task });
                 }
             }
-            _ => {}
+            Some(task) => {
+                if !matches!(&task.source, TaskSource::GitHub { repository, number, .. }
+                    if repository.eq_ignore_ascii_case(&cfg.repository) && *number == issue.number)
+                {
+                    bail!("GitHub source identity {} conflicts with existing task {}", fresh.key, task.id);
+                }
+            }
         }
     }
     for mut task in store.list_open_tasks()? {
@@ -104,7 +112,7 @@ pub async fn plan_sync(store: &Store, cfg: &GitHubConfig, client: &GitHubClient)
         let issue = client.get_issue(repository, *number).await?;
         let before = task.clone();
         update_issue(&mut task, &issue);
-        on_github_admission(&mut task, client.admission(cfg, &issue).await?);
+        on_github_source_admission(&mut task, client.admission(cfg, &issue).await?, &cfg.execution_project);
         let closed = issue.state == "closed" && issue.pull_request.is_none();
         if closed {
             on_github_closed(&mut task, Utc::now());
@@ -125,10 +133,19 @@ pub fn apply_plan(store: &Store, plan: &SyncPlan) -> Result<()> {
         let admission = task.github_admission.take();
         let effects;
         if change.action == "create" {
-            if store.get_task_by_key(&task.key)?.is_some() {
+            if let Some(current) = store.get_task_by_key(&task.key)? {
+                let same_source = matches!((&current.source, &task.source),
+                    (TaskSource::GitHub { repository: a, number: an, .. }, TaskSource::GitHub { repository: b, number: bn, .. })
+                    if a.eq_ignore_ascii_case(b) && an == bn);
+                if !same_source || current.execution_project != plan.execution_project {
+                    bail!(
+                        "GitHub task {} acquired a conflicting source or execution project after preview; sync again",
+                        task.key
+                    );
+                }
                 continue;
             }
-            effects = admission.map(|a| on_github_admission(&mut task, a)).unwrap_or_default();
+            effects = admission.map(|a| on_github_source_admission(&mut task, a, &plan.execution_project)).unwrap_or_default();
             store.insert_task(&task).with_context(|| format!("create GitHub task {}", task.key))?;
         } else {
             let Some(mut current) = store.get_task(task.id)? else { continue };
@@ -146,7 +163,7 @@ pub fn apply_plan(store: &Store, plan: &SyncPlan) -> Result<()> {
                 current.labels = task.labels;
                 current.source = task.source;
             }
-            effects = admission.map(|a| on_github_admission(&mut current, a)).unwrap_or_default();
+            effects = admission.map(|a| on_github_source_admission(&mut current, a, &plan.execution_project)).unwrap_or_default();
             current.updated_at = Utc::now();
             store.update_task(&current).with_context(|| format!("update GitHub task {}", current.key))?;
             task = current;
@@ -162,7 +179,7 @@ pub fn apply_plan(store: &Store, plan: &SyncPlan) -> Result<()> {
             EventLevel::Info,
             kind,
             &format!("GitHub sync: {} {}", change.action, task.key),
-            serde_json::json!({"source": "github", "key": task.key}),
+            serde_json::json!({"source": "github", "key": task.key, "execution_project": task.execution_project}),
         )?;
         for effect in effects {
             if let Effect::Log { level, kind, message, data } = effect {

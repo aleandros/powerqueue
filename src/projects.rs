@@ -81,7 +81,17 @@ impl Config {
                 && !k.starts_with("github.")
                 && !["scheduler.max_concurrent", "scheduler.tick_secs", "scheduler.resource_sample_secs"].contains(&k.as_str())
         });
+        // The resolved config has one checkout and no registry. Validate source
+        // mappings against the machine registry, not this temporary projection.
+        let routing = self.github_routing_problems();
+        if !routing.is_empty() {
+            bail!("{}", routing.join("; "));
+        }
+        let github = std::mem::take(&mut cfg.github);
+        let github_sources = std::mem::take(&mut cfg.github_sources);
         cfg.ensure_valid().with_context(|| format!("execution project `{id}`"))?;
+        cfg.github = github;
+        cfg.github_sources = github_sources;
         Ok(cfg)
     }
 

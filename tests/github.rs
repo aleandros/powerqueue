@@ -689,3 +689,202 @@ fn schema_upgrade_leaves_legacy_github_tasks_unverified() {
     assert!(restored.github_admission.is_none());
     assert!(!restored.execution_approved());
 }
+
+#[test]
+fn source_registry_migrates_legacy_and_rejects_unknown_or_conflicting_routes() {
+    let mut cfg =
+        Config::from_toml("[repo]\npath = '/tmp/default'\n[github]\nenabled = true\nrepository = 'acme/app'\n").unwrap();
+    assert!(cfg.github_routing_problems().is_empty());
+    assert_eq!(cfg.github_source("ACME/APP").unwrap().execution_project, "default");
+    assert_eq!(cfg.github_sources().len(), 1);
+    cfg.github_sources.push(GitHubConfig {
+        enabled: true,
+        repository: "ACME/App".into(),
+        execution_project: "api".into(),
+        ..Default::default()
+    });
+    assert!(cfg.github_source("acme/app").is_err());
+    assert_eq!(cfg.github_routing_problems().len(), 2);
+    cfg.github_sources[0].repository = "acme/api".into();
+    let mut project = powerqueue::projects::ProjectConfig::default();
+    project.repo.path = "/tmp/api".into();
+    cfg.projects.insert("api".into(), project);
+    assert!(cfg.github_routing_problems().is_empty());
+    let roundtrip = Config::from_toml(&toml::to_string(&cfg).unwrap()).unwrap();
+    assert_eq!(roundtrip, cfg);
+    let dir = tempfile::tempdir().unwrap();
+    assert!(cfg.for_project("api", &powerqueue::paths::Paths::rooted(dir.path())).is_ok());
+}
+
+#[tokio::test]
+async fn multi_source_identity_routing_and_reconciliation_remain_isolated() {
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+    let store = Store::open_in_memory().unwrap();
+    let mut ca = config(&a);
+    ca.execution_project = "frontend".into();
+    let mut cb = config(&b);
+    cb.repository = "acme/backend".into();
+    cb.execution_project = "backend".into();
+    list(&a, vec![issue(1)]).await;
+    let mut other = issue(1);
+    other["html_url"] = json!("https://github.com/acme/backend/issues/1");
+    approval(&b, vec![other.clone()]).await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/backend/issues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vec![other]))
+        .mount(&b)
+        .await;
+    for (source, server) in [(&ca, &a), (&cb, &b)] {
+        let plan = plan_sync(&store, source, &client(server)).await.unwrap();
+        assert_eq!(plan.changes[0].task.execution_project, source.execution_project);
+        apply_plan(&store, &plan).unwrap();
+        assert!(plan_sync(&store, source, &client(server)).await.unwrap().changes.is_empty());
+    }
+    assert_eq!(store.list_tasks().unwrap().len(), 2);
+    // Metadata and mapping changes cannot silently retarget queued or active work.
+    ca.execution_project = "backend".into();
+    let plan = plan_sync(&store, &ca, &client(&a)).await.unwrap();
+    assert_eq!(plan.changes[0].task.execution_project, "frontend");
+    assert!(!plan.changes[0].task.execution_approved());
+    let mut active = store.get_task_by_key("acme/app#1").unwrap().unwrap();
+    active.state = TaskState::Running;
+    active.attempts = 2;
+    active.execution_repo = Some("/original/checkout".into());
+    store.update_task(&active).unwrap();
+    apply_plan(&store, &plan).unwrap();
+    let saved = store.get_task(active.id).unwrap().unwrap();
+    assert_eq!(saved.state, TaskState::Running);
+    assert_eq!(saved.execution_project, "frontend");
+    assert_eq!(saved.execution_repo, active.execution_repo);
+    assert!(!saved.execution_approved());
+    // Failed access to A cannot close B; only B's confirmed closure can do that.
+    a.reset().await;
+    Mock::given(method("GET")).respond_with(ResponseTemplate::new(404)).mount(&a).await;
+    assert!(plan_sync(&store, &ca, &client(&a)).await.is_err());
+    assert_eq!(store.get_task_by_key("acme/backend#1").unwrap().unwrap().state, TaskState::Queued);
+    b.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/backend/issues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&b)
+        .await;
+    let mut closed = issue(1);
+    closed["state"] = json!("closed");
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/backend/issues/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(closed))
+        .mount(&b)
+        .await;
+    apply_plan(&store, &plan_sync(&store, &cb, &client(&b)).await.unwrap()).unwrap();
+    assert_eq!(store.get_task_by_key("acme/backend#1").unwrap().unwrap().state, TaskState::Cancelled);
+    assert_eq!(store.get_task(active.id).unwrap().unwrap(), saved);
+}
+
+#[tokio::test]
+async fn stale_preview_cannot_approve_a_concurrently_reassigned_task() {
+    let server = MockServer::start().await;
+    let store = Store::open_in_memory().unwrap();
+    let mut saved = task(1);
+    saved.github_admission = None;
+    store.insert_task(&saved).unwrap();
+    list(&server, vec![issue(1)]).await;
+    let plan = plan_sync(&store, &config(&server), &client(&server)).await.unwrap();
+    store.set_execution_project(saved.id, "default", "other").unwrap();
+    apply_plan(&store, &plan).unwrap();
+    saved = store.get_task(saved.id).unwrap().unwrap();
+    assert_eq!(saved.execution_project, "other");
+    assert!(!saved.execution_approved());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_multi_source_tokens_partial_failure_preview_and_manual_selection() {
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+    list(&a, vec![issue(1)]).await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/backend/issues"))
+        .and(header("authorization", "Bearer second-token"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&b)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = format!(
+        r#"
+[repo]
+path = {root:?}
+[linear]
+enabled = false
+[projects.api.repo]
+path = {root:?}
+[[github_sources]]
+enabled = true
+repository = "acme/app"
+execution_project = "api"
+endpoint = {a:?}
+token_env = "PQ_TEST_SOURCE_A_TOKEN"
+[[github_sources]]
+enabled = true
+repository = "acme/backend"
+execution_project = "default"
+endpoint = {b:?}
+token_env = "PQ_TEST_SOURCE_B_TOKEN"
+"#,
+        root = tmp.path(),
+        a = a.uri(),
+        b = b.uri()
+    );
+    std::fs::create_dir_all(tmp.path().join("config")).unwrap();
+    std::fs::write(tmp.path().join("config/config.toml"), cfg).unwrap();
+    let command = |args: &[&str]| {
+        let mut cmd = assert_cmd::Command::cargo_bin("powerqueue").unwrap();
+        cmd.env("POWERQUEUE_HOME", tmp.path())
+            .env("POWERQUEUE_SECRETS", "file")
+            .env("GITHUB_TOKEN", "wrong-global-token")
+            .env("PQ_TEST_SOURCE_A_TOKEN", "first-token")
+            .env("PQ_TEST_SOURCE_B_TOKEN", "second-token")
+            .args(args);
+        cmd
+    };
+    let out = command(&["--json", "github", "sync"]).assert().code(1).get_output().stdout.clone();
+    let preview: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(preview["changes"][0]["task"]["execution_project"], "api");
+    assert_eq!(preview["errors"][0]["repository"], "acme/backend");
+    command(&["--json", "task", "show", "acme/app#1"]).assert().failure();
+    command(&["--json", "github", "sync", "--apply"]).assert().code(1);
+    let out = command(&["--json", "task", "show", "acme/app#1"]).assert().success().get_output().stdout.clone();
+    let saved: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(saved["task"]["execution_project"], "api");
+    assert_eq!(saved["source_route"]["execution_project"], "api");
+    assert_eq!(saved["source_route"]["matches_saved_project"], true);
+    for (args, project) in
+        [(vec!["--json", "add", "Default manual"], "default"), (vec!["--json", "add", "API manual", "--project", "api"], "api")]
+    {
+        let out = command(&args).assert().success().get_output().stdout.clone();
+        assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["execution_project"], project);
+    }
+    command(&["add", "Unknown", "--project", "missing"]).assert().failure();
+    let before = a.received_requests().await.unwrap().len();
+    let out =
+        command(&["--json", "github", "sync"]).env_remove("PQ_TEST_SOURCE_A_TOKEN").assert().code(1).get_output().stdout.clone();
+    let errors: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(errors["errors"].as_array().unwrap().len(), 2);
+    assert_eq!(a.received_requests().await.unwrap().len(), before, "explicit missing token must not use the global token");
+    for request in a.received_requests().await.unwrap() {
+        assert_eq!(request.headers.get("authorization").unwrap(), "Bearer first-token");
+    }
+}
+
+#[tokio::test]
+async fn conflicting_source_identity_is_visible_in_preview_and_apply() {
+    let server = MockServer::start().await;
+    let store = Store::open_in_memory().unwrap();
+    list(&server, vec![issue(1)]).await;
+    let plan = plan_sync(&store, &config(&server), &client(&server)).await.unwrap();
+    let manual = Task::new("acme/app#1", "unrelated manual task", TaskSource::Manual);
+    store.insert_task(&manual).unwrap();
+    let manual = store.get_task(manual.id).unwrap().unwrap();
+    assert!(apply_plan(&store, &plan).unwrap_err().to_string().contains("conflicting source"));
+    assert!(plan_sync(&store, &config(&server), &client(&server)).await.unwrap_err().to_string().contains("conflicts"));
+    assert_eq!(store.get_task(manual.id).unwrap().unwrap(), manual);
+}
