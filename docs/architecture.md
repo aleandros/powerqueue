@@ -66,8 +66,8 @@ rows, calls the function, persists what changed and carries out the effects.
 
 `Daemon::commit` persists a task only when the transition changed it
 (`Task: PartialEq`) and again after the effects ran, since cleanup may
-change it further. `Effect` is `Serialize`, so a run can be replayed or
-checked against a model from the event log. The budget core takes
+change it further. `Effect` is `Serialize`; logged effects can be projected into a model trace,
+although the event log does not contain every state change or budget reservation. The budget core takes
 `LedgerSource` (plain usage rows and the observation history) and never
 sees the store, which is what lets `budget plan` and `priority simulate`
 share `LaunchPlanner` with the daemon (`budget plan` runs `plan_all`). The
@@ -78,6 +78,14 @@ candidate of the same pass. `task pause|resume|cancel|retry` applied offline by
 the CLI (no daemon) call the same `commands::*` transitions.
 
 ### Testing the core
+
+The optional [Quint specification and replay](../spec/README.md) add an independent
+queue/launch/crash/budget abstraction and conditional progress property. The
+advisory workflow simulates bounded schedules and replays actual e2e event logs
+through shared specification guards. Replay checks observable lifecycle prefixes,
+not unlogged budget reservations or full state equivalence; the linked event-kind
+mapping and coverage report make omissions explicit. `serde_json` enables
+`float_roundtrip` for exact float payload round trips.
 
 Because the core takes plain data and returns `Effect`s, it is tested in
 three layers. Example tests next to each function pin the documented

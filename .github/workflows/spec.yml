@@ -1,0 +1,61 @@
+name: Quint (advisory)
+on:
+  pull_request:
+    paths:
+      - 'spec/**'
+      - 'src/scheduler/**'
+      - 'src/budget/**'
+      - 'src/domain.rs'
+      - 'tests/e2e_daemon.rs'
+      - 'tests/fixtures/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/spec.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: quint-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  quint:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: spec/package-lock.json
+      - run: npm ci --prefix spec --ignore-scripts
+      - run: npm --prefix spec run typecheck
+      - run: npm --prefix spec test
+      - run: spec/node_modules/.bin/quint test spec/powerqueue.qnt --main=progress
+      - run: npm --prefix spec run check
+      - run: python3 -m unittest discover -s spec -p 'test_*.py'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Collect real daemon traces
+        env:
+          POWERQUEUE_TRACE_DIR: ${{ runner.temp }}/pq-traces
+          POWERQUEUE_SECRETS: file
+        run: |
+          cargo test --test e2e_daemon task_runs_to_completion_with_usage_and_cleanup
+          cargo test --test e2e_daemon crashed_session_is_resumed_and_completes
+          cargo test --test e2e_daemon codex_rate_limit_puts_provider_on_cooldown
+      - name: Replay every required trace (missing artifacts fail)
+        run: |
+          for name in completion crash-resume rate-limit; do
+            python3 spec/replay.py "$RUNNER_TEMP/pq-traces/$name.json" --name "$name" --run
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quint-traces
+          path: |
+            spec/.generated/*.itf.json
+            spec/.generated/*.coverage.json
+          if-no-files-found: ignore

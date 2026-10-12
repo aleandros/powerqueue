@@ -1,0 +1,15 @@
+{
+  "name": "powerqueue-spec",
+  "private": true,
+  "scripts": {
+    "typecheck": "quint typecheck powerqueue.qnt",
+    "test": "quint test powerqueue.qnt",
+    "check": "quint run powerqueue.qnt --invariant=safety --max-samples=1000 --max-steps=100 --seed=42 --verbosity=1"
+  },
+  "devDependencies": {
+    "@informalsystems/quint": "0.33.0"
+  },
+  "overrides": {
+    "adm-zip": "0.6.1"
+  }
+}
