@@ -51,7 +51,7 @@ jobs:
           for name in completion crash-resume rate-limit; do
             python3 spec/replay.py "$RUNNER_TEMP/pq-traces/$name.json" --name "$name" --run
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: quint-traces
