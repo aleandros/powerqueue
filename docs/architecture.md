@@ -79,6 +79,11 @@ the CLI (no daemon) call the same `commands::*` transitions.
 
 ### Testing the core
 
+The optional [Kani budget harnesses](../spec/KANI.md) check production arithmetic
+and collection operations exhaustively within documented small domains. They
+are `cfg(kani)`-only and run in a separate advisory workflow; timeouts and unwind
+failures remain failures, and do not stand for successful proofs.
+
 The optional [Quint specification and replay](../spec/README.md) add an independent
 queue/launch/crash/budget abstraction and conditional progress property. The
 advisory workflow simulates bounded schedules and replays actual e2e event logs

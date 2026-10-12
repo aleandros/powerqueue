@@ -485,3 +485,45 @@ mod properties {
         }
     }
 }
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// Two chronologically ordered readings exercise the recent/old spacing
+    /// boundaries and the age cutoff without a symbolic growing input vector.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn kani_thin_samples_preserves_order_age_and_spacing() {
+        let now = DateTime::<Utc>::UNIX_EPOCH;
+        let age = if kani::any::<bool>() {
+            0
+        } else if kani::any::<bool>() {
+            7_200
+        } else {
+            777_600
+        };
+        let gap = if kani::any::<bool>() {
+            0
+        } else if kani::any::<bool>() {
+            60
+        } else {
+            600
+        };
+        let newer = ObservationSample { at: now - Duration::seconds(age), period_used: Some(0.5), window_used: None };
+        let older = ObservationSample { at: newer.at - Duration::seconds(gap), ..newer };
+        let samples = &[older, newer][..];
+        let kept = thin_samples(samples, now);
+        assert!(kept.len() <= samples.len());
+        for sample in &kept {
+            assert!(now - sample.at <= SAMPLE_MAX_AGE);
+        }
+        for pair in kept.windows(2) {
+            let spacing = if now - pair[0].at <= SAMPLE_RECENT { SAMPLE_SPACING_RECENT } else { SAMPLE_SPACING_OLD };
+            assert!(pair[1].at - pair[0].at >= spacing);
+        }
+        if let Some(newest) = samples.last().filter(|s| now - s.at <= SAMPLE_MAX_AGE) {
+            assert!(kept.last().map(|s| s.at) == Some(newest.at));
+        }
+    }
+}

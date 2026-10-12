@@ -1086,3 +1086,44 @@ mod properties {
         }
     }
 }
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// Two reservations at exact finite costs conserve tier/provider totals.
+    /// The tier is present, as for a configured launch candidate.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn kani_add_spend_conserves_totals() {
+        let cost = if kani::any::<bool>() {
+            0.0
+        } else if kani::any::<bool>() {
+            0.25
+        } else {
+            4.0
+        };
+        let tier = ModelTier::sonnet();
+        let now = DateTime::<Utc>::UNIX_EPOCH;
+        let period = Period { start: now, end: now + Duration::seconds(60) };
+        let mut ledger = Ledger::blank(Provider::Claude, now, period, period);
+        ledger.tiers.push(TierLedger {
+            tier: tier.clone(),
+            period_usage: TokenUsage::default(),
+            window_usage: TokenUsage::default(),
+            period_weighted: 0.0,
+            window_weighted: 0.0,
+            period_budget: 0.0,
+            messages: 0,
+        });
+        ledger.add_spend(&tier, cost);
+        ledger.add_spend(&tier, cost);
+        assert!(ledger.total_period_weighted == 2.0 * cost);
+        assert!(ledger.total_window_weighted == 2.0 * cost);
+        assert!(ledger.spent_since_observation == 2.0 * cost);
+        assert!(ledger.tiers[0].period_weighted == ledger.total_period_weighted);
+        assert!(ledger.tiers[0].window_weighted == ledger.total_window_weighted);
+        std::mem::forget(ledger);
+        std::mem::forget(tier);
+    }
+}

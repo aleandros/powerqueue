@@ -1271,3 +1271,30 @@ mod properties {
         }
     }
 }
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// Compare numeric seconds against the real timestamp-based map lookup.
+    /// All 25 deadline/now combinations include past, equal and future marks.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn kani_rate_limit_mark_boundary() {
+        let deadline: u8 = kani::any();
+        let offset: u8 = kani::any();
+        kani::assume(deadline <= 4 && offset <= 4);
+        let origin = DateTime::<Utc>::UNIX_EPOCH;
+        let now = origin + Duration::seconds(i64::from(offset));
+        let until = origin + Duration::seconds(i64::from(deadline));
+        let tier = ModelTier::sonnet();
+        let mut state = RateLimitState::default();
+        state.mark(tier.clone(), until);
+        assert!(state.is_exhausted(&tier, now) == (offset < deadline));
+        assert!(!state.is_exhausted(&tier, until));
+        assert!(state.until(&tier, now) == if offset < deadline { Some(until) } else { None });
+        // Teardown of std's collection is not part of the budget proof.
+        std::mem::forget(state);
+        std::mem::forget(tier);
+    }
+}

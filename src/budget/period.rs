@@ -354,3 +354,66 @@ mod properties {
         }
     }
 }
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// Whole-second timestamps within 360 seconds on either side of
+    /// the anchor. No chrono extreme values or subsecond rounding assumptions.
+    #[kani::proof]
+    fn kani_periods_contain_now_and_tile() {
+        let seconds: u8 = kani::any();
+        let offset: i16 = kani::any();
+        kani::assume(seconds > 0 && seconds <= 120);
+        kani::assume((-360..=360).contains(&offset));
+        let anchor = DateTime::<Utc>::UNIX_EPOCH;
+        let clock = PeriodClock {
+            period: Duration::seconds(i64::from(seconds)),
+            window: Duration::seconds(60),
+            anchor,
+            anchor_source: AnchorSource::Config,
+        };
+        let now = anchor + Duration::seconds(i64::from(offset));
+        let period = clock.current_period(now);
+        assert!(period.contains(now));
+        assert!((period.len()) == (clock.period));
+        assert!(!period.contains(period.end));
+        assert!((clock.current_period(period.end).start) == (period.end));
+        assert!((clock.current_period(period.start - Duration::seconds(1)).end) == (period.start));
+        let window = clock.current_window(now);
+        assert!((window.end) == (now));
+        assert!((window.len()) == (clock.window));
+        assert!(!window.contains(now));
+    }
+
+    /// Covers before/start/interior/end/after, including clamping and an empty
+    /// rolling window. Small exact inputs keep floating-point verification bounded.
+    #[kani::proof]
+    fn kani_period_fraction_and_remaining() {
+        let offset: i8 = kani::any();
+        kani::assume((-2..=12).contains(&offset));
+        let start = DateTime::<Utc>::UNIX_EPOCH;
+        let period = Period { start, end: start + Duration::seconds(10) };
+        let now = start + Duration::seconds(i64::from(offset));
+        let fraction = period.elapsed_fraction(now);
+        assert!((0.0..=1.0).contains(&fraction));
+        assert!((period.remaining(now).num_seconds()) == ((10 - i64::from(offset)).max(0)));
+        if offset <= 0 {
+            assert!((fraction) == (0.0));
+        } else if offset >= 10 {
+            assert!((fraction) == (1.0));
+        } else {
+            assert!(fraction > 0.0 && fraction < 1.0);
+            assert!((period.remaining(now) + (now - start)) == (period.len()));
+        }
+        let clock = PeriodClock {
+            period: Duration::seconds(10),
+            window: Duration::zero(),
+            anchor: start,
+            anchor_source: AnchorSource::Config,
+        };
+        assert!(!clock.has_window());
+        assert!((clock.current_window(now)) == (Period { start: now, end: now }));
+    }
+}
