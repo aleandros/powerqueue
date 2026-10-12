@@ -31,7 +31,8 @@ const SCHEMA: &str = include_str!("schema.sql");
 ///   waiting on a human does not count towards `max_session_secs`).
 /// * v7: tasks.execution_project and execution_repo (stable execution binding).
 /// * v8: persisted GitHub execution admission (legacy rows start unverified).
-pub const SCHEMA_VERSION: i64 = 8;
+/// * v9: tasks.routing (persisted deterministic routing evidence).
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// kv key of the Claude calibration before schema v2.
 const LEGACY_CALIBRATION_KEY: &str = "budget.calibration";
@@ -236,6 +237,7 @@ impl Store {
                 ("execution_project", "ALTER TABLE tasks ADD COLUMN execution_project TEXT NOT NULL DEFAULT 'default'"),
                 ("execution_repo", "ALTER TABLE tasks ADD COLUMN execution_repo TEXT"),
                 ("github_admission", "ALTER TABLE tasks ADD COLUMN github_admission TEXT"),
+                ("routing", "ALTER TABLE tasks ADD COLUMN routing TEXT"),
             ] {
                 if !cols.iter().any(|c| c == name) {
                     conn.execute(sql, []).with_context(|| format!("add tasks.{name}"))?;
@@ -271,9 +273,9 @@ impl Store {
             "INSERT INTO tasks (id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score,
                 labels, linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts,
                 not_before, last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number,
-                blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission)
+                blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-                ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38)",
+                ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)",
             params![
                 task.id.to_string(),
                 task.key,
@@ -313,6 +315,7 @@ impl Store {
                 task.execution_project,
                 task.execution_repo,
                 task.github_admission.as_ref().map(json),
+                task.routing.as_ref().map(json),
             ],
         )
         .with_context(|| format!("insert task {}", task.key))?;
@@ -327,7 +330,7 @@ impl Store {
                 criticality=?9, score=?10, labels=?11, linear_priority=?12, estimate=?13, project=?14, model_override=?15,
                 model=?16, worktree_path=?17, branch=?18, attempts=?19, max_attempts=?20, not_before=?21, last_error=?22,
                 summary=?23, score_reasons=?24, updated_at=?25, started_at=?26, completed_at=?27, cycle=?28, cycle_number=?29,
-                blocked_by=?30, children=?31, parent=?32, pr_url=?33, review=?34, execution_project=?35, execution_repo=?36, github_admission=?37
+                blocked_by=?30, children=?31, parent=?32, pr_url=?33, review=?34, execution_project=?35, execution_repo=?36, github_admission=?37, routing=?38
              WHERE id=?1",
             params![
                 task.id.to_string(),
@@ -367,6 +370,7 @@ impl Store {
                 task.execution_project,
                 task.execution_repo,
                 task.github_admission.as_ref().map(json),
+                task.routing.as_ref().map(json),
             ],
         )?;
         if n == 0 {
@@ -396,14 +400,85 @@ impl Store {
         Ok(())
     }
 
+    /// Save routing evidence only while its metadata and assignment remain current.
+    /// Returns false on a concurrent sync, reassignment or launch; never changes execution state.
+    pub fn record_routing(&self, before: &Task, task: &Task) -> Result<bool> {
+        let changed = self
+            .lock()
+            .execute(
+                "UPDATE tasks SET routing=?2 WHERE id=?1 AND execution_project=?3 AND state=?4
+             AND attempts=?5 AND routing IS ?6 AND labels=?7 AND project IS ?8 AND source=?9",
+                params![
+                    task.id.to_string(),
+                    task.routing.as_ref().map(json),
+                    before.execution_project,
+                    before.state.as_str(),
+                    before.attempts,
+                    before.routing.as_ref().map(json),
+                    json(&before.labels),
+                    before.project,
+                    json(&before.source)
+                ],
+            )
+            .context("record deterministic routing decision")?;
+        Ok(changed != 0)
+    }
+
+    /// Apply source metadata and cancellation only if the inspected task is still current.
+    /// A concurrent launch/reassignment wins; sync retries on the next poll.
+    pub fn update_source_task(&self, before: &Task, task: &Task) -> Result<bool> {
+        let changed = self
+            .lock()
+            .execute(
+                "UPDATE tasks SET title=?2, description=?3, labels=?4, source=?5,
+             linear_priority=?6, estimate=?7, project=?8, cycle=?9, cycle_number=?10,
+             blocked_by=?11, children=?12, parent=?13, github_admission=?14, routing=?15,
+             state=?16, last_error=?17, completed_at=?18, updated_at=?19
+             WHERE id=?1 AND execution_project=?20 AND state=?21 AND attempts=?22
+             AND routing IS ?23 AND github_admission IS ?24 AND updated_at=?25
+             AND execution_repo IS ?26",
+                params![
+                    task.id.to_string(),
+                    task.title,
+                    task.description,
+                    json(&task.labels),
+                    json(&task.source),
+                    task.linear_priority,
+                    task.estimate,
+                    task.project,
+                    task.cycle,
+                    task.cycle_number,
+                    json(&task.blocked_by),
+                    json(&task.children),
+                    task.parent,
+                    task.github_admission.as_ref().map(json),
+                    task.routing.as_ref().map(json),
+                    task.state.as_str(),
+                    task.last_error,
+                    task.completed_at.as_ref().map(ts),
+                    ts(&Utc::now()),
+                    before.execution_project,
+                    before.state.as_str(),
+                    before.attempts,
+                    before.routing.as_ref().map(json),
+                    before.github_admission.as_ref().map(json),
+                    ts(&before.updated_at),
+                    before.execution_repo
+                ],
+            )
+            .context("apply source sync without overwriting concurrent execution")?;
+        Ok(changed != 0)
+    }
+
     /// Persist admission only if the verified task snapshot is still current.
     /// Leaves execution state untouched; returns false when a concurrent update won.
     pub fn record_github_admission(&self, before: &Task, task: &Task) -> Result<bool> {
         let changed = self
             .lock()
             .execute(
-                "UPDATE tasks SET github_admission=?2 WHERE id=?1 AND title=?3 AND description=?4
-             AND state=?5 AND attempts=?6 AND github_admission IS ?7 AND execution_project=?8",
+                "UPDATE tasks SET github_admission=?2, routing=?9 WHERE id=?1 AND title=?3 AND description=?4
+             AND state=?5 AND attempts=?6 AND github_admission IS ?7 AND execution_project=?8
+             AND routing IS ?10 AND labels=?11 AND project IS ?12 AND source=?13",
                 params![
                     task.id.to_string(),
                     task.github_admission.as_ref().map(json),
@@ -412,7 +487,12 @@ impl Store {
                     before.state.as_str(),
                     before.attempts,
                     before.github_admission.as_ref().map(json),
-                    before.execution_project
+                    before.execution_project,
+                    task.routing.as_ref().map(json),
+                    before.routing.as_ref().map(json),
+                    json(&before.labels),
+                    before.project,
+                    json(&before.source)
                 ],
             )
             .context("record verified GitHub admission")?;
@@ -433,7 +513,8 @@ impl Store {
                 "UPDATE tasks SET state=?5, model=?6, not_before=?7, review=?8, updated_at=?9,
              attempts=?13, branch=?14, worktree_path=?15
              WHERE id=?1 AND execution_project=?2 AND state=?3 AND attempts=?4
-             AND github_admission IS ?10 AND title=?11 AND description=?12",
+             AND github_admission IS ?10 AND title=?11 AND description=?12
+             AND routing IS ?16 AND labels=?17 AND project IS ?18 AND source=?19",
                 params![
                     before.id.to_string(),
                     before.execution_project,
@@ -449,7 +530,11 @@ impl Store {
                     before.description,
                     starting.attempts,
                     starting.branch,
-                    starting.worktree_path
+                    starting.worktree_path,
+                    before.routing.as_ref().map(json),
+                    json(&before.labels),
+                    before.project,
+                    json(&before.source)
                 ],
             )
             .context("claim task start in its execution project")?;
@@ -483,6 +568,7 @@ impl Store {
                 .map(from_json)
                 .transpose()
                 .map_err(conv)?,
+            routing: row.get::<_, Option<String>>("routing")?.as_deref().map(from_json).transpose().map_err(conv)?,
             execution_project: row.get("execution_project")?,
             execution_repo: row.get("execution_repo")?,
             state: TaskState::from_str(&state).map_err(|e| conv(anyhow!(e)))?,
@@ -520,7 +606,7 @@ impl Store {
         "id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score, labels,
         linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts, not_before,
         last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number,
-        blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission";
+        blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing";
 
     pub fn get_task(&self, id: TaskId) -> Result<Option<Task>> {
         let conn = self.lock();

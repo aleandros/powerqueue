@@ -423,3 +423,15 @@ approximation available.
 
 **XDG paths and `POWERQUEUE_HOME`.** Short, predictable paths that show well
 in diagnostics; a single variable isolates test and parallel instances.
+
+### Deterministic routing
+
+`routing.rs` evaluates the shared structured condition schema against source
+metadata and labels, using only the machine execution registry. It is independent
+of source approval, priority and execution configuration. `transitions::on_routing`
+persists the decision through effects without reassigning existing tasks. A
+conflict blocks future starts but preserves active work, retry/review state and
+checkout ownership. SQLite schema v9 adds `tasks.routing`; source sync and launch
+claims compare the observed assignment, routing evidence and metadata so stale
+snapshots cannot overwrite a newer claim or routing hold. See
+[routing configuration](configuration.md#routing) for precedence and recovery.

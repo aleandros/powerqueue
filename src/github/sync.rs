@@ -7,9 +7,9 @@ use chrono::Utc;
 use serde::Serialize;
 
 use super::client::{GitHubClient, GitHubIssue};
-use crate::config::GitHubConfig;
+use crate::config::{Config, GitHubConfig};
 use crate::domain::{EventLevel, Task, TaskSource, TaskState};
-use crate::scheduler::transitions::{Effect, on_github_closed, on_github_source_admission};
+use crate::scheduler::transitions::{Effect, on_github_admission, on_github_closed, on_github_source_admission, on_routing};
 use crate::store::Store;
 
 /// One planned local queue change. The task is the complete updated snapshot.
@@ -58,6 +58,32 @@ fn update_issue(task: &mut Task, issue: &GitHubIssue) -> bool {
 /// active tasks are never cancelled. Missing access or any failed request aborts
 /// the plan without changing the store. Approval revocation blocks future launches.
 pub async fn plan_sync(store: &Store, cfg: &GitHubConfig, client: &GitHubClient) -> Result<SyncPlan> {
+    plan_sync_inner(store, cfg, client, None).await
+}
+
+/// Preview source intake with registry-validated deterministic routing.
+/// Fetch failures abort without writes; routing failures are visible held tasks.
+pub async fn plan_sync_routed(store: &Store, cfg: &GitHubConfig, client: &GitHubClient, routing: &Config) -> Result<SyncPlan> {
+    plan_sync_inner(store, cfg, client, Some(routing)).await
+}
+
+fn reconcile(
+    task: &mut Task,
+    admission: crate::domain::GitHubAdmission,
+    source: &GitHubConfig,
+    config: Option<&Config>,
+    fresh: bool,
+) {
+    if let Some(config) = config {
+        let decision = config.route(task);
+        on_routing(task, decision, fresh);
+        on_github_admission(task, admission);
+    } else {
+        on_github_source_admission(task, admission, &source.execution_project);
+    }
+}
+
+async fn plan_sync_inner(store: &Store, cfg: &GitHubConfig, client: &GitHubClient, routing: Option<&Config>) -> Result<SyncPlan> {
     let finished: HashSet<_> = store
         .list_tasks()?
         .into_iter()
@@ -80,7 +106,7 @@ pub async fn plan_sync(store: &Store, cfg: &GitHubConfig, client: &GitHubClient)
         reconciled.insert(issue.number);
         match store.get_task_by_key(&fresh.key)? {
             None => {
-                fresh.github_admission = Some(admission);
+                reconcile(&mut fresh, admission, cfg, routing, true);
                 plan.changes.push(Change { action: "create", task: fresh });
             }
             Some(mut task)
@@ -90,7 +116,7 @@ pub async fn plan_sync(store: &Store, cfg: &GitHubConfig, client: &GitHubClient)
             {
                 let before = task.clone();
                 update_issue(&mut task, issue);
-                on_github_source_admission(&mut task, admission, &cfg.execution_project);
+                reconcile(&mut task, admission, cfg, routing, false);
                 if task != before {
                     plan.changes.push(Change { action: "update", task });
                 }
@@ -112,7 +138,7 @@ pub async fn plan_sync(store: &Store, cfg: &GitHubConfig, client: &GitHubClient)
         let issue = client.get_issue(repository, *number).await?;
         let before = task.clone();
         update_issue(&mut task, &issue);
-        on_github_source_admission(&mut task, client.admission(cfg, &issue).await?, &cfg.execution_project);
+        reconcile(&mut task, client.admission(cfg, &issue).await?, cfg, routing, false);
         let closed = issue.state == "closed" && issue.pull_request.is_none();
         if closed {
             on_github_closed(&mut task, Utc::now());
@@ -131,13 +157,14 @@ pub fn apply_plan(store: &Store, plan: &SyncPlan) -> Result<()> {
     for change in &plan.changes {
         let mut task = change.task.clone();
         let admission = task.github_admission.take();
+        let routing = task.routing.take();
         let effects;
         if change.action == "create" {
             if let Some(current) = store.get_task_by_key(&task.key)? {
                 let same_source = matches!((&current.source, &task.source),
                     (TaskSource::GitHub { repository: a, number: an, .. }, TaskSource::GitHub { repository: b, number: bn, .. })
                     if a.eq_ignore_ascii_case(b) && an == bn);
-                if !same_source || current.execution_project != plan.execution_project {
+                if !same_source || current.execution_project != task.execution_project {
                     bail!(
                         "GitHub task {} acquired a conflicting source or execution project after preview; sync again",
                         task.key
@@ -145,10 +172,11 @@ pub fn apply_plan(store: &Store, plan: &SyncPlan) -> Result<()> {
                 }
                 continue;
             }
-            effects = admission.map(|a| on_github_source_admission(&mut task, a, &plan.execution_project)).unwrap_or_default();
+            effects = apply_decisions(&mut task, admission, routing, &plan.execution_project);
             store.insert_task(&task).with_context(|| format!("create GitHub task {}", task.key))?;
         } else {
             let Some(mut current) = store.get_task(task.id)? else { continue };
+            let before = current.clone();
             if current.state.is_terminal() {
                 continue;
             }
@@ -163,9 +191,11 @@ pub fn apply_plan(store: &Store, plan: &SyncPlan) -> Result<()> {
                 current.labels = task.labels;
                 current.source = task.source;
             }
-            effects = admission.map(|a| on_github_source_admission(&mut current, a, &plan.execution_project)).unwrap_or_default();
+            effects = apply_decisions(&mut current, admission, routing, &plan.execution_project);
             current.updated_at = Utc::now();
-            store.update_task(&current).with_context(|| format!("update GitHub task {}", current.key))?;
+            if !store.update_source_task(&before, &current).with_context(|| format!("update GitHub task {}", current.key))? {
+                continue;
+            }
             task = current;
         }
         let kind = match change.action {
@@ -188,4 +218,23 @@ pub fn apply_plan(store: &Store, plan: &SyncPlan) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn apply_decisions(
+    task: &mut Task,
+    admission: Option<crate::domain::GitHubAdmission>,
+    routing: Option<crate::routing::RoutingDecision>,
+    fallback: &str,
+) -> Vec<Effect> {
+    if let Some(mut routing) = routing {
+        // The saved assignment may have changed since preview; compare again.
+        routing.permitted = routing.project.is_some();
+        let mut effects = on_routing(task, routing, false);
+        if let Some(admission) = admission {
+            effects.extend(on_github_admission(task, admission));
+        }
+        effects
+    } else {
+        admission.map(|a| on_github_source_admission(task, a, fallback)).unwrap_or_default()
+    }
 }

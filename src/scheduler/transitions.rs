@@ -72,6 +72,29 @@ pub enum Effect {
     ForgetAnswer,
 }
 
+/// Record routing evidence without changing an existing project or execution state.
+/// A fresh intake may set its initial assignment; subsequent conflicts hold future starts.
+pub fn on_routing(task: &mut Task, mut decision: crate::routing::RoutingDecision, fresh: bool) -> Vec<Effect> {
+    if fresh {
+        task.execution_project = decision.project.clone().unwrap_or_default();
+    }
+    decision.saved_project = Some(task.execution_project.clone());
+    if decision.project.as_deref().is_some_and(|p| p != task.execution_project) {
+        decision.permitted = false;
+    }
+    if task.routing.as_ref() == Some(&decision) {
+        return Vec::new();
+    }
+    let effect = Effect::log(
+        EventLevel::Info,
+        if decision.permitted { "routing.selected" } else { "routing.blocked" },
+        decision.explanation(),
+        serde_json::json!({"routing": decision, "execution_project": task.execution_project}),
+    );
+    task.routing = Some(decision);
+    vec![effect]
+}
+
 /// Deny admission when the source mapping conflicts with the saved project.
 /// Never retarget work or interrupt an active session; identical decisions are quiet.
 pub fn on_github_source_admission(task: &mut Task, admission: crate::domain::GitHubAdmission, project: &str) -> Vec<Effect> {
@@ -110,7 +133,7 @@ pub fn on_github_admission(task: &mut Task, admission: crate::domain::GitHubAdmi
 }
 
 /// Hold a launch revoked during setup, preserving the prepared worktree and branch.
-/// Only a starting task without approval changes; active sessions are untouched.
+/// Only a starting task without routing/approval changes; active sessions are untouched.
 pub fn on_github_launch_held(task: &mut Task) -> Vec<Effect> {
     if task.state != TaskState::Starting || task.execution_approved() {
         return Vec::new();
@@ -118,8 +141,8 @@ pub fn on_github_launch_held(task: &mut Task) -> Vec<Effect> {
     task.state = TaskState::Queued;
     vec![Effect::log(
         EventLevel::Info,
-        "github.launch_held",
-        "approval lost during setup; launch held and worktree preserved",
+        if task.routing.as_ref().is_some_and(|r| !r.permitted) { "routing.launch_held" } else { "github.launch_held" },
+        "routing or approval changed during setup; launch held and worktree preserved",
         serde_json::json!({}),
     )]
 }
@@ -2133,6 +2156,32 @@ mod properties {
     }
 
     proptest! {
+        #[test]
+        fn routing_preserves_execution_and_blocks_conflicts((cfg, mut task) in crate::strategies::routing_case()) {
+            let before = task.clone();
+            let decision = cfg.route(&task);
+            let effects = on_routing(&mut task, decision.clone(), false);
+            prop_assert!(!effects.is_empty());
+            prop_assert!(on_routing(&mut task, decision, false).is_empty());
+            if !task.routing.as_ref().unwrap().permitted {
+                prop_assert!(!task.execution_approved());
+            }
+            let saved = task.routing.take();
+            task.routing = before.routing.clone();
+            prop_assert_eq!(&task, &before);
+            task.routing = saved;
+            if !task.routing.as_ref().unwrap().permitted {
+                prop_assert!(crate::scheduler::pick_next(std::slice::from_ref(&task), Utc::now()).is_none());
+                let mut starting = task.clone();
+                starting.state = TaskState::Starting;
+                let effects = on_github_launch_held(&mut starting);
+                prop_assert_eq!(starting.state, TaskState::Queued);
+                prop_assert_eq!(&starting.execution_project, &task.execution_project);
+                prop_assert_eq!(&starting.execution_repo, &task.execution_repo);
+                prop_assert!(effects.iter().any(|effect| matches!(effect, Effect::Log { kind, .. } if kind == "routing.launch_held")), "routing holds emit a diagnostic event");
+            }
+        }
+
         #[test]
         fn source_routing_never_retargets_work(mut task in github_task(), matches in any::<bool>(), approved in any::<bool>()) {
             let before = task.clone();

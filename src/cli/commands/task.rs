@@ -237,14 +237,17 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let pr_events = if task.pr_url.is_some() { pr_timeline(&store.events_for_task(task.id, 2000)?) } else { Vec::new() };
     let base = store.last_task_event(task.id, BRANCH_CREATED_EVENT)?.and_then(|e| e.branch_base());
     let rounds_max = ctx.config_or_default()?.scheduler.review_rounds_max;
+    let mut routed = task.clone();
+    let decision = ctx.config_or_default()?.route(&task);
+    crate::scheduler::transitions::on_routing(&mut routed, decision, false);
+    let current_routing = routed.routing;
     let source_route = if let crate::domain::TaskSource::GitHub { repository, .. } = &task.source {
-        Some(match ctx.config_or_default()?.github_source(repository) {
-            Ok(source) => serde_json::json!({
-                "repository": repository,
-                "execution_project": source.execution_project,
-                "matches_saved_project": source.execution_project == task.execution_project,
-            }),
-            Err(error) => serde_json::json!({"repository": repository, "error": format!("{error:#}")}),
+        current_routing.as_ref().map(|route| {
+            serde_json::json!({
+                "repository": repository, "execution_project": route.project,
+                "matches_saved_project": route.project.as_deref() == Some(task.execution_project.as_str()),
+                "routing": route,
+            })
         })
     } else {
         None
@@ -261,6 +264,7 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
         let out = serde_json::json!({
             "task": task,
             "source_route": source_route,
+            "current_routing": current_routing,
             "execution_location": location,
             "provider": effective_model(&task).map(|m| m.provider()),
             "usage": usage,
@@ -330,22 +334,11 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     }
     kv("execution project", task.execution_project.clone());
     kv("configured checkout", location["checkout"].as_str().or(location["error"].as_str()).unwrap_or_default().into());
-    if let Some(route) = &source_route {
-        let description = if let Some(error) = route["error"].as_str() {
-            error.to_string()
-        } else {
-            format!(
-                "{} → {}{}",
-                route["repository"].as_str().unwrap_or_default(),
-                route["execution_project"].as_str().unwrap_or_default(),
-                if route["matches_saved_project"] == false {
-                    " (conflicts with saved project; future launches blocked)"
-                } else {
-                    ""
-                }
-            )
-        };
-        kv("source route", description);
+    if let Some(route) = &current_routing {
+        kv("current routing", route.explanation());
+    }
+    if let Some(route) = &task.routing {
+        kv("saved routing", route.explanation());
     }
     if let Some(repo) = &task.execution_repo {
         kv("execution checkout", repo.clone());
@@ -524,12 +517,17 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let store = ctx.store()?.clone();
     let task = find_task(&store, &task_ref.task)?;
     let location = execution_location(ctx, &task)?;
+    let mut routed = task.clone();
+    let decision = ctx.config_or_default()?.route(&task);
+    crate::scheduler::transitions::on_routing(&mut routed, decision, false);
     let events = store.events_for_task(task.id, 500)?;
     let throttled = events.iter().rev().find(|e| e.kind == "task.throttled");
     let chosen = events.iter().rev().find(|e| e.kind == "task.model_chosen" || e.kind == "task.starting");
     if ctx.json {
         let out = serde_json::json!({
             "execution_project": task.execution_project,
+            "routing": task.routing,
+            "current_routing": routed.routing,
             "execution_location": location,
             "execution_repo": task.execution_repo,
             "key": task.key,
@@ -557,6 +555,12 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let color = ctx.color;
     println!("{} {}", task.key.if_supports_color(Stream::Stdout, |t| t.bold()), task.title);
     println!("  project      {}", task.execution_project);
+    if let Some(r) = &task.routing {
+        println!("  saved route  {}", r.explanation());
+    }
+    if let Some(r) = &routed.routing {
+        println!("  current route {}", r.explanation());
+    }
     println!("  checkout     {}", location["checkout"].as_str().or(location["error"].as_str()).unwrap_or_default());
     println!("  state        {}", paint(color, output::state_colored(task.state), task.state.as_str()));
     println!("  criticality  {}", paint(color, output::criticality_colored(task.criticality), task.criticality.as_str()));

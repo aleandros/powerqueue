@@ -207,8 +207,20 @@ pub struct Evaluation {
 pub const MAX_AGE_BOOST: f64 = 200.0;
 
 /// Fields a condition may reference.
-pub(super) const FIELDS: [&str; 11] =
-    ["label", "priority", "estimate", "project", "cycle", "cycle_number", "team", "title", "description", "source", "key"];
+pub(super) const FIELDS: [&str; 12] = [
+    "label",
+    "priority",
+    "estimate",
+    "project",
+    "cycle",
+    "cycle_number",
+    "team",
+    "title",
+    "description",
+    "source",
+    "key",
+    "repository",
+];
 /// Fields that support `>` / `<`.
 pub(super) const NUMERIC_FIELDS: [&str; 3] = ["priority", "estimate", "cycle_number"];
 /// Values `cycle` may be compared with (the status word stored on the task).
@@ -581,6 +593,10 @@ fn field_text(field: &str, task: &Task) -> Option<String> {
         "description" => Some(task.description.clone()),
         "source" => Some(task.source.kind().to_string()),
         "key" => Some(task.key.clone()),
+        "repository" => match &task.source {
+            TaskSource::GitHub { repository, .. } => Some(repository.clone()),
+            _ => None,
+        },
         _ => None,
     }
 }

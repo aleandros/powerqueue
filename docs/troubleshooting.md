@@ -612,3 +612,18 @@ lines or the daemon restarts. Provider quota percentages appear separately in
 Legacy `PRIORITY.md` policies must be migrated explicitly; see
 [policy migration and reload recovery](priority.md#migration-from-markdown).
 Invalid reloads retain the last valid policy until repaired.
+
+## A task is held by routing
+
+Run `powerqueue task explain <task>` and `powerqueue doctor --offline`. Routing
+holds appear as `routing.blocked` events independently of GitHub approval. A
+conflict lists every matching rule and destination; narrow the conditions so all
+matches agree. An unmatched issue needs a source fallback or a matching rule.
+Unknown projects must be registered in machine `config.toml`.
+
+Saved assignments are stable. If updated labels, Linear team/project metadata,
+or configuration select another project, restore the original route or explicitly
+use `powerqueue task project <task> <id>` on unstarted work. Initially unmatched
+work also needs this explicit assignment after the rules are fixed. Work with
+execution history cannot move projects; create a new task instead. Reload the
+configuration and preview `github sync` / `linear sync` before applying changes.

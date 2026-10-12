@@ -7,8 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-12
+
 ### Added
 
+- Deterministic repository routing from source repository, Linear team/project
+  metadata and labels, using typed conditions in `config.toml`. Matching rules
+  override source fallbacks; conflicting, unmatched and invalid destinations hold
+  future launches with persisted reasons. Sync previews, task show/explain and
+  doctor expose routing decisions. Saved assignments and pinned checkouts survive
+  metadata changes, retries and review; reassignment remains explicit.
+- Routing properties and integration coverage for conflicting labels, unknown
+  projects, metadata changes, database restart, project isolation and stale
+  sync/launch races.
 - Tune free-form Markdown intent into validated TOML proposals, with project
   selection, intent-change diagnostics, scoped queue simulation and reviewable
   working-copy changes for committed repository policies. Stale drafts refuse
@@ -977,7 +988,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/aleandros/powerqueue/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.16.0
 [0.15.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.15.0
 [0.14.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.14.0

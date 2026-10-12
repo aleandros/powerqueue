@@ -60,6 +60,8 @@ pub struct Config {
     pub github: GitHubConfig,
     /// Additional independent GitHub intake sources; the legacy `github` is retained.
     pub github_sources: Vec<GitHubConfig>,
+    /// Deterministic routing, separate from admission and priority policy.
+    pub routing: crate::routing::RoutingConfig,
     pub priority: PriorityConfig,
     pub prompt: PromptConfig,
     pub scheduler: SchedulerConfig,
@@ -195,6 +197,8 @@ impl AppliedOverrides {
 #[serde(default, deny_unknown_fields)]
 pub struct LinearConfig {
     pub enabled: bool,
+    /// Fallback execution project; empty requires a matching routing rule.
+    pub execution_project: String,
     /// Team keys to pull issues from (e.g. `["ENG"]`). Empty = all teams visible to the key.
     pub team_keys: Vec<String>,
     /// Only issues assigned to this user id, or `"me"`. `None` = any assignee.
@@ -240,6 +244,7 @@ impl Default for LinearConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            execution_project: "default".into(),
             team_keys: Vec::new(),
             assignee: None,
             queued_states: vec!["Todo".to_string()],
@@ -395,9 +400,7 @@ impl GitHubConfig {
         {
             problems.push("github.repository must be owner/repo".into());
         }
-        if self.execution_project.is_empty()
-            || !self.execution_project.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
-        {
+        if !self.execution_project.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c)) {
             problems.push("github.execution_project must be a registered project ID".into());
         }
         if self.token_env.as_ref().is_some_and(|name| {
@@ -2029,11 +2032,7 @@ impl Config {
         if self.repo.path.trim().is_empty() && self.projects.is_empty() {
             problems.push("repo.path is empty".to_string());
         }
-        if self.linear.enabled && !self.projects.is_empty() && !self.project_ids().contains("default") {
-            problems.push(
-                "Linear intake requires a default execution project; register default or set linear.enabled = false".into(),
-            );
-        }
+        problems.extend(self.routing_problems());
         if !self.repo.branch_template.contains("{key}") && !self.repo.branch_template.contains("{id}") {
             problems.push("repo.branch_template must contain {key} or {id}".to_string());
         }

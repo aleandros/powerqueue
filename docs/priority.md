@@ -91,6 +91,7 @@ nonempty conjunction (AND). Separate criticality rules supply alternatives
 | `team` | Linear team key |
 | `title`, `description`, `key` | task text |
 | `source` | linear, github, manual |
+| `repository` | GitHub source owner/repo; absent for Linear/manual tasks |
 
 `eq` and `ne` use case-insensitive text equality or numeric equality. `matches`
 is a case-insensitive Rust regex, supplied as a string (TOML literal strings

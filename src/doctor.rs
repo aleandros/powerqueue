@@ -2191,18 +2191,12 @@ pub async fn run_all(
 
     results.extend(check_secrets(cfg, secrets, online).await);
     for task in store.list_open_tasks()? {
-        if let crate::domain::TaskSource::GitHub { repository, .. } = &task.source {
-            let problem = match cfg.github_source(repository) {
-                Ok(source) if source.execution_project != task.execution_project => {
-                    Some(format!("source maps to `{}`; task retains `{}`", source.execution_project, task.execution_project))
-                }
-                Err(error) => Some(format!("{error:#}")),
-                _ => None,
-            };
-            if let Some(problem) = problem {
-                results.push(CheckResult::fail(STATE, &format!("{} source routing", task.key), problem,
-                    "restore the source mapping; use task project only for deliberate reassignment of unstarted work; active work keeps its saved project"));
-            }
+        let mut routed = task.clone();
+        let decision = cfg.route(&task);
+        crate::scheduler::transitions::on_routing(&mut routed, decision, false);
+        if let Some(routing) = routed.routing.filter(|r| !r.permitted) {
+            results.push(CheckResult::fail(STATE, &format!("{} source routing", task.key), routing.explanation(),
+                "fix routing rules/source fallback and registered destinations; restore the saved route or deliberately use task project for unstarted work; active work retains its checkout"));
         }
     }
     if cfg.github_sources().iter().any(|s| s.enabled) {
@@ -2222,7 +2216,10 @@ pub async fn run_all(
     let unapproved: Vec<_> = store
         .list_open_tasks()?
         .into_iter()
-        .filter(|t| !t.execution_approved())
+        .filter(|t| {
+            matches!(t.source, crate::domain::TaskSource::GitHub { .. })
+                && !t.github_admission.as_ref().is_some_and(|a| a.approved)
+        })
         .map(|t| {
             format!(
                 "{}: {}",

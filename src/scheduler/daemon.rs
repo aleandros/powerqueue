@@ -23,11 +23,11 @@ use crate::domain::{
     BRANCH_CREATED_EVENT, DaemonCommand, EventLevel, ModelTier, Provider, SCHEDULING_PAUSE_KEY, SchedulingPause, Session,
     SessionState, Task, TaskId, TaskSource, TaskState, is_closed_state_type,
 };
-use crate::github::{Gh, GitHubClient, PrRef, apply_plan, plan_sync};
+use crate::github::{Gh, GitHubClient, PrRef, apply_plan, plan_sync_routed};
 use crate::jev::{JevClient, JevQuestion, content_hash};
 use crate::linear::{
     IssueFilter, LinearClient, LinearIssue, WATCHED_PARENTS_KEY, WatchedParents, container_comment, container_finished,
-    parents_to_watch, sync_issues,
+    parents_to_watch, sync_issues_routed,
 };
 use crate::paths::Paths;
 use crate::priority::{PriorityRules, RulesWatcher};
@@ -1252,7 +1252,7 @@ impl Daemon {
             }
         };
 
-        // `sync_issues` takes a synchronous state lookup, so fetch the states
+        // `sync_issues_routed` takes a synchronous state lookup, so fetch the states
         // of open tasks whose issues are no longer in the queued set up front.
         // Those still open in Linear are synced too, so their dependencies
         // stay current while they sit outside the queued states.
@@ -1312,7 +1312,7 @@ impl Daemon {
         }
         self.mark_merged_blockers(&client, &mut issues, &open, now).await;
 
-        let report = sync_issues(&self.store, &self.cfg.linear, &issues, |id| states.get(id).cloned())?;
+        let report = sync_issues_routed(&self.store, &self.cfg, &issues, |id| states.get(id).cloned())?;
         self.rt.linear_backoff = Duration::zero();
         self.rt.linear_next_allowed = None;
         if !report.created.is_empty() || !report.updated.is_empty() || !report.cancelled.is_empty() {
@@ -1935,17 +1935,23 @@ impl Daemon {
         self.rt.github.get(&repository.to_ascii_lowercase()).and_then(|s| s.next_allowed).is_some_and(|at| now < at)
     }
 
-    async fn refresh_github_admission(&mut self, task: &mut Task) -> Result<bool> {
+    async fn refresh_launch_permissions(&mut self, task: &mut Task) -> Result<bool> {
         use crate::domain::GitHubAdmission;
-        let TaskSource::GitHub { repository, number, .. } = &task.source else { return Ok(true) };
+        let before = task.clone();
+        let decision = self.cfg.route(task);
+        let mut effects = transitions::on_routing(task, decision, false);
+        let TaskSource::GitHub { repository, number, .. } = &before.source else {
+            if !self.store.record_routing(&before, task)? {
+                return Ok(false);
+            }
+            self.log_only(task, None, effects);
+            return Ok(task.execution_approved());
+        };
         let source = self.cfg.github_source(repository).cloned();
         let admission = match source {
             Err(error) => GitHubAdmission::denied(format!("{error:#}")),
             Ok(_) if self.offline => GitHubAdmission::denied("GitHub approval verification disabled or offline"),
-            Ok(cfg) if cfg.execution_project != task.execution_project => GitHubAdmission::denied(format!(
-                "source maps to project `{}` but task retains `{}`; restore the mapping or deliberately reassign unstarted work",
-                cfg.execution_project, task.execution_project
-            )),
+
             Ok(_) if self.github_backoff(repository, Utc::now()) => {
                 GitHubAdmission::denied("GitHub approval unavailable during API backoff")
             }
@@ -1956,6 +1962,15 @@ impl Daemon {
                         if issue.title != task.title || issue.body.as_deref().unwrap_or_default() != task.description {
                             return Ok(GitHubAdmission::denied("issue title/body changed; sync and reapproval required"));
                         }
+                        let mut observed = task.clone();
+                        observed.labels = issue.labels.iter().map(|l| l.name.clone()).collect();
+                        let mut decision = self.cfg.route(&observed);
+                        if observed.labels != task.labels {
+                            decision = crate::routing::RoutingDecision::blocked(
+                                "issue labels changed; source sync required before launch",
+                            );
+                        }
+                        effects.extend(transitions::on_routing(task, decision, false));
                         client.admission(&cfg, &issue).await
                     }
                     .await;
@@ -1971,8 +1986,7 @@ impl Daemon {
                 }
             }
         };
-        let before = task.clone();
-        let effects = transitions::on_github_admission(task, admission);
+        effects.extend(transitions::on_github_admission(task, admission));
         if !self.store.record_github_admission(&before, task)? {
             return Ok(false);
         }
@@ -2001,7 +2015,7 @@ impl Daemon {
             state.last_poll = Some(now);
             let Some(client) = self.github_client(&cfg) else { continue };
             let result = async {
-                let plan = plan_sync(&self.store, &cfg, &client).await?;
+                let plan = plan_sync_routed(&self.store, &cfg, &client, &self.cfg).await?;
                 apply_plan(&self.store, &plan)?;
                 anyhow::Ok(plan)
             }
@@ -3022,7 +3036,17 @@ impl Daemon {
             return Ok(());
         }
         let busy: HashSet<TaskId> = live.iter().map(|s| s.task_id).collect();
-        let tasks: Vec<Task> = self.store.list_open_tasks()?.into_iter().filter(|t| !busy.contains(&t.id)).collect();
+        let mut tasks = Vec::new();
+        for mut task in self.store.list_open_tasks()?.into_iter().filter(|t| !busy.contains(&t.id)) {
+            let before = task.clone();
+            let decision = self.cfg.route(&task);
+            let effects = transitions::on_routing(&mut task, decision, false);
+            if !self.store.record_routing(&before, &task)? {
+                continue;
+            }
+            self.log_only(&task, None, effects);
+            tasks.push(task);
+        }
         if !tasks.iter().any(|t| t.state.is_schedulable()) {
             return Ok(());
         }
@@ -3084,7 +3108,7 @@ impl Daemon {
     /// `starting` row was written leaves that row without a session (no
     /// phase picks a `starting` task up again; `task retry` does).
     async fn start_task(&mut self, mut task: Task, model: ModelTier, decision: &Decision, now: DateTime<Utc>) -> Result<Started> {
-        if !self.refresh_github_admission(&mut task).await? {
+        if !self.refresh_launch_permissions(&mut task).await? {
             return Ok(Started::CrashedBeforeLaunch);
         }
         let cfg = self.cfg.for_task(&task, &self.paths)?;
@@ -3134,17 +3158,25 @@ impl Daemon {
         }
 
         // Setup may take minutes. Recheck immediately before preparing the agent,
-        // preserving any work already created if approval was revoked meanwhile.
-        if matches!(task.source, TaskSource::GitHub { .. }) {
+        // preserving any work already created if routing or approval changed meanwhile.
+        {
             let Some(mut fresh) = self.store.get_task(task.id)? else { return Ok(Started::CrashedBeforeLaunch) };
             if fresh.state != TaskState::Starting {
                 return Ok(Started::CrashedBeforeLaunch);
             }
-            if !self.refresh_github_admission(&mut fresh).await? {
+            if !self.refresh_launch_permissions(&mut fresh).await? {
                 // Reload so a concurrent cancellation/pause is never replaced by our hold.
                 if let Some(mut current) = self.store.get_task(task.id)? {
                     let before = current.clone();
-                    let mut effects = if current.execution_approved() {
+                    let mut effects = if current.execution_approved() && !matches!(current.source, TaskSource::GitHub { .. }) {
+                        transitions::on_routing(
+                            &mut current,
+                            crate::routing::RoutingDecision::blocked(
+                                "task changed during routing verification; retry after sync",
+                            ),
+                            false,
+                        )
+                    } else if current.execution_approved() {
                         transitions::on_github_admission(
                             &mut current,
                             crate::domain::GitHubAdmission::denied("task changed during approval verification; retry after sync"),
@@ -3481,7 +3513,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
-        for mode in ["removed", "edited", "unavailable", "offline", "disabled", "backoff", "wrong-repository"] {
+        for mode in ["removed", "edited", "labels-changed", "unavailable", "offline", "disabled", "backoff", "wrong-repository"] {
             server.reset().await;
             let dir = tempfile::tempdir().unwrap();
             let mut daemon = github_daemon(dir.path(), &server.uri());
@@ -3501,7 +3533,7 @@ mod tests {
             } else {
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "number":1, "title": if mode == "edited" { "Different work" } else { "Fix bug" }, "body":"",
-                    "html_url":"https://github.com/acme/app/issues/1", "state":"open", "labels":[],
+                    "html_url":"https://github.com/acme/app/issues/1", "state":"open", "labels": if mode == "labels-changed" { serde_json::json!([{ "name": "repo/other" }]) } else { serde_json::json!([]) },
                     "created_at":"2026-09-01T12:00:00Z", "updated_at":"2026-09-01T12:01:00Z"
                 }))
             };
@@ -3515,9 +3547,14 @@ mod tests {
                 "wrong-repository" => daemon.cfg.github.repository = "other/repo".into(),
                 _ => {}
             }
-            assert!(!daemon.refresh_github_admission(&mut task).await.unwrap(), "{mode}");
+            assert!(!daemon.refresh_launch_permissions(&mut task).await.unwrap(), "{mode}");
             let saved = daemon.store.get_task(task.id).unwrap().unwrap();
             assert!(!saved.execution_approved(), "{mode}");
+            if mode == "labels-changed" {
+                assert!(!saved.routing.as_ref().unwrap().permitted);
+                assert!(saved.routing.as_ref().unwrap().reason.contains("labels changed"));
+                assert_eq!(saved.execution_project, "default");
+            }
             assert_eq!(saved.state, TaskState::Queued);
             assert!(saved.worktree_path.is_none());
             assert!(daemon.store.list_live_sessions().unwrap().is_empty());
@@ -3611,7 +3648,7 @@ mod tests {
         daemon.poll_github(Utc::now()).await.unwrap();
         let mut task = daemon.store.get_task_by_key("acme/api#1").unwrap().unwrap();
         assert_eq!(task.execution_project, "api");
-        assert!(daemon.refresh_github_admission(&mut task).await.unwrap(), "source A backoff cannot block B");
+        assert!(daemon.refresh_launch_permissions(&mut task).await.unwrap(), "source A backoff cannot block B");
         assert_eq!(daemon.store.list_tasks().unwrap().len(), 1);
         assert!(daemon.github_backoff("ACME/APP", Utc::now()));
         assert!(!daemon.github_backoff("acme/api", Utc::now()));
@@ -3634,11 +3671,11 @@ mod tests {
         assert!(daemon.update_github(&task, Some(LinearTarget::Done), Some("not posted".into())).await);
         assert!(!server.received_requests().await.unwrap().iter().any(|r| r.url.path().ends_with("/comments")));
         daemon.cfg.github_sources[0].execution_project = "default".into();
-        assert!(!daemon.refresh_github_admission(&mut task).await.unwrap());
+        assert!(!daemon.refresh_launch_permissions(&mut task).await.unwrap());
         assert_eq!(task.execution_project, "api");
-        assert!(task.github_admission.as_ref().unwrap().reason.contains("task retains"));
+        assert!(task.routing.as_ref().unwrap().explanation().contains("task retains"));
         daemon.cfg.github_sources.clear();
-        assert!(!daemon.refresh_github_admission(&mut task).await.unwrap());
+        assert!(!daemon.refresh_launch_permissions(&mut task).await.unwrap());
         assert!(!daemon.update_github(&task, Some(LinearTarget::Done), None).await);
         assert!(daemon.store.events_for_task(task.id, 30).unwrap().iter().any(|e| e.kind == "github.update_skipped"));
     }

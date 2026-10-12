@@ -272,11 +272,20 @@ async fn cli_preview_apply_and_json_work_with_file_secrets() {
     let preview: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(preview["applied"], false);
     assert_eq!(preview["changes"][0]["action"], "create");
+    assert_eq!(
+        preview["changes"][0]["task"]["execution_project"], "default",
+        "disabled source previews keep their configured destination"
+    );
+    assert_eq!(preview["changes"][0]["task"]["routing"]["permitted"], true);
     command(&["--json", "github", "sync", "--apply"]).assert().success();
     let out = command(&["--json", "github", "sync"]).assert().success().get_output().stdout.clone();
     let repeat: Value = serde_json::from_slice(&out).unwrap();
     assert!(repeat["changes"].as_array().unwrap().is_empty());
-    command(&["--json", "task", "show", "acme/app#1"]).assert().success();
+    let out = command(&["--json", "task", "show", "acme/app#1"]).assert().success().get_output().stdout.clone();
+    let saved: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(saved["task"]["execution_project"], "default");
+    assert_eq!(saved["current_routing"]["permitted"], false, "disabled sources still cannot launch");
+    assert!(saved["current_routing"]["reason"].as_str().unwrap().contains("disabled"));
 }
 
 #[test]
@@ -887,4 +896,118 @@ async fn conflicting_source_identity_is_visible_in_preview_and_apply() {
     assert!(apply_plan(&store, &plan).unwrap_err().to_string().contains("conflicting source"));
     assert!(plan_sync(&store, &config(&server), &client(&server)).await.unwrap_err().to_string().contains("conflicts"));
     assert_eq!(store.get_task(manual.id).unwrap().unwrap(), manual);
+}
+
+fn routed_config(server: &MockServer) -> Config {
+    let mut cfg: Config = toml::from_str(
+        r#"
+        [repo]
+        path = "/repos/default"
+        [projects.api.repo]
+        path = "/repos/api"
+        [projects.web.repo]
+        path = "/repos/web"
+        [[routing.rules]]
+        name = "api label"
+        project = "api"
+        all = [{field = "repository", op = "eq", value = "acme/app"}, {field = "label", op = "eq", value = "repo/api"}]
+        [[routing.rules]]
+        name = "web label"
+        project = "web"
+        all = [{field = "label", op = "eq", value = "repo/web"}]
+    "#,
+    )
+    .unwrap();
+    cfg.github = config(server);
+    cfg
+}
+
+#[tokio::test]
+async fn deterministic_routing_preview_conflicts_and_restart_preserve_projects() {
+    use powerqueue::github::plan_sync_routed;
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let store = Store::open(&path).unwrap();
+    let cfg = routed_config(&server);
+    let mut api = issue(1);
+    api["labels"] = json!([{"name":"agent:ready"},{"name":"repo/api"}]);
+    let mut web = issue(2);
+    web["labels"] = json!([{"name":"agent:ready"},{"name":"repo/web"}]);
+    let mut conflict = issue(3);
+    conflict["labels"] = json!([{"name":"agent:ready"},{"name":"repo/api"},{"name":"repo/web"}]);
+    list(&server, vec![api.clone(), web.clone(), conflict.clone()]).await;
+    let preview = plan_sync_routed(&store, &cfg.github, &client(&server), &cfg).await.unwrap();
+    assert!(store.list_tasks().unwrap().is_empty());
+    assert_eq!(preview.changes[0].task.execution_project, "api");
+    assert_eq!(preview.changes[1].task.execution_project, "web");
+    assert_eq!(preview.changes[2].task.execution_project, "");
+    assert!(!preview.changes[2].task.execution_approved());
+    assert!(preview.changes[2].task.routing.as_ref().unwrap().reason.contains("conflicting"));
+    apply_plan(&store, &preview).unwrap();
+    assert!(plan_sync_routed(&store, &cfg.github, &client(&server), &cfg).await.unwrap().changes.is_empty());
+    let mut started = store.get_task_by_key("acme/app#1").unwrap().unwrap();
+    started.state = TaskState::InReview;
+    started.attempts = 1;
+    started.execution_repo = Some("/repos/api".into());
+    started.branch = Some("pq/api-1".into());
+    started.pr_url = Some("https://github.com/acme/api/pull/9".into());
+    store.update_task(&started).unwrap();
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    api["labels"] = web["labels"].clone();
+    server.reset().await;
+    list(&server, vec![api, web, conflict]).await;
+    let plan = plan_sync_routed(&store, &cfg.github, &client(&server), &cfg).await.unwrap();
+    apply_plan(&store, &plan).unwrap();
+    let saved = store.get_task(started.id).unwrap().unwrap();
+    assert_eq!(saved.execution_project, "api");
+    assert_eq!(saved.execution_repo, started.execution_repo);
+    assert_eq!(saved.branch, started.branch);
+    assert_eq!(saved.state, TaskState::InReview);
+    assert_eq!(saved.pr_url, started.pr_url);
+    assert!(saved.github_admission.as_ref().unwrap().approved, "approval remains distinct from routing");
+    assert!(!saved.execution_approved());
+    assert!(saved.routing.as_ref().unwrap().explanation().contains("retains `api`"));
+    assert!(plan_sync_routed(&store, &cfg.github, &client(&server), &cfg).await.unwrap().changes.is_empty());
+    assert!(store.events_for_task(saved.id, 100).unwrap().iter().any(|e| e.kind == "routing.blocked"));
+    assert!(store.set_execution_project(saved.id, "api", "web").is_err());
+    let other = store.get_task_by_key("acme/app#2").unwrap().unwrap();
+    assert_eq!(other.execution_project, "web");
+    assert!(other.execution_approved());
+}
+
+#[tokio::test]
+async fn routing_unknown_destination_and_stale_preview_never_reassign() {
+    use powerqueue::github::plan_sync_routed;
+    let server = MockServer::start().await;
+    let store = Store::open_in_memory().unwrap();
+    let mut cfg = routed_config(&server);
+    let mut row = issue(1);
+    row["labels"] = json!([{"name":"agent:ready"},{"name":"repo/api"}]);
+    list(&server, vec![row.clone()]).await;
+    cfg.routing.rules[0].project = "unknown".into();
+    let preview = plan_sync_routed(&store, &cfg.github, &client(&server), &cfg).await.unwrap();
+    assert!(!preview.changes[0].task.execution_approved());
+    assert!(preview.changes[0].task.routing.as_ref().unwrap().reason.contains("unknown execution project"));
+    cfg.routing.rules[0].project = "api".into();
+    let preview = plan_sync_routed(&store, &cfg.github, &client(&server), &cfg).await.unwrap();
+    apply_plan(&store, &preview).unwrap();
+    let saved = store.get_task_by_key("acme/app#1").unwrap().unwrap();
+    row["labels"] = json!([{"name":"agent:ready"},{"name":"repo/web"}]);
+    server.reset().await;
+    list(&server, vec![row]).await;
+    let preview = plan_sync_routed(&store, &cfg.github, &client(&server), &cfg).await.unwrap();
+    let mut running = saved.clone();
+    running.state = TaskState::Running;
+    running.attempts = 1;
+    running.execution_repo = Some("/repos/api".into());
+    store.update_task(&running).unwrap();
+    apply_plan(&store, &preview).unwrap();
+    let saved = store.get_task(saved.id).unwrap().unwrap();
+    assert_eq!(saved.state, TaskState::Running);
+    assert_eq!(saved.execution_project, "api");
+    assert_eq!(saved.execution_repo, running.execution_repo);
+    assert!(!saved.execution_approved());
+    assert!(!store.update_source_task(&running, &running).unwrap(), "stale metadata cannot overwrite routing evidence");
 }

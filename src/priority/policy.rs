@@ -59,34 +59,34 @@ struct TaskOverride {
     #[serde(default)]
     skip: bool,
 }
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Operator {
+pub enum Operator {
     Eq,
     Ne,
     Matches,
     Gt,
     Lt,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
-enum Value {
+pub enum Value {
     Text(String),
     Number(f64),
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Predicate {
-    field: String,
-    op: Operator,
-    value: Value,
+pub struct Predicate {
+    pub field: String,
+    pub op: Operator,
+    pub value: Value,
 }
 
 fn line(text: &str, offset: usize) -> usize {
     text.as_bytes()[..offset.min(text.len())].iter().filter(|c| **c == b'\n').count() + 1
 }
 
-fn predicates(all: &[Predicate]) -> Result<Vec<Condition>, String> {
+pub(crate) fn predicates(all: &[Predicate]) -> Result<Vec<Condition>, String> {
     if all.is_empty() {
         return Err("all must contain at least one condition".into());
     }

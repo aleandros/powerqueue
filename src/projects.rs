@@ -83,13 +83,18 @@ impl Config {
         });
         // The resolved config has one checkout and no registry. Validate source
         // mappings against the machine registry, not this temporary projection.
-        let routing = self.github_routing_problems();
+        let mut routing = self.github_routing_problems();
+        routing.extend(self.routing_problems());
         if !routing.is_empty() {
             bail!("{}", routing.join("; "));
         }
         let github = std::mem::take(&mut cfg.github);
         let github_sources = std::mem::take(&mut cfg.github_sources);
+        let routing = std::mem::take(&mut cfg.routing);
+        let linear_project = std::mem::take(&mut cfg.linear.execution_project);
         cfg.ensure_valid().with_context(|| format!("execution project `{id}`"))?;
+        cfg.routing = routing;
+        cfg.linear.execution_project = linear_project;
         cfg.github = github;
         cfg.github_sources = github_sources;
         Ok(cfg)
