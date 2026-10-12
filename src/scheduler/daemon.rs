@@ -1895,6 +1895,44 @@ impl Daemon {
         self.rt.github.client.clone()
     }
 
+    async fn refresh_github_admission(&mut self, task: &mut Task) -> Result<bool> {
+        use crate::domain::GitHubAdmission;
+        let TaskSource::GitHub { repository, number, .. } = &task.source else { return Ok(true) };
+        let admission = if !self.cfg.github.enabled || self.offline {
+            GitHubAdmission::denied("GitHub approval verification disabled or offline")
+        } else if !repository.eq_ignore_ascii_case(&self.cfg.github.repository) {
+            GitHubAdmission::denied("task repository does not match github.repository")
+        } else if self.rt.github.next_allowed.is_some_and(|at| Utc::now() < at) {
+            GitHubAdmission::denied("GitHub approval unavailable during API backoff")
+        } else if let Some(client) = self.github_client() {
+            let result = async {
+                let issue = client.get_issue(repository, *number).await?;
+                // A changed prompt must first go through sync and priority evaluation.
+                if issue.title != task.title || issue.body.as_deref().unwrap_or_default() != task.description {
+                    return Ok(GitHubAdmission::denied("issue title/body changed; sync and reapproval required"));
+                }
+                client.admission(&self.cfg.github, &issue).await
+            }
+            .await;
+            match result {
+                Ok(admission) => admission,
+                Err(error) => {
+                    self.github_failure(&error);
+                    GitHubAdmission::denied(format!("GitHub approval unavailable: {error:#}"))
+                }
+            }
+        } else {
+            GitHubAdmission::denied("GitHub approval unavailable; check credentials")
+        };
+        let before = task.clone();
+        let effects = transitions::on_github_admission(task, admission);
+        if !self.store.record_github_admission(&before, task)? {
+            return Ok(false);
+        }
+        self.log_only(task, None, effects);
+        Ok(task.execution_approved())
+    }
+
     async fn poll_github(&mut self, now: DateTime<Utc>) -> Result<()> {
         let interval = Duration::seconds(self.cfg.github.poll_interval_secs.clamp(5, 86400) as i64);
         if self.rt.github.next_allowed.is_some_and(|t| now < t)
@@ -2960,6 +2998,9 @@ impl Daemon {
     /// `starting` row was written leaves that row without a session (no
     /// phase picks a `starting` task up again; `task retry` does).
     async fn start_task(&mut self, mut task: Task, model: ModelTier, decision: &Decision, now: DateTime<Utc>) -> Result<Started> {
+        if !self.refresh_github_admission(&mut task).await? {
+            return Ok(Started::CrashedBeforeLaunch);
+        }
         let cfg = self.cfg.for_task(&task, &self.paths)?;
         // A review round resumes the session that armed the merge, in the
         // same worktree path, told only what changed on the PR.
@@ -2970,7 +3011,8 @@ impl Daemon {
         let answer = self.store.kv_get::<RelayState>(&relay_key(task.id))?.and_then(|r| r.answer_for(latest).map(str::to_string));
         let root = cfg.worktree_root(&self.paths);
         let before = task.clone();
-        let start = launch::on_starting(&mut task, &model, decision, &cfg, &root, relaunch.is_some() || answer.is_some());
+        let start = launch::on_starting(&mut task, &model, decision, &cfg, &root, relaunch.is_some() || answer.is_some())
+            .context("source approval is required before launch")?;
         if !self.store.claim_task_start(&before, &task)? {
             bail!("task {} changed before launch; its project and state will be reconsidered next tick", task.key);
         }
@@ -3003,6 +3045,33 @@ impl Daemon {
                 transitions::on_crash(&mut task, None, &format!("worktree setup failed: {e:#}"), None, &cfg.scheduler, now, None);
             self.commit(&before, &mut task, None, effects).await?;
             return Ok(Started::CrashedBeforeLaunch);
+        }
+
+        // Setup may take minutes. Recheck immediately before preparing the agent,
+        // preserving any work already created if approval was revoked meanwhile.
+        if matches!(task.source, TaskSource::GitHub { .. }) {
+            let Some(mut fresh) = self.store.get_task(task.id)? else { return Ok(Started::CrashedBeforeLaunch) };
+            if fresh.state != TaskState::Starting {
+                return Ok(Started::CrashedBeforeLaunch);
+            }
+            if !self.refresh_github_admission(&mut fresh).await? {
+                // Reload so a concurrent cancellation/pause is never replaced by our hold.
+                if let Some(mut current) = self.store.get_task(task.id)? {
+                    let before = current.clone();
+                    let mut effects = if current.execution_approved() {
+                        transitions::on_github_admission(
+                            &mut current,
+                            crate::domain::GitHubAdmission::denied("task changed during approval verification; retry after sync"),
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    effects.extend(transitions::on_github_launch_held(&mut current));
+                    self.commit(&before, &mut current, None, effects).await?;
+                }
+                return Ok(Started::CrashedBeforeLaunch);
+            }
+            task = fresh;
         }
 
         let mut previous = self.store.latest_session(task.id)?;
@@ -3317,6 +3386,54 @@ mod tests {
         cfg.github.repository = "acme/app".into();
         cfg.github.endpoint = endpoint.into();
         Daemon::new(cfg, paths, Store::open_in_memory().unwrap(), secrets).unwrap()
+    }
+
+    #[tokio::test]
+    async fn github_launch_rechecks_cached_approval_and_never_starts_on_unavailable_data() {
+        use crate::domain::GitHubAdmission;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        for mode in ["removed", "edited", "unavailable", "offline", "disabled", "backoff", "wrong-repository"] {
+            server.reset().await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut daemon = github_daemon(dir.path(), &server.uri());
+            let mut task = Task::new(
+                "acme/app#1",
+                "Fix bug",
+                TaskSource::GitHub {
+                    repository: "acme/app".into(),
+                    number: 1,
+                    url: "https://github.com/acme/app/issues/1".into(),
+                },
+            );
+            task.github_admission = Some(GitHubAdmission { approved: true, reason: "cached before restart".into() });
+            daemon.store.insert_task(&task).unwrap();
+            let response = if mode == "unavailable" {
+                ResponseTemplate::new(500)
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "number":1, "title": if mode == "edited" { "Different work" } else { "Fix bug" }, "body":"",
+                    "html_url":"https://github.com/acme/app/issues/1", "state":"open", "labels":[],
+                    "created_at":"2026-09-01T12:00:00Z", "updated_at":"2026-09-01T12:01:00Z"
+                }))
+            };
+            Mock::given(method("GET")).and(path("/repos/acme/app/issues/1")).respond_with(response).mount(&server).await;
+            match mode {
+                "offline" => daemon.offline = true,
+                "disabled" => daemon.cfg.github.enabled = false,
+                "backoff" => daemon.rt.github.next_allowed = Some(Utc::now() + Duration::minutes(10)),
+                "wrong-repository" => daemon.cfg.github.repository = "other/repo".into(),
+                _ => {}
+            }
+            assert!(!daemon.refresh_github_admission(&mut task).await.unwrap(), "{mode}");
+            let saved = daemon.store.get_task(task.id).unwrap().unwrap();
+            assert!(!saved.execution_approved(), "{mode}");
+            assert_eq!(saved.state, TaskState::Queued);
+            assert!(saved.worktree_path.is_none());
+            assert!(daemon.store.list_live_sessions().unwrap().is_empty());
+            assert!(daemon.store.events_for_task(task.id, 20).unwrap().iter().any(|e| e.kind == "github.revoked"));
+        }
     }
 
     #[tokio::test]

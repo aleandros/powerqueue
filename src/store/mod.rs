@@ -30,7 +30,8 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// * v6: `sessions.waiting_since` and `sessions.waited_secs` (time spent
 ///   waiting on a human does not count towards `max_session_secs`).
 /// * v7: tasks.execution_project and execution_repo (stable execution binding).
-pub const SCHEMA_VERSION: i64 = 7;
+/// * v8: persisted GitHub execution admission (legacy rows start unverified).
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// kv key of the Claude calibration before schema v2.
 const LEGACY_CALIBRATION_KEY: &str = "budget.calibration";
@@ -234,6 +235,7 @@ impl Store {
             for (name, sql) in [
                 ("execution_project", "ALTER TABLE tasks ADD COLUMN execution_project TEXT NOT NULL DEFAULT 'default'"),
                 ("execution_repo", "ALTER TABLE tasks ADD COLUMN execution_repo TEXT"),
+                ("github_admission", "ALTER TABLE tasks ADD COLUMN github_admission TEXT"),
             ] {
                 if !cols.iter().any(|c| c == name) {
                     conn.execute(sql, []).with_context(|| format!("add tasks.{name}"))?;
@@ -269,9 +271,9 @@ impl Store {
             "INSERT INTO tasks (id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score,
                 labels, linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts,
                 not_before, last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number,
-                blocked_by, children, parent, pr_url, review, execution_project, execution_repo)
+                blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-                ?31, ?32, ?33, ?34, ?35, ?36, ?37)",
+                ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38)",
             params![
                 task.id.to_string(),
                 task.key,
@@ -310,6 +312,7 @@ impl Store {
                 task.review.as_ref().map(json),
                 task.execution_project,
                 task.execution_repo,
+                task.github_admission.as_ref().map(json),
             ],
         )
         .with_context(|| format!("insert task {}", task.key))?;
@@ -324,7 +327,7 @@ impl Store {
                 criticality=?9, score=?10, labels=?11, linear_priority=?12, estimate=?13, project=?14, model_override=?15,
                 model=?16, worktree_path=?17, branch=?18, attempts=?19, max_attempts=?20, not_before=?21, last_error=?22,
                 summary=?23, score_reasons=?24, updated_at=?25, started_at=?26, completed_at=?27, cycle=?28, cycle_number=?29,
-                blocked_by=?30, children=?31, parent=?32, pr_url=?33, review=?34, execution_project=?35, execution_repo=?36
+                blocked_by=?30, children=?31, parent=?32, pr_url=?33, review=?34, execution_project=?35, execution_repo=?36, github_admission=?37
              WHERE id=?1",
             params![
                 task.id.to_string(),
@@ -363,6 +366,7 @@ impl Store {
                 task.review.as_ref().map(json),
                 task.execution_project,
                 task.execution_repo,
+                task.github_admission.as_ref().map(json),
             ],
         )?;
         if n == 0 {
@@ -392,15 +396,42 @@ impl Store {
         Ok(())
     }
 
+    /// Persist admission only if the verified task snapshot is still current.
+    /// Leaves execution state untouched; returns false when a concurrent update won.
+    pub fn record_github_admission(&self, before: &Task, task: &Task) -> Result<bool> {
+        let changed = self
+            .lock()
+            .execute(
+                "UPDATE tasks SET github_admission=?2 WHERE id=?1 AND title=?3 AND description=?4
+             AND state=?5 AND attempts=?6 AND github_admission IS ?7 AND execution_project=?8",
+                params![
+                    task.id.to_string(),
+                    task.github_admission.as_ref().map(json),
+                    before.title,
+                    before.description,
+                    before.state.as_str(),
+                    before.attempts,
+                    before.github_admission.as_ref().map(json),
+                    before.execution_project
+                ],
+            )
+            .context("record verified GitHub admission")?;
+        Ok(changed != 0)
+    }
+
     /// Persist the pure start transition only if the candidate still belongs
     /// to the same project and is in the state the planner read. Returns false
     /// when another command superseded it; no repository operation may follow.
     pub fn claim_task_start(&self, before: &Task, starting: &Task) -> Result<bool> {
+        if !before.execution_approved() || !starting.execution_approved() {
+            return Ok(false);
+        }
         let changed = self
             .lock()
             .execute(
                 "UPDATE tasks SET state=?5, model=?6, not_before=?7, review=?8, updated_at=?9
-             WHERE id=?1 AND execution_project=?2 AND state=?3 AND attempts=?4",
+             WHERE id=?1 AND execution_project=?2 AND state=?3 AND attempts=?4
+             AND github_admission IS ?10 AND title=?11 AND description=?12",
                 params![
                     before.id.to_string(),
                     before.execution_project,
@@ -410,7 +441,10 @@ impl Store {
                     starting.model.as_ref().map(|m| m.alias()),
                     starting.not_before.as_ref().map(ts),
                     starting.review.as_ref().map(json),
-                    ts(&Utc::now())
+                    ts(&Utc::now()),
+                    before.github_admission.as_ref().map(json),
+                    before.title,
+                    before.description
                 ],
             )
             .context("claim task start in its execution project")?;
@@ -438,6 +472,12 @@ impl Store {
             title: row.get("title")?,
             description: row.get("description")?,
             source: from_json(&source).map_err(conv)?,
+            github_admission: row
+                .get::<_, Option<String>>("github_admission")?
+                .as_deref()
+                .map(from_json)
+                .transpose()
+                .map_err(conv)?,
             execution_project: row.get("execution_project")?,
             execution_repo: row.get("execution_repo")?,
             state: TaskState::from_str(&state).map_err(|e| conv(anyhow!(e)))?,
@@ -475,7 +515,7 @@ impl Store {
         "id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score, labels,
         linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts, not_before,
         last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number,
-        blocked_by, children, parent, pr_url, review, execution_project, execution_repo";
+        blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission";
 
     pub fn get_task(&self, id: TaskId) -> Result<Option<Task>> {
         let conn = self.lock();

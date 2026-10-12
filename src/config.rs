@@ -331,8 +331,10 @@ pub struct GitHubConfig {
     pub enabled: bool,
     /// Explicit `owner/repo`; issues are executed in `repo.path`.
     pub repository: String,
-    /// All these labels are required. Empty means any open issue.
+    /// Explicit execution approval labels; all must have a current approval event.
     pub required_labels: Vec<String>,
+    /// Allowed approval-event actors (case insensitive); empty allows any actor.
+    pub trusted_approvers: Vec<String>,
     /// Any of these labels prevents intake.
     pub excluded_labels: Vec<String>,
     /// GitHub login, `*` (assigned), or `none` (unassigned).
@@ -353,7 +355,8 @@ impl Default for GitHubConfig {
         Self {
             enabled: false,
             repository: String::new(),
-            required_labels: vec!["powerqueue".into()],
+            required_labels: vec!["agent:ready".into()],
+            trusted_approvers: Vec::new(),
             excluded_labels: vec!["no-agent".into()],
             assignee: None,
             in_progress_label: None,
@@ -392,6 +395,22 @@ impl GitHubConfig {
         }
         if self.required_labels.iter().chain(&self.excluded_labels).any(|s| s.trim().is_empty() || s.contains(',')) {
             problems.push("github label filters must contain nonempty names without commas".into());
+        }
+        if self.enabled && self.required_labels.is_empty() {
+            problems.push("github.required_labels must name at least one execution approval label".into());
+        }
+        if self.trusted_approvers.iter().any(|s| s.trim().is_empty() || s.trim() != s || s.contains(char::is_whitespace)) {
+            problems.push("github.trusted_approvers must contain nonempty GitHub logins without whitespace".into());
+        }
+        if self.required_labels.iter().any(|label| {
+            self.excluded_labels
+                .iter()
+                .chain(self.in_progress_label.iter())
+                .chain(self.done_label.iter())
+                .chain(self.blocked_label.iter())
+                .any(|other| label.eq_ignore_ascii_case(other))
+        }) {
+            problems.push("github approval labels must be distinct from excluded and lifecycle labels".into());
         }
         let labels: Vec<_> = [&self.in_progress_label, &self.done_label, &self.blocked_label].into_iter().flatten().collect();
         if labels.iter().any(|l| l.trim().is_empty()) {
@@ -1394,6 +1413,7 @@ pub struct GitHubOverrides {
     pub enabled: Option<bool>,
     pub repository: Option<String>,
     pub required_labels: Option<Vec<String>>,
+    pub trusted_approvers: Option<Vec<String>>,
     pub excluded_labels: Option<Vec<String>>,
     pub assignee: Option<String>,
     pub in_progress_label: Option<String>,
@@ -1819,6 +1839,7 @@ impl Config {
             take!(self.github.enabled, g.enabled, "github.enabled");
             take!(self.github.repository, g.repository, "github.repository");
             take!(self.github.required_labels, g.required_labels, "github.required_labels");
+            take!(self.github.trusted_approvers, g.trusted_approvers, "github.trusted_approvers");
             take!(self.github.excluded_labels, g.excluded_labels, "github.excluded_labels");
             take!(self.github.assignee, g.assignee.map(Some), "github.assignee");
             take!(self.github.in_progress_label, g.in_progress_label.map(Some), "github.in_progress_label");
@@ -2633,6 +2654,8 @@ cycle = "active"
 [github]
 enabled = true
 repository = "acme/app"
+required_labels = ["team:approved"]
+trusted_approvers = ["maintainer"]
 
 [scheduler]
 max_concurrent = 3
@@ -2653,6 +2676,8 @@ restart_backoff_secs = [5, 10]
         assert_eq!(cfg.linear.queued_states, vec!["Todo".to_string()], "untouched keys keep the global value");
         assert!(cfg.github.enabled);
         assert_eq!(cfg.github.repository, "acme/app");
+        assert_eq!(cfg.github.required_labels, ["team:approved"]);
+        assert_eq!(cfg.github.trusted_approvers, ["maintainer"]);
         assert_eq!(cfg.scheduler.max_concurrent, 3);
         assert_eq!(cfg.scheduler.restart_backoff_secs, vec![5, 10]);
         assert_eq!(cfg.scheduler.max_attempts, 3);
@@ -2671,6 +2696,8 @@ restart_backoff_secs = [5, 10]
                 "linear.post_comments",
                 "github.enabled",
                 "github.repository",
+                "github.required_labels",
+                "github.trusted_approvers",
                 "scheduler.max_concurrent",
                 "scheduler.restart_backoff_secs",
             ]

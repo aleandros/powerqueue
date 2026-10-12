@@ -1,4 +1,4 @@
-//! Shared dry-run/apply reconciliation. Only confirmed closures cancel tasks.
+//! Shared dry-run/apply reconciliation of execution approval and issue metadata.
 
 use std::collections::HashSet;
 
@@ -9,6 +9,7 @@ use serde::Serialize;
 use super::client::{GitHubClient, GitHubIssue};
 use crate::config::GitHubConfig;
 use crate::domain::{EventLevel, Task, TaskSource, TaskState};
+use crate::scheduler::transitions::{Effect, on_github_admission, on_github_closed};
 use crate::store::Store;
 
 /// One planned local queue change. The task is the complete updated snapshot.
@@ -54,7 +55,7 @@ fn update_issue(task: &mut Task, issue: &GitHubIssue) -> bool {
 
 /// Fetch intake and reconcile existing tasks from this repository. Terminal and
 /// active tasks are never cancelled. Missing access or any failed request aborts
-/// the plan without changing the store. Tasks outside intake remain queued while open.
+/// the plan without changing the store. Approval revocation blocks future launches.
 pub async fn plan_sync(store: &Store, cfg: &GitHubConfig, client: &GitHubClient) -> Result<SyncPlan> {
     let finished: HashSet<_> = store
         .list_tasks()?
@@ -70,17 +71,25 @@ pub async fn plan_sync(store: &Store, cfg: &GitHubConfig, client: &GitHubClient)
         .collect();
     let issues = client.fetch_issues_ignoring(cfg, &finished).await?;
     let mut plan = SyncPlan { fetched: issues.len(), changes: Vec::new() };
+    let mut reconciled = HashSet::new();
     for issue in &issues {
-        let fresh = task_from_issue(&cfg.repository, issue);
+        let mut fresh = task_from_issue(&cfg.repository, issue);
+        let admission = client.admission(cfg, issue).await?;
+        reconciled.insert(issue.number);
         match store.get_task_by_key(&fresh.key)? {
-            None => plan.changes.push(Change { action: "create", task: fresh }),
+            None => {
+                fresh.github_admission = Some(admission);
+                plan.changes.push(Change { action: "create", task: fresh });
+            }
             Some(mut task)
                 if !task.state.is_terminal()
                     && matches!(&task.source,
                 TaskSource::GitHub { repository, number, .. } if repository.eq_ignore_ascii_case(&cfg.repository) && *number == issue.number) =>
             {
-                if update_issue(&mut task, issue) {
-                    task.updated_at = Utc::now();
+                let before = task.clone();
+                update_issue(&mut task, issue);
+                on_github_admission(&mut task, admission);
+                if task != before {
                     plan.changes.push(Change { action: "update", task });
                 }
             }
@@ -89,19 +98,19 @@ pub async fn plan_sync(store: &Store, cfg: &GitHubConfig, client: &GitHubClient)
     }
     for mut task in store.list_open_tasks()? {
         let TaskSource::GitHub { repository, number, .. } = &task.source else { continue };
-        if !repository.eq_ignore_ascii_case(&cfg.repository)
-            || issues.iter().any(|i| i.number == *number)
-            || !(task.state.is_schedulable() || task.state == TaskState::Paused)
-        {
+        if !repository.eq_ignore_ascii_case(&cfg.repository) || reconciled.contains(number) {
             continue;
         }
         let issue = client.get_issue(repository, *number).await?;
-        if issue.state == "closed" && issue.pull_request.is_none() {
-            task.state = TaskState::Cancelled;
-            task.last_error = Some("closed in GitHub".into());
-            task.completed_at = Some(Utc::now());
-            task.updated_at = Utc::now();
-            plan.changes.push(Change { action: "cancel", task });
+        let before = task.clone();
+        update_issue(&mut task, &issue);
+        on_github_admission(&mut task, client.admission(cfg, &issue).await?);
+        let closed = issue.state == "closed" && issue.pull_request.is_none();
+        if closed {
+            on_github_closed(&mut task, Utc::now());
+        }
+        if task != before {
+            plan.changes.push(Change { action: if task.state == TaskState::Cancelled { "cancel" } else { "update" }, task });
         }
     }
     Ok(plan)
@@ -113,10 +122,13 @@ pub async fn plan_sync(store: &Store, cfg: &GitHubConfig, client: &GitHubClient)
 pub fn apply_plan(store: &Store, plan: &SyncPlan) -> Result<()> {
     for change in &plan.changes {
         let mut task = change.task.clone();
+        let admission = task.github_admission.take();
+        let effects;
         if change.action == "create" {
             if store.get_task_by_key(&task.key)?.is_some() {
                 continue;
             }
+            effects = admission.map(|a| on_github_admission(&mut task, a)).unwrap_or_default();
             store.insert_task(&task).with_context(|| format!("create GitHub task {}", task.key))?;
         } else {
             let Some(mut current) = store.get_task(task.id)? else { continue };
@@ -127,15 +139,14 @@ pub fn apply_plan(store: &Store, plan: &SyncPlan) -> Result<()> {
                 if !(current.state.is_schedulable() || current.state == TaskState::Paused) {
                     continue;
                 }
-                current.state = task.state;
-                current.last_error = task.last_error;
-                current.completed_at = task.completed_at;
+                on_github_closed(&mut current, Utc::now());
             } else {
                 current.title = task.title;
                 current.description = task.description;
                 current.labels = task.labels;
                 current.source = task.source;
             }
+            effects = admission.map(|a| on_github_admission(&mut current, a)).unwrap_or_default();
             current.updated_at = Utc::now();
             store.update_task(&current).with_context(|| format!("update GitHub task {}", current.key))?;
             task = current;
@@ -153,6 +164,11 @@ pub fn apply_plan(store: &Store, plan: &SyncPlan) -> Result<()> {
             &format!("GitHub sync: {} {}", change.action, task.key),
             serde_json::json!({"source": "github", "key": task.key}),
         )?;
+        for effect in effects {
+            if let Effect::Log { level, kind, message, data } = effect {
+                store.log_event(Some(task.id), None, level, &kind, &message, data)?;
+            }
+        }
     }
     Ok(())
 }

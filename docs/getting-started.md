@@ -70,9 +70,13 @@ powerqueue secrets set github
 powerqueue config set github.repository '"owner/repo"'
 powerqueue config set github.enabled true
 powerqueue github test
-powerqueue github sync              # preview open issues labeled powerqueue
+powerqueue github sync              # preview issues deliberately labeled agent:ready
 powerqueue run
 ```
+
+Create the `agent:ready` label in the repository and apply it only after approving
+implementation. To use another label, set `github.required_labels = ["your-label"]`.
+Title/body edits require removing and reapplying approval after review.
 
 To use both trackers, keep Linear enabled and add the GitHub token and settings.
 See [GitHub configuration](configuration.md#github) for filters and optional lifecycle updates.

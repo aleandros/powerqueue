@@ -5,6 +5,7 @@
 //! required checks of the head commit and review threads. Parsing is a pure function ([`parse_pr_status`]) so the
 //! decision table is tested without `gh`.
 
+pub mod admission;
 pub mod client;
 pub mod sync;
 

@@ -16,15 +16,18 @@ use crate::worktree::{Repo, run_commands};
 /// `not_before` has passed and that wait on nothing ([`Task::is_waiting`]:
 /// no pending blocker, not a container); ties broken by criticality then age.
 pub fn pick_next(tasks: &[Task], now: DateTime<Utc>) -> Option<&Task> {
-    tasks.iter().filter(|t| t.state.is_schedulable() && !t.is_waiting() && t.not_before.is_none_or(|nb| nb <= now)).min_by(
-        |a, b| {
+    tasks
+        .iter()
+        .filter(|t| {
+            t.state.is_schedulable() && t.execution_approved() && !t.is_waiting() && t.not_before.is_none_or(|nb| nb <= now)
+        })
+        .min_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.criticality.cmp(&b.criticality))
                 .then(a.created_at.cmp(&b.created_at))
-        },
-    )
+        })
 }
 
 /// What [`cleanup_task`] will do, decided from config and the repository facts.

@@ -40,6 +40,11 @@
 //! consume no slot or reservation. A separate SQLite model interleaves saved
 //! candidates, reassignment and conditional launch claims for two tasks.
 //!
+//! GitHub tasks carry missing, denied or approved admission. Admission changes
+//! interleave with setup and active work; setup revocation holds the launch without
+//! consuming a slot/reservation. Restarts preserve durable admission. A SQLite model
+//! additionally checks claims against stale approval and material-issue snapshots.
+//!
 //! The ops are generated without preconditions and skipped when one does
 //! not hold, which keeps the generator simple and lets shrinking drop any
 //! op.
@@ -66,6 +71,9 @@ use super::{commands, launch, review, transitions};
 /// One call into the core, as the daemon or the CLI would make it.
 #[derive(Debug, Clone)]
 enum Op {
+    Admission(crate::domain::GitHubAdmission),
+    HoldApproval,
+    Restart,
     Pause,
     Resume,
     Cancel,
@@ -137,6 +145,9 @@ fn launch_op() -> impl Strategy<Value = Op> {
 /// Everything the daemon and the CLI do to one task outside a launch.
 fn task_op() -> impl Strategy<Value = Op> {
     prop_oneof![
+        5 => admission_decision().prop_map(Op::Admission),
+        2 => Just(Op::HoldApproval),
+        1 => Just(Op::Restart),
         2 => Just(Op::Pause),
         3 => Just(Op::Resume),
         1 => Just(Op::Cancel),
@@ -192,6 +203,7 @@ impl TaskWorld {
     /// What the planner hands out: schedulable, waiting on nothing, retry time passed, no live session.
     fn can_start(&self, now: DateTime<Utc>) -> bool {
         self.task.state.is_schedulable()
+            && self.task.execution_approved()
             && !self.task.is_waiting()
             && self.task.not_before.is_none_or(|t| t <= now)
             && !self.session_live()
@@ -207,10 +219,29 @@ impl TaskWorld {
         // launch or the crash that prevents it. The CLI's direct writes run
         // in another process and do see it; they must refuse (checked).
         let direct = matches!(op, Op::Complete(_) | Op::HandOff(_) | Op::Block(_) | Op::SetProject(_) | Op::CheckBinding { .. });
-        if self.start.is_some() && !direct && !matches!(op, Op::Claim | Op::LaunchFailed(_) | Op::Launched { .. }) {
+        if self.start.is_some()
+            && !direct
+            && !matches!(op, Op::Claim | Op::LaunchFailed(_) | Op::Launched { .. } | Op::Admission(_) | Op::HoldApproval)
+        {
             return None;
         }
         match op {
+            Op::Admission(admission) => matches!(self.task.source, TaskSource::GitHub { .. })
+                .then(|| transitions::on_github_admission(&mut self.task, admission.clone())),
+            Op::HoldApproval => {
+                if self.start.is_none() || self.task.execution_approved() {
+                    return None;
+                }
+                let effects = transitions::on_github_launch_held(&mut self.task);
+                self.start = None;
+                self.claimed = false;
+                Some(effects)
+            }
+            Op::Restart => {
+                self.task = serde_json::from_value(serde_json::to_value(&self.task).unwrap()).unwrap();
+                self.session = serde_json::from_value(serde_json::to_value(&self.session).unwrap()).unwrap();
+                Some(Vec::new())
+            }
             Op::Pause => Some(commands::on_pause(&mut self.task, live)),
             Op::Resume => Some(commands::on_resume(&mut self.task, live, now)),
             Op::Cancel => Some(commands::on_cancel(&mut self.task, self.session.as_mut(), now)),
@@ -237,7 +268,7 @@ impl TaskWorld {
                 };
                 let mut effects = commands::bind_project(&mut self.task, &checkout).expect("same checkout");
                 let root = std::path::PathBuf::from("/wt").join(&self.task.execution_project);
-                let start = launch::on_starting(&mut self.task, model, d, cfg, &root, resuming);
+                let start = launch::on_starting(&mut self.task, model, d, cfg, &root, resuming).expect("model task is approved");
                 effects.extend(start.effects.clone());
                 self.start = Some(start);
                 self.claimed = false;
@@ -262,7 +293,7 @@ impl TaskWorld {
             }
             Op::Launched { answered } => {
                 let start = self.start.take()?;
-                if !self.claimed {
+                if !self.claimed || !self.task.execution_approved() {
                     self.start = Some(start);
                     return None;
                 }
@@ -411,8 +442,8 @@ impl TaskWorld {
 
 /// A fresh task as `powerqueue add` or the sync would insert it.
 fn fresh_task() -> impl Strategy<Value = Task> {
-    (word(), criticality(), 0.0f64..2000.0, prop::option::of(1u32..=4), vec(word(), 0..2), execution_project()).prop_map(
-        |(key, criticality, score, max_attempts, labels, project)| {
+    (word(), criticality(), 0.0f64..2000.0, prop::option::of(1u32..=4), vec(word(), 0..2), execution_project())
+        .prop_map(|(key, criticality, score, max_attempts, labels, project)| {
             let mut t = Task::new(format!("ENG-{key}"), "t", TaskSource::Manual);
             t.execution_project = project;
             t.criticality = criticality;
@@ -422,8 +453,8 @@ fn fresh_task() -> impl Strategy<Value = Task> {
             t.created_at = origin() - Duration::hours(1);
             t.updated_at = t.created_at;
             t
-        },
-    )
+        })
+        .prop_flat_map(with_source_admission)
 }
 
 fn check(
@@ -492,10 +523,32 @@ fn check(
     // or confirm the existing binding without modifying it.
     if before.start.is_some() {
         prop_assert!(
-            matches!(op, Op::Claim | Op::LaunchFailed(_) | Op::Launched { .. } | Op::SetProject(_) | Op::CheckBinding { .. }),
+            matches!(
+                op,
+                Op::Claim
+                    | Op::LaunchFailed(_)
+                    | Op::Launched { .. }
+                    | Op::SetProject(_)
+                    | Op::CheckBinding { .. }
+                    | Op::Admission(_)
+                    | Op::HoldApproval
+            ),
             "{}",
             ctx("applied to a task the daemon is launching")
         );
+    }
+
+    if matches!(op, Op::Start(..) | Op::Launched { .. }) {
+        prop_assert!(b.execution_approved(), "started or launched without approval");
+    }
+    if matches!(op, Op::Admission(_)) {
+        prop_assert_eq!(&before.session, &after.session, "revocation destroyed active work");
+        prop_assert_eq!(b.state, a.state, "admission changed execution state");
+        prop_assert_eq!(&b.worktree_path, &a.worktree_path);
+    }
+    if matches!(op, Op::Restart) {
+        prop_assert_eq!(b, a, "restart lost durable admission or lifecycle state");
+        prop_assert_eq!(&before.session, &after.session);
     }
 
     // Session / task agreement.
@@ -621,8 +674,11 @@ proptest! {
 /// How a start that the planner handed out ends in `start_task`.
 #[derive(Debug, Clone)]
 enum LaunchOutcome {
+    ApprovalLost,
     /// The session launched (`on_launched`).
-    Launched { answered: bool },
+    Launched {
+        answered: bool,
+    },
     /// The worktree or the launcher failed first (`on_crash` without a session).
     Failed(String),
 }
@@ -631,6 +687,7 @@ fn launch_outcome() -> impl Strategy<Value = LaunchOutcome> {
     prop_oneof![
         3 => any::<bool>().prop_map(|answered| LaunchOutcome::Launched { answered }),
         1 => line().prop_map(LaunchOutcome::Failed),
+        1 => Just(LaunchOutcome::ApprovalLost),
     ]
 }
 
@@ -862,7 +919,18 @@ impl DaemonWorld {
                             );
                             prop_assert!(!self.tasks[idx].session_live(), "{what}: live session after a failed start");
                         }
-                        LaunchOutcome::Launched { answered } => {
+                        LaunchOutcome::ApprovalLost if matches!(self.tasks[idx].task.source, TaskSource::GitHub { .. }) => {
+                            self.step(step, idx, &Op::Admission(crate::domain::GitHubAdmission::denied("revoked during setup")))?;
+                            prop_assert!(
+                                self.step(step, idx, &Op::Launched { answered: false })?.is_none(),
+                                "revoked launch accepted"
+                            );
+                            prop_assert!(self.step(step, idx, &Op::HoldApproval)?.is_some());
+                            prop_assert_eq!(self.tasks[idx].task.state, TaskState::Queued);
+                            prop_assert!(!self.tasks[idx].session_live());
+                        }
+                        outcome => {
+                            let answered = matches!(outcome, LaunchOutcome::Launched { answered: true });
                             prop_assert!(self.step(step, idx, &Op::Launched { answered })?.is_some(), "{what}: launch refused");
                             prop_assert_eq!(self.tasks[idx].task.state, TaskState::Running, "{}", what);
                             planner.started(&self.cfg.budget, &candidate);
@@ -1022,6 +1090,7 @@ fn daemon_task() -> impl Strategy<Value = TaskWorld> {
             }
             t
         })
+        .prop_flat_map(with_source_admission)
         .prop_flat_map(|t| {
             let session = if t.state.has_live_session() {
                 session_for(&t).prop_map(Some).boxed()
@@ -1156,6 +1225,59 @@ proptest! {
                 rows[i] = store.get_task(rows[i].id).unwrap().unwrap();
                 expected[i].updated_at = rows[i].updated_at;
                 prop_assert_eq!(&rows[i], &expected[i], "claim/reassignment changed another field or task");
+            }
+        }
+    }
+}
+
+proptest! {
+    /// SQLite must reject a candidate whose approval or scope changed while it waited.
+    /// Reading after a change/restart can restore eligibility only with approved evidence.
+    #[test]
+    fn stale_admission_candidates_cannot_claim(
+        ops in vec((0u8..6, admission_decision()), 1..60)
+    ) {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut task = Task::new("acme/app#1", "scope", TaskSource::GitHub {
+            repository: "acme/app".into(), number: 1, url: "https://github.com/acme/app/issues/1".into()
+        });
+        store.insert_task(&task).unwrap();
+        let mut snapshot = task.clone();
+        for (op, admission) in ops {
+            match op {
+                0 => snapshot = store.get_task(task.id).unwrap().unwrap(),
+                1 => {
+                    transitions::on_github_admission(&mut task, admission);
+                    store.update_task(&task).unwrap();
+                }
+                2 => {
+                    task.description.push('x');
+                    transitions::on_github_admission(&mut task, crate::domain::GitHubAdmission::denied("material edit"));
+                    store.update_task(&task).unwrap();
+                }
+                3 => {
+                    // A restarted reader reloads persisted evidence; it cannot synthesize approval.
+                    snapshot = store.get_task(task.id).unwrap().unwrap();
+                    prop_assert_eq!(snapshot.execution_approved(), task.execution_approved());
+                }
+                4 => {
+                    transitions::on_github_admission(&mut task, crate::domain::GitHubAdmission::denied("revoked in setup"));
+                    transitions::on_github_launch_held(&mut task);
+                    store.update_task(&task).unwrap();
+                }
+                _ => {
+                    if snapshot.state != TaskState::Queued { continue; }
+                    let mut starting = snapshot.clone();
+                    starting.state = TaskState::Starting;
+                    let accepted = snapshot.execution_approved() && task.execution_approved()
+                        && task.state == snapshot.state && task.description == snapshot.description
+                        && task.github_admission == snapshot.github_admission;
+                    prop_assert_eq!(store.claim_task_start(&snapshot, &starting).unwrap(), accepted);
+                    if accepted { task.state = TaskState::Starting; }
+                    let saved = store.get_task(task.id).unwrap().unwrap();
+                    prop_assert_eq!(saved.state, task.state);
+                    prop_assert_eq!(saved.github_admission, task.github_admission.clone());
+                }
             }
         }
     }

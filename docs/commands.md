@@ -99,7 +99,7 @@ state machine allows it. `complete` and `block` always write directly.
 | `linear test` | verify the key (prints the viewer) |
 | `linear sync [--apply]` | fetch queued issues and print what would change; `--apply` applies it |
 | `github test` | check token access to the configured GitHub repository |
-| `github sync [--apply]` | preview GitHub intake, metadata updates and confirmed closures; `--apply` updates the local queue; supports `--json` |
+| `github sync [--apply]` | preview GitHub intake, approval decisions/revocations, metadata updates and confirmed closures; `--apply` updates the local queue; supports `--json` |
 
 ## Config and secrets
 

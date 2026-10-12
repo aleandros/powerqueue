@@ -71,6 +71,57 @@ pub enum Effect {
     ForgetAnswer,
 }
 
+/// Record source admission without interrupting an active session or changing its state.
+/// Repeated identical decisions do not generate duplicate events.
+pub fn on_github_admission(task: &mut Task, admission: crate::domain::GitHubAdmission) -> Vec<Effect> {
+    if task.github_admission.as_ref() == Some(&admission) {
+        return Vec::new();
+    }
+    let was_approved = task.github_admission.as_ref().is_some_and(|a| a.approved);
+    let kind = if admission.approved {
+        "github.admitted"
+    } else if was_approved {
+        "github.revoked"
+    } else {
+        "github.admission_blocked"
+    };
+    let message = if admission.approved {
+        admission.reason.clone()
+    } else {
+        format!("{}; future launches blocked; any active session is left intact", admission.reason)
+    };
+    let effect = Effect::log(EventLevel::Info, kind, message, serde_json::json!({"admission": admission}));
+    task.github_admission = Some(admission);
+    vec![effect]
+}
+
+/// Hold a launch revoked during setup, preserving the prepared worktree and branch.
+/// Only a starting task without approval changes; active sessions are untouched.
+pub fn on_github_launch_held(task: &mut Task) -> Vec<Effect> {
+    if task.state != TaskState::Starting || task.execution_approved() {
+        return Vec::new();
+    }
+    task.state = TaskState::Queued;
+    vec![Effect::log(
+        EventLevel::Info,
+        "github.launch_held",
+        "approval lost during setup; launch held and worktree preserved",
+        serde_json::json!({}),
+    )]
+}
+
+/// A confirmed remote closure cancels only inactive GitHub tasks, preserving active work.
+pub fn on_github_closed(task: &mut Task, now: DateTime<Utc>) -> Vec<Effect> {
+    if !(task.state.is_schedulable() || task.state == TaskState::Paused) {
+        return Vec::new();
+    }
+    task.state = TaskState::Cancelled;
+    task.last_error = Some("closed in GitHub".into());
+    task.completed_at = Some(now);
+    task.updated_at = now;
+    vec![Effect::log(EventLevel::Info, "task.cancelled", "closed in GitHub", serde_json::json!({}))]
+}
+
 impl Effect {
     /// A [`Effect::Log`] event.
     pub fn log(level: EventLevel, kind: &str, message: impl Into<String>, data: serde_json::Value) -> Self {
@@ -2058,6 +2109,46 @@ mod properties {
                 provider_cooldown_until,
             },
         )
+    }
+
+    proptest! {
+        #[test]
+        fn holding_revoked_setup_preserves_artifacts(mut task in github_task()) {
+            task.github_admission = Some(crate::domain::GitHubAdmission::denied("revoked"));
+            let mut expected = task.clone();
+            if task.state == TaskState::Starting { expected.state = TaskState::Queued; }
+            let effects = on_github_launch_held(&mut task);
+            prop_assert_eq!(task, expected);
+            prop_assert!(effects.iter().all(|e| matches!(e, Effect::Log { .. })), "holding must only log");
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn github_admission_preserves_active_work_and_cannot_be_bypassed(mut task in github_task(), approved in any::<bool>()) {
+            let before = task.clone();
+            let admission = crate::domain::GitHubAdmission { approved, reason: "event evidence".into() };
+            let effects = on_github_admission(&mut task, admission.clone());
+            prop_assert_eq!(effects.len(), 1);
+            prop_assert_eq!(task.execution_approved(), approved);
+            prop_assert!(on_github_admission(&mut task, admission).is_empty());
+            task.github_admission = before.github_admission.clone();
+            prop_assert_eq!(task, before);
+        }
+
+        #[test]
+        fn github_closure_only_cancels_inactive_tasks(mut task in github_task()) {
+            let before = task.clone();
+            let effects = on_github_closed(&mut task, origin());
+            if before.state.is_schedulable() || before.state == TaskState::Paused {
+                prop_assert_eq!(task.state, TaskState::Cancelled);
+                prop_assert_eq!(task.completed_at, Some(origin()));
+                prop_assert_eq!(effects.len(), 1);
+            } else {
+                prop_assert_eq!(task, before);
+                prop_assert!(effects.is_empty());
+            }
+        }
     }
 
     proptest! {

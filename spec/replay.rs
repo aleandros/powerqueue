@@ -38,9 +38,17 @@ const STUTTERS: &[&str] = &[
     "review.lookup_failed",
     "session.marker_polled",
     "session.rate_limit_detected",
+    "github.sync",
+    "github.label",
+    "github.closed",
+    "github.comment",
+    "github.error",
+    "github.unavailable",
+    "github.update_failed",
+    "github.update_skipped",
 ];
 const STUTTER_PREFIXES: &[&str] =
-    &["hook.", "worktree.", "cleanup.", "linear.", "github.", "repo.", "daemon.", "rules.", "tune.", "config.", "usage."];
+    &["hook.", "worktree.", "cleanup.", "linear.", "repo.", "daemon.", "rules.", "tune.", "config.", "usage."];
 const OUT_OF_SCOPE: &[&str] = &[
     "task.in_review",
     "task.unblocked",
@@ -60,6 +68,10 @@ type Counts = BTreeMap<String, usize>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 enum Op {
     Create,
+    CreateGitHub,
+    Approve,
+    Revoke,
+    Hold,
     Start,
     Launch,
     Crash,
@@ -196,7 +208,7 @@ fn project(mut events: Vec<Event>) -> Result<(Vec<Observation>, Coverage)> {
                     continue;
                 }
                 creations.insert(task, data.get("identifier").is_some());
-                Op::Create
+                if data.get("source").and_then(|v| v.as_str()) == Some("github") { Op::CreateGitHub } else { Op::Create }
             }
             "budget.rate_limited" if data.get("source").and_then(|v| v.as_str()) == Some("pane") => {
                 count(&mut ignored, "budget.rate_limited (provider only)");
@@ -206,6 +218,15 @@ fn project(mut events: Vec<Event>) -> Result<(Vec<Observation>, Coverage)> {
                 count(&mut ignored, "task.cancelled (daemon echo of Linear sync)");
                 continue;
             }
+            "github.admitted" | "github.revoked" | "github.admission_blocked" => {
+                let approved = data
+                    .pointer("/admission/approved")
+                    .and_then(|v| v.as_bool())
+                    .with_context(|| format!("event {}: missing approval decision", event.id))?;
+                ensure!(approved == (kind == "github.admitted"), "event {}: inconsistent approval decision", event.id);
+                if approved { Op::Approve } else { Op::Revoke }
+            }
+            "github.launch_held" => Op::Hold,
             "task.starting" => Op::Start,
             "session.launched" => Op::Launch,
             "session.crashed" => Op::Crash,
@@ -222,6 +243,7 @@ fn project(mut events: Vec<Event>) -> Result<(Vec<Observation>, Coverage)> {
                 cancellations.insert(task);
                 Op::SourceCancel
             }
+            "task.cancelled" if data.get("source").and_then(|v| v.as_str()) == Some("github") => Op::SourceCancel,
             "task.cancelled" => Op::Cancel,
             "task.retried" => Op::Retry,
             "task.attention_resolved" => Op::Progress,

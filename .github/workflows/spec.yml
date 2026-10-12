@@ -6,6 +6,9 @@ on:
       - 'src/scheduler/**'
       - 'src/budget/**'
       - 'src/domain.rs'
+      - 'src/github/**'
+      - 'src/config.rs'
+      - 'src/store/**'
       - 'tests/e2e_daemon.rs'
       - 'tests/fixtures/**'
       - 'Cargo.toml'
@@ -47,9 +50,10 @@ jobs:
           cargo test --test e2e_daemon task_runs_to_completion_with_usage_and_cleanup
           cargo test --test e2e_daemon crashed_session_is_resumed_and_completes
           cargo test --test e2e_daemon codex_rate_limit_puts_provider_on_cooldown
+          cargo test --test e2e_daemon github_issue_runs_to_completion_and_closes
       - name: Replay every required trace (missing artifacts fail)
         run: |
-          for name in completion crash-resume rate-limit; do
+          for name in completion crash-resume rate-limit github-approved; do
             cargo run --quiet --example quint-replay -- "$RUNNER_TEMP/pq-traces/$name.json" --name "$name" --run
           done
       - uses: actions/upload-artifact@v7

@@ -292,6 +292,15 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
         crate::domain::TaskSource::Manual => "manual".to_string(),
     };
     kv("source", source);
+    if matches!(task.source, crate::domain::TaskSource::GitHub { .. }) {
+        kv(
+            "GitHub admission",
+            task.github_admission
+                .as_ref()
+                .map(|a| a.reason.clone())
+                .unwrap_or_else(|| "unverified; launch blocked until approval is checked".into()),
+        );
+    }
     kv("execution project", task.execution_project.clone());
     if let Some(repo) = &task.execution_repo {
         kv("execution checkout", repo.clone());
@@ -490,6 +499,8 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
             "blocked_by": task.blocked_by,
             "children": task.children,
             "parent": task.parent,
+            "github_admission": task.github_admission,
+            "execution_approved": task.execution_approved(),
             "last_throttled": throttled,
             "last_model_decision": chosen,
         });
@@ -501,6 +512,15 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     println!("  state        {}", paint(color, output::state_colored(task.state), task.state.as_str()));
     println!("  criticality  {}", paint(color, output::criticality_colored(task.criticality), task.criticality.as_str()));
     println!("  score        {:.1}", task.score);
+    if matches!(task.source, crate::domain::TaskSource::GitHub { .. }) {
+        println!(
+            "  admission    {}",
+            task.github_admission
+                .as_ref()
+                .map(|a| a.reason.as_str())
+                .unwrap_or("unverified; launch blocked until approval is checked")
+        );
+    }
     if task.score_reasons.is_empty() {
         println!(
             "    {}",

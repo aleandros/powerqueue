@@ -153,7 +153,7 @@ and add this to `config.toml`:
 [github]
 enabled = true
 repository = "owner/repo"
-required_labels = ["powerqueue"]
+required_labels = ["agent:ready"]
 # Optional lifecycle labels; create these labels in the repository first:
 # in_progress_label = "agent:working"
 # done_label = "agent:review"
@@ -167,13 +167,14 @@ immediately, or let `powerqueue run` poll automatically. `GITHUB_TOKEN` override
 stored token. A fine-grained token needs access to the repository and **Issues: read**
 for intake; comments, labels and closing need **Issues: write**. Issue intake
 does not require the GitHub CLI; [PR watching](task-lifecycle.md#review-pull-requests) does.
-API behavior follows the [GitHub Issues REST API](https://docs.github.com/en/rest/issues/issues).
+Intake uses the [GitHub Issues REST API](https://docs.github.com/en/rest/issues/issues); approval verification also needs [GraphQL issue history](https://docs.github.com/en/graphql/reference/issues). The GraphQL endpoint is derived from `endpoint`: `/graphql`, or `/api/graphql` for an Enterprise `/api/v3` base.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `enabled` | `false` | enable daemon intake and lifecycle updates |
 | `repository` | `""` | explicit `owner/repo`; required when enabled or using GitHub helpers |
-| `required_labels` | `["powerqueue"]` | require **all** labels; `[]` accepts any open issue |
+| `required_labels` | `["agent:ready"]` | configurable execution approval labels; **all** require current label-application events; cannot be empty when enabled |
+| `trusted_approvers` | `[]` | optional GitHub login allowlist (case insensitive); every effective approval event must be by an allowed actor; empty allows any verifiable actor |
 | `excluded_labels` | `["no-agent"]` | ignore issues with any listed label during intake |
 | `assignee` | unset | GitHub login, `*` for assigned issues, `none` for unassigned; unset accepts any |
 | `in_progress_label` | unset | lifecycle label added when an attempt starts |
@@ -190,8 +191,51 @@ Task keys are `owner/repo#123`; use quoted keys in commands, for example
 issue labels. Linear-only priority, estimate, cycle, project and team fields remain
 unset. Issue titles, bodies and labels populate the task and agent prompt.
 
-Pull requests are excluded. Removing an intake label or changing the assignee does
-not cancel an imported task. A confirmed closed issue cancels queued, throttled,
+Planning, triage and execution are separate steps. Planning issues describe possible
+work; triage labels such as `bug`, `enhancement` or `planning` classify it. Neither
+approves execution. Apply an execution approval label deliberately after reviewing
+the requested work. Public issue forms and automated categorization must not assign
+approval labels indiscriminately. The label name is configurable: for example,
+`required_labels = ["team:approved"]`. If multiple labels are configured, **each**
+is an approval label with its own effective approval event. Lifecycle labels must
+be distinct from approval labels so the daemon cannot grant itself approval.
+
+To restrict who can approve, set `trusted_approvers = ["edgar", "maintainer"]`
+globally or in `.powerqueue.toml`. Admission checks the actor on the latest effective
+application of each label, never the issue author. Removing and reapplying a label
+replaces the earlier approval, so an untrusted reapplication does not inherit a
+trusted approval. Missing actors/events, incomplete history, GraphQL errors or
+unavailable credentials prevent launch, including after daemon restart.
+
+Any title or body edit invalidates earlier approval, including formatting edits or
+edits later reverted. Review the changed issue, then remove and reapply every
+approval label. Edits in the same timestamp second as approval are treated
+conservatively: reapply in a later second. Comments, unrelated labels, assignments
+and priority changes do not invalidate approval by themselves; excluded labels and
+the configured assignee filter still prevent execution. Priority rules and local
+`task resume`, `retry` or model changes cannot bypass admission.
+
+Approval is reconciled during polling and freshly verified before every start,
+crash restart and review round, with another check after worktree setup. A launch
+revoked during setup is held (`github.launch_held`) with its artifacts preserved.
+Revoked tasks retain their queue state and worktree,
+but cannot launch; reapproval restores eligibility without overriding a manual pause.
+An already active session may finish its existing work: revocation does not kill
+its pane, remove its worktree or cancel the task. Stop active work explicitly with
+the task controls when needed. `task show`, `task explain` (also `--json`), sync
+previews and `doctor` explain decisions; `github.admitted`, `github.revoked` and
+`github.admission_blocked` events retain the approval actor/event or denial reason.
+
+**Migration:** new configurations and omitted `required_labels` now default to
+`["agent:ready"]`. Explicit settings such as `["powerqueue"]` are preserved and
+that label becomes the deliberate execution approval label. To adopt the new name,
+create `agent:ready`, update `required_labels`, review queued issues and apply the
+new label deliberately. If the previous `powerqueue` label was applied automatically,
+review the issue and remove/reapply it (or migrate to a fresh label). Previously
+imported tasks start unverified on upgrade and must pass fresh history checks;
+`required_labels = []` is no longer valid for enabled GitHub intake.
+
+Pull requests are excluded. A confirmed closed issue cancels queued, throttled,
 paused or crashed tasks; running sessions continue. API failures and missing access
 (including HTTP 404) never count as closure. GitHub questions are posted when comments are enabled; answer them with `task send`
 or `attach` (GitHub replies are not relayed). For tasks handed off with `--pr`,
@@ -205,7 +249,7 @@ writes are best effort: failures or writes skipped during backoff appear as
 `github.update_failed` / `github.update_skipped` events; check `task show` / `logs`
 and update the issue manually. `doctor` checks credentials and repository/Issues
 read access (write permissions cannot be verified without making a change).
-`run --offline` disables both remote sources. Explicit `github` helpers work even
+`run --offline` disables both remote sources and prevents GitHub tasks from starting without online approval verification. Explicit `github` helpers work even
 when `github.enabled = false`, so you can preview configuration before enabling it.
 
 ## `[linear]`
@@ -636,7 +680,7 @@ post_comments = "questions"
 done_state = ""              # "" clears a state the global config set
 
 [github]                     # everything in [github] but endpoint
-required_labels = ["powerqueue"]
+required_labels = ["agent:ready"]
 
 [scheduler]                  # everything in [scheduler] but gh_binary
 max_concurrent = 2

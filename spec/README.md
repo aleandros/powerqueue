@@ -1,4 +1,4 @@
-# Quint: queue, launch, crash, budget, execution projects
+# Quint: queue, launch, crash, budget, execution projects, admission
 
 This specification models queue lifecycle and launch scheduling.
 It supplements the Rust properties and whole-daemon model. It does not replace
@@ -48,8 +48,27 @@ Successful launches reserve cost; a failed start consumes neither a slot nor
 budget. `spent` is a **pass-local reservation**, reset on the next pass, not
 historical token usage. Provider cooldowns expire with time. The model checks
 slot and budget bounds, serialized launches, retry-time state restrictions,
-and the crash-attempt limit. A task has at most one live session by its type;
+the crash-attempt limit, and a history witness that every start/launch had approval. A task has at most one live session by its type;
 the replay additionally rejects a launch while that task already has one.
+
+GitHub admission is an explicit lifecycle value. `Approve` models verified approval;
+`Revoke` abstracts label removal, material edits, untrusted actors, or unavailable
+evidence. It can interleave with setup and active sessions. Both `Start` and
+`Launch` require approval; `Hold` returns a revoked setup to the queue without
+consuming a slot/reservation or removing artifacts. Resume/retry preserve the
+admission value. Active sessions may finish after revocation: the invariant is
+that **new starts are authorized**, not that every existing session remains approved.
+The approval evaluator and GitHub pagination/actor/edit parsing are exercised by
+Rust integration tests; Quint assumes their resulting decision, rather than proving
+the external API or trust policy. Remote changes after the final verification response
+are outside the atomic `Launch` abstraction.
+
+The Rust one-task and whole-daemon models generate approved, denied and unverified
+GitHub tasks, admission changes, restart round trips and revocation during setup.
+A separate SQLite stateful property interleaves saved candidates, approval changes,
+material edits, re-reads after restart, and conditional claims. It checks that stale
+approval/scope cannot claim a start. These models call production transitions;
+Quint supplies the independent abstract lifecycle guards.
 
 `Start` combines `on_starting` with `claim`: the observed attempt is reserved
 at that point. The daemon finishes a start within a tick. Commands in this
@@ -88,7 +107,7 @@ The model reflects two details of the Rust lifecycle:
   retries of nonterminal throttled tasks preserve attempts. Retrying a terminal
   task resets them. Review rounds, which also affect attempts, are out of scope.
 
-The `progress` module isolates the liveness claim: with persistent budget and
+The `progress` module isolates the liveness claim: with persistent approval, budget and
 a free slot, no competing tasks, and weak fairness for time and launch, a queued
 or throttled task eventually starts. Its finite clock saturates after the retry
 time. This is a conditional property, not a starvation-freedom claim about the
@@ -131,6 +150,14 @@ only in the v0.14 message (`retrying in Ns`); the adapter reads it strictly, che
 that the next start respects it, but cannot verify it against historical config.
 Timestamps are coarse and record logging time rather than transition time.
 
+Replay distinguishes GitHub creation (initially unverified) from ordinary creation
+(initially admitted). It consumes `github.admitted`, `github.revoked`,
+`github.admission_blocked` and `github.launch_held`; unknown GitHub events must be
+classified explicitly. Denial/reapproval schedules are tested both positively and
+negatively, including attempts to bypass approval through pause/resume/retry and
+launches after revocation during setup. Replay verifies the **logged** admission
+decision and launch ordering, not the correctness of the underlying GitHub evidence.
+
 At the first unsupported lifecycle event for a task (review, blocker, relay,
 dependency, launch error/supersession), replay **ends that task's prefix**. It
 never skips a state change and then resumes checking from stale state. The report
@@ -141,7 +168,9 @@ and cancellation are recognized separately from the original transition.
 
 | Event kind | Action |
 | --- | --- |
-| `task.created` | Create |
+| `task.created` | Create / CreateGitHub (unverified) |
+| `github.admitted`, `github.revoked`, `github.admission_blocked` | Approve / Revoke |
+| `github.launch_held` | Hold (preserves setup artifacts) |
 | `task.starting`, `session.launched` | Start, Launch |
 | `session.crashed`, `task.failed` | Crash, Fail (check logged attempt and limit) |
 | `task.completed`, `task.completed_by_command` | Finish, Complete |
@@ -152,17 +181,17 @@ and cancellation are recognized separately from the original transition.
 | `task.resumed` after cooldown | Wake |
 | `task.paused`, ordinary `task.resumed`, `task.cancelled`, `task.retried` | Pause, Resume, Cancel/SourceCancel, Retry |
 
-To capture the three supported real-daemon scenarios without adding Quint to
+To capture the four supported real-daemon scenarios without adding Quint to
 `cargo test`:
 
 ```sh
 POWERQUEUE_TRACE_DIR=/tmp/pq-traces cargo test --test e2e_daemon
-for name in completion crash-resume rate-limit; do
+for name in completion crash-resume rate-limit github-approved; do
   cargo run --quiet --example quint-replay -- "/tmp/pq-traces/$name.json" --name "$name" --run
 done
 ```
 
-The advisory workflow requires all three artifacts, so skipped e2e tests cannot
+The advisory workflow requires all four artifacts, so skipped e2e tests cannot
 produce a false success. Adapter tests include negative schedules: double launch,
 wrong attempt, premature restart, early failure, crash past the limit, and duplicate
 completion after a session has ended. Projection tests run with ordinary
