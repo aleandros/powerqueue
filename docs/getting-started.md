@@ -55,7 +55,7 @@ Project site: <https://aleandros.github.io/powerqueue/>
 
 ```sh
 cd ~/code/my-repo
-powerqueue init --team ENG          # keys, repo, Linear team, PRIORITY.md
+powerqueue init --team ENG          # keys, repo, Linear team, priority.toml
 powerqueue doctor                   # checks git/tmux/claude, keys, config
 powerqueue run                      # daemon, foreground
 ```

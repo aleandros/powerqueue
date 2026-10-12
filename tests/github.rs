@@ -282,7 +282,7 @@ async fn cli_preview_apply_and_json_work_with_file_secrets() {
 #[test]
 fn github_priority_rules_and_prompt_use_issue_metadata() {
     let task = task(7);
-    let rules = powerqueue::priority::PriorityRules::parse("## Scoring\n- +40 if source: github\n").unwrap();
+    let rules = powerqueue::priority::PriorityRules::parse("version = 1\ndefault_criticality = \"normal\"\n[[scoring]]\ndelta = 40.0\nall = [{ field = \"source\", op = \"eq\", value = \"github\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap();
     let score = rules.evaluate(&task, task.created_at, None, 0.0, 0.0);
     assert!(score.reasons.iter().any(|r| r.contains("source: github")));
     let prompt =

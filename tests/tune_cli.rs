@@ -30,7 +30,7 @@ impl Env {
             format!("[repo]\npath = \"{}\"\n\n[claude]\nbinary = \"{}\"\n", repo.path().display(), fixture().display()),
         )
         .unwrap();
-        std::fs::write(config_dir.join("PRIORITY.md"), "## Low\n- label: chore\n").unwrap();
+        std::fs::write(config_dir.join("priority.toml"), "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"low\"\nall = [{ field = \"label\", op = \"eq\", value = \"chore\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap();
         let env = Env { home, _repo: repo, state };
         for (title, key, label) in [("Fix outage", "FAKE-1", "incident"), ("Tidy docs", "CH-2", "chore")] {
             env.pq().args(["add", title, "-k", key, "-l", label]).assert().success();
@@ -57,7 +57,7 @@ impl Env {
     }
 
     fn priority(&self) -> String {
-        std::fs::read_to_string(self.home.path().join("config/PRIORITY.md")).unwrap()
+        std::fs::read_to_string(self.home.path().join("config/priority.toml")).unwrap()
     }
     fn config(&self) -> String {
         std::fs::read_to_string(self.home.path().join("config/config.toml")).unwrap()
@@ -115,8 +115,8 @@ fn tune_proposes_applies_and_undoes() {
         .success()
         .stdout(predicate::str::contains("Claude:"))
         .stdout(predicate::str::contains("fake-tune (edit): made FAKE-1 critical."))
-        .stdout(predicate::str::contains("Change to PRIORITY.md"))
-        .stdout(predicate::str::contains("+- FAKE-1: critical"))
+        .stdout(predicate::str::contains("Change to priority.toml"))
+        .stdout(predicate::str::contains("+key = \"FAKE-1\""))
         .stdout(predicate::str::contains("Change to config.toml"))
         .stdout(predicate::str::contains("+max_concurrent = 3"))
         .stdout(predicate::str::contains("Simulated queue with"))
@@ -129,12 +129,12 @@ fn tune_proposes_applies_and_undoes() {
     let _ = out;
 
     // Live files changed, originals kept, metadata recorded.
-    assert!(env.priority().contains("- FAKE-1: critical"));
+    assert!(env.priority().contains("key = \"FAKE-1\""));
     assert!(env.config().contains("max_concurrent = 3"));
     let drafts = env.drafts();
     assert_eq!(drafts.len(), 1);
     let draft = &drafts[0];
-    assert_eq!(std::fs::read_to_string(draft.join("original/PRIORITY.md")).unwrap(), before_priority);
+    assert_eq!(std::fs::read_to_string(draft.join("original/priority.toml")).unwrap(), before_priority);
     assert_eq!(std::fs::read_to_string(draft.join("original/config.toml")).unwrap(), before_config);
     let meta = env.meta(draft);
     assert_eq!(meta["status"], "applied");
@@ -156,7 +156,7 @@ fn tune_proposes_applies_and_undoes() {
     assert!(prompt.contains("## The request\n\nFAKE-1 must be critical"), "{prompt}");
     assert!(prompt.contains("Simulated queue with"), "the current simulation is in the prompt");
     assert!(prompt.contains("| FAKE-1 | queued |"), "{prompt}");
-    assert!(prompt.contains("# Reference: PRIORITY.md grammar"));
+    assert!(prompt.contains("# Reference: priority.toml schema"));
     assert!(prompt.contains("## `[scheduler]`"), "config reference is embedded");
     assert_eq!(prompt, std::fs::read_to_string(draft.join("prompt.md")).unwrap());
     // `powerqueue` resolved through PATH inside the session, against the same home.
@@ -172,7 +172,7 @@ fn tune_proposes_applies_and_undoes() {
         .assert()
         .success()
         .stdout(predicate::str::contains("undone:"))
-        .stdout(predicate::str::contains("PRIORITY.md"));
+        .stdout(predicate::str::contains("priority.toml"));
     assert_eq!(env.priority(), before_priority);
     assert_eq!(env.config(), before_config);
     assert_eq!(env.meta(draft)["status"], "undone");
@@ -203,11 +203,11 @@ fn tune_dry_run_then_apply_latest() {
         .args(["tune", "--apply"])
         .assert()
         .code(3)
-        .stdout(predicate::str::contains("Change to PRIORITY.md"))
+        .stdout(predicate::str::contains("Change to priority.toml"))
         .stdout(predicate::str::contains("proposed:"));
     assert_eq!(env.priority(), before);
     env.pq().args(["tune", "--apply", "-y", "--no-budget"]).assert().success().stdout(predicate::str::contains("applied:"));
-    assert!(env.priority().contains("- FAKE-1: critical"));
+    assert!(env.priority().contains("key = \"FAKE-1\""));
     assert_eq!(env.meta(&drafts[0])["status"], "applied");
     env.pq().args(["tune", "--apply", "-y"]).assert().code(1).stderr(predicate::str::contains("no proposed tune draft"));
     let dir = drafts[0].to_str().unwrap().to_string();
@@ -235,7 +235,7 @@ fn tune_rejects_invalid_drafts() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("invalid:"))
-        .stderr(predicate::str::contains("PRIORITY.md line"))
+        .stderr(predicate::str::contains("priority.toml line"))
         .stderr(predicate::str::contains("scheduler.max_concurrent must be >= 1"));
     assert_eq!(env.priority(), p);
     assert_eq!(env.config(), c);
@@ -285,7 +285,7 @@ fn tune_reports_no_change_failures_and_timeouts() {
 fn tune_scope_and_json() {
     let env = Env::new();
     let before_config = env.config();
-    // The fake edits both drafts, but only PRIORITY.md is in scope.
+    // The fake edits both drafts, but only priority.toml is in scope.
     let out =
         env.tune("edit").args(["--json", "tune", "FAKE-1 first", "-y", "--no-budget", "--scope", "priority"]).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -295,21 +295,21 @@ fn tune_scope_and_json() {
     assert_eq!(v["scope"], "priority");
     let files = v["files"].as_array().unwrap();
     assert_eq!(files.len(), 1);
-    assert_eq!(files[0]["name"], "PRIORITY.md");
+    assert_eq!(files[0]["name"], "priority.toml");
     assert_eq!(files[0]["changed"], true);
-    assert!(files[0]["diff"].as_str().unwrap().contains("+- FAKE-1: critical"));
+    assert!(files[0]["diff"].as_str().unwrap().contains("+key = \"FAKE-1\""));
     assert_eq!(v["simulation"]["rows"][0]["key"], "FAKE-1");
     assert_eq!(v["simulation"]["rows"][0]["criticality"], "critical");
     assert!(v["summary"].as_str().unwrap().contains("fake-tune"));
     assert_eq!(env.config(), before_config, "config.toml is out of scope");
-    assert!(env.priority().contains("- FAKE-1: critical"));
+    assert!(env.priority().contains("key = \"FAKE-1\""));
 }
 
 #[test]
 fn draft_flags_on_check_simulate_and_validate() {
     let env = Env::new();
     let draft_rules = env.home.path().join("draft.md");
-    std::fs::write(&draft_rules, "## High\n- label: chore\n").unwrap();
+    std::fs::write(&draft_rules, "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"high\"\nall = [{ field = \"label\", op = \"eq\", value = \"chore\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap();
     env.pq()
         .args(["priority", "check", "--file", draft_rules.to_str().unwrap()])
         .assert()

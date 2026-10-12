@@ -55,7 +55,7 @@ impl Paths {
         self.config_dir.join("config.toml")
     }
     pub fn priority_file(&self) -> PathBuf {
-        self.config_dir.join("PRIORITY.md")
+        self.config_dir.join("priority.toml")
     }
     pub fn secrets_file(&self) -> PathBuf {
         self.config_dir.join("secrets.toml")

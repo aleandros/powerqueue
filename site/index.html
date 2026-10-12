@@ -123,7 +123,7 @@ powerqueue run          <span class="c-comment"># or a systemd unit</span></code
       </div>
       <div class="install-card">
         <h3>nothing else</h3>
-        <p class="install-desc">One static binary, SQLite, a Markdown rules file. No orchestration platform, no cloud account, no agents-as-a-service. Use Linear, GitHub Issues, or both. <code>powerqueue add</code> also queues work by hand.</p>
+        <p class="install-desc">One static binary, SQLite, a TOML policy file. No orchestration platform, no cloud account, no agents-as-a-service. Use Linear, GitHub Issues, or both. <code>powerqueue add</code> also queues work by hand.</p>
         <div class="code-block"><pre><code>$ powerqueue budget show
 period  43% used, day 3.1 of 7
 window  12% of the 5h window
@@ -170,7 +170,7 @@ fable   8% of 25% share, 12 tasks ok</code></pre></div>
         </g>
         <g class="pipeline-policy" transform="translate(318 128)">
           <rect class="pipeline-policy-shell" width="492" height="62" rx="8"/>
-          <text class="pipeline-policy-title" x="16" y="25">PRIORITY.md → budget → model</text>
+          <text class="pipeline-policy-title" x="16" y="25">priority.toml → budget → model</text>
           <text class="pipeline-micro" x="16" y="45">The right task, when capacity allows.</text>
         </g>
         <g class="pipeline-wires" fill="none">
@@ -233,7 +233,7 @@ fable   8% of 25% share, 12 tasks ok</code></pre></div>
     </figure>
     <div class="flow-steps">
       <div class="flow-step"><strong>1. sync</strong>Queued issues from your team become tasks. Manual tasks come from <code>powerqueue add</code>.</div>
-      <div class="flow-step"><strong>2. score</strong>Rules in a Markdown file set criticality and score. Edit it; the daemon reloads live. Optional Jev scoring.</div>
+      <div class="flow-step"><strong>2. score</strong>Rules in a typed TOML file set criticality and score. Edit it; the daemon reloads live. Optional Jev scoring.</div>
       <div class="flow-step"><strong>3. pick a model</strong>The budget policy chooses the best tier the period and the 5-hour window can afford.</div>
       <div class="flow-step"><strong>4. run</strong>A fresh worktree, a tmux window, an interactive Claude Code session you can attach to at any time.</div>
       <div class="flow-step"><strong>5. watch</strong>Hooks report turns, prompts and failures. Transcripts give tokens. A dead pane means a resumed retry.</div>
@@ -339,7 +339,7 @@ powerqueue run</code></pre></div>
     <div class="usage-preview">
       <h3>Linear setup and daily use</h3>
       <div class="code-block">
-        <pre><code><span class="c-comment"># Linear setup: key → keychain, team, states, permission mode, PRIORITY.md</span>
+        <pre><code><span class="c-comment"># Linear setup: key → keychain, team, states, permission mode, priority.toml</span>
 powerqueue init
 
 <span class="c-comment"># check tools, keys, state and the algorithm</span>
@@ -364,27 +364,27 @@ powerqueue add "Rotate the staging certs" --criticality high</code></pre>
     <h2><span class="prompt">›</span> rules and budget</h2>
     <div class="two-col">
       <div>
-        <h3>PRIORITY.md</h3>
-        <p>Criticality comes from the first matching section. Scoring lines add points. Overrides pin a ticket. <code>## Models</code> states a preference the budget may downgrade. Save the file and the daemon re-scores the queue.</p>
-        <div class="code-block"><pre><code><span class="md-h">## Critical</span>
-<span class="md-b">-</span> <span class="md-k">label:</span> <span class="md-v">incident</span>
-<span class="md-b">-</span> <span class="md-k">priority:</span> <span class="md-v">urgent</span> <span class="md-k">and</span> <span class="md-k">label:</span> <span class="md-v">customer</span>
+        <h3>priority.toml</h3>
+        <p>Typed TOML classifies tasks in criticality order and adds matching score deltas. Model lists are preferences the budget may downgrade. Invalid edits keep the last valid policy. Markdown can record intent; only TOML executes.</p>
+        <div class="code-block"><pre><code>version = 1
 
-<span class="md-h">## Low</span>
-<span class="md-b">-</span> <span class="md-k">label:</span> <span class="md-v">chore</span>
+<span class="md-h">[[criticality]]</span>
+level = "critical"
+all = [{ field = "label", op = "eq", value = "incident" }]
 
-<span class="md-h">## Scoring</span>
-<span class="md-b">-</span> <span class="md-v">+40</span> <span class="md-k">if label:</span> <span class="md-v">customer</span>
-<span class="md-b">-</span> <span class="md-v">-30</span> <span class="md-k">if estimate &gt;</span> <span class="md-v">8</span>
+<span class="md-h">[[scoring]]</span>
+delta = 40
+all = [{ field = "label", op = "eq", value = "customer" }]
 
-<span class="md-h">## Overrides</span>
-<span class="md-b">-</span> <span class="md-k">ENG-412:</span> <span class="md-v">critical</span>
-<span class="md-b">-</span> <span class="md-k">ENG-377:</span> <span class="md-v">skip</span>
+<span class="md-h">[[overrides]]</span>
+key = "ENG-377"
+skip = true
 
-<span class="md-h">## Models</span>
-<span class="md-b">-</span> <span class="md-k">critical:</span> <span class="md-v">fable</span>
-<span class="md-b">-</span> <span class="md-k">high:</span> <span class="md-v">opus</span>
-<span class="md-b">-</span> <span class="md-k">normal:</span> <span class="md-v">sonnet</span></code></pre></div>
+<span class="md-h">[models]</span>
+critical = ["fable"]
+high = ["opus"]
+normal = ["sonnet"]</code></pre></div>
+        <p>Existing rules: <code>powerqueue priority migrate --from PRIORITY.md --to priority.toml</code>, then update the configured policy path.</p>
       </div>
       <div>
         <h3>budget policy</h3>

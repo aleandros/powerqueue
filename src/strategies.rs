@@ -661,6 +661,31 @@ pub fn github_task() -> impl Strategy<Value = Task> {
     })
 }
 
+/// Synthetic tasks covering the fields and legacy edge cases used by policy migration.
+pub fn policy_task() -> impl Strategy<Value = Task> {
+    (
+        task(),
+        prop::sample::select(vec!["PIN-1", "pin-1", "SKIP-1", "ENG-1"]),
+        prop::sample::select(vec!["outage: database", "a:b", "ordinary", "research and development"]),
+        prop::sample::subsequence(vec!["Chore", "customer", "blocked", "model/fable", "security", "hidden"], 0..=6),
+        prop::option::of(0u8..=4),
+        prop::option::of(0.0f64..20.0),
+        prop::option::of(prop::sample::select(vec!["active", "next", "past", "future"])),
+        prop::option::of(0u32..10),
+    )
+        .prop_map(|(mut task, key, title, labels, priority, estimate, cycle, number)| {
+            task.key = key.into();
+            task.title = title.into();
+            task.description = "follow:up".into();
+            task.labels = labels.into_iter().map(str::to_owned).collect();
+            task.linear_priority = priority;
+            task.estimate = estimate;
+            task.cycle = cycle.map(str::to_owned);
+            task.cycle_number = number;
+            task
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

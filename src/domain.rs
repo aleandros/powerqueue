@@ -68,7 +68,7 @@ impl TaskSource {
     }
 }
 
-/// Business importance of a task, as decided by `PRIORITY.md` (and optionally Jev).
+/// Business importance of a task, as decided by `priority.toml` (and optionally Jev).
 /// Ordered from most to least important so `Ord` can be used directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -582,7 +582,7 @@ impl TaskState {
                 next,
                 Queued | Starting | Running | NeedsAttention | Crashed | Failed | Cancelled | Paused | Blocked | Completed
             ),
-            // Unskipped by PRIORITY.md while waiting on a blocker: `blocked`.
+            // Unskipped by priority.toml while waiting on a blocker: `blocked`.
             Paused => matches!(next, Queued | Running | InReview | Cancelled | Completed | Blocked),
             Blocked => matches!(next, Queued | Paused | Cancelled | Completed),
             NeedsAttention => {
@@ -675,7 +675,7 @@ pub struct Task {
     /// Identifier of the parent issue, if this is a sub-issue.
     #[serde(default)]
     pub parent: Option<String>,
-    /// Model forced by the user or `PRIORITY.md`; `None` lets the budget policy choose.
+    /// Model forced by the user or `priority.toml`; `None` lets the budget policy choose.
     pub model_override: Option<ModelTier>,
     /// Model actually used by the latest session.
     pub model: Option<ModelTier>,
@@ -976,7 +976,7 @@ pub fn qualified_label(name: &str, parent: Option<&str>) -> String {
 }
 
 /// True if the stored label `stored` satisfies the label `wanted` written in
-/// config or `PRIORITY.md`. Case-insensitive. A qualified `wanted`
+/// config or `priority.toml`. Case-insensitive. A qualified `wanted`
 /// (`model/fable`) only matches that exact child label; an unqualified one
 /// (`fable`) matches a plain `fable` label and, so configurations written
 /// before labels were qualified keep working, the child part of any group
@@ -1268,7 +1268,7 @@ pub enum DaemonCommand {
     },
     /// Re-read enabled issue sources immediately.
     SyncNow,
-    /// Reload config + PRIORITY.md.
+    /// Reload config + priority.toml.
     Reload,
     /// Stop the daemon gracefully (sessions keep running in tmux).
     Shutdown,

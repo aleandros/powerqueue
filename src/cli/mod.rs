@@ -1,7 +1,7 @@
 //! Command-line interface.
 //!
 //! ```text
-//! powerqueue init                 guided setup (keys, repo, team, providers, PRIORITY.md); --reconfigure edits an existing install
+//! powerqueue init                 guided setup (keys, repo, team, providers, priority.toml); --reconfigure edits an existing install
 //! powerqueue run [--once]         start the scheduler daemon (foreground)
 //! powerqueue stop                 ask a running daemon to exit
 //! powerqueue dashboard            live TUI
@@ -9,8 +9,8 @@
 //! powerqueue add "title" [...]    enqueue a manual task
 //! powerqueue task <show|list|complete [--pr]|block|cancel|pause|resume|retry|explain|model|prompt|output|send>
 //! powerqueue attach <task>        open the task's tmux window
-//! powerqueue priority <show|check|edit|explain|simulate|path>
-//! powerqueue tune "what you expect" [-y] [--dry-run] [--scope priority|config|all]   let Claude edit PRIORITY.md / config.toml for you; --apply [DIR], --undo
+//! powerqueue priority <show|check|edit|explain|simulate|path|migrate>
+//! powerqueue tune "what you expect" [-y] [--dry-run] [--scope priority|config|all]   let Claude edit priority.toml / config.toml for you; --apply [DIR], --undo
 //! powerqueue budget <show|set-reset|set-observed|clear-limits|estimate> [--provider <p>]
 //! powerqueue linear <teams|states|test|sync>
 //! powerqueue github <test|sync>
@@ -89,11 +89,11 @@ pub enum Command {
     Task(TaskCommand),
     /// Attach to a task's tmux window (or the powerqueue session).
     Attach(AttachArgs),
-    /// Priority rules (PRIORITY.md).
+    /// Priority rules (priority.toml).
     #[command(subcommand)]
     Priority(PriorityCommand),
     /// Describe a change in plain words ("ENG-12 should run before ENG-40", "use sonnet for
-    /// chores") and let Claude Code edit drafts of PRIORITY.md and config.toml; review the
+    /// chores") and let Claude Code edit drafts of priority.toml and config.toml; review the
     /// diff and the simulated queue, then apply.
     Tune(TuneArgs),
     /// Model budget and pacing.
@@ -121,7 +121,7 @@ pub enum Command {
     #[command(subcommand)]
     Secrets(SecretsCommand),
     /// Start over: stop the daemon, kill the tmux session, remove worktrees and task
-    /// state, and empty the database (config, secrets, PRIORITY.md and logs are kept).
+    /// state, and empty the database (config, secrets, priority.toml and logs are kept).
     Reset(ResetArgs),
     /// Internal: receive a Claude Code hook event.
     #[command(hide = true)]
@@ -247,7 +247,7 @@ pub struct AddArgs {
     /// Explicit key (default: `manual-<id>`).
     #[arg(short, long)]
     pub key: Option<String>,
-    /// Labels for PRIORITY.md rules.
+    /// Labels for priority.toml rules.
     #[arg(short, long)]
     pub label: Vec<String>,
     /// Start paused.
@@ -338,22 +338,38 @@ pub struct AttachArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum PriorityCommand {
+    /// Convert retired Markdown rules to TOML without overwriting either file.
+    Migrate {
+        #[arg(long, value_name = "MARKDOWN")]
+        from: PathBuf,
+        #[arg(long, value_name = "TOML")]
+        to: PathBuf,
+    },
     /// Print the parsed rules.
-    Show,
+    Show(PolicyArgs),
     /// Validate the file (or a draft `--file`) and report problems.
     Check(CheckArgs),
-    /// Open PRIORITY.md in $EDITOR.
-    Edit,
+    /// Open priority.toml in $EDITOR.
+    Edit(PolicyArgs),
     /// Show how the rules score one task.
     Explain(TaskRef),
     /// Dry-run: score every task with the rules (or a draft file) and show the resulting queue order.
     Simulate(SimulateArgs),
     /// Print the path of the rules file.
-    Path,
+    Path(PolicyArgs),
+}
+
+#[derive(Debug, Args, Default)]
+pub struct PolicyArgs {
+    /// Select an execution project; otherwise inspect the machine policy.
+    #[arg(long)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Args, Default)]
 pub struct CheckArgs {
+    #[arg(long)]
+    pub project: Option<String>,
     /// Rules file to validate instead of the live one.
     #[arg(long, value_name = "PATH")]
     pub file: Option<PathBuf>,
@@ -361,6 +377,9 @@ pub struct CheckArgs {
 
 #[derive(Debug, Args, Default, Clone)]
 pub struct SimulateArgs {
+    /// Restrict the simulation to an execution project.
+    #[arg(long)]
+    pub project: Option<String>,
     /// Rules file to try instead of the live one (edit a copy, simulate, then replace).
     #[arg(long, value_name = "PATH")]
     pub file: Option<PathBuf>,
@@ -582,7 +601,7 @@ pub enum ConfigCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TuneScope {
-    /// Only PRIORITY.md.
+    /// Only priority.toml.
     Priority,
     /// Only config.toml.
     Config,

@@ -25,16 +25,16 @@ mkdir -p "$state_dir"
 # `powerqueue tune` runs `claude -p ... --output-format json` with the prompt
 # on stdin and the draft directory as cwd. FAKE_TUNE_MODE selects what the
 # "agent" does to the drafts:
-#   edit     (default) add an override to PRIORITY.md and set
+#   edit     (default) add an override to priority.toml and set
 #            scheduler.max_concurrent = 3 in config.toml (appended; the test
 #            configs have no [scheduler] table)
-#   priority only edit PRIORITY.md
+#   priority only edit priority.toml
 #   noop     change nothing
 #   invalid  write an unparsable rule and an invalid config value
 #   fail     exit 1 with a message on stderr
 #   hang     sleep (for the timeout path)
 # The prompt is saved to $FAKE_CLAUDE_STATE_DIR/tune-prompt.md and the
-# argv to tune-argv.txt; `powerqueue priority check --file PRIORITY.md` is run
+# argv to tune-argv.txt; `powerqueue priority check --file priority.toml` is run
 # through PATH and its exit code saved to tune-check-exit.txt, so tests can
 # verify that the session sees the right binary and home.
 headless=0
@@ -47,22 +47,22 @@ if [ "$headless" = 1 ]; then
   cat > "$state_dir/tune-prompt.md"
   echo "fake-claude: headless mode=$tune_mode cwd=$(pwd) prompt bytes=$(wc -c < "$state_dir/tune-prompt.md")" >&2
   if command -v powerqueue >/dev/null 2>&1; then
-    powerqueue priority check --file PRIORITY.md >/dev/null 2>&1
+    powerqueue priority check --file priority.toml >/dev/null 2>&1
     echo "$?" > "$state_dir/tune-check-exit.txt"
     powerqueue config validate --file config.toml >/dev/null 2>&1
     echo "$?" > "$state_dir/tune-validate-exit.txt"
   fi
   case "$tune_mode" in
     edit)
-      printf '\n## Overrides\n- FAKE-1: critical\n' >> PRIORITY.md
+      printf '\n[[overrides]]\nkey = "FAKE-1"\ncriticality = "critical"\n' >> priority.toml
       printf '\n[scheduler]\nmax_concurrent = 3\n' >> config.toml
       ;;
     priority)
-      printf '\n## Overrides\n- FAKE-1: critical\n' >> PRIORITY.md
+      printf '\n[[overrides]]\nkey = "FAKE-1"\ncriticality = "critical"\n' >> priority.toml
       ;;
     noop) ;;
     invalid)
-      printf '\n## Critical\n- bogus: nonsense\n' >> PRIORITY.md
+      printf '\n[[criticality]]\nlevel = "critical"\nall = [{ field = "bogus", op = "eq", value = "nonsense" }]\n' >> priority.toml
       printf '\n[scheduler]\nmax_concurrent = 0\n' >> config.toml
       ;;
     fail)

@@ -13,7 +13,7 @@
 //! | [`store`] | SQLite persistence: tasks, sessions, usage, events, commands |
 //! | [`linear`] | Linear GraphQL client |
 //! | [`github`] | GitHub Issues REST client and synchronization |
-//! | [`priority`] | `PRIORITY.md` rules, live reload, optional Jev scoring |
+//! | [`priority`] | `priority.toml` rules, live reload, optional Jev scoring |
 //! | [`budget`] | model-usage pacing, token accounting, cost estimation |
 //! | [`worktree`] / [`tmux`] / [`session`] | runtime: worktrees, tmux windows, Claude Code sessions |
 //! | [`scheduler`] | the daemon loop |

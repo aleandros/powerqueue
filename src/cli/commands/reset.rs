@@ -7,7 +7,7 @@
 //! directories, empty the database. Every step continues past per-item
 //! failures and the summary lists what was removed, kept and why.
 //!
-//! Config, secrets, PRIORITY.md and logs are never touched. Nothing outside
+//! Config, secrets, priority.toml and logs are never touched. Nothing outside
 //! the worktree root, the task state directory and the database is deleted.
 
 use std::collections::BTreeMap;
@@ -857,7 +857,7 @@ fn print_result(plan: &ResetPlan, result: &ResetResult, args: &ResetArgs) {
         }
     }
     println!(
-        "\nKept: config.toml, secrets, PRIORITY.md and logs.{}",
+        "\nKept: config.toml, secrets, priority.toml and logs.{}",
         if plan.linear.requested { "" } else { " Linear issues were left as-is (use --revert-linear to re-queue them)." }
     );
 }

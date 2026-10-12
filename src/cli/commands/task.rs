@@ -573,7 +573,7 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     if task.score_reasons.is_empty() {
         println!(
             "    {}",
-            "(not scored yet — the daemon scores tasks against PRIORITY.md on its next tick)"
+            "(not scored yet — the daemon scores tasks against priority.toml on its next tick)"
                 .if_supports_color(Stream::Stdout, |t| t.dimmed())
         );
     }

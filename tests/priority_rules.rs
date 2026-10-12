@@ -1,4 +1,4 @@
-//! `PRIORITY.md` parsing and evaluation through the public API, plus the
+//! `priority.toml` parsing and evaluation through the public API, plus the
 //! sync → store → evaluate round trip.
 
 use chrono::{Duration, Utc};
@@ -94,7 +94,10 @@ fn chore_label_is_low() {
 
 #[test]
 fn overrides_pin_tickets() {
-    let md = format!("{}\n## Overrides\n- ENG-9: skip\n- ENG-8: critical\n- ENG-8: model = haiku\n", template());
+    let md = format!(
+        "{}\n[[overrides]]\nkey = \"ENG-9\"\nskip = true\n[[overrides]]\nkey = \"ENG-8\"\ncriticality = \"critical\"\nmodels = [\"haiku\"]\n",
+        template()
+    );
     let r = PriorityRules::parse(&md).unwrap();
     let e = r.evaluate(&linear_task("eng-9", "x"), Utc::now(), None, 0.0, 0.0);
     assert!(e.skip);
@@ -106,8 +109,8 @@ fn overrides_pin_tickets() {
 #[test]
 fn model_lists_accept_alternatives_across_providers() {
     let md = format!(
-        "{}\n## Overrides\n- ENG-7: model = gpt-6-astra | sonnet\n",
-        template().replace("- critical: fable\n", "- critical: fable | gpt-6.1-sol | opus\n")
+        "{}\n[[overrides]]\nkey = \"ENG-7\"\nmodels = [\"gpt-6-astra\", \"sonnet\"]\n",
+        template().replace(r#"critical = ["fable"]"#, r#"critical = ["fable", "gpt-6.1-sol", "opus"]"#)
     );
     let r = PriorityRules::parse(&md).unwrap();
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
@@ -119,23 +122,24 @@ fn model_lists_accept_alternatives_across_providers() {
     assert_eq!(e.model, Some(ModelTier::fable()));
     let e = r.evaluate(&linear_task("ENG-7", "x"), Utc::now(), None, 0.0, 0.0);
     assert_eq!(e.models, vec![ModelTier::new("gpt-6-astra"), ModelTier::sonnet()]);
-    assert!(e.reasons.iter().any(|x| x == "model gpt-6-astra | sonnet from ## Overrides"), "{:?}", e.reasons);
+    assert!(e.reasons.iter().any(|x| x == "model gpt-6-astra | sonnet from overrides"), "{:?}", e.reasons);
 
     // Unknown names fail with the line number and the alias rules.
-    let bad = template().replace("- high: opus\n", "- high: opus | llama\n");
+    let bad = template().replace(r#"high = ["opus"]"#, r#"high = ["opus", "llama"]"#);
     let errs = PriorityRules::parse(&bad).unwrap_err();
     assert_eq!(errs.len(), 1);
     assert!(errs[0].message.contains("unknown model `llama`") && errs[0].message.contains("codex:<name>"), "{}", errs[0].message);
-    assert_eq!(bad.lines().nth(errs[0].line - 1).unwrap().trim(), "- high: opus | llama");
+    assert_eq!(bad.lines().nth(errs[0].line - 1).unwrap().trim(), r#"high = ["opus", "llama"]"#);
 }
 
 #[test]
 fn parse_errors_name_the_line() {
-    let md = "## Critical\n- label: ok\n- estimate > lots\n";
+    let md =
+        "version = 1\n[[criticality]]\nlevel = \"critical\"\nall = [{ field = \"estimate\", op = \"gt\", value = \"lots\" }]\n";
     let errs = PriorityRules::parse(md).unwrap_err();
     assert_eq!(errs.len(), 1);
-    assert_eq!(errs[0].line, 3);
-    assert_eq!(errs[0].to_string(), format!("PRIORITY.md line 3: {}", errs[0].message));
+    assert_eq!(errs[0].line, 2);
+    assert_eq!(errs[0].to_string(), format!("priority policy line 2: {}", errs[0].message));
 }
 
 #[test]

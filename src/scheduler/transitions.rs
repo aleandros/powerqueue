@@ -14,7 +14,8 @@ use crate::domain::{EventLevel, HookEvent, LinkedIssue, ModelTier, Provider, Ses
 use crate::priority::Evaluation;
 use crate::session::{HookOutcome, SessionProbe};
 
-/// `last_error` marker for tasks paused by a PRIORITY.md `skip` override.
+/// `last_error` marker for tasks paused by a priority.toml `skip` override.
+// Persisted marker: retain the legacy spelling so existing paused tasks unskip.
 pub const SKIP_REASON: &str = "skipped by PRIORITY.md";
 
 /// What Claude is told when a session sits idle without a completion signal.
@@ -844,7 +845,7 @@ pub fn on_dependencies(task: &mut Task) -> Vec<Effect> {
     }
 }
 
-/// Apply a PRIORITY.md evaluation to a task that has no live session:
+/// Apply a priority.toml evaluation to a task that has no live session:
 /// criticality, score (moves of more than half a point), the preferred
 /// model line of the reasons trail, a `skip` override (⇒ `paused`, marked
 /// with [`SKIP_REASON`]; lifted when the skip goes away) and the dependency
@@ -862,7 +863,7 @@ pub fn on_evaluation(task: &mut Task, eval: &Evaluation) -> Vec<Effect> {
         task.score = eval.score;
         changed = true;
     }
-    // A new label or `## Models` row can change the preferred models
+    // A new label or model preference row can change the preferred models
     // without moving criticality or score; keep the stored trail honest.
     let model_line = |reasons: &[String]| reasons.iter().find(|r| r.starts_with("model ")).cloned();
     let (old_model, new_model) = (model_line(&task.score_reasons), model_line(&eval.reasons));
@@ -871,7 +872,7 @@ pub fn on_evaluation(task: &mut Task, eval: &Evaluation) -> Vec<Effect> {
         effects.push(Effect::log(
             EventLevel::Info,
             "task.models_changed",
-            new_model.clone().unwrap_or_else(|| "no preferred model from PRIORITY.md".to_string()),
+            new_model.clone().unwrap_or_else(|| "no preferred model from priority.toml".to_string()),
             serde_json::json!({ "models": eval.models, "source": eval.model_source, "previous": old_model }),
         ));
     }
@@ -886,7 +887,12 @@ pub fn on_evaluation(task: &mut Task, eval: &Evaluation) -> Vec<Effect> {
     } else if !eval.skip && task.state == TaskState::Paused && task.last_error.as_deref() == Some(SKIP_REASON) {
         task.state = TaskState::Queued;
         task.last_error = None;
-        effects.push(Effect::log(EventLevel::Info, "task.unskipped", "no longer skipped by PRIORITY.md", serde_json::json!({})));
+        effects.push(Effect::log(
+            EventLevel::Info,
+            "task.unskipped",
+            "no longer skipped by priority.toml",
+            serde_json::json!({}),
+        ));
     }
     effects.extend(on_dependencies(task));
     effects
@@ -1910,7 +1916,7 @@ mod tests {
         let eval = evaluation(Criticality::High, 500.0, false, &["label urgent"]);
         let effects = on_evaluation(&mut t, &eval);
         assert!(
-            matches!(&effects[..], [Effect::Log { message, .. }] if message == "no preferred model from PRIORITY.md"),
+            matches!(&effects[..], [Effect::Log { message, .. }] if message == "no preferred model from priority.toml"),
             "{effects:?}"
         );
         assert_eq!(t.score_reasons, vec!["label urgent".to_string()]);
@@ -2412,7 +2418,7 @@ mod properties {
             prop_assert_eq!(&t, &again);
         }
 
-        /// A PRIORITY.md skip pauses open work and lifts only what it
+        /// A priority.toml skip pauses open work and lifts only what it
         /// paused; the same evaluation applied twice is a no-op.
         #[test]
         fn evaluation_skips_and_unskips(task in task(), eval in evaluation()) {

@@ -7,7 +7,7 @@
 //! Categories:
 //! * environment: git, tmux, the CLI of every enabled provider (binary,
 //!   version, logged in: `claude auth status`, `codex login status`, ...)
-//! * configuration: config.toml validity, PRIORITY.md parse, repo path, worktree root writable,
+//! * configuration: config.toml validity, priority.toml parse, repo path, worktree root writable,
 //!   per provider: model shares, period anchor known (config / observed / default),
 //!   `powerqueue tune` drafts waiting to be applied or left behind by a failed run
 //! * secrets: keychain backend, Linear key works (`viewer`), Jev key (if enabled)
@@ -511,7 +511,7 @@ fn check_priority_file(cfg: &Config, paths: &Paths) -> CheckResult {
         Ok(None) => {
             return CheckResult::warn(
                 CONF,
-                "PRIORITY.md",
+                "priority.toml",
                 format!("{source} not found; every task gets the default criticality"),
                 match source.rev() {
                     Some(rev) => format!("commit the file on {rev} (the daemon reads the rules from that branch)"),
@@ -522,23 +522,23 @@ fn check_priority_file(cfg: &Config, paths: &Paths) -> CheckResult {
         Err(e) => {
             return CheckResult::fail(
                 CONF,
-                "PRIORITY.md",
+                "priority.toml",
                 format!("cannot read {source}: {e:#}"),
-                "fix the file permissions, or the git state of the main checkout",
+                "repair the source or migrate legacy Markdown with `powerqueue priority migrate --from PRIORITY.md --to priority.toml` and update the configured path",
             );
         }
     };
     match PriorityRules::parse(&text) {
-        Ok(rules) if rules.warnings.is_empty() => CheckResult::ok(CONF, "PRIORITY.md", format!("{source} parses cleanly")),
+        Ok(rules) if rules.warnings.is_empty() => CheckResult::ok(CONF, "priority.toml", format!("{source} parses cleanly")),
         Ok(rules) => CheckResult::warn(
             CONF,
-            "PRIORITY.md",
+            "priority.toml",
             rules.warnings.iter().map(|w| format!("line {}: {}", w.line, w.message)).collect::<Vec<_>>().join("; "),
             "run `powerqueue priority check` and fix the listed lines",
         ),
         Err(errors) => CheckResult::fail(
             CONF,
-            "PRIORITY.md",
+            "priority.toml",
             errors.iter().map(|w| format!("line {}: {}", w.line, w.message)).collect::<Vec<_>>().join("; "),
             "run `powerqueue priority check` and fix the listed lines",
         ),

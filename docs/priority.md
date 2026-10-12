@@ -1,513 +1,210 @@
-# PRIORITY.md: the rules grammar
+# priority.toml: typed executable policy
 
-`PRIORITY.md` decides three things for every task: its **criticality**
-(`critical`, `high`, `normal`, `low`), its **score** (higher runs first), and
-optionally its **model**. It is ordinary Markdown so it can be edited anywhere
-and reviewed like code. `powerqueue init` writes the reference template
-(`src/priority/PRIORITY.template.md`); `powerqueue priority path` prints where
-the live file is.
+`priority.toml` determines criticality, score, skip decisions and preferred
+models. `PRIORITY.md` may contain free-form intent for people and agents, but
+Markdown prose alone is **not executable**. The daemon never evaluates Markdown.
+Use `tune` to translate an instruction into a validated TOML draft for review.
 
-Check a file with `powerqueue priority check`. See what it does to one task
-with `powerqueue priority explain ENG-123`, or to the whole queue with
-`powerqueue priority simulate` (see [Tuning](#tuning-with-priority-simulate)).
+## Schema (version 1)
 
-## Document structure
+```toml
+version = 1
+# Optional; the built-in fallback is normal.
+default_criticality = "normal"
 
-A document is a sequence of `##` sections. Section names are matched
-case-insensitively. Anything outside a known section (prose, HTML comments,
-other headings) is ignored, so you can keep notes in the file.
+[[criticality]]
+level = "critical"
+all = [{ field = "label", op = "eq", value = "incident" }]
 
-| Section | Purpose |
-|---------|---------|
-| `## Critical`, `## High`, `## Normal`, `## Low` | rules that assign a criticality |
-| `## Default` | criticality for tasks no rule matches (default `normal`) |
-| `## Scoring` | point adjustments |
-| `## Overrides` | per-ticket pins |
-| `## Models` | preferred models per criticality (`fable \| gpt-6.1-sol`), plus conditional `if <conditions>: <models>` rows |
-| `## Jev` | Jev question and rubric |
+[[criticality]]
+level = "high"
+all = [
+  { field = "priority", op = "eq", value = "high" },
+  { field = "label", op = "ne", value = "chore" },
+]
 
-Rules are bullet lines (`- ...` or `* ...`). Blank lines and non-bullet lines
-inside a section are ignored, and HTML comments (`<!-- ... -->`, even across
-lines) are stripped; there is no `#` line comment. Unknown sections, bullets
-before the first `##`, a repeated `## Default` or `## Models` entry and unknown
-Jev settings produce warnings, which `priority check` and `doctor` report with
-line numbers. A bullet that cannot be parsed (unknown field, bad operator,
-invalid regex, unknown model name) is an error.
+[[scoring]]
+delta = 40
+all = [{ field = "source", op = "eq", value = "github" }]
 
-## Conditions
+[[scoring]]
+delta = -30
+all = [{ field = "estimate", op = "gt", value = 8 }]
 
-A condition compares one task field with a value.
+[[model_rules]]
+models = ["fable", "gpt-6.1-sol"]
+all = [{ field = "label", op = "eq", value = "model/fable" }]
 
-| Form | Meaning | Example |
-|------|---------|---------|
-| `field: value` | equals, case-insensitive; for `label`, membership in the label list (`=` and `==` are accepted too) | `label: incident` |
-| `field != value` | not equals (for `label`: label absent) | `project != Sandbox` |
-| `field ~ regex` | case-insensitive regex match (for `label`: any label matches) | `title ~ "^hotfix"` |
-| `field > n` | numeric greater than (`priority`, `estimate`, `cycle_number` only) | `estimate > 8` |
-| `field < n` | numeric less than (`priority`, `estimate`, `cycle_number` only) | `priority < 3` |
+[[overrides]]
+key = "ENG-123"
+criticality = "high"
+score_delta = 100
+models = ["opus", "gpt-6.1-sol"]
 
-Join conditions with ` and `. All conditions in a rule must hold. There is no
-`or`: write a second bullet instead.
+[[overrides]]
+key = "ENG-200"
+skip = true
 
-```markdown
-## Critical
-- priority: urgent and label: customer
-- label: incident
+[models]
+critical = ["fable", "gpt-6.1-sol"]
+high = ["opus"]
+normal = ["sonnet"]
+low = ["sonnet"]
+
+[jev]
+enabled = false
+question = "How important is it to ship this ticket this week?"
+levels = ["later", "soon", "now"]
 ```
 
-Quotes around values are optional; use them when a value contains spaces or
-regex metacharacters.
+`version` is required. Other top-level keys are optional; absent rule lists and
+model maps are empty. Unconfigured policies use normal criticality, no custom
+scores/skips/model preferences, and disabled Jev. `init` writes the richer
+shipped template (incident/security/urgent critical; customer/high high;
+normal priority normal; chore/docs low).
 
-### Grouped labels (`parent/name`)
+All tables reject unknown keys. Duplicate TOML keys, invalid criticalities,
+unknown models, duplicate model preferences, case-insensitive duplicate task
+keys, empty condition/model lists and non-finite numbers fail validation.
+`priority check` reports source lines; semantic errors also identify the rule
+array and index (zero-based). Jev requires a nonempty question and 2–10 nonempty
+levels. Every override must set at least one action. `skip` defaults to false;
+other override actions default to absent.
 
-Linear labels can live in a group (a parent label): the `fable` label inside
-the `model` group is a different label from a loose `fable` label.
-powerqueue stores a child label qualified with its group, `model/fable`, and
-a loose label as plain `fable` (`task show` lists them that way). Labels on
-existing tasks are re-synced on the next Linear poll.
+### Conditions
 
-- `label: model/fable` matches only the child label in the `model` group.
-- `label: fable` (no `/`) matches a loose `fable` label **and** any child
-  label called `fable`, so rules (and `linear.required_labels` /
-  `excluded_labels`) written before labels were qualified keep working.
-- `label ~ regex` matches the stored form or the bare child name:
-  `label ~ ^model/` matches any label in the `model` group, and an older
-  `label ~ ^fable$` still matches `model/fable`.
-- `/` is the group separator, so a label whose own name contains `/` is
-  ambiguous: a loose label named `frontend/web` also matches `label: web`,
-  and a child `ios/android` in group `platform` is stored as
-  `platform/ios/android` (write that, or `label: android`, to match it).
+Conditions are data: `{ field = ..., op = ..., value = ... }`. `all` is a
+nonempty conjunction (AND). Separate criticality rules supply alternatives
+(OR); no expression mini-language is parsed from values.
 
-## Fields
+| Field | Meaning |
+|---|---|
+| `label` | membership; qualified Linear labels such as `model/fable` work; bare child names retain legacy matching |
+| `priority` | Linear priority: none/no priority/0, urgent/1, high/2, normal/medium/3, low/4 |
+| `estimate` | numeric estimate |
+| `cycle_number` | numeric Linear cycle number |
+| `cycle` | active, next, past, future |
+| `project` | source Linear project name, **not** execution-project ID |
+| `team` | Linear team key |
+| `title`, `description`, `key` | task text |
+| `source` | linear, github, manual |
 
-| Field | Type | Values |
-|-------|------|--------|
-| `label` | list of strings | any Linear label, or labels given with `add --label`; a child label in a Linear label group is stored as `parent/name` (see below) |
-| `priority` | enum / number | `urgent`, `high`, `normal` (`medium`), `low`, `none`, or Linear's 0–4 (0 = none, 1 = urgent) |
-| `estimate` | number | Linear estimate points |
-| `project` | string | Linear project name |
-| `cycle` | enum | `active`, `next`, `past` or `future`: where the issue's cycle sits today; missing when the issue is in no cycle (and on manual tasks) |
-| `cycle_number` | number | the cycle's number (`Cycle.number` in Linear); missing without a cycle |
-| `team` | string | Linear team key (`ENG`); missing on manual tasks |
-| `title` | string | task title |
-| `description` | string | task description (Markdown) |
-| `source` | enum | `linear`, `github` or `manual` |
-| `key` | string | task key (`ENG-123`, `manual-1a2b3c4d`) |
+`eq` and `ne` use case-insensitive text equality or numeric equality. `matches`
+is a case-insensitive Rust regex, supplied as a string (TOML literal strings
+are convenient for backslashes). `gt` and `lt` accept TOML numbers and only
+numeric fields (`priority`, `estimate`, `cycle_number`). Equality for numeric
+fields also accepts numeric strings and priority names for migration fidelity.
+Missing optional fields fail every predicate except `ne`, which succeeds.
+Labels use the existing qualified/bare-child equality and regex behavior.
+Strings containing colons, `and`, quotes or pipes are ordinary values, not
+condition separators. A regex with `|` keeps its normal regex meaning.
 
-Comparing a missing field (no estimate, no project) with `:` or `~` never
-matches; `!=` matches.
+### Ordering and precedence
 
-## Criticality sections
+1. Match a task override by case-insensitive key. Its criticality replaces
+   classification, its score delta adds to scoring, its models take precedence,
+   and `skip = true` pauses the task. Removing a skip lets the daemon re-evaluate
+   it (dependency and user-pause rules still apply).
+2. Otherwise classify by **critical → high → normal → low**, regardless of
+   the order different levels appear in the file. Within a level, the first
+   matching rule wins. With no match, use `default_criticality`.
+3. Begin at the criticality base score: critical 1000, high 500, normal 100,
+   low 10. Add **every** matching scoring delta in file order, then the task
+   override delta. Add the configured Jev contribution and waiting-age boost
+   (capped at 200), as before.
+4. Model preference is task override → first matching `model_rules` row in
+   file order → `models.<effective criticality>` → budget defaults.
 
-```markdown
-## Critical
-- priority: urgent
-- label: security
+The existing budget/provider eligibility, reservations, fallback, downgrade
+chains and CLI `task model` behavior are unchanged. Policy model lists are
+preferences, not permission to exceed budgets or enable a disabled provider.
+`explain` shows decisions and source locations; `simulate --reasons` shows
+queue changes and budget decisions without writing state.
 
-## High
-- priority: high
-- project ~ "Launch"
+## Machine and execution-project policies
 
-## Normal
-- priority: normal
+The machine default is `<config>/priority.toml`, or `[priority].file` in
+`config.toml`. A registered project's `[projects.ID.priority]` replaces the
+machine priority settings when present; omitted settings in that block use
+`PriorityConfig` defaults. Without the block it inherits machine settings.
+The project's `.powerqueue.toml` `priority_file` takes precedence over either
+file selection and resolves relative to its checkout. Use absolute paths for
+`priority.file` and `projects.ID.priority.file` (relative filesystem paths use
+the process working directory). Policies replace the
+whole selected document; rules from different files are not concatenated.
+Machine budgets and total concurrency remain machine-wide.
 
-## Low
-- label: chore
-- label: docs
+With `repo.overrides_from = "default-branch"`, a repository-relative
+`priority_file` is read from the same commit as `.powerqueue.toml`. Editing the
+working copy does not affect execution until that commit is selected. Absolute
+paths are read from disk. `project list --json` and `priority path --project ID`
+show effective paths. `priority explain TASK` selects the task's execution
+project automatically; live simulation evaluates each task using its own
+project policy. `--project ID` filters simulation. `--file` applies a draft
+policy to the selected tasks while keeping machine budget rules.
 
-## Default
-- normal
+## Migration from Markdown
+
+Stop scheduling while switching files, then convert each global or project
+policy explicitly:
+
+```sh
+powerqueue pause
+powerqueue priority migrate --from PRIORITY.md --to priority.toml
+powerqueue priority check --file priority.toml
+powerqueue priority simulate --file priority.toml --reasons
+# Update [priority].file, [projects.ID.priority].file, or priority_file
+# in .powerqueue.toml. Commit both repository-owned changes when applicable.
+# Restart the daemon or use Reload in the dashboard.
+powerqueue resume
 ```
 
-Evaluation walks the sections from `Critical` down to `Low` and stops at the
-first section with a matching bullet. A task that matches nothing gets the
-`## Default` criticality, which is `normal` when the section is absent. The
-`Default` section holds a single bullet with one of the four names.
+Migration never overwrites either file or changes configuration. Keep the
+Markdown for optional intent/history. If the old file was at the default
+`<config>/PRIORITY.md`, the new default is `<config>/priority.toml`; no path
+setting is necessary after migration. If only the legacy default exists,
+loading and initialization report the migration command rather than silently
+using defaults. Explicit Markdown policy paths must also be migrated.
 
-Criticality is what the budget policy looks at when it decides whether a tier
-is eligible (see [budget.md](budget.md)). Its base score is:
+The converter uses the actual legacy parser, including `*` bullets, case
+variants, `=`/`==`, comments, repeated sections/settings, optional scoring `if`,
+conditional-model colon splitting, model aliases and Jev aliases. It preserves
+first default, last per-criticality model row, last override criticality/model,
+additive override deltas, and first conditional model match. It reports the
+legacy warnings for ignored/duplicate content. Explanations now refer to TOML
+locations; evaluation equivalence is checked on generated synthetic tasks.
 
-| criticality | base score |
-|-------------|-----------:|
-| critical | 1000 |
-| high | 500 |
-| normal | 100 |
-| low | 10 |
+Intentional changes: unknown keys are errors rather than ignored warnings;
+duplicate override keys must be combined; duplicate models must be removed;
+non-finite numbers must be repaired. Migration consolidates supported duplicate
+settings automatically. The old parser split `and` even inside quotes; malformed
+legacy conditions are rejected, not guessed. TOML now supports literal `and`
+and other punctuation inside values. Arbitrary legacy prose has no rule
+semantics and migrates to defaults, with that limitation reported by the command.
 
-## Scoring
+## Commands and reload
 
-```markdown
-## Scoring
-- +40 if label: customer
-- +20 if priority: high
-- -30 if estimate > 8
-- +10 if source: manual
+```sh
+powerqueue priority show --project api
+powerqueue priority check --project api
+powerqueue priority path --project api
+powerqueue priority edit --project api
+powerqueue priority explain ENG-123
+powerqueue priority simulate --project api --reasons
+powerqueue priority simulate --file draft.toml --no-budget --all
+powerqueue tune "customer tickets should rank above chores" --scope priority --dry-run
 ```
 
-Each bullet is `+N if <conditions>` or `-N if <conditions>` (the `if` is
-optional). Every matching bullet adds its delta; bullets are independent.
-Deltas are plain numbers (decimals allowed). Base scores are 10/100/500/1000, so a delta of a few
-hundred can reorder tasks across criticality levels; keep deltas below 400 if
-you want criticality to dominate.
+`show`, `check`, `edit` and `path` select the machine policy when `--project`
+is omitted. JSON is available through the global `--json` option. `edit` uses
+`$VISUAL`, then `$EDITOR`, then `vi`. `tune` edits validated TOML drafts and
+retains its diff/apply/undo workflow; see [commands](commands.md).
 
-## Overrides
-
-Pins for individual tickets. The key is the task key, case-insensitive.
-
-```markdown
-## Overrides
-<!-- KEY: critical|high|normal|low, KEY: +N / -N, KEY: model = <tier>, KEY: skip -->
-- ENG-123: critical
-- ENG-200: +100
-- ENG-201: model = opus
-- ENG-300: skip
-```
-
-One ticket may have several override bullets. `skip` moves the task to
-`paused` with the last error `skipped by PRIORITY.md`; remove the line and
-the daemon re-queues it on the next tick. A criticality override beats the
-section rules. A score override is added after scoring rules. A model
-override is a *preference list* handed to the budget policy (`KEY: model =
-fable | gpt-6.1-sol`, most wanted first; the alternatives may belong to
-different providers), which tries each entry through its provider's
-downgrade chain and may still pick something else when nothing on the list
-fits (it says so in `task explain`); only `task model` and `add --model` set
-a hard `model_override`, and even that is downgraded within its provider
-rather than ignored.
-
-## Models
-
-```markdown
-## Models
-- critical: fable | gpt-6.1-sol
-- high: opus | gpt-6-astra
-- normal: sonnet
-- low: sonnet
-```
-
-```markdown
-## Models
-- if label: model/fable: fable
-- if label ~ ^model/ and priority: urgent: opus | gpt-6.1-sol
-- critical: fable
-```
-
-Maps a criticality to a list of preferred models, most wanted first.
-A bullet starting with `if` is a **conditional row**: `if <conditions>:
-<model> [| <model>...]`. Conditions use the same grammar as the criticality
-sections (`label: model/fable`, `label ~ regex`, `and`, ...). The conditions
-and the model list are split at the first `:` where both halves parse, so
-`if title ~ a:b: fable` and `if label: x: codex:gpt-6` work. Conditional
-rows are tried in file order and the first one whose conditions all hold
-wins over the criticality row (an `## Overrides` model list still wins over
-both); a row repeating an earlier row's conditions is a warning, since it can
-never apply. They do not change the task's criticality or score.
-
-A conditional row is still a preference: the budget reservation
-(`budget.providers.<p>.models.<m>.min_criticality`, fable is reserved for
-`critical` by default) applies, so `if label: model/fable: fable` on a
-`high` task runs a downgrade until the reservation relaxes late in the
-period. `priority check` and `priority explain` print a `note:` when that
-happens. When a row changes a task's preferred models the daemon logs a
-`task.models_changed` event and refreshes the task's reasons.
-
-Alternatives are separated by `|` (whitespace around them does not matter;
-`critical = fable | gpt-6.1-sol` also works). Each name is parsed with the
-same rules as `task model`: Claude's aliases (`fable`, `opus`, `sonnet`,
-`haiku`), `gpt-*`/`o1*`/`o3*`/`o4*`/`codex*` for Codex, `gemini-*` for
-Antigravity, or an explicit `codex:<name>` / `gemini:<name>`; an unknown
-name is an error with the line number and those rules, and a name listed
-twice is a warning (the repeat is ignored). A model whose provider is
-disabled in `config.toml` is simply skipped by the policy (`budget show`
-lists disabled providers).
-
-Missing levels leave the choice to the budget policy: `normal` falls back to
-`budget.default_model`, `low` to `budget.low_model`, and `critical`/`high`
-take the most capable eligible model. As with override models, this is a
-preference: the policy tries each alternative in order (each through its own
-provider's downgrade chain) and, when none is eligible, the first eligible
-model in `budget.provider_order`. `priority check` prints the lists
-(conditional rows first, with their line numbers); `priority explain` shows
-which one applied, e.g. `model: fable (if label: model/fable)` or `model:
-opus (high row)`, and `priority simulate` tags models chosen by a
-conditional row the same way.
-
-## Jev
-
-```markdown
-## Jev
-- enabled: true
-- question: How important is it to ship this ticket this week for a small product team?
-- levels: can wait indefinitely | nice to have | important this week | blocking customers or revenue
-```
-
-Jev (TypeSafe "System One") answers a fixed-form question with a probability
-over ordered rubric levels. powerqueue sends the ticket (title, description,
-labels, criticality, Linear priority, project) with `question` as the
-instructions and `levels` (pipe-separated, lowest first, 2 to 10 entries) as
-the rubric. `instructions` and `criteria` are accepted as aliases. The reply's
-probability-weighted level index is divided by `levels - 1`, clamped to 0..1
-and multiplied by `priority.jev.weight` (default 300 points).
-
-Jev needs a key (`powerqueue secrets set jev`) and `priority.jev.enabled = true`
-in `config.toml` *and* `enabled: true` in this section; the section controls
-the question. Scores are cached per ticket (`jev_scores` table) by content
-hash of title, description and labels and re-requested when the ticket
-changes (`priority.jev.rescore_on_change`). When a request fails the cached
-score is kept and the error is logged once (`jev.error` event).
-
-## Evaluation order and precedence
-
-For one task, at every re-score:
-
-1. **Skip**: if an `## Overrides` bullet says `skip`, the task is marked
-   `skip` and nothing else matters.
-2. **Criticality**: override bullet, else the first matching section
-   (`Critical` → `High` → `Normal` → `Low`), else `## Default`.
-3. **Score** = base score of the criticality
-   `+` every matching `## Scoring` delta
-   `+` any `## Overrides` score delta
-   `+` Jev normalised score × `priority.jev.weight` (when enabled)
-   `+` hours waiting × `priority.age_boost_per_hour`, capped at 200 points.
-4. **Model**: the CLI (`task model`, `add --model`) wins, then the
-   `## Overrides` model list, then the first matching `## Models` `if` row,
-   then the `## Models` list for the criticality, else none. The list is handed to the budget policy as the preferences
-   (`Evaluation.models`; `Evaluation.model` is its first entry): each entry
-   is tried in order, downgraded within its own provider when it is out of
-   budget, never upgraded above it; when nothing on the list fits the
-   policy falls back to `budget.provider_order` (see [budget.md](budget.md)).
-
-Every step records a reason, shown by `task explain`, `task show` and the
-dashboard. The exact strings (`src/priority/rules.rs::evaluate`):
-
-| Step | Reason |
-|------|--------|
-| skip override | `skip: override for ENG-300` |
-| criticality override | `critical: override for ENG-123` |
-| section rule | `critical: matched rule at line 5 (label: incident)` |
-| no rule matched | `normal: default (no rule matched)` |
-| base score | `base 1000 (critical)` |
-| scoring rule | `+40 scoring line 21 (label: customer)` |
-| score override | `+100 override for ENG-200` |
-| Jev | `jev 0.48 × 300 = +144` |
-| age | `age +4.0 (2.0h)` |
-| model from overrides | `model opus from ## Overrides` |
-| model from a Models `if` row | `model fable from ## Models line 30 (if label: model/fable)` |
-| model from Models | `model fable \| gpt-6.1-sol from ## Models` |
-
-Ties in score are broken by criticality, then by age (older first)
-(`scheduler::pick_next`).
-
-### Dependencies come before the score
-
-The score only orders tasks that may run. A task waiting on another Linear
-issue is never picked, whatever its score or criticality:
-
-* `blocked by` an issue that is not `completed`/`canceled` in Linear and
-  whose GitHub PR is not merged → state `blocked`, back to `queued` once
-  every blocker is satisfied;
-* a parent issue (it has sub-issues) → `blocked` until powerqueue closes it
-  (moves it to `linear.done_state_parent` once every sub-issue is done); it
-  never runs.
-
-Rules still evaluate blocked tasks (their score, criticality and model are
-up to date when they unblock), and a `skip` override still wins: a skipped
-task is `paused`, not `blocked`. There is no `PRIORITY.md` field for
-relations; `task explain` prints a `dependencies` block with each blocker
-and why it does or does not hold the task back, and `status` / the
-dashboard show a `WAITING ON` column. See
-[Dependencies](configuration.md#dependencies-blocked-by-and-parent-issues).
-
-## Live reload
-
-With `priority.live_reload = true` (default) the daemon watches the file's
-directory with the OS file watcher and falls back to mtime polling when a
-watcher cannot be created (network drives). On each tick the daemon checks the
-flag, re-parses the file and re-scores every open task that has no live
-session (running tasks keep their score until they finish). A file that
-fails to parse is reported as a `rules.invalid` event, in the log and by
-`doctor`, and the previously loaded rules stay in effect, so a typo never
-empties the queue (`scheduler/daemon.rs::load_rules`). A missing file logs
-`rules.missing` once and falls back to the built-in defaults (every task
-`normal`, no scoring, no models). Editing with `powerqueue priority edit` or
-any editor works the same way. `powerqueue stop` is never needed to apply
-rules.
-
-## Tuning with `priority simulate`
-
-`powerqueue priority simulate` is a dry run of the whole pipeline for every
-open task: it re-scores each task with the rules, ranks them exactly as
-`scheduler::pick_next` does (score, then criticality, then age), runs the
-first `scheduler.max_concurrent` schedulable tasks through the budget policy
-with the current ledgers, and prints the result. Nothing is written: the
-stored scores, the tasks and the ledgers are untouched.
-
-```text
-$ powerqueue priority simulate
-Simulated queue with ~/.config/powerqueue/PRIORITY.md (max 2 concurrent; nothing was written)
- #    was  task    state   criticality        score       prefers  policy would run  title
- 1 ▶  =    INC-1   queued  normal → critical  100 → 1000  fable    fable             Fix outage
- 2 ▶  ↑3   CUS-3   queued  normal             100 → 140   opus     opus              Customer ask
- 3    ↓2   CH-2    queued  normal → low       100 → 10    sonnet   sonnet            Tidy docs
- 4    =    ENG-77  skip    normal             100         opus     –                 Already taken
-```
-
-- `was` is the task's rank with the scores stored by the daemon; `↑3` means
-  it moved up from third place, `=` that it stays, `new` that it is not in
-  the queue yet (`--linear`).
-- `criticality` and `score` show `stored → simulated` when the rules change
-  them.
-- `prefers` is the model list the rules hand to the policy; `policy would
-  run` is what the budget policy picks for that task right now (or why it is
-  throttled). `▶` marks the rows that would start on the next tick.
-
-Options:
-
-| Flag | Effect |
-|------|--------|
-| `--file PATH` | try a draft file instead of the live one; the daemon keeps using the live file until you copy the draft over it |
-| `--config PATH` | try a draft `config.toml` too (budget shares, concurrency); the repo's `.powerqueue.toml` still applies |
-| `--linear` | also fetch the queued issues from Linear and rank the ones not in the queue yet (nothing is stored) |
-| `-a`, `--all` | include completed/failed/cancelled tasks, to check rules against history |
-| `--reasons` | print every rule that fired for each task, plus the policy's reason |
-| `--no-budget` | skip the budget policy (rank only) |
-| `-n N` | show only the first N rows |
-| `--json` | the rows as JSON (`rank`, `stored_rank`, `criticality`, `score`, `preferred_models`, `model`, `policy`, `would_start_now`, `reasons`, ...) |
-
-Typical loop: copy `PRIORITY.md` to a draft, edit, `priority simulate --file
-draft.md`, repeat until the order looks right, then move the draft over the
-live file. With `priority.live_reload = true` (the default) the daemon
-re-scores every task without a live session on its next tick.
-
-## Tuning with `powerqueue tune`
-
-`powerqueue tune "<what you expect>"` runs that loop for you with a headless
-Claude Code session. It copies `PRIORITY.md` and `config.toml` into
-`<state>/tune/<id>/`, writes a `CONTEXT.md` with the current simulation
-(`--reasons`), every open task's matchable fields and the budget state, and
-sends Claude the request together with this document and the config
-reference. Claude edits the drafts and verifies them with `priority check
---file`, `priority simulate --file --config` and `config validate --file`
-(the only commands it may run). powerqueue then parses both drafts, refuses
-anything that does not validate, shows Claude's summary, the diff and the
-simulated queue with the drafts, and asks before replacing the live files
-(`-y` skips the question, `--dry-run` never applies, `--apply` applies a kept
-proposal later, `--undo` restores the previous files). Requests the rules
-cannot decide, such as an order set by the budget policy, come back as an
-explanation and no change.
-
-Good requests name what you saw and what you expected: "ENG-12 should rank
-above ENG-40 because customer bugs come first", "anything labelled `chore` is
-low and runs on sonnet", "skip ENG-77, someone else took it", "tasks from the
-active cycle before everything else". `--scope priority` keeps Claude out of
-`config.toml`; `--scope config` is for "run three tasks at once" or "give
-fable 40% of the week".
-
-Draft directories retain `original/` (the previous live files), `CONTEXT.md`
-(the queue and budget snapshot), `prompt.md`, `result.json` and `meta.json`.
-`doctor` reports proposals that have not been applied. The
-[`[tune]` settings](configuration.md#tune) control model, timeout and retention.
-For a complete rules example, see [Priority rules example](examples/priority-rules.md).
-
-## Idioms
-
-**Pin a ticket to the front of the queue**
-
-```markdown
-## Overrides
-- ENG-451: critical
-- ENG-451: +500
-```
-
-**Keep Fable for incidents**
-
-```markdown
-## Critical
-- label: incident
-- label: security
-
-## Models
-- critical: fable
-- high: opus
-- normal: sonnet
-```
-
-Pair with `budget.providers.claude.models.fable.min_criticality = "critical"` (the default) so
-only critical tasks touch Fable early in the period.
-
-**Spill critical work onto a second subscription**
-
-```markdown
-## Models
-- critical: fable | gpt-6.1-sol
-- high: opus | gpt-6-astra
-- low: gpt-6-luna | haiku
-```
-
-With `budget.providers.codex.enabled = true`, an incident still goes to
-Fable while Claude has room and to `gpt-6.1-sol` when it does not (a
-rate-limited or exhausted provider is skipped until its reset). Listing
-`gpt-6-luna` first for `low` sends chores to the Codex budget and keeps
-Claude's for everything else.
-
-**Deprioritise chores without blocking them**
-
-```markdown
-## Low
-- label: chore
-- label: docs
-- title ~ "^(chore|docs)[:(]"
-
-## Scoring
-- -50 if label: chore
-```
-
-`priority.age_boost_per_hour` (2 points per hour, at most 200) still lets a
-chore surface after a quiet day.
-
-**Prefer the current cycle**
-
-```markdown
-## Scoring
-- +150 if cycle: active
-- -100 if cycle: future
-```
-
-Issues in the active cycle jump ahead of everything else at the same
-criticality; issues planned for a later cycle wait. Issues in no cycle match
-neither line and keep their base score. `cycle_number > 14` works too when
-you want to pin a specific sprint. To not pull later cycles at all, set
-`linear.cycle = "active"` (or `"active-or-next"`) in `config.toml` instead:
-that filters on the server, so those issues never become tasks.
-
-**Let Jev break ties**
-
-```markdown
-## Jev
-- enabled: true
-- question: How much would shipping this ticket this week matter to paying customers?
-- levels: not at all | a little | noticeably | it is blocking them
-```
-
-With `priority.jev.weight = 300`, Jev can lift a `normal` ticket (base 100)
-above other `normal` tickets but not above a `high` one (base 500). Raise the
-weight if you want Jev to cross levels.
-
-**Skip tickets a human is already on**
-
-```markdown
-## Overrides
-- ENG-77: skip
-```
-
-The task shows as `paused` until the line goes away. Or add the `no-agent`
-label in Linear (`linear.excluded_labels`), which keeps the issue out of the
-queue entirely.
-
-**Prefer small tickets**
-
-```markdown
-## Scoring
-- +30 if estimate < 3
-- -30 if estimate > 8
-```
+File changes reload when `priority.live_reload = true`. Project policies are
+polled on ticks; single-repository policies are watched, and committed policies
+are polled through git. Invalid, unreadable or removed policies keep the last
+valid policy and log an error/warning; `doctor` checks the current source and
+reports repair/migration instructions. With no valid policy on first load,
+invalid policies prevent launches for that project. A genuinely absent initial
+policy uses built-in defaults. Last-valid policies are in memory; after a daemon
+restart, invalid files must be repaired before that project can launch.

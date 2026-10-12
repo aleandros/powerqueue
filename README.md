@@ -11,7 +11,7 @@ or manual tasks. It gives each task its own git worktree and tmux window,
 launches an interactive agent, and monitors it through completion and PR review.
 Run it on your Linux or macOS machine, or a server that stays on.
 
-- **Prioritize work:** write rules in `PRIORITY.md` to score tasks and choose preferred models.
+- **Prioritize work:** write rules in `priority.toml` to score tasks and choose preferred models.
 - **Pace usage:** reserve stronger models for critical work and release capacity as the budget period ends.
 - **Keep work moving:** resume crashed sessions, watch PRs for conflicts and review feedback, and clean up completed tasks.
 - **Stay involved:** inspect the dashboard, attach to any session, and answer questions when a task needs attention.
@@ -26,7 +26,7 @@ never be reached. See [providers and configuration](docs/configuration.md#provid
 ```mermaid
 flowchart LR
     Sources["Linear / GitHub Issues / manual tasks"] --> Queue["Task queue"]
-    Rules["PRIORITY.md + budget policy"] --> Queue
+    Rules["priority.toml + budget policy"] --> Queue
     Queue --> Session["Agent session: git worktree + tmux"]
     Session -->|"done"| Cleanup["Push and cleanup"]
     Session -->|"PR handoff"| Review["Watch pull request"]

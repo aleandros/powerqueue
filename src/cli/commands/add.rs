@@ -25,7 +25,7 @@ pub struct NewTask {
 /// Build a [`Task`] from the request without touching the database.
 ///
 /// The key defaults to `manual-<short id>`; the score is the criticality's base
-/// score until the daemon re-scores it against `PRIORITY.md`.
+/// score until the daemon re-scores it against `priority.toml`.
 pub fn build_task(req: &NewTask) -> Result<Task> {
     let title = req.title.trim();
     if title.is_empty() {

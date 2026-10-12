@@ -560,7 +560,7 @@ pub fn context_markdown(
     if !priority_exists {
         let _ = writeln!(
             md,
-            "_The live `{}` does not exist yet; the draft `PRIORITY.md` starts from the template and every task is `normal`._\n",
+            "_The live `{}` does not exist yet; the draft `priority.toml` starts from the template and every task is `normal`._\n",
             live_priority.display()
         );
     }
@@ -716,7 +716,7 @@ mod tests {
         t.labels = vec!["bug".into()];
         t.description = "line one\n\nline two".into();
         let sim = Simulation {
-            rules: "/x/PRIORITY.md".into(),
+            rules: "/x/priority.toml".into(),
             rules_missing: false,
             warnings: vec![],
             max_concurrent: 2,
@@ -745,7 +745,7 @@ mod tests {
         let store = crate::store::Store::open_in_memory().unwrap();
         let ledgers = Ledgers::load(&store, &cfg.budget, chrono::Utc::now()).unwrap();
         let args = SimulateArgs { reasons: true, no_budget: true, ..SimulateArgs::default() };
-        let md = context_markdown(&cfg, Path::new("/x/PRIORITY.md"), false, &sim, &args, &[t], &ledgers);
+        let md = context_markdown(&cfg, Path::new("/x/priority.toml"), false, &sim, &args, &[t], &ledgers);
         assert!(md.contains("does not exist yet"));
         assert!(md.contains("| ENG-1 | queued | normal | 100 | bug |"));
         assert!(md.contains("Fix \\| the thing"));

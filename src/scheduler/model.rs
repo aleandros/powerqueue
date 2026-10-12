@@ -116,7 +116,7 @@ enum Op {
         blocked_by: Vec<LinkedIssue>,
         children: Vec<LinkedIssue>,
     },
-    /// PRIORITY.md re-scored the task.
+    /// priority.toml re-scored the task.
     Evaluate {
         criticality: Criticality,
         score: f64,
@@ -829,8 +829,12 @@ impl DaemonWorld {
     fn set_project(&mut self, id: &str, (available, moved, model): &(bool, bool, ModelTier)) {
         self.checkouts.insert(id.into(), format!("/{}/{id}", if *moved { "moved" } else { "repos" }));
         if *available {
-            let rules = PriorityRules::parse(&format!("## Models\n- normal: {}\n- critical: {}\n", model.alias(), model.alias()))
-                .expect("generated model rules");
+            let rules = PriorityRules::parse(&format!(
+                "version = 1\n[models]\nnormal = [\"{}\"]\ncritical = [\"{}\"]\n",
+                model.alias(),
+                model.alias()
+            ))
+            .expect("generated model rules");
             self.rules.insert(id.into(), rules);
         } else {
             self.rules.remove(id);

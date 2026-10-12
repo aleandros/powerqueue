@@ -277,10 +277,18 @@ pub fn render_config(answers: &Answers) -> Result<String> {
     Ok(format!("{}\n\n{}", header.join("\n"), cfg.to_toml()?))
 }
 
-/// Write config, PRIORITY.md (if absent), directories and the database.
+/// Write config, priority.toml (if absent), directories and the database.
 pub fn write_files(ctx: &Context, answers: &Answers) -> Result<Vec<String>> {
     let paths = &ctx.paths;
     paths.ensure()?;
+    let priority_file = paths.priority_file();
+    if !priority_file.exists() && priority_file.with_file_name("PRIORITY.md").exists() {
+        anyhow::bail!(
+            "legacy PRIORITY.md exists; run `powerqueue priority migrate --from {} --to {}` before initialization",
+            priority_file.with_file_name("PRIORITY.md").display(),
+            priority_file.display()
+        );
+    }
     let mut written = Vec::new();
     let config_file = paths.config_file();
     write_private(&config_file, render_config(answers)?.as_bytes())
@@ -840,7 +848,7 @@ fn stored_linear_client(
 }
 
 /// "Change settings": walk the editable settings with the current values as
-/// defaults and write only those keys back. Keys, PRIORITY.md and every
+/// defaults and write only those keys back. Keys, priority.toml and every
 /// other section are left alone. Non-interactive runs apply the flags given
 /// and keep everything else.
 fn reconfigure(ctx: &mut Context, ui: &Ui, args: &InitArgs, interactive: bool) -> Result<i32> {

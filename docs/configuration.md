@@ -40,7 +40,7 @@ instructions = "Run the API contract checks before finishing."
 push_branch = true
 
 [projects.api.priority]
-file = "/home/me/code/api/PRIORITY.md"
+file = "/home/me/code/api/priority.toml"
 ```
 
 Use `powerqueue add "Fix the API" --project api`. IDs allow ASCII letters,
@@ -123,11 +123,10 @@ each one (binary and version, logged in, shares, anchor, probe freshness).
 Which provider a task lands on: a `task model` / `add --model` override is a
 hard choice (it never crosses providers; the CLI warns when that provider is
 disabled). Otherwise the task's **preference list** is tried in order: the
-`## Overrides` model list in `PRIORITY.md` (`ENG-1: model = fable |
-gpt-6.1-sol`), else the first matching conditional `## Models` row (`if
-label: model/fable: fable`), else the `## Models` entry for its criticality
-(`critical: fable | gpt-6.1-sol`), each alternative through its provider's downgrade
-chain. When nothing on the list is eligible, the first eligible model in
+`[[overrides]]` models in `priority.toml`, else the first matching
+`[[model_rules]]` row, else `[models]` for its criticality
+(e.g. `critical = ["fable", "gpt-6.1-sol"]`), each alternative through its
+provider's downgrade chain. When nothing on the list is eligible, the first eligible model in
 `budget.provider_order` (default `["claude", "codex", "gemini"]`) runs it, so
 a provider that is out of budget or rate-limited falls back to the next one.
 Model names infer their provider (`gpt-*` → codex, `gemini-*` → gemini);
@@ -330,7 +329,7 @@ when `github.enabled = false`, so you can preview configuration before enabling 
 | `queued_states` | `["Todo"]` | workflow state names that mean "ready for the agent" |
 | `required_labels` | `[]` | issues must carry one of these labels |
 | `excluded_labels` | `["no-agent"]` | issues with any of these are ignored |
-| `cycle` | `"any"` | which cycles to pull from, filtered server-side: `any`, `active` (alias `current`), `next`, `active-or-next`, or `none` (issues outside any cycle). The issue's cycle is also exposed to `PRIORITY.md` as `cycle` / `cycle_number` |
+| `cycle` | `"any"` | which cycles to pull from, filtered server-side: `any`, `active` (alias `current`), `next`, `active-or-next`, or `none` (issues outside any cycle). The issue's cycle is also exposed to `priority.toml` as `cycle` / `cycle_number` |
 | `projects` | `[]` | only issues in these projects (matched by project name, server-side); empty = any project |
 | `in_progress_state` | `"In Progress"` | state set when a session starts; `""` = leave the state alone for this transition |
 | `done_state` | `"In Review"` | state set on completion; `""` = no change |
@@ -381,7 +380,7 @@ tasks (which would wait forever) and failed attempts to close a parent.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `file` | `<config>/PRIORITY.md` | rules file |
+| `file` | `<config>/priority.toml` | version 1 typed TOML policy; see [schema and Markdown migration](priority.md) |
 | `live_reload` | `true` | watch the file and re-score tasks on change |
 | `age_boost_per_hour` | `2.0` | points a waiting task gains per hour so nothing starves (capped at 200) |
 | `jev.enabled` | `false` | score tickets with Jev |
@@ -664,8 +663,8 @@ run = ["[ \"$POWERQUEUE_SUCCEEDED\" = 1 ] && claude -p --permission-mode acceptE
 ## `[tune]`
 
 `powerqueue tune` runs a headless Claude Code session (`claude -p`) that edits
-drafts of `PRIORITY.md` and `config.toml`; see [Tuning with
-`tune`](priority.md#tuning-with-powerqueue-tune).
+drafts of `priority.toml` and `config.toml`; see [Tuning with
+`tune`](priority.md#commands-and-reload).
 
 | Key | Default | Meaning |
 |-----|---------|---------|
@@ -739,7 +738,7 @@ default_branch = "develop"
 branch_template = "agent/{key}"
 instructions = "Run `npm test` before you finish. Never touch migrations."
 prompt_template = "docs/agent-prompt.md"   # see [prompt] above
-priority_file = "docs/PRIORITY.md"         # the rules file, versioned with the code
+priority_file = "docs/priority.toml"         # the rules file, versioned with the code
 
 [linear]                     # everything in [linear] but endpoint
 queued_states = ["Todo"]
@@ -784,10 +783,10 @@ read `.powerqueue.toml` as committed on `origin/<default_branch>` instead
 checkout` in the main checkout changes nothing, and a change merged upstream
 applies on its own after the next `git fetch`, which the daemon runs before
 each task and every `repo.fetch_interval_secs` (300 by default). A relative
-`priority_file` is then read from the same commit, so `PRIORITY.md` can live
+`priority_file` is then read from the same commit, so `priority.toml` can live
 in the repository too; `priority show`, `priority check`, `priority explain`,
 `priority simulate` and `doctor` read that same committed copy and say so
-(`docs/PRIORITY.md (origin/main)`), `priority edit` edits the working-tree
+(`docs/priority.toml (origin/main)`), `priority edit` edits the working-tree
 copy and reminds you to commit and push it, and `tune` refuses to rewrite a
 rules file the repository owns (use `--scope config`, or edit the file in the
 repository). What is read from the commit is only `.powerqueue.toml` and
@@ -800,7 +799,7 @@ in the working tree; blob ids on the branch) and reloads its configuration
 when it changed (event `daemon.reloaded`, with the keys taken), or only the
 rules when nothing but the committed rules changed. As with `config set`,
 new sessions use the new values; running sessions keep theirs. A working-tree
-`PRIORITY.md` (global or `priority_file`) is watched as before
+`priority.toml` (global or `priority_file`) is watched as before
 (`priority.live_reload`). A change that cannot be applied (the file does not
 parse, `config.toml` was mid-edit, git was busy) is reported once (event
 `daemon.reload_failed`) and retried every check, so a transient failure

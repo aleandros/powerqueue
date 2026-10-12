@@ -126,7 +126,7 @@ fn reset_requires_yes_without_a_tty_and_then_empties_everything() {
         .success()
         .stdout(predicate::str::contains("powerqueue reset done"))
         .stdout(predicate::str::contains("task dirs  removed 2"))
-        .stdout(predicate::str::contains("Kept: config.toml, secrets, PRIORITY.md and logs"))
+        .stdout(predicate::str::contains("Kept: config.toml, secrets, priority.toml and logs"))
         .stdout(predicate::str::contains("Linear issues were left as-is"));
 
     pq(home.path()).arg("status").assert().success().stdout(predicate::str::contains("no open tasks"));

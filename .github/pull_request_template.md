@@ -8,7 +8,7 @@
 
 ## How to verify
 
-<!-- Commands, config, or a PRIORITY.md snippet a reviewer can try. -->
+<!-- Commands, config, or a priority.toml snippet a reviewer can try. -->
 
 ## Checklist
 

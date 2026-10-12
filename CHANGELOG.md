@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Replace executable Markdown priority rules with strict versioned `priority.toml`.
+  Structured conditions share the existing evaluator and budget behavior. Use
+  `priority migrate --from PRIORITY.md --to priority.toml` and update policy paths;
+  Markdown remains optional intent only. See [migration](docs/priority.md).
+- Priority commands support execution projects; live simulation and explanation
+  use each task's policy. Invalid reloads retain the last valid project policy.
+  Initialization, doctor and tune use TOML and report legacy migration needs.
+- Rust API: `PriorityRules::parse` now accepts TOML; Markdown conversion is
+  `priority::migration::migrate`. Priority show/edit/path command variants now
+  carry `PolicyArgs`, and check/simulate arguments include an optional project.
+
 ## [0.16.0] - 2026-10-12
 
 Set up one local queue for multiple GitHub repositories with project registration,
