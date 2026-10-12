@@ -224,6 +224,18 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let pr_events = if task.pr_url.is_some() { pr_timeline(&store.events_for_task(task.id, 2000)?) } else { Vec::new() };
     let base = store.last_task_event(task.id, BRANCH_CREATED_EVENT)?.and_then(|e| e.branch_base());
     let rounds_max = ctx.config_or_default()?.scheduler.review_rounds_max;
+    let source_route = if let crate::domain::TaskSource::GitHub { repository, .. } = &task.source {
+        Some(match ctx.config_or_default()?.github_source(repository) {
+            Ok(source) => serde_json::json!({
+                "repository": repository,
+                "execution_project": source.execution_project,
+                "matches_saved_project": source.execution_project == task.execution_project,
+            }),
+            Err(error) => serde_json::json!({"repository": repository, "error": format!("{error:#}")}),
+        })
+    } else {
+        None
+    };
     let usage = store.usage_for_task(task.id)?;
     let mut session_rows = Vec::with_capacity(sessions.len());
     for s in &sessions {
@@ -235,6 +247,7 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     if ctx.json {
         let out = serde_json::json!({
             "task": task,
+            "source_route": source_route,
             "provider": effective_model(&task).map(|m| m.provider()),
             "usage": usage,
             "weighted_tokens": usage.weighted(),
@@ -302,6 +315,23 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
         );
     }
     kv("execution project", task.execution_project.clone());
+    if let Some(route) = &source_route {
+        let description = if let Some(error) = route["error"].as_str() {
+            error.to_string()
+        } else {
+            format!(
+                "{} → {}{}",
+                route["repository"].as_str().unwrap_or_default(),
+                route["execution_project"].as_str().unwrap_or_default(),
+                if route["matches_saved_project"] == false {
+                    " (conflicts with saved project; future launches blocked)"
+                } else {
+                    ""
+                }
+            )
+        };
+        kv("source route", description);
+    }
     if let Some(repo) = &task.execution_repo {
         kv("execution checkout", repo.clone());
     }

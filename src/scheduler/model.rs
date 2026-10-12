@@ -44,6 +44,8 @@
 //! interleave with setup and active work; setup revocation holds the launch without
 //! consuming a slot/reservation. Restarts preserve durable admission. A SQLite model
 //! additionally checks claims against stale approval and material-issue snapshots.
+//! Source mapping decisions interleave with lifecycle operations and launch setup:
+//! conflicts deny future starts without retargeting tasks, sessions or artifacts.
 //!
 //! The ops are generated without preconditions and skipped when one does
 //! not hold, which keeps the generator simple and lets shrinking drop any
@@ -72,6 +74,7 @@ use super::{commands, launch, review, transitions};
 #[derive(Debug, Clone)]
 enum Op {
     Admission(crate::domain::GitHubAdmission),
+    SourceAdmission(String, crate::domain::GitHubAdmission),
     HoldApproval,
     Restart,
     Pause,
@@ -146,6 +149,7 @@ fn launch_op() -> impl Strategy<Value = Op> {
 fn task_op() -> impl Strategy<Value = Op> {
     prop_oneof![
         5 => admission_decision().prop_map(Op::Admission),
+        5 => source_routing_decision().prop_map(|(project, admission)| Op::SourceAdmission(project, admission)),
         2 => Just(Op::HoldApproval),
         1 => Just(Op::Restart),
         2 => Just(Op::Pause),
@@ -221,13 +225,23 @@ impl TaskWorld {
         let direct = matches!(op, Op::Complete(_) | Op::HandOff(_) | Op::Block(_) | Op::SetProject(_) | Op::CheckBinding { .. });
         if self.start.is_some()
             && !direct
-            && !matches!(op, Op::Claim | Op::LaunchFailed(_) | Op::Launched { .. } | Op::Admission(_) | Op::HoldApproval)
+            && !matches!(
+                op,
+                Op::Claim
+                    | Op::LaunchFailed(_)
+                    | Op::Launched { .. }
+                    | Op::Admission(_)
+                    | Op::SourceAdmission(..)
+                    | Op::HoldApproval
+            )
         {
             return None;
         }
         match op {
             Op::Admission(admission) => matches!(self.task.source, TaskSource::GitHub { .. })
                 .then(|| transitions::on_github_admission(&mut self.task, admission.clone())),
+            Op::SourceAdmission(project, admission) => matches!(self.task.source, TaskSource::GitHub { .. })
+                .then(|| transitions::on_github_source_admission(&mut self.task, admission.clone(), project)),
             Op::HoldApproval => {
                 if self.start.is_none() || self.task.execution_approved() {
                     return None;
@@ -531,6 +545,7 @@ fn check(
                     | Op::SetProject(_)
                     | Op::CheckBinding { .. }
                     | Op::Admission(_)
+                    | Op::SourceAdmission(..)
                     | Op::HoldApproval
             ),
             "{}",
@@ -541,7 +556,18 @@ fn check(
     if matches!(op, Op::Start(..) | Op::Launched { .. }) {
         prop_assert!(b.execution_approved(), "started or launched without approval");
     }
-    if matches!(op, Op::Admission(_)) {
+    if let Op::SourceAdmission(project, admission) = op {
+        prop_assert_eq!(
+            a.execution_approved(),
+            admission.approved && project == &b.execution_project,
+            "source routing bypassed approval or accepted a conflicting destination"
+        );
+        let mut expected = b.clone();
+        expected.github_admission = a.github_admission.clone();
+        prop_assert_eq!(a, &expected, "source sync retargeted or rewrote execution history");
+        prop_assert!(effects.iter().all(|e| matches!(e, Effect::Log { .. })), "routing must only log");
+    }
+    if matches!(op, Op::Admission(_) | Op::SourceAdmission(..)) {
         prop_assert_eq!(&before.session, &after.session, "revocation destroyed active work");
         prop_assert_eq!(b.state, a.state, "admission changed execution state");
         prop_assert_eq!(&b.worktree_path, &a.worktree_path);
@@ -669,12 +695,60 @@ proptest! {
     }
 }
 
+proptest! {
+    /// Force meaningful routing interleavings as well as the arbitrary walks:
+    /// denied setup, retry/restart, successful launch, active revocation and review.
+    #[test]
+    fn source_routing_interleaves_with_setup_retry_restart_and_review(
+        project in execution_project(), mut decision in decision()
+    ) {
+        let cfg = Config::default();
+        let now = origin();
+        let mut task = Task::new("acme/app#1", "routed task", TaskSource::GitHub {
+            repository: "acme/app".into(), number: 1, url: "https://github.com/acme/app/issues/1".into()
+        });
+        task.execution_project = project.clone();
+        let other = if project == "default" { "api" } else { "default" };
+        let verified = crate::domain::GitHubAdmission { approved: true, reason: "verified".into() };
+        let admit = Op::SourceAdmission(project.clone(), verified.clone());
+        let conflict = Op::SourceAdmission(other.into(), verified);
+        decision.model = Some(ModelTier::opus());
+        decision.retry_at = None;
+        let start = Op::Start(ModelTier::opus(), decision);
+        let launch = Op::Launched { answered: false };
+        let mut world = TaskWorld::new(task);
+        let schedule = [
+            (admit.clone(), true), (start.clone(), true), (Op::Claim, true),
+            (conflict.clone(), true), (launch.clone(), false), (Op::HoldApproval, true),
+            (Op::Restart, true), (Op::Retry, true), (start.clone(), false),
+            (admit.clone(), true), (start.clone(), true), (Op::Claim, true), (launch.clone(), true),
+            (conflict, true), (Op::Restart, true),
+            (Op::HandOff("https://github.com/acme/app/pull/1".into()), true),
+            (Op::Restart, true), (Op::Retry, true), (start.clone(), false),
+            (admit, true), (start, true), (Op::Claim, true), (launch, true),
+        ];
+        for (step, (op, accepted)) in schedule.iter().enumerate() {
+            let before = world.clone();
+            let effects = world.apply(&cfg, now, op);
+            prop_assert_eq!(effects.is_some(), *accepted, "step {} {:?}", step, op);
+            if let Some(effects) = effects {
+                check(step, op, &cfg, &before, &world, &effects)?;
+            }
+            prop_assert_eq!(&world.task.execution_project, &project);
+        }
+        prop_assert!(world.session_live());
+        prop_assert_eq!(world.task.state, TaskState::Running);
+        prop_assert_eq!(world.task.execution_repo, Some(format!("/repos/{project}")));
+    }
+}
+
 // ------------------------------------------------------------ whole daemon
 
 /// How a start that the planner handed out ends in `start_task`.
 #[derive(Debug, Clone)]
 enum LaunchOutcome {
     ApprovalLost,
+    RouteChanged,
     /// The session launched (`on_launched`).
     Launched {
         answered: bool,
@@ -688,6 +762,7 @@ fn launch_outcome() -> impl Strategy<Value = LaunchOutcome> {
         3 => any::<bool>().prop_map(|answered| LaunchOutcome::Launched { answered }),
         1 => line().prop_map(LaunchOutcome::Failed),
         1 => Just(LaunchOutcome::ApprovalLost),
+        1 => Just(LaunchOutcome::RouteChanged),
     ]
 }
 
@@ -919,8 +994,22 @@ impl DaemonWorld {
                             );
                             prop_assert!(!self.tasks[idx].session_live(), "{what}: live session after a failed start");
                         }
-                        LaunchOutcome::ApprovalLost if matches!(self.tasks[idx].task.source, TaskSource::GitHub { .. }) => {
-                            self.step(step, idx, &Op::Admission(crate::domain::GitHubAdmission::denied("revoked during setup")))?;
+                        outcome @ (LaunchOutcome::ApprovalLost | LaunchOutcome::RouteChanged)
+                            if matches!(self.tasks[idx].task.source, TaskSource::GitHub { .. }) =>
+                        {
+                            let op = if matches!(outcome, LaunchOutcome::RouteChanged) {
+                                let project = if self.tasks[idx].task.execution_project == "default" { "api" } else { "default" };
+                                Op::SourceAdmission(
+                                    project.into(),
+                                    crate::domain::GitHubAdmission {
+                                        approved: true,
+                                        reason: "approval still valid; source mapping changed".into(),
+                                    },
+                                )
+                            } else {
+                                Op::Admission(crate::domain::GitHubAdmission::denied("revoked during setup"))
+                            };
+                            self.step(step, idx, &op)?;
                             prop_assert!(
                                 self.step(step, idx, &Op::Launched { answered: false })?.is_none(),
                                 "revoked launch accepted"

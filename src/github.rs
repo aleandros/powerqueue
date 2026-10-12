@@ -7,6 +7,7 @@
 
 pub mod admission;
 pub mod client;
+pub mod routing;
 pub mod sync;
 
 pub use client::GitHubClient;

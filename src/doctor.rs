@@ -1055,14 +1055,19 @@ async fn check_secrets(cfg: &Config, secrets: &Secrets, online: bool) -> Vec<Che
             "check the keychain / secrets file",
         )),
     }
-    if cfg.github.enabled {
-        let hint = "run `powerqueue secrets set github` or set GITHUB_TOKEN; check github.repository and token Issues permissions (read for intake, write for lifecycle updates)";
-        match secrets.get_with_origin(SecretKind::GitHubToken) {
-            Ok(Some((key, origin))) if online => {
+    let sources: Vec<_> = cfg.github_sources().into_iter().filter(|s| s.enabled).collect();
+    if sources.is_empty() {
+        out.push(CheckResult::skipped(SEC, "github token", "GitHub disabled"));
+    }
+    for source in sources {
+        let name = format!("github token: {} → {}", source.repository, source.execution_project);
+        let hint = "check this source's token_env (or secrets set github / GITHUB_TOKEN), repository access, Issues permissions and GraphQL access";
+        match source.token(secrets) {
+            Ok((key, origin)) if online => {
                 let result = async {
-                    let client = crate::github::GitHubClient::new(&cfg.github.endpoint, key)?;
-                    client.test_repository(&cfg.github.repository).await?;
-                    let mut probe = cfg.github.clone();
+                    let client = crate::github::GitHubClient::new(&source.endpoint, key)?;
+                    client.test_repository(&source.repository).await?;
+                    let mut probe = source.clone();
                     probe.max_issues = 1;
                     for issue in client.fetch_issues(&probe).await? {
                         client.admission(&probe, &issue).await?;
@@ -1071,20 +1076,13 @@ async fn check_secrets(cfg: &Config, secrets: &Secrets, online: bool) -> Vec<Che
                 }
                 .await;
                 match result {
-                    Ok(()) => {
-                        out.push(CheckResult::ok(SEC, "github token", format!("{origin}; repository and Issues API accessible")))
-                    }
-                    Err(e) => out.push(CheckResult::fail(SEC, "github token", format!("{e:#}"), hint)),
+                    Ok(()) => out.push(CheckResult::ok(SEC, &name, format!("{origin}; repository and Issues API accessible"))),
+                    Err(e) => out.push(CheckResult::fail(SEC, &name, format!("{e:#}"), hint)),
                 }
             }
-            Ok(Some((_, origin))) => {
-                out.push(CheckResult::ok(SEC, "github token", format!("present ({origin}); not verified offline")))
-            }
-            Ok(None) => out.push(CheckResult::fail(SEC, "github token", "no GitHub token configured", hint)),
-            Err(e) => out.push(CheckResult::fail(SEC, "github token", format!("cannot read token: {e:#}"), hint)),
+            Ok((_, origin)) => out.push(CheckResult::ok(SEC, &name, format!("present ({origin}); not verified offline"))),
+            Err(e) => out.push(CheckResult::fail(SEC, &name, format!("cannot read token: {e:#}"), hint)),
         }
-    } else {
-        out.push(CheckResult::skipped(SEC, "github token", "GitHub disabled"));
     }
     if cfg.priority.jev.enabled {
         match secrets.get_with_origin(SecretKind::JevApiKey) {
@@ -2097,9 +2095,25 @@ pub async fn run_all(
     }
 
     results.extend(check_secrets(cfg, secrets, online).await);
-    if cfg.github.enabled {
+    for task in store.list_open_tasks()? {
+        if let crate::domain::TaskSource::GitHub { repository, .. } = &task.source {
+            let problem = match cfg.github_source(repository) {
+                Ok(source) if source.execution_project != task.execution_project => {
+                    Some(format!("source maps to `{}`; task retains `{}`", source.execution_project, task.execution_project))
+                }
+                Err(error) => Some(format!("{error:#}")),
+                _ => None,
+            };
+            if let Some(problem) = problem {
+                results.push(CheckResult::fail(STATE, &format!("{} source routing", task.key), problem,
+                    "restore the source mapping; use task project only for deliberate reassignment of unstarted work; active work keeps its saved project"));
+            }
+        }
+    }
+    if cfg.github_sources().iter().any(|s| s.enabled) {
         let since = Utc::now() - Duration::days(1);
-        let errors = store.count_events_of_kind("github.error", since)?;
+        let errors =
+            store.count_events_of_kind("github.error", since)? + store.count_events_of_kind("github.unavailable", since)?;
         let missed = store.count_events_of_kind("github.update_failed", since)?
             + store.count_events_of_kind("github.update_skipped", since)?;
         results.push(if errors + missed == 0 {

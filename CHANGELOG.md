@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Multiple GitHub intake sources with explicit execution-project mappings,
+  per-source credentials, filters, polling and lifecycle settings. Preserve legacy
+  `[github]` configuration and task assignments; reject unknown or conflicting
+  routes and report per-source failures in previews, admission and doctor.
+- Stateful routing checks across setup, retry, restart, review and active work,
+  including mapping conflicts during a launch pass and shared resource accounting.
+
 - Explicit GitHub execution approval with configurable `required_labels` (default
   `agent:ready`) and optional `trusted_approvers`. Verify effective label actors and
   title/body edit history before starts and after setup; revocation holds future

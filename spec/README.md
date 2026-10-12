@@ -70,6 +70,19 @@ material edits, re-reads after restart, and conditional claims. It checks that s
 approval/scope cannot claim a start. These models call production transitions;
 Quint supplies the independent abstract lifecycle guards.
 
+Source-to-project reconciliation is also an operation in both Rust stateful
+models. Generated source destinations and approval decisions interleave with
+reassignment, retry, restart, review and launch. A forced lifecycle sequence
+checks that a mapping conflict holds setup, survives retry/restart, preserves
+active work and review history, and permits a later launch after the original
+mapping is restored. Launch passes also exercise mapping changes during setup,
+checking that refused launches consume neither a slot nor a budget reservation
+and do not alter other tasks. These operations exercise the production routing
+admission transition. Registry lookup, source credentials, multi-repository
+identity, HTTP failures and preview/apply races remain integration-test concerns;
+Quint abstracts routing conflicts as denied admission rather than modeling the
+source registry or network.
+
 `Start` combines `on_starting` with `claim`: the observed attempt is reserved
 at that point. The daemon finishes a start within a tick. Commands in this
 cut run between passes, except project reassignment attempts, which can also

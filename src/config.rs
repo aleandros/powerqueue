@@ -58,6 +58,8 @@ pub struct Config {
     pub projects: BTreeMap<String, crate::projects::ProjectConfig>,
     pub linear: LinearConfig,
     pub github: GitHubConfig,
+    /// Additional independent GitHub intake sources; the legacy `github` is retained.
+    pub github_sources: Vec<GitHubConfig>,
     pub priority: PriorityConfig,
     pub prompt: PromptConfig,
     pub scheduler: SchedulerConfig,
@@ -324,13 +326,17 @@ impl<'de> Deserialize<'de> for PostComments {
     }
 }
 
-/// GitHub Issues integration for the repository worked on by this daemon.
+/// One GitHub issue source and its execution project mapping.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GitHubConfig {
     pub enabled: bool,
-    /// Explicit `owner/repo`; issues are executed in `repo.path`.
+    /// Explicit source `owner/repo`, independent of the execution checkout.
     pub repository: String,
+    pub execution_project: String,
+    /// Optional environment variable containing this source's token. No fallback
+    /// to the global token when explicitly configured but missing.
+    pub token_env: Option<String>,
     /// Explicit execution approval labels; all must have a current approval event.
     pub required_labels: Vec<String>,
     /// Allowed approval-event actors (case insensitive); empty allows any actor.
@@ -355,6 +361,8 @@ impl Default for GitHubConfig {
         Self {
             enabled: false,
             repository: String::new(),
+            execution_project: "default".into(),
+            token_env: None,
             required_labels: vec!["agent:ready".into()],
             trusted_approvers: Vec::new(),
             excluded_labels: vec!["no-agent".into()],
@@ -385,7 +393,19 @@ impl GitHubConfig {
                         || !p.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
                 }))
         {
-            problems.push("github.repository must be owner/repo and must match repo.path".into());
+            problems.push("github.repository must be owner/repo".into());
+        }
+        if self.execution_project.is_empty()
+            || !self.execution_project.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
+        {
+            problems.push("github.execution_project must be a registered project ID".into());
+        }
+        if self.token_env.as_ref().is_some_and(|name| {
+            name.is_empty()
+                || name.as_bytes()[0].is_ascii_digit()
+                || !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        }) {
+            problems.push("github.token_env must name an environment variable".into());
         }
         if self.poll_interval_secs == 0 || self.poll_interval_secs > 86400 {
             problems.push("github.poll_interval_secs must be between 1 and 86400 seconds".into());
@@ -2119,6 +2139,10 @@ impl Config {
             problems.push(format!("gemini.mode `{}` is not one of {}", self.gemini.mode, GEMINI_MODES.join("|")));
         }
         problems.extend(self.github.validate());
+        for (index, source) in self.github_sources.iter().enumerate() {
+            problems.extend(source.validate().into_iter().map(|p| format!("github_sources[{index}]: {p}")));
+        }
+        problems.extend(self.github_routing_problems());
         if self.linear.enabled && self.linear.queued_states.is_empty() {
             problems.push("linear.queued_states is empty; no issues would ever be picked up".to_string());
         }
