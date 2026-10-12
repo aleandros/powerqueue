@@ -7,20 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-12
+
+Set up one local queue for multiple GitHub repositories with project registration,
+explicit issue approval, shared provider budgets and concurrency, and separate
+worktrees. See [the multi-project setup guide](https://github.com/aleandros/powerqueue/blob/v0.16.0/docs/multi-project.md).
+
 ### Added
 
 - Focused `project register`/`project list` setup and reconfiguration, project
   columns and filters in status/dashboard, per-project doctor cleanup/isolation
   checks, and disposable three-project GitHub review lifecycle validation.
   Named-only registries work with Linear disabled. Quint now models three projects.
-
 - Multiple GitHub intake sources with explicit execution-project mappings,
   per-source credentials, filters, polling and lifecycle settings. Preserve legacy
   `[github]` configuration and task assignments; reject unknown or conflicting
   routes and report per-source failures in previews, admission and doctor.
 - Stateful routing checks across setup, retry, restart, review and active work,
   including mapping conflicts during a launch pass and shared resource accounting.
-
 - Explicit GitHub execution approval with configurable `required_labels` (default
   `agent:ready`) and optional `trusted_approvers`. Verify effective label actors and
   title/body edit history before starts and after setup; revocation holds future
@@ -30,12 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   setup, reapproval, restart, stale candidates and rejection of unapproved event
   traces. Advisory CI also replays a real GitHub approval/launch trace.
 
-### Fixed
-
-- GitHub review/retry launches now persist the attempt and worktree claim before
-  rechecking approval, even when the checkout is already bound. Approval reloads
-  no longer discard the recreated worktree or reset crash accounting.
-
 ### Changed
 
 - Explicit existing GitHub label settings remain unchanged. Omitted settings now
@@ -44,9 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GraphQL access; unavailable evidence blocks starts, including offline starts.
 - `scheduler::launch::on_starting` returns `Option<Start>` and refuses unapproved
   tasks without mutation.
+- CLI argument and dashboard structs include project fields; `dashboard::Options`
+  remains `Clone` but is no longer `Copy`.
 
 ### Fixed
 
+- GitHub review/retry launches now persist the attempt and worktree claim before
+  rechecking approval, even when the checkout is already bound. Approval reloads
+  no longer discard the recreated worktree or reset crash accounting.
 - Make the multi-project cleanup test wait for transcript usage collection,
   avoiding a timing race when cleanup finishes before usage is recorded.
 - Record crash retry deadlines for formal replay, so delayed event logging
@@ -954,7 +957,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.16.0
 [0.15.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.15.0
 [0.14.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.14.0
 [0.13.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.13.0
