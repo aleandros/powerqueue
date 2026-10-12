@@ -31,7 +31,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::TuneScope;
-use crate::config::Config;
+use crate::config::{Config, RulesSource};
 use crate::paths::Paths;
 use crate::priority::PriorityRules;
 
@@ -39,6 +39,8 @@ use crate::priority::PriorityRules;
 pub const PRIORITY_FILE: &str = "priority.toml";
 /// Name of the config draft inside a draft directory.
 pub const CONFIG_FILE: &str = "config.toml";
+/// Read-only free-form intent snapshot.
+pub const INTENT_FILE: &str = "PRIORITY.md";
 /// Sub-directory holding the untouched copies of the live files.
 pub const ORIGINAL_DIR: &str = "original";
 /// Metadata file written in every draft directory.
@@ -125,6 +127,23 @@ pub struct DraftMeta {
     /// Whether the live `priority.toml` existed when the draft was made (if
     /// not, `original/priority.toml` is absent and `--undo` deletes the file).
     pub had_priority: bool,
+    /// Execution project selected for this proposal; None selects the machine policy.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Original policy source, including the configured committed-file workflow.
+    #[serde(default)]
+    pub source: Option<RulesSource>,
+    /// Intent path and exact text read when preparing the proposal.
+    #[serde(default)]
+    pub intent_path: Option<PathBuf>,
+    #[serde(default)]
+    pub intent_text: Option<String>,
+    #[serde(default)]
+    pub intent_status: String,
+    /// Files actually written, so undo does not restore unrelated reference files.
+    #[serde(default)]
+    pub applied_files: Option<Vec<String>>,
+
     /// The agent's final message.
     #[serde(default)]
     pub summary: Option<String>,
@@ -189,6 +208,12 @@ impl Draft {
             live_priority: live_priority.to_path_buf(),
             live_config: live_config.to_path_buf(),
             had_priority: priority_text.is_some(),
+            project: None,
+            source: None,
+            intent_path: None,
+            intent_text: None,
+            intent_status: String::new(),
+            applied_files: None,
             summary: None,
             agent: AgentReport::default(),
             applied_at: None,
@@ -198,6 +223,25 @@ impl Draft {
         let draft = Draft { dir, meta };
         draft.save_meta()?;
         Ok(draft)
+    }
+
+    /// Capture project, source and optional prose before running the agent. Fails on
+    /// unreadable intent or a dirty committed-policy working copy, preserving live files.
+    pub fn capture_intent(&mut self, paths: &Paths, project: Option<String>, source: RulesSource, intent: PathBuf) -> Result<()> {
+        if self.meta.scope.includes_priority() && source.rev().is_some() && read_optional(&source.path())? != source.read()? {
+            bail!(
+                "{} differs from {}; commit/stash or restore this policy before tuning",
+                source.path().display(),
+                source.describe()
+            );
+        }
+        self.meta.intent_status = intent_status(paths, &source.path(), &intent)?;
+        self.meta.intent_text = read_optional(&intent)?;
+        self.write_file(INTENT_FILE, self.meta.intent_text.as_deref().unwrap_or(""))?;
+        self.meta.intent_path = Some(intent);
+        self.meta.project = project;
+        self.meta.source = Some(source);
+        self.save_meta()
     }
 
     /// Load a draft from its directory. Fails when `meta.json` is missing or unreadable.
@@ -260,7 +304,7 @@ impl Draft {
 
     pub fn save_meta(&self) -> Result<()> {
         let text = serde_json::to_string_pretty(&self.meta).context("serialise meta.json")?;
-        write(&self.dir.join(META_FILE), &(text + "\n"))
+        atomic_write(&self.dir.join(META_FILE), &(text + "\n"), false)
     }
 
     pub fn priority_path(&self) -> PathBuf {
@@ -287,6 +331,53 @@ impl Draft {
         self.meta.problems = problems;
         self.save_meta()
     }
+}
+
+/// Compare prose with the last applied priority proposal for this target. Does
+/// not evaluate Markdown or change scheduling. Read failures are returned.
+pub fn intent_status(paths: &Paths, policy: &Path, intent: &Path) -> Result<String> {
+    let current = read_optional(intent)?;
+    let applied = Draft::list(paths)?.into_iter().rev().find(|d| {
+        d.meta.status == DraftStatus::Applied
+            && d.meta.scope.includes_priority()
+            && d.meta.live_priority == policy
+            && d.meta.intent_path.as_deref() == Some(intent)
+    });
+    Ok(match applied {
+        Some(d) if d.meta.intent_text == current => "unchanged since last applied proposal",
+        Some(_) => "intent changed since last applied proposal; scheduling still uses the applied TOML policy",
+        None if current.is_some() => "intent has no applied proposal; scheduling uses only TOML policy",
+        None => "no intent document; scheduling uses only TOML policy",
+    }
+    .into())
+}
+
+/// Verify a proposal still targets the configured source and unchanged input.
+/// Refuses stale proposals rather than overwriting concurrent edits or routing
+/// them to a different project or committed-file workflow.
+pub fn check_target(paths: &Paths, cfg: &Config, draft: &Draft) -> Result<()> {
+    if read_optional(&draft.meta.live_config)? != read_optional(&draft.original_path(CONFIG_FILE))? {
+        bail!("config changed since drafting; prepare a new tune proposal");
+    }
+    let effective = match &draft.meta.project {
+        Some(id) => cfg.for_project(id, paths)?,
+        None => cfg.clone(),
+    };
+    if draft.meta.scope.includes_priority() {
+        let source = effective.rules_source(paths);
+        if source.path() != draft.meta.live_priority || draft.meta.source.as_ref().is_some_and(|s| *s != source) {
+            bail!("policy source changed since drafting; prepare a new tune proposal");
+        }
+        if source.read()? != read_optional(&draft.original_path(PRIORITY_FILE))? {
+            bail!("policy changed since drafting; prepare a new tune proposal");
+        }
+    }
+    if let Some(intent) = &draft.meta.intent_path
+        && read_optional(intent)? != draft.meta.intent_text
+    {
+        bail!("intent changed since drafting; prepare a new tune proposal");
+    }
+    Ok(())
 }
 
 fn write(path: &Path, text: &str) -> Result<()> {
@@ -404,13 +495,23 @@ pub struct ValidDrafts {
     pub config: Config,
 }
 
-/// Parse and validate the draft files. Files outside the draft's scope are
-/// validated too (the agent must not have touched them, but a broken file
-/// must never be applied). `Err` lists every problem found; `Ok` carries the
-/// parsed rules and config.
+/// Parse and validate the proposal, using original snapshots for files outside
+/// its scope so ignored agent edits cannot distort simulation. Intent is
+/// read-only. `Err` lists every problem; `Ok` carries parsed rules and config.
 pub fn validate(paths: &Paths, draft: &Draft) -> std::result::Result<ValidDrafts, Vec<String>> {
     let mut problems = Vec::new();
-    let rules = match std::fs::read_to_string(draft.priority_path()) {
+    let rules_text = if draft.meta.scope.includes_priority() {
+        read_optional(&draft.priority_path()).and_then(|t| t.ok_or_else(|| anyhow!("missing policy draft")))
+    } else {
+        read_optional(&draft.original_path(PRIORITY_FILE)).map(|t| t.unwrap_or_else(|| "version = 1\n".into()))
+    };
+    if draft.meta.intent_path.is_some() {
+        match read_optional(&draft.dir.join(INTENT_FILE)) {
+            Ok(text) if text.as_deref() == Some(draft.meta.intent_text.as_deref().unwrap_or("")) => {}
+            _ => problems.push("PRIORITY.md is read-only intent; restore the snapshot or prepare a new proposal".into()),
+        }
+    }
+    let rules = match rules_text {
         Ok(text) => match PriorityRules::parse(&text) {
             Ok(rules) => Some(rules),
             Err(errors) => {
@@ -423,9 +524,25 @@ pub fn validate(paths: &Paths, draft: &Draft) -> std::result::Result<ValidDrafts
             None
         }
     };
-    let config = match Config::load_draft(paths, &draft.config_path()) {
+    let config_path = if draft.meta.scope.includes_config() { draft.config_path() } else { draft.original_path(CONFIG_FILE) };
+    let config = match Config::load_draft(paths, &config_path) {
         Ok(cfg) => {
-            let cfg_problems = cfg.validate();
+            let mut cfg_problems = cfg.validate();
+            let selected = match &draft.meta.project {
+                Some(id) => cfg.for_project(id, paths),
+                None => Ok(cfg.clone()),
+            };
+            match selected {
+                Err(e) => cfg_problems.push(format!("{e:#}")),
+                Ok(selected)
+                    if draft.meta.scope.includes_priority()
+                        && draft.meta.source.as_ref().is_some_and(|source| *source != selected.rules_source(paths)) =>
+                {
+                    cfg_problems
+                        .push("policy source changed in the draft config; tune policy and source changes separately".into());
+                }
+                Ok(_) => {}
+            }
             if cfg_problems.is_empty() {
                 Some(cfg)
             } else {
@@ -448,18 +565,47 @@ pub fn validate(paths: &Paths, draft: &Draft) -> std::result::Result<ValidDrafts
 
 /// Write every changed file of `changes` to its live path (atomically, one
 /// file at a time) and mark the draft applied. Returns the paths written.
-/// A failure midway leaves the files already written in place; `--undo`
-/// restores all of them.
+/// Refuses stale input. On a write failure, restores files already written and
+/// reports any rollback failure with the affected path.
 pub fn apply(draft: &mut Draft, changes: &[FileChange]) -> Result<Vec<PathBuf>> {
-    let mut written = Vec::new();
     for change in changes.iter().filter(|c| c.changed) {
-        atomic_write(&change.live, &change.after, change.name == CONFIG_FILE)?;
-        written.push(change.live.clone());
+        if !in_scope(draft.meta.scope, &change.name) {
+            bail!("{} is outside the draft scope", change.name);
+        }
+        if read_optional(&change.live)? != change.before || change.live_changed_since_draft {
+            bail!("{} changed since drafting; prepare a new tune proposal", change.live.display());
+        }
     }
-    draft.meta.status = DraftStatus::Applied;
-    draft.meta.applied_at = Some(Utc::now());
-    draft.save_meta()?;
-    Ok(written)
+    let previous_meta = draft.meta.clone();
+    let mut written: Vec<&FileChange> = Vec::new();
+    let result = (|| -> Result<()> {
+        for change in changes.iter().filter(|c| c.changed) {
+            atomic_write(&change.live, &change.after, change.name == CONFIG_FILE)?;
+            written.push(change);
+        }
+        draft.meta.status = DraftStatus::Applied;
+        draft.meta.applied_at = Some(Utc::now());
+        draft.meta.applied_files = Some(written.iter().map(|c| c.name.clone()).collect());
+        draft.save_meta()
+    })();
+    if let Err(error) = result {
+        draft.meta = previous_meta;
+        let mut failures = Vec::new();
+        for change in written.iter().rev() {
+            let restored = match &change.before {
+                Some(text) => atomic_write(&change.live, text, change.name == CONFIG_FILE),
+                None => std::fs::remove_file(&change.live).with_context(|| format!("remove {}", change.live.display())),
+            };
+            if let Err(e) = restored {
+                failures.push(format!("{e:#}"));
+            }
+        }
+        if !failures.is_empty() {
+            return Err(error.context(format!("rollback failed: {}", failures.join("; "))));
+        }
+        return Err(error);
+    }
+    Ok(written.iter().map(|c| c.live.clone()).collect())
 }
 
 /// Restore the live files an applied draft replaced from its `original/`
@@ -472,7 +618,7 @@ pub fn undo(draft: &mut Draft) -> Result<Vec<PathBuf>> {
     let mut touched = Vec::new();
     let scope = draft.meta.scope;
     for (name, live) in [(PRIORITY_FILE, draft.meta.live_priority.clone()), (CONFIG_FILE, draft.meta.live_config.clone())] {
-        if !in_scope(scope, name) {
+        if !in_scope(scope, name) || draft.meta.applied_files.as_ref().is_some_and(|files| !files.iter().any(|f| f == name)) {
             continue;
         }
         match read_optional(&draft.original_path(name))? {
@@ -497,14 +643,14 @@ pub fn undo(draft: &mut Draft) -> Result<Vec<PathBuf>> {
     Ok(touched)
 }
 
-/// Remove finished drafts (anything but `running`/`proposed`) beyond the
+/// Remove finished drafts (anything but `running`/`proposed`/`applied`) beyond the
 /// newest `keep` drafts. Returns how many directories were removed.
 pub fn prune(paths: &Paths, keep: usize) -> Result<usize> {
     let drafts = Draft::list(paths)?;
     let mut removed = 0;
     let excess = drafts.len().saturating_sub(keep);
     for draft in drafts.iter().take(excess) {
-        if matches!(draft.meta.status, DraftStatus::Running | DraftStatus::Proposed) {
+        if matches!(draft.meta.status, DraftStatus::Running | DraftStatus::Proposed | DraftStatus::Applied) {
             continue;
         }
         std::fs::remove_dir_all(&draft.dir).with_context(|| format!("remove {}", draft.dir.display()))?;
@@ -536,6 +682,7 @@ pub fn build_prompt(instruction: &str, scope: TuneScope, context_md: &str, repo_
          against a subscription budget. The user looked at the current queue and wants it to behave differently. \
          Change the draft files in the current directory so that it does, verify with the simulation, and report.\n\n",
     );
+    p.push_str("## Intent and executable policy\n\nRead `PRIORITY.md` for free-form goals, rationale and examples. It is read-only context, not a rule language. Translate relevant intent and the request into the structured `priority.toml` schema. Only applied TOML affects scheduling; editing prose alone never does. Preserve existing policy unless the intent or request calls for a change.\n\n");
     p.push_str("## The request\n\n");
     p.push_str(instruction.trim());
     p.push_str("\n\n## Files you may edit (current directory)\n\n");
@@ -1020,6 +1167,41 @@ mod tests {
         assert_eq!(left.len(), 3);
         assert!(left.iter().any(|id| id.ends_with("000001")));
         assert_eq!(prune(&paths, 10).unwrap(), 0);
+    }
+
+    #[test]
+    fn apply_rolls_back_when_metadata_cannot_be_saved() {
+        let (_tmp, paths) = paths();
+        let mut draft = make_draft(&paths, "rollback", Some("version = 1\n"));
+        std::fs::write(draft.priority_path(), "version = 1\ndefault_criticality = 'low'\n").unwrap();
+        std::fs::write(draft.config_path(), "[repo]\npath = '/tmp/repo'\n[scheduler]\nmax_concurrent = 3\n").unwrap();
+        let file_changes = changes(&draft).unwrap();
+        std::fs::remove_file(draft.dir.join(META_FILE)).unwrap();
+        std::fs::create_dir(draft.dir.join(META_FILE)).unwrap();
+        assert!(apply(&mut draft, &file_changes).is_err());
+        for change in file_changes {
+            assert_eq!(read_optional(&change.live).unwrap(), change.before);
+        }
+        assert_eq!(draft.meta.status, DraftStatus::Running);
+    }
+
+    #[test]
+    fn undo_only_restores_written_files_and_prune_preserves_intent_history() {
+        let (_tmp, paths) = paths();
+        let mut draft = make_draft(&paths, "history", Some("version = 1\n"));
+        let intent = paths.priority_file().with_file_name(INTENT_FILE);
+        std::fs::write(&intent, "Customer incidents first.\n").unwrap();
+        draft.capture_intent(&paths, None, RulesSource::File(paths.priority_file()), intent.clone()).unwrap();
+        std::fs::write(draft.priority_path(), "version = 1\ndefault_criticality = 'high'\n").unwrap();
+        let file_changes = changes(&draft).unwrap();
+        apply(&mut draft, &file_changes).unwrap();
+        prune(&paths, 0).unwrap();
+        assert!(draft.dir.exists());
+        assert_eq!(intent_status(&paths, &paths.priority_file(), &intent).unwrap(), "unchanged since last applied proposal");
+        std::fs::write(paths.config_file(), "unrelated later edit").unwrap();
+        undo(&mut draft).unwrap();
+        assert_eq!(std::fs::read_to_string(paths.config_file()).unwrap(), "unrelated later edit");
+        assert!(intent_status(&paths, &paths.priority_file(), &intent).unwrap().contains("no applied proposal"));
     }
 
     #[test]

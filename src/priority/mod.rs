@@ -30,3 +30,8 @@ pub fn format_errors(errors: &[RuleError]) -> String {
 pub fn template() -> &'static str {
     include_str!("priority.template.toml")
 }
+
+/// Free-form intent template; never parsed by the scheduler.
+pub fn intent_template() -> &'static str {
+    include_str!("PRIORITY.template.md")
+}

@@ -476,6 +476,19 @@ pub fn simulate_with(
     rules: &PriorityRules,
     path: &Path,
 ) -> Result<Simulation> {
+    simulate_target(ctx, args, cfg, rules, path, None)
+}
+
+/// Simulate a tune proposal only for tasks consuming the target policy, leaving
+/// other projects on their own policies. Reads state without changing it.
+pub(crate) fn simulate_target(
+    ctx: &mut Context,
+    args: &SimulateArgs,
+    cfg: &Config,
+    rules: &PriorityRules,
+    path: &Path,
+    target: Option<&Path>,
+) -> Result<Simulation> {
     let store = ctx.store()?.clone();
     let now = Utc::now();
     let mut tasks = if args.all { store.list_tasks()? } else { store.list_open_tasks()? };
@@ -512,11 +525,11 @@ pub fn simulate_with(
     for task in &tasks {
         if !policies.contains_key(&task.execution_project) {
             let effective = cfg.for_task(task, &ctx.paths)?;
-            let policy = if args.file.is_some() || cfg.projects.is_empty() {
-                rules.clone()
-            } else {
-                crate::projects::load_rules(&effective, &ctx.paths)?
+            let use_draft = match target {
+                Some(target) => effective.rules_source(&ctx.paths).path() == target,
+                None => args.file.is_some() || cfg.projects.is_empty(),
             };
+            let policy = if use_draft { rules.clone() } else { crate::projects::load_rules(&effective, &ctx.paths)? };
             policies.insert(task.execution_project.clone(), (effective, policy));
         }
         let (effective, rules) = &policies[&task.execution_project];

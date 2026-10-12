@@ -293,6 +293,7 @@ fn tune_scope_and_json() {
     assert_eq!(v["status"], "applied");
     assert_eq!(v["applied"], true);
     assert_eq!(v["scope"], "priority");
+    assert_eq!(v["simulation"]["max_concurrent"], 2, "out-of-scope config edits must not affect simulation");
     let files = v["files"].as_array().unwrap();
     assert_eq!(files.len(), 1);
     assert_eq!(files[0]["name"], "priority.toml");
@@ -357,4 +358,185 @@ fn draft_flags_on_check_simulate_and_validate() {
         .assert()
         .code(1)
         .stdout(predicate::str::contains("\"ok\":false"));
+}
+
+#[test]
+fn intent_snapshot_staleness_and_prose_only_edits() {
+    let env = Env::new();
+    let intent = env.home.path().join("config/PRIORITY.md");
+    let prose = "# Goals\nFAKE-1 should be critical because customers cannot work.\n";
+    std::fs::write(&intent, prose).unwrap();
+    let before = env.priority();
+    env.tune("intent")
+        .args(["tune", "translate intent", "--scope", "priority", "--dry-run", "--no-budget"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("intent has no applied proposal"));
+    assert_eq!(env.priority(), before);
+    let draft = env.draft_with_status("proposed");
+    assert_eq!(std::fs::read_to_string(draft.join("PRIORITY.md")).unwrap(), prose);
+    let prompt = env.state_file("tune-prompt.md").unwrap();
+    assert!(prompt.contains(prose));
+    assert!(prompt.contains("Only applied TOML affects scheduling"));
+    std::fs::write(&intent, "Now run chores first.\n").unwrap();
+    env.pq().args(["tune", "--apply", "-y"]).assert().code(1).stderr(predicate::str::contains("intent changed since drafting"));
+    assert_eq!(env.priority(), before);
+    std::fs::write(&intent, prose).unwrap();
+    env.pq().args(["tune", "--apply", "-y"]).assert().success();
+    let applied = env.priority();
+    let paths = powerqueue::paths::Paths::rooted(env.home.path());
+    assert_eq!(
+        powerqueue::tune::intent_status(&paths, &paths.priority_file(), &intent).unwrap(),
+        "unchanged since last applied proposal"
+    );
+    std::fs::write(&intent, "Chores must run first instead.\n").unwrap();
+    assert!(
+        powerqueue::tune::intent_status(&paths, &paths.priority_file(), &intent)
+            .unwrap()
+            .contains("intent changed since last applied proposal")
+    );
+    assert_eq!(env.priority(), applied, "prose alone never rewrites policy");
+    env.pq().args(["priority", "explain", "FAKE-1"]).assert().success().stdout(predicate::str::contains("critical"));
+    env.pq().args(["tune", "--undo"]).assert().success();
+    assert_eq!(env.priority(), before);
+    assert!(std::fs::read_to_string(intent).unwrap().contains("Chores must run first"));
+}
+
+#[test]
+fn project_selection_simulation_apply_and_undo_are_isolated() {
+    let env = Env::new();
+    let repo = tempfile::tempdir().unwrap();
+    let policy = repo.path().join("priority.toml");
+    std::fs::write(&policy, "version = 1\ndefault_criticality = 'low'\n").unwrap();
+    std::fs::write(repo.path().join(".powerqueue.toml"), "priority_file = 'priority.toml'\n").unwrap();
+    std::fs::write(repo.path().join("PRIORITY.md"), "Give FAKE-1 precedence in this project.\n").unwrap();
+    std::fs::write(
+        env.home.path().join("config/config.toml"),
+        format!("{}\n[projects.api.repo]\npath = '{}'\n", env.config(), repo.path().display()),
+    )
+    .unwrap();
+    env.pq().args(["task", "project", "FAKE-1", "api"]).assert().success();
+    let machine_before = env.priority();
+    let project_before = std::fs::read_to_string(&policy).unwrap();
+    env.tune("priority")
+        .args(["tune", "x", "--project", "missing", "--dry-run"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("unknown execution project"));
+    assert!(env.drafts().is_empty());
+    let out = env
+        .tune("priority")
+        .args(["--json", "tune", "translate intent", "--project", "api", "--scope", "priority", "--dry-run", "--no-budget"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(json["project"], "api");
+    assert_eq!(json["simulation"]["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(json["simulation"]["rows"][0]["key"], "FAKE-1");
+    assert_eq!(json["simulation"]["rows"][0]["criticality"], "critical");
+    assert!(env.state_file("tune-prompt.md").unwrap().contains("--project api --reasons"));
+    env.pq().args(["tune", "--apply", "--project", "default", "-y"]).assert().code(1);
+    env.pq().args(["tune", "--apply", "--project", "api", "-y"]).assert().success();
+    assert_eq!(env.priority(), machine_before);
+    assert!(std::fs::read_to_string(&policy).unwrap().contains("FAKE-1"));
+    env.pq().args(["tune", "--undo", "--project", "api"]).assert().success();
+    assert_eq!(std::fs::read_to_string(&policy).unwrap(), project_before);
+    assert_eq!(env.priority(), machine_before);
+    // A machine proposal must not replace api's independently configured policy.
+    let out = env
+        .tune("priority")
+        .args(["--json", "tune", "machine intent", "--scope", "priority", "--dry-run", "--no-budget"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let rows = json["simulation"]["rows"].as_array().unwrap();
+    assert_eq!(rows.iter().find(|r| r["key"] == "FAKE-1").unwrap()["criticality"], "low");
+}
+
+#[test]
+fn committed_policy_apply_prepares_a_reviewable_change() {
+    if which::which("git").is_err() {
+        return;
+    }
+    let env = Env::new();
+    let repo = env._repo.path();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap()
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(repo.join(".powerqueue.toml"), "priority_file = 'priority.toml'\n").unwrap();
+    let before = "version = 1\ndefault_criticality = 'normal'\n";
+    std::fs::write(repo.join("priority.toml"), before).unwrap();
+    std::fs::write(repo.join("PRIORITY.md"), "FAKE-1 is customer critical.\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial"]);
+    env.pq().args(["config", "set", "repo.overrides_from", "default-branch"]).assert().success();
+    env.pq().args(["config", "set", "repo.default_branch", "main"]).assert().success();
+    env.tune("priority")
+        .args(["tune", "translate intent", "--scope", "priority", "-y", "--no-budget"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("review, commit and merge"));
+    assert!(git(&["diff", "--", "priority.toml"]).contains("+key = \"FAKE-1\""));
+    assert_eq!(git(&["show", "main:priority.toml"]), before);
+    env.pq().args(["priority", "show"]).assert().success().stdout(predicate::str::contains("FAKE-1").not());
+    env.pq().args(["tune", "--undo"]).assert().success();
+    assert_eq!(std::fs::read_to_string(repo.join("priority.toml")).unwrap(), before);
+    assert!(git(&["diff", "--", "priority.toml"]).is_empty());
+    std::fs::write(repo.join("priority.toml"), "version = 1\ndefault_criticality = 'low'\n").unwrap();
+    env.tune("priority")
+        .args(["tune", "x", "--scope", "priority", "-y"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("commit/stash or restore"));
+    assert!(std::fs::read_to_string(repo.join("priority.toml")).unwrap().contains("'low'"));
+}
+
+#[test]
+fn apply_rejects_policy_edits_and_invalid_or_modified_intent_drafts() {
+    let env = Env::new();
+    env.tune("priority").args(["tune", "x", "--scope", "priority", "--dry-run"]).assert().success();
+    let draft = env.draft_with_status("proposed");
+    let before = env.priority();
+    std::fs::write(env.home.path().join("config/priority.toml"), "version = 1\ndefault_criticality = 'low'\n").unwrap();
+    env.pq().args(["tune", "--apply", "-y"]).assert().code(1).stderr(predicate::str::contains("policy changed since drafting"));
+    std::fs::write(env.home.path().join("config/priority.toml"), &before).unwrap();
+    std::fs::write(draft.join("PRIORITY.md"), "agent changed the intent").unwrap();
+    env.pq().args(["tune", "--apply", "-y"]).assert().code(1).stderr(predicate::str::contains("read-only intent"));
+    std::fs::write(draft.join("PRIORITY.md"), "").unwrap();
+    std::fs::write(draft.join("priority.toml"), "version = 1\nunknown = true\n").unwrap();
+    env.pq().args(["tune", "--apply", "-y"]).assert().code(1).stderr(predicate::str::contains("does not validate"));
+    assert_eq!(env.priority(), before);
+}
+
+#[test]
+fn custom_intent_and_agent_error_keep_live_policy() {
+    let env = Env::new();
+    let intent = env.home.path().join("goals.md");
+    std::fs::write(&intent, "FAKE-1 should be critical.\n").unwrap();
+    let before = env.priority();
+    env.tune("intent")
+        .args(["tune", "translate", "--intent", intent.to_str().unwrap(), "--scope", "priority", "--dry-run"])
+        .assert()
+        .success();
+    let draft = env.draft_with_status("proposed");
+    assert_eq!(env.meta(&draft)["intent_path"], intent.to_str().unwrap());
+    env.tune("report-error").args(["tune", "translate", "--intent", intent.to_str().unwrap(), "-y"]).assert().code(1);
+    assert_eq!(env.priority(), before);
+    assert_eq!(env.meta(&env.draft_with_status("failed"))["agent"]["is_error"], true);
+    env.tune("intent")
+        .args(["tune", "translate", "--intent", "/missing/pq-intent.md", "-y"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("intent document"));
 }

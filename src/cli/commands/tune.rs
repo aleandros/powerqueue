@@ -14,11 +14,11 @@ use owo_colors::{OwoColorize, Stream, Style};
 
 use crate::budget::Ledgers;
 use crate::cli::commands::config::apply_note;
-use crate::cli::commands::priority::{Simulation, render_simulation, simulate_with};
+use crate::cli::commands::priority::{Simulation, render_simulation, simulate_target, simulate_with};
 use crate::cli::commands::status::ensure_initialised;
 use crate::cli::output::{human_duration, truncate};
 use crate::cli::{Context, SimulateArgs, TuneArgs};
-use crate::config::{Config, REPO_CONFIG_FILE};
+use crate::config::Config;
 use crate::domain::{EventLevel, ModelTier, Provider, Task};
 use crate::priority::PriorityRules;
 use crate::tune::{
@@ -32,7 +32,7 @@ use crate::tune::{
 pub fn run(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
     ensure_initialised(ctx)?;
     if args.undo {
-        return undo(ctx);
+        return undo(ctx, args.project.as_deref());
     }
     if let Some(which) = args.apply.clone() {
         return apply_existing(ctx, &args, &which);
@@ -45,14 +45,10 @@ fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
     let instruction = read_instruction(args.instruction.as_deref())?;
     let cfg = ctx.config()?.clone();
     let paths = ctx.paths.clone();
-    if args.scope.includes_priority() && cfg.overrides.sets("priority.file") {
-        bail!(
-            "the rules file is set by the repository ({} in {}); edit it in the repository (or run with `--scope config`) \
-             instead of letting tune write into the checkout",
-            cfg.priority_file(&paths).display(),
-            cfg.overrides.file.as_deref().map(|f| f.display().to_string()).unwrap_or_else(|| REPO_CONFIG_FILE.to_string())
-        );
-    }
+    let selected = match &args.project {
+        Some(id) => cfg.for_project(id, &paths)?,
+        None => cfg.clone(),
+    };
 
     let model = match &args.model {
         Some(m) => m.clone(),
@@ -79,22 +75,33 @@ fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
     let timeout = Duration::from_secs(args.timeout.unwrap_or(cfg.tune.timeout_secs).max(1));
 
     // Live files.
-    let live_priority = cfg.priority_file(&paths);
+    let live_priority = selected.priority_file(&paths);
     let live_config = paths.config_file();
     // What the daemon reads (the committed copy when the repo owns the rules).
-    let priority_text = cfg.read_rules_text(&paths)?;
+    let priority_text = selected.read_rules_text(&paths)?;
     let config_text = std::fs::read_to_string(&live_config).with_context(|| format!("read {}", live_config.display()))?;
-    let rules = PriorityRules::from_source(&cfg.rules_source(&paths))
+    let rules = PriorityRules::from_source(&selected.rules_source(&paths))
         .context("fix the rules first (`powerqueue priority check`)")?
         .unwrap_or_default();
 
     // Current state for the prompt.
-    let sim_args = SimulateArgs { reasons: true, no_budget: args.no_budget, ..SimulateArgs::default() };
+    let sim_args =
+        SimulateArgs { project: args.project.clone(), reasons: true, no_budget: args.no_budget, ..SimulateArgs::default() };
     let live_sim = simulate_with(ctx, &sim_args, &cfg, &rules, &live_priority)?;
-    let tasks = ctx.store()?.list_open_tasks()?;
+    let mut tasks = ctx.store()?.list_open_tasks()?;
+    if let Some(id) = &args.project {
+        tasks.retain(|t| &t.execution_project == id);
+    }
     let ledgers = Ledgers::load(ctx.store()?, &cfg.budget, chrono::Utc::now())?;
-    let context_md = context_markdown(&cfg, &live_priority, priority_text.is_some(), &live_sim, &sim_args, &tasks, &ledgers);
-    let repo_overrides = cfg.read_repo_overrides(&cfg.repo_path()).ok().and_then(|l| l.text);
+    let mut context_md = context_markdown(&cfg, &live_priority, priority_text.is_some(), &live_sim, &sim_args, &tasks, &ledgers);
+    let repo_overrides =
+        if selected.repo.path.trim().is_empty() { None } else { selected.read_repo_overrides(&selected.repo_path())?.text };
+
+    let intent = args.intent.clone().unwrap_or_else(|| live_priority.with_file_name(crate::tune::INTENT_FILE));
+    let intent = std::path::absolute(&intent).with_context(|| format!("resolve {}", intent.display()))?;
+    if args.intent.is_some() && !intent.is_file() {
+        bail!("intent document {} does not exist or is not a file", intent.display());
+    }
 
     // Draft directory + prompt.
     let id = new_draft_id(chrono::Utc::now());
@@ -109,8 +116,25 @@ fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
         &live_config,
         &config_text,
     )?;
+    if let Err(e) = draft.capture_intent(&paths, args.project.clone(), selected.rules_source(&paths), intent) {
+        draft.set_status(DraftStatus::Failed, vec![format!("{e:#}")])?;
+        return Err(e);
+    }
+    context_md.push_str(&format!(
+        "\n## Policy target\n\nProject: {}\nSource: {}\nIntent: {}\nStatus: {}\n",
+        args.project.as_deref().unwrap_or("machine"),
+        selected.rules_source(&paths),
+        draft.meta.intent_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+        draft.meta.intent_status
+    ));
+    if let Some(text) = &draft.meta.intent_text {
+        context_md.push_str(&format!("\n## Free-form intent (read-only PRIORITY.md)\n\n{text}\n"));
+    }
     draft.write_file(CONTEXT_FILE, &context_md)?;
-    let prompt = build_prompt(&instruction, args.scope, &context_md, repo_overrides.as_deref());
+    let mut prompt = build_prompt(&instruction, args.scope, &context_md, repo_overrides.as_deref());
+    if let Some(id) = &args.project {
+        prompt = prompt.replace("--config config.toml --reasons", &format!("--config config.toml --project {id} --reasons"));
+    }
     draft.write_file(crate::tune::PROMPT_FILE, &prompt)?;
 
     let self_bin = std::env::current_exe().context("locate the powerqueue binary")?;
@@ -165,10 +189,14 @@ fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
             &outcome.stderr,
         );
     }
-    if outcome.report.exit_code.is_some_and(|c| c != 0) {
-        let code = outcome.report.exit_code.unwrap_or(1);
-        draft.set_status(DraftStatus::Failed, vec![format!("`{binary}` exited with {code}")])?;
-        return fail(ctx, &draft, &format!("`{binary}` exited with {code}"), &outcome.stderr);
+    if outcome.report.is_error || outcome.report.exit_code.is_some_and(|c| c != 0) {
+        let reason = if outcome.report.exit_code.is_some_and(|c| c != 0) {
+            format!("`{binary}` exited with {}", outcome.report.exit_code.unwrap_or(1))
+        } else {
+            format!("`{binary}` reported an agent error")
+        };
+        draft.set_status(DraftStatus::Failed, vec![reason.clone()])?;
+        return fail(ctx, &draft, &reason, &outcome.stderr);
     }
 
     // Validate and compare.
@@ -201,6 +229,7 @@ fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
             print_json(&draft, &file_changes, None, false)?;
         } else {
             print_summary(&draft);
+            println!("Intent: {}", draft.meta.intent_status);
             println!(
                 "{} Claude changed nothing (see its explanation above). Draft kept at {}.",
                 "no change:".if_supports_color(Stream::Stdout, |t| t.style(Style::new().yellow().bold())),
@@ -211,7 +240,14 @@ fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
     }
     draft.set_status(DraftStatus::Proposed, vec![])?;
 
-    let draft_sim = simulate_with(ctx, &draft_sim_args(&args), &valid.config, &valid.rules, &draft.priority_path())?;
+    let draft_sim = simulate_target(
+        ctx,
+        &draft_sim_args(&args, &draft),
+        &valid.config,
+        &valid.rules,
+        &draft.priority_path(),
+        Some(&draft.meta.live_priority),
+    )?;
     review_and_apply(ctx, &cfg, &mut draft, &file_changes, &draft_sim, &args, true)
 }
 
@@ -219,12 +255,24 @@ fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
 fn apply_existing(ctx: &mut Context, args: &TuneArgs, which: &str) -> Result<i32> {
     let cfg = ctx.config()?.clone();
     let paths = ctx.paths.clone();
-    let mut draft = Draft::resolve(&paths, which)?;
+    let mut draft = if which == "latest" && args.project.is_some() {
+        Draft::list(&paths)?
+            .into_iter()
+            .rev()
+            .find(|d| d.meta.status == DraftStatus::Proposed && d.meta.project == args.project)
+            .ok_or_else(|| anyhow!("no proposed tune draft for this project"))?
+    } else {
+        Draft::resolve(&paths, which)?
+    };
+    if args.project.is_some() && args.project != draft.meta.project {
+        bail!("draft belongs to a different project");
+    }
     match draft.meta.status {
         DraftStatus::Proposed => {}
         DraftStatus::Applied => bail!("draft {} was already applied (use --undo to revert it)", draft.dir.display()),
         other => bail!("draft {} is {}; only proposed drafts can be applied", draft.dir.display(), other),
     }
+    crate::tune::check_target(&paths, &cfg, &draft)?;
     let valid = match validate(&paths, &draft) {
         Ok(v) => v,
         Err(problems) => bail!("draft {} does not validate:\n  - {}", draft.dir.display(), problems.join("\n  - ")),
@@ -239,7 +287,14 @@ fn apply_existing(ctx: &mut Context, args: &TuneArgs, which: &str) -> Result<i32
         }
         return Ok(0);
     }
-    let draft_sim = simulate_with(ctx, &draft_sim_args(args), &valid.config, &valid.rules, &draft.priority_path())?;
+    let draft_sim = simulate_target(
+        ctx,
+        &draft_sim_args(args, &draft),
+        &valid.config,
+        &valid.rules,
+        &draft.priority_path(),
+        Some(&draft.meta.live_priority),
+    )?;
     review_and_apply(ctx, &cfg, &mut draft, &file_changes, &draft_sim, args, false)
 }
 
@@ -277,9 +332,15 @@ fn review_and_apply(
             );
             print_summary(draft);
         }
+        println!("Intent: {}", draft.meta.intent_status);
+        if draft.meta.source.as_ref().is_some_and(|s| s.rev().is_some()) {
+            println!(
+                "Applying prepares a repository working-copy change. Review, commit and merge it into the configured default branch before scheduling changes."
+            );
+        }
         print_diffs(file_changes);
         println!();
-        print!("{}", render_simulation(draft_sim, &draft_sim_args(args)));
+        print!("{}", render_simulation(draft_sim, &draft_sim_args(args, draft)));
         println!();
     }
 
@@ -320,6 +381,7 @@ fn review_and_apply(
         });
     }
 
+    crate::tune::check_target(&ctx.paths, cfg, draft)?;
     let written = crate::tune::apply(draft, file_changes)?;
     let store = ctx.store()?.clone();
     store.log_event(
@@ -331,7 +393,10 @@ fn review_and_apply(
         serde_json::json!({ "draft": draft.dir, "files": written, "model": draft.meta.model }),
     )?;
     tracing::info!(draft = %draft.dir.display(), files = ?written, "tune: applied");
-    let note = apply_note(ctx)?;
+    let mut note = apply_note(ctx)?;
+    if draft.meta.scope.includes_priority() && draft.meta.source.as_ref().is_some_and(|s| s.rev().is_some()) {
+        note.push_str("; repository change prepared; review, commit and merge into the configured default branch");
+    }
     prune(ctx, cfg);
     if ctx.json {
         print_json(draft, file_changes, Some(draft_sim), true)?;
@@ -355,9 +420,13 @@ enum Decision {
 }
 
 /// `--undo`: restore the files of the most recent applied draft.
-fn undo(ctx: &mut Context) -> Result<i32> {
+fn undo(ctx: &mut Context, project: Option<&str>) -> Result<i32> {
     let paths = ctx.paths.clone();
-    let Some(mut draft) = Draft::latest_with(&paths, DraftStatus::Applied)? else {
+    let Some(mut draft) = Draft::list(&paths)?
+        .into_iter()
+        .rev()
+        .find(|d| d.meta.status == DraftStatus::Applied && project.is_none_or(|p| d.meta.project.as_deref() == Some(p)))
+    else {
         bail!("no applied tune draft to undo");
     };
     let touched = crate::tune::undo(&mut draft)?;
@@ -371,7 +440,10 @@ fn undo(ctx: &mut Context) -> Result<i32> {
         serde_json::json!({ "draft": draft.dir, "files": touched }),
     )?;
     tracing::info!(draft = %draft.dir.display(), files = ?touched, "tune: undone");
-    let note = apply_note(ctx)?;
+    let mut note = apply_note(ctx)?;
+    if draft.meta.scope.includes_priority() && draft.meta.source.as_ref().is_some_and(|s| s.rev().is_some()) {
+        note.push_str("; repository change prepared; review, commit and merge into the configured default branch");
+    }
     if ctx.json {
         println!(
             "{}",
@@ -415,8 +487,14 @@ fn read_instruction(arg: Option<&str>) -> Result<String> {
     Ok(text)
 }
 
-fn draft_sim_args(args: &TuneArgs) -> SimulateArgs {
-    SimulateArgs { file: Some("draft".into()), no_budget: args.no_budget, ..SimulateArgs::default() }
+fn draft_sim_args(args: &TuneArgs, draft: &Draft) -> SimulateArgs {
+    SimulateArgs {
+        project: draft.meta.project.clone(),
+        file: Some("draft".into()),
+        reasons: true,
+        no_budget: args.no_budget,
+        ..SimulateArgs::default()
+    }
 }
 
 fn spinner(ctx: &Context, msg: &str) -> Option<indicatif::ProgressBar> {
@@ -523,6 +601,11 @@ fn print_json(draft: &Draft, changes: &[FileChange], sim: Option<&Simulation>, a
             "status": draft.meta.status,
             "instruction": draft.meta.instruction,
             "scope": draft.meta.scope,
+            "project": draft.meta.project,
+            "source": draft.meta.source,
+            "intent_path": draft.meta.intent_path,
+            "intent_status": draft.meta.intent_status,
+            "requires_commit": draft.meta.scope.includes_priority() && draft.meta.source.as_ref().is_some_and(|s| s.rev().is_some()),
             "model": draft.meta.model,
             "summary": draft.meta.summary,
             "agent": draft.meta.agent,

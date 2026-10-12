@@ -295,10 +295,14 @@ fn repo_overrides_are_attributed_validated_and_read_from_the_default_branch() {
     pq(home.path()).args(["priority", "show"]).assert().success().stdout(predicate::str::contains("(main)"));
     pq(home.path()).args(["config", "validate"]).assert().success().stdout(predicate::str::contains("(main) is valid"));
     pq(home.path())
+        .args(["config", "set", "claude.binary", concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-claude.sh")])
+        .assert()
+        .success();
+    pq(home.path())
         .args(["tune", "--dry-run", "make chores low"])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("set by the repository"));
+        .stderr(predicate::str::contains("commit/stash or restore"));
 
     // A branch that cannot be read does not lock the CLI out: status, config
     // show and doctor run on config.toml alone and say so; run refuses.

@@ -3,7 +3,10 @@
 `priority.toml` determines criticality, score, skip decisions and preferred
 models. `PRIORITY.md` may contain free-form intent for people and agents, but
 Markdown prose alone is **not executable**. The daemon never evaluates Markdown.
-Use `tune` to translate an instruction into a validated TOML draft for review.
+Use `tune` to translate that intent and an instruction into a validated TOML
+draft for review. `init` generates both a free-form `PRIORITY.md` template and
+a typed `priority.toml` template. The old Markdown grammar is used only by the
+explicit migration command.
 
 ## Schema (version 1)
 
@@ -197,8 +200,13 @@ powerqueue tune "customer tickets should rank above chores" --scope priority --d
 
 `show`, `check`, `edit` and `path` select the machine policy when `--project`
 is omitted. JSON is available through the global `--json` option. `edit` uses
-`$VISUAL`, then `$EDITOR`, then `vi`. `tune` edits validated TOML drafts and
-retains its diff/apply/undo workflow; see [commands](commands.md).
+`$VISUAL`, then `$EDITOR`, then `vi`. `tune --project ID` reads the selected
+policy and adjacent `PRIORITY.md` (or
+`--intent PATH`), edits TOML drafts and shows the diff and simulated effects
+before apply. It records the intent snapshot; tune and doctor report subsequent
+prose changes without changing scheduling. Repository policies read from a
+committed branch produce working-copy changes for review and commit under that
+same workflow. See [commands](commands.md) for apply, undo and stale-input checks.
 
 File changes reload when `priority.live_reload = true`. Project policies are
 polled on ticks; single-repository policies are watched, and committed policies

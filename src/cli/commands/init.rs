@@ -300,6 +300,12 @@ pub fn write_files(ctx: &Context, answers: &Answers) -> Result<Vec<String>> {
             .with_context(|| format!("write {}", priority_file.display()))?;
         written.push(priority_file.display().to_string());
     }
+    let intent_file = priority_file.with_file_name(crate::tune::INTENT_FILE);
+    if !intent_file.exists() {
+        std::fs::write(&intent_file, crate::priority::intent_template())
+            .with_context(|| format!("write {}", intent_file.display()))?;
+        written.push(intent_file.display().to_string());
+    }
     let db = paths.database();
     Store::open(&db)?;
     written.push(db.display().to_string());
@@ -1242,9 +1248,14 @@ mod tests {
         let ctx = Context::new(Some(dir.path().to_path_buf()), crate::logging::Verbosity::Normal, false, false);
         let answers = Answers { repo_path: dir.path().to_path_buf(), ..Answers::default() };
         let written = write_files(&ctx, &answers).unwrap();
-        assert_eq!(written.len(), 3);
+        assert_eq!(written.len(), 4);
         assert!(ctx.paths.config_file().exists());
         assert!(ctx.paths.priority_file().exists());
+        let intent = ctx.paths.priority_file().with_file_name(crate::tune::INTENT_FILE);
+        assert_eq!(std::fs::read_to_string(&intent).unwrap(), crate::priority::intent_template());
+        std::fs::write(&intent, "My own goals").unwrap();
+        write_files(&ctx, &answers).unwrap();
+        assert_eq!(std::fs::read_to_string(intent).unwrap(), "My own goals");
         assert!(ctx.paths.database().exists());
         Config::load(&ctx.paths).unwrap();
     }

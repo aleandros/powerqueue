@@ -671,7 +671,7 @@ drafts of `priority.toml` and `config.toml`; see [Tuning with
 | `model` | `"sonnet"` | Claude model alias for the tuning session (`-m` overrides per run; must be a Claude model) |
 | `timeout_secs` | `600` | kill the session after this long; the draft is kept and reported as failed |
 | `extra_args` | `[]` | flags appended to the `claude -p` command line |
-| `keep_drafts` | `20` | drafts to keep under `<state>/tune/`; older finished ones (applied, undone, unchanged, failed, invalid) are pruned after each run, proposed ones never |
+| `keep_drafts` | `20` | drafts to keep under `<state>/tune/`; older undone, unchanged, failed and invalid drafts are pruned after each run; running, proposed and applied drafts are retained for review, undo and intent comparison |
 
 The session uses `claude.binary` and refuses commands with per-task placeholders.
 It runs in the draft directory with
@@ -787,9 +787,10 @@ each task and every `repo.fetch_interval_secs` (300 by default). A relative
 in the repository too; `priority show`, `priority check`, `priority explain`,
 `priority simulate` and `doctor` read that same committed copy and say so
 (`docs/priority.toml (origin/main)`), `priority edit` edits the working-tree
-copy and reminds you to commit and push it, and `tune` refuses to rewrite a
-rules file the repository owns (use `--scope config`, or edit the file in the
-repository). What is read from the commit is only `.powerqueue.toml` and
+copy and reminds you to commit and push it. `tune --project ID` reads that
+committed policy plus free-form intent, validates and simulates a proposal, then
+prepares a working-copy change on approval. Review, commit and merge it through
+the configured branch; tune never changes the source mode or writes a commit. What is read from the commit is only `.powerqueue.toml` and
 `priority_file`: `prompt_template` is still read from the main checkout's
 working tree, and `setup` / `cleanup.run` commands run inside the task's
 worktree (which starts from the same `origin/<default_branch>`).
