@@ -1300,8 +1300,13 @@ fn execution_projects_push_and_clean_up_only_their_own_repositories() {
     env.start_daemon();
 
     for (index, key) in keys.iter().enumerate() {
+        // Hooks can finish cleanup before this tick reaches transcript polling.
+        // Wait for usage independently so the assertion cannot race that phase.
         let show = env.wait_for_show(key, |v| {
-            v["task"]["state"] == "completed" && has_event(v, "cleanup.done") && v["task"]["worktree_path"].is_null()
+            v["task"]["state"] == "completed"
+                && has_event(v, "cleanup.done")
+                && v["task"]["worktree_path"].is_null()
+                && output_tokens(v) >= 1400
         });
         assert_eq!(show["task"]["state"], "completed", "{}", env.daemon_log());
         assert!(show["task"]["worktree_path"].is_null(), "worktree should be removed after push: {show}");

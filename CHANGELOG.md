@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scheduler::launch::on_starting` returns `Option<Start>` and refuses unapproved
   tasks without mutation.
 
+### Fixed
+
+- Make the multi-project cleanup test wait for transcript usage collection,
+  avoiding a timing race when cleanup finishes before usage is recorded.
+
 ## [0.15.0] - 2026-10-12
 
 ### Added
