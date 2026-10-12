@@ -17,6 +17,11 @@ exclude = [".github/", ".claude/", "docs/reference/", "justfile"]
 name = "powerqueue"
 path = "src/main.rs"
 
+[[example]]
+name = "quint-replay"
+path = "spec/replay.rs"
+test = true
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -34,9 +34,10 @@ jobs:
       - run: npm --prefix spec test
       - run: spec/node_modules/.bin/quint test spec/powerqueue.qnt --main=progress
       - run: npm --prefix spec run check
-      - run: python3 -m unittest discover -s spec -p 'test_*.py'
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Test Rust replay projection and Quint rejection schedules
+        run: cargo test --example quint-replay -- --include-ignored
       - run: sudo apt-get update && sudo apt-get install -y tmux
       - name: Collect real daemon traces
         env:
@@ -49,7 +50,7 @@ jobs:
       - name: Replay every required trace (missing artifacts fail)
         run: |
           for name in completion crash-resume rate-limit; do
-            python3 spec/replay.py "$RUNNER_TEMP/pq-traces/$name.json" --name "$name" --run
+            cargo run --quiet --example quint-replay -- "$RUNNER_TEMP/pq-traces/$name.json" --name "$name" --run
           done
       - uses: actions/upload-artifact@v7
         if: always()

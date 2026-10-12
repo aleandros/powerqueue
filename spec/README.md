@@ -6,7 +6,9 @@ those tests or prove the implementation equivalent to the specification.
 
 ## Run
 
-Node 22, Python 3.9+, and npm are sufficient for the advisory gate:
+The replay adapter uses the project's Rust toolchain and dependencies. Node 22
+and npm run Quint; Python 3 is needed only by the fake-agent e2e fixtures,
+not by the adapter or its tests:
 
 ```sh
 npm ci --prefix spec --ignore-scripts
@@ -14,7 +16,7 @@ npm --prefix spec run typecheck
 npm --prefix spec test
 spec/node_modules/.bin/quint test spec/powerqueue.qnt --main=progress
 npm --prefix spec run check
-python3 -m unittest discover -s spec -p 'test_*.py'
+cargo test --example quint-replay -- --include-ignored
 ```
 
 Quint is locked to 0.33.0. Its `adm-zip` dependency is overridden to 0.6.1
@@ -80,11 +82,12 @@ are reported as skipped. UUIDs become local integer task indices. Ticket titles,
 paths, hook bodies and other raw text are not written to generated traces.
 
 ```sh
-python3 spec/replay.py events.json --name queue --run
+cargo run --quiet --example quint-replay -- events.json --name queue --run
 ```
 
-The adapter sorts by store event ID, converts times to integer seconds from the
-first event, and generates a deterministic `replayTest` under `.generated/`.
+The Rust adapter (`spec/replay.rs`, a Cargo example) reads the application's
+`Event` type, sorts by store event ID, converts times to integer seconds from the
+earliest timestamp, and generates a deterministic `replayTest` under `.generated/`.
 Every observation asserts the **same lifecycle guard used by the simulation**,
 then checks logged attempt numbers. An illegal step fails an assertion, rather
 than silently stopping a simulation at a disabled action. Quint emits ITF state
@@ -127,14 +130,20 @@ To capture the three supported real-daemon scenarios without adding Quint to
 ```sh
 POWERQUEUE_TRACE_DIR=/tmp/pq-traces cargo test --test e2e_daemon
 for name in completion crash-resume rate-limit; do
-  python3 spec/replay.py "/tmp/pq-traces/$name.json" --name "$name" --run
+  cargo run --quiet --example quint-replay -- "/tmp/pq-traces/$name.json" --name "$name" --run
 done
 ```
 
 The advisory workflow requires all three artifacts, so skipped e2e tests cannot
 produce a false success. Adapter tests include negative schedules: double launch,
 wrong attempt, premature restart, early failure, crash past the limit, and duplicate
-completion after a session has ended.
+completion after a session has ended. Projection tests run with ordinary
+`cargo test`; tests that invoke Quint are explicitly ignored there and required
+by the advisory command above. A missing Quint executable fails that command.
+The adapter requires the full application event envelope (including UUID task
+IDs and event level), timezone-bearing RFC 3339 timestamps, and positive integer
+attempts and limits. It retains microsecond truncation before converting to
+coarse seconds; timestamp fields in coverage reports use normalized UTC.
 
 ## Operational validation
 
