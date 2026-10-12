@@ -49,17 +49,18 @@ fn cwd() -> PathBuf {
     std::env::temp_dir()
 }
 
-/// Poll until `pred` holds for the pane or the timeout elapses.
+/// Poll until `pred` holds, failing with the last observation on timeout.
 fn wait_for_pane(tmux: &Tmux, session: &str, pane_id: &str, pred: impl Fn(&PaneInfo) -> bool) -> Option<PaneInfo> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Some(p) = tmux.find_pane(session, pane_id).unwrap()
-            && pred(&p)
+        let pane = tmux.find_pane(session, pane_id).unwrap();
+        if let Some(p) = pane.as_ref()
+            && pred(p)
         {
-            return Some(p);
+            return pane;
         }
         if Instant::now() > deadline {
-            return tmux.find_pane(session, pane_id).unwrap();
+            panic!("timed out waiting for pane {pane_id} in {session}; last observation: {pane:?}");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -179,7 +180,9 @@ fn dead_pane_reports_exit_status_and_can_be_respawned() {
     t.ensure_session("pq", &cwd()).unwrap();
     let w = t.new_window("pq", "dies", &cwd(), "exit 3", true).unwrap();
 
-    let pane = wait_for_pane(t, "pq", &w.pane_id, |p| p.dead).expect("pane kept by remain-on-exit");
+    // PTY closure marks the pane dead before tmux necessarily reaps the child.
+    // Wait for both observations before asserting the exit code.
+    let pane = wait_for_pane(t, "pq", &w.pane_id, |p| p.dead && p.dead_status.is_some()).expect("pane kept by remain-on-exit");
     assert!(pane.dead, "{pane:?}");
     assert_eq!(pane.dead_status, Some(3));
 
