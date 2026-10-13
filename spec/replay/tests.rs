@@ -258,6 +258,96 @@ fn review_observations_do_not_hide_unsupported_review_or_relay_changes() {
 }
 
 #[test]
+fn container_lifecycle_ends_its_prefix_without_hiding_other_tasks() {
+    for blocked_first in [false, true] {
+        let mut rows = launched();
+        let mut container = vec![event(4, "task.created")];
+        if blocked_first {
+            let mut block = dependency_block(5);
+            block.data["container"] = json!(true);
+            container.push(block);
+        }
+        container.extend([
+            payload(6, "task.completed", json!({"previous_state": "blocked", "children": ["EXAMPLE-2"]})),
+            event(7, "task.teleported"),
+        ]);
+        for row in &mut container {
+            row.task_id = Some(TaskId(Uuid::from_u128(2)));
+        }
+        rows.extend(container);
+        let (observations, report) = project(rows).unwrap();
+        assert_eq!(observations.len(), 4);
+        assert_eq!(report.actions["Launch"], 1);
+        let cutoff = if blocked_first { "task.blocked" } else { "task.completed" };
+        assert_eq!(report.truncated_or_skipped_tasks[&format!("prefix ends at {cutoff}")], 1);
+    }
+}
+
+#[test]
+fn both_pr_adoption_paths_end_the_prefix() {
+    for command_completion in [false, true] {
+        let mut rows = launched();
+        if command_completion {
+            rows.push(event(4, "task.completed_by_command"));
+        }
+        rows.extend([
+            payload(5, "task.in_review", json!({"from": "completed", "adopted": true})),
+            event(6, "session.released"),
+            event(7, "review.merged"),
+            event(8, "task.teleported"),
+        ]);
+        let (observations, report) = project(rows).unwrap();
+        assert_eq!(observations.len(), if command_completion { 4 } else { 3 });
+        assert!(!report.actions.contains_key("HandOff"));
+        assert_eq!(report.truncated_or_skipped_tasks["prefix ends at task.in_review"], 1);
+    }
+}
+
+#[test]
+fn live_retry_release_is_an_explicit_cutoff() {
+    for tail in ["task.retried", "review.relaunch"] {
+        let (_, report) = project(with_tail(vec![
+            payload(4, "session.ended", json!({"attempt": 1})),
+            event(5, tail),
+            payload(6, "task.starting", json!({"attempt": 2})),
+        ]))
+        .unwrap();
+        assert_eq!(report.observations, 3);
+        assert_eq!(report.truncated_or_skipped_tasks["prefix ends at session.ended"], 1);
+    }
+}
+
+#[test]
+#[ignore = "requires Quint"]
+fn quint_dependency_block_checks_previous_state_and_rejects_live_sessions() {
+    // A throttled session waiting in place must not be pulled back to blocked.
+    let mut block = dependency_block(5);
+    block.data["previous_state"] = json!("throttled");
+    check_trace(
+        with_tail(vec![payload(4, "budget.rate_limited", json!({"until": event(30, "").timestamp})), block.clone()]),
+        false,
+    );
+
+    // Both legal source states work, but the logged previous state must match.
+    for throttled in [false, true] {
+        for consistent in [false, true] {
+            let mut rows = vec![event(1, "task.created")];
+            if throttled {
+                rows.push(payload(2, "task.throttled", json!({"retry_at": event(30, "").timestamp})));
+            }
+            block.data["previous_state"] = json!(if throttled == consistent { "throttled" } else { "queued" });
+            rows.extend([
+                block.clone(),
+                event(6, "task.unblocked"),
+                payload(7, "task.starting", json!({"attempt": 1})),
+                payload(8, "session.launched", json!({"attempt": 1})),
+            ]);
+            check_trace(rows, consistent);
+        }
+    }
+}
+
+#[test]
 fn partial_history_is_reported_without_hiding_other_tasks() {
     let mut partial = event(0, "session.launched");
     partial.task_id = Some(TaskId(Uuid::from_u128(2)));

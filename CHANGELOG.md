@@ -13,7 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handoff, session release, review relaunch and merge, including per-round crash
   allowances and paused review watches. Synthetic rejection tests check invalid
   ordering; existing v0.14.0 event logs work without a daemon upgrade. Human
-  blockers and unsupported review/relay changes still end the affected prefix.
+  blockers, containers, PR adoption, live-session retry release, and unsupported
+  review/relay changes still end the affected prefix. Dependency holds reject
+  live sessions and check the logged previous state against the model.
 
 ## [0.17.0] - 2026-10-12
 

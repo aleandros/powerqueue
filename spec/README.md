@@ -127,7 +127,7 @@ The model reflects two details of the Rust lifecycle:
   task resets them. A requested review round records its starting attempt count;
   only attempts since that base count against the round's crash limit.
 
-Dependency holds move queued/throttled tasks to `blocked`; a logged unblock
+Dependency holds move queued/throttled tasks without live sessions to `blocked`; a logged unblock
 returns them to `queued`. The model checks these state transitions, not the
 dependency graph, container completion, or whether upstream issues really cleared.
 PR handoff preserves a live session until a separate release. Merge and review
@@ -192,7 +192,8 @@ routing predicates. Older traces without routing events retain the legacy defaul
 of permitted routing. Source approval and routing are independent in every trace.
 
 At the first unsupported lifecycle event for a task (review parking/adoption,
-human blocker, relayed answer, launch error/supersession), replay **ends that task's prefix**. It
+human blocker, container lifecycle, relayed answer, live-session retry release,
+launch error/supersession), replay **ends that task's prefix**. It
 never skips a state change and then resumes checking from stale state. The report
 names every cutoff. Known observational events stutter; unknown task/session
 kinds fail until explicitly classified. A `review.lookup_failed` is observational:
@@ -201,7 +202,13 @@ and cancellation are recognized separately from the original transition.
 
 Dependency `task.blocked` events are distinguished by their structured
 `previous_state`, `waiting_on`, and `container` fields; agent-reported blockers
-with a `reason` still end the prefix. `review.status` and `relay.hint_sent` are
+with a `reason` still end the prefix. The logged previous state must match the
+model's state, and a live session prevents dependency blocking. Container holds
+(`container: true`) and container completion (`task.completed` with `children`)
+end the prefix, as does `task.in_review` with `adopted: true`. A live-session retry
+emits `session.ended` before `task.retried` or `review.relaunch`; the adapter ends
+that prefix rather than ignoring the session mutation. Retries after a normal
+review release remain supported. `review.status` and `relay.hint_sent` are
 observational; other unsupported review/relay events still end the prefix.
 The supported dependency/review events already exist in v0.14.0: replay tooling
 can validate those historical logs without upgrading or restarting the daemon.

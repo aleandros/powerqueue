@@ -23,7 +23,7 @@ module lifecycle {
     else if (op == "Finish") (t.state == "completed" and t.live) or Set("running", "idle", "paused", "throttled", "crashed", "failed", "needs_attention").contains(t.state)
     else if (op == "Complete") Set("running", "idle", "paused", "throttled", "crashed", "failed", "needs_attention", "blocked", "in_review").contains(t.state)
     else if (op == "Release") t.live and terminal(t)
-    else if (op == "DependencyBlock") Set("queued", "throttled").contains(t.state)
+    else if (op == "DependencyBlock") Set("queued", "throttled").contains(t.state) and not(t.live)
     else if (op == "Unblock") t.state == "blocked"
     else if (op == "HandOff") Set("running", "idle", "paused", "needs_attention", "in_review").contains(t.state)
     else if (op == "ReviewRelease") t.state == "in_review" and t.live
@@ -326,6 +326,7 @@ module powerqueue {
         // CLI completion has a live session until the daemon's next sweep.
         t.state != "cancelled" and t.state != "failed" or not(t.live),
         t.state != "starting" or not(t.live),
+        not(Set("queued", "blocked").contains(t.state)) or not(t.live),
       }
     }),
   }
