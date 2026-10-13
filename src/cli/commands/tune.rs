@@ -31,6 +31,7 @@ use crate::tune::{
 /// declined), [`EXIT_PROPOSED`] when a proposal is waiting for `--apply`.
 pub fn run(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
     ensure_initialised(ctx)?;
+    ctx.require_valid_overrides()?;
     if args.undo {
         return undo(ctx, args.project.as_deref());
     }

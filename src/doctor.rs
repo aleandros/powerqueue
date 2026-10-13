@@ -2175,6 +2175,16 @@ pub async fn run_all(
     let isolation = check_project_isolation(cfg, paths);
     let isolated = isolation.status == Status::Ok;
     results.push(isolation);
+    let pending = store
+        .kv_get::<std::collections::BTreeMap<crate::domain::TaskId, crate::scheduler::lifecycle::PendingCleanup>>(
+            crate::scheduler::lifecycle::PENDING_CLEANUP_KEY,
+        )?
+        .unwrap_or_default();
+    for (id, cleanup) in pending {
+        results.push(CheckResult::fail(STATE, &format!("{id} pending cleanup"),
+            cleanup.error.unwrap_or_else(|| "cleanup interrupted; waiting for the daemon to retry".into()),
+            "repair the project's checkout or overrides and run the daemon; cleanup retries automatically, including after restart"));
+    }
     for task in store.list_tasks()? {
         if let Err(e) = cfg.for_task(&task, paths) {
             results.push(CheckResult::fail(STATE, &format!("{} execution project", task.key), format!("{e:#}"),

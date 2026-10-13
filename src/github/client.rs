@@ -18,6 +18,24 @@ pub struct RateLimited {
     pub retry_at: DateTime<Utc>,
 }
 
+/// A failed HTTP request, retaining status so callers can distinguish a
+/// source-wide authentication failure from one inaccessible issue.
+#[derive(Debug, thiserror::Error)]
+#[error("GitHub {method} {path} returned HTTP {status}; check repository access, token permissions and API rate limits")]
+pub struct ApiFailure {
+    pub status: StatusCode,
+    pub method: Method,
+    pub path: String,
+}
+
+/// Whether an issue request proves a source-wide credential/rate-limit failure.
+pub(crate) fn source_failure(error: &anyhow::Error) -> bool {
+    error.is::<RateLimited>()
+        || error
+            .downcast_ref::<ApiFailure>()
+            .is_some_and(|e| matches!(e.status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN))
+}
+
 /// Issue metadata used by the queue. Pull requests are filtered out by the client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubIssue {
@@ -125,10 +143,7 @@ impl GitHubClient {
         }
         if !status.is_success() {
             // Do not copy response bodies (which can contain private issue data) to logs.
-            bail!(
-                "GitHub {method} {} returned HTTP {status}; check repository access, token permissions and API rate limits",
-                url.path()
-            );
+            return Err(ApiFailure { status, method, path: url.path().to_owned() }.into());
         }
         Ok(response)
     }

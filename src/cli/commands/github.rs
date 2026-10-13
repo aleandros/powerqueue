@@ -25,6 +25,7 @@ pub fn run(ctx: &mut Context, cmd: GitHubCommand) -> Result<i32> {
     let mut errors = Vec::new();
     let mut results = Vec::new();
     let mut changes = Vec::new();
+    let mut problems = Vec::new();
     let mut fetched = 0;
     let apply = matches!(cmd, GitHubCommand::Sync { apply: true });
     for source in sources {
@@ -54,6 +55,7 @@ pub fn run(ctx: &mut Context, cmd: GitHubCommand) -> Result<i32> {
                     }
                     fetched += plan.fetched;
                     changes.extend(plan.changes);
+                    problems.extend(plan.problems);
                 }
             }
             Ok(())
@@ -75,7 +77,7 @@ pub fn run(ctx: &mut Context, cmd: GitHubCommand) -> Result<i32> {
             GitHubCommand::Sync { .. } => println!(
                 "{}",
                 serde_json::json!({"applied": apply, "fetched": fetched,
-                "changes": changes, "sources": results, "errors": errors})
+                "changes": changes, "sources": results, "errors": errors, "problems": problems})
             ),
         }
     } else {
@@ -90,6 +92,9 @@ pub fn run(ctx: &mut Context, cmd: GitHubCommand) -> Result<i32> {
                 }
             }
             GitHubCommand::Sync { .. } => {
+                for problem in &problems {
+                    eprintln!("warning: {}: {}", problem.key, problem.reason);
+                }
                 println!(
                     "{}: fetched {} issue(s), {} queue change(s).",
                     if apply { "Applied" } else { "Dry run" },

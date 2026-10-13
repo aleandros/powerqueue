@@ -73,11 +73,11 @@ impl Repo {
         if !path.exists() {
             return Ok(());
         }
-        let args = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
+        let args = ["rev-parse", "--git-common-dir"];
         let expected = self.git(None, &args)?;
         let actual = self.git(Some(path), &args)?;
-        let expected = Path::new(expected.trim()).canonicalize().context("resolve checkout git directory")?;
-        let actual = Path::new(actual.trim()).canonicalize().context("resolve worktree git directory")?;
+        let expected = self.path.join(expected.trim()).canonicalize().context("resolve checkout git directory")?;
+        let actual = path.join(actual.trim()).canonicalize().context("resolve worktree git directory")?;
         if expected != actual {
             bail!("worktree {} belongs to another repository, not {}", path.display(), self.path.display());
         }
@@ -206,9 +206,9 @@ impl Repo {
             bail!("`{rev}` does not resolve to a commit in {}", self.path.display());
         }
         let spec = format!("{rev}:{path}");
-        // Existence is a separate, exit-status-only probe: `git show`'s
-        // "does not exist" message is translated on localized hosts.
-        if !self.git_succeeds(None, &["cat-file", "-e", &spec])? {
+        // A tree entry distinguishes absence from an unreadable/missing blob.
+        // Object failures must never silently discard repository policy.
+        if !self.blob_ids(rev, &[path])?.contains_key(path) {
             return Ok(None);
         }
         Ok(Some(self.git(None, &["show", &spec])?))

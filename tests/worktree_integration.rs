@@ -373,3 +373,13 @@ fn show_file_blob_ids_and_current_branch() {
     git(&repo.path, &["checkout", "-q", "--detach"]);
     assert_eq!(repo.current_branch().unwrap(), None);
 }
+
+#[test]
+fn committed_missing_blob_is_an_error_not_an_absent_policy() {
+    let Some((_dir, repo)) = fixture() else { return };
+    assert_eq!(repo.show_file("HEAD", "absent.toml").unwrap(), None);
+    let oid = repo.git(None, &["rev-parse", "HEAD:README.md"]).unwrap();
+    let oid = oid.trim();
+    std::fs::remove_file(repo.path.join(".git/objects").join(&oid[..2]).join(&oid[2..])).unwrap();
+    assert!(repo.show_file("HEAD", "README.md").is_err());
+}

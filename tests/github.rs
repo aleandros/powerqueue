@@ -157,7 +157,7 @@ async fn missing_access_and_server_failures_never_cancel_or_partially_import() {
     let store = Store::open_in_memory().unwrap();
     let tracked = task(1);
     store.insert_task(&tracked).unwrap();
-    for status in [401, 403, 404, 429, 500] {
+    for status in [401, 403, 429] {
         server.reset().await;
         list(&server, vec![issue(2)]).await;
         Mock::given(method("GET"))
@@ -893,8 +893,10 @@ async fn conflicting_source_identity_is_visible_in_preview_and_apply() {
     let manual = Task::new("acme/app#1", "unrelated manual task", TaskSource::Manual);
     store.insert_task(&manual).unwrap();
     let manual = store.get_task(manual.id).unwrap().unwrap();
-    assert!(apply_plan(&store, &plan).unwrap_err().to_string().contains("conflicting source"));
-    assert!(plan_sync(&store, &config(&server), &client(&server)).await.unwrap_err().to_string().contains("conflicts"));
+    apply_plan(&store, &plan).unwrap();
+    let plan = plan_sync(&store, &config(&server), &client(&server)).await.unwrap();
+    assert!(plan.changes.is_empty());
+    assert!(plan.problems[0].reason.contains("conflicts"));
     assert_eq!(store.get_task(manual.id).unwrap().unwrap(), manual);
 }
 
@@ -1010,4 +1012,51 @@ async fn routing_unknown_destination_and_stale_preview_never_reassign() {
     assert_eq!(saved.execution_repo, running.execution_repo);
     assert!(!saved.execution_approved());
     assert!(!store.update_source_task(&running, &running).unwrap(), "stale metadata cannot overwrite routing evidence");
+}
+
+#[tokio::test]
+async fn one_inaccessible_issue_or_collision_does_not_block_healthy_intake() {
+    for status in [404, 500] {
+        let server = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        let mut inaccessible = task(1);
+        inaccessible.github_admission =
+            Some(powerqueue::domain::GitHubAdmission { approved: true, reason: "previously approved".into() });
+        store.insert_task(&inaccessible).unwrap();
+        let manual = Task::new("acme/app#2", "manual", TaskSource::Manual);
+        store.insert_task(&manual).unwrap();
+        list(&server, vec![issue(2), issue(3)]).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/app/issues/1"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+        let plan = plan_sync(&store, &config(&server), &client(&server)).await.unwrap();
+        assert_eq!(plan.problems.len(), 2);
+        apply_plan(&store, &plan).unwrap();
+        assert!(store.get_task_by_key("acme/app#3").unwrap().unwrap().execution_approved());
+        let held = store.get_task(inaccessible.id).unwrap().unwrap();
+        assert_eq!(held.state, TaskState::Queued);
+        assert!(!held.execution_approved());
+        assert_eq!(store.get_task(manual.id).unwrap().unwrap(), store.get_task_by_key("acme/app#2").unwrap().unwrap());
+    }
+}
+
+#[tokio::test]
+async fn inconsistent_issue_snapshot_denies_only_that_issue() {
+    let server = MockServer::start().await;
+    let store = Store::open_in_memory().unwrap();
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/app/issues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vec![issue(1), issue(2)]))
+        .mount(&server)
+        .await;
+    let mut mismatched = issue(1);
+    mismatched["updated_at"] = json!("2026-09-01T12:02:00Z");
+    approval(&server, vec![mismatched, issue(2)]).await;
+    let plan = plan_sync(&store, &config(&server), &client(&server)).await.unwrap();
+    assert_eq!(plan.problems.len(), 1);
+    apply_plan(&store, &plan).unwrap();
+    assert!(!store.get_task_by_key("acme/app#1").unwrap().unwrap().execution_approved());
+    assert!(store.get_task_by_key("acme/app#2").unwrap().unwrap().execution_approved());
 }

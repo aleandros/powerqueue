@@ -540,3 +540,30 @@ fn custom_intent_and_agent_error_keep_live_policy() {
         .code(1)
         .stderr(predicate::str::contains("intent document"));
 }
+
+#[test]
+fn invalid_overrides_refuse_all_policy_mutations() {
+    let env = Env::new();
+    let policy = env.priority();
+    let config = env.config();
+    std::fs::write(env._repo.path().join(".powerqueue.toml"), "priority_file = 'docs/priority.toml'\n[broken\n").unwrap();
+    for args in
+        [vec!["tune", "change something", "--dry-run"], vec!["tune", "--apply"], vec!["tune", "--undo"], vec!["priority", "edit"]]
+    {
+        env.pq().args(args).assert().failure().stderr(predicate::str::contains("invalid repository overrides"));
+    }
+    assert!(env.drafts().is_empty());
+    assert_eq!(env.priority(), policy);
+    assert_eq!(env.config(), config);
+}
+
+#[test]
+fn intent_only_policy_can_be_created_by_tune() {
+    let env = Env::new();
+    std::fs::remove_file(env.home.path().join("config/priority.toml")).unwrap();
+    let intent = env.home.path().join("config/PRIORITY.md");
+    std::fs::write(&intent, powerqueue::priority::intent_template()).unwrap();
+    env.tune("priority").args(["tune", "make FAKE-1 critical", "--yes"]).assert().success();
+    assert!(env.home.path().join("config/priority.toml").exists());
+    assert_eq!(std::fs::read_to_string(intent).unwrap(), powerqueue::priority::intent_template());
+}

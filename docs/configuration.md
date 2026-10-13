@@ -55,9 +55,13 @@ resolve from that project's checkout, as in single-repository mode.
 
 Without a named project table, the global setting is inherited. Repository-local
 setup, agent options, prompts, priority file, cleanup and task/review limits
-apply only to that project. With a registry configured, repository overrides
-for source admission (`linear`/`github`), total `max_concurrent`, `tick_secs`,
-and `resource_sample_secs` are ignored. Provider budgets, cooldowns and usage
+apply only to that project. With a registry configured, named repositories'
+source admission (`linear`/`github`) overrides are ignored. The legacy `[repo]`
+checkout's source overrides remain machine-wide, preserving existing approval
+restrictions and intake filters when projects are added. Its source overrides
+continue to reload; `config show` identifies the applied keys. Repository
+overrides for total `max_concurrent`, `tick_secs`, and `resource_sample_secs`
+are ignored in registry mode. Provider budgets, cooldowns and usage
 ledgers are always machine-wide; projects cannot declare a budget or scheduler
 table in config.toml. One launch pass allocates slots and reserves predicted
 usage across all projects in priority order.

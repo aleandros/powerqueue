@@ -39,6 +39,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `priority::migration::migrate`. Priority show/edit/path command variants now
   carry `PolicyArgs`, and check/simulate arguments include an optional project.
 
+### Fixed
+
+- Refuse legacy or stale tune undo operations before touching live files; policy
+  mutation commands refuse unresolved repository overrides instead of editing
+  the machine policy by mistake. Intent-only Markdown can seed a new TOML policy.
+- Preserve the legacy checkout's GitHub approver restrictions and Linear intake
+  filters when adding execution projects, including daemon reloads.
+- Treat unreadable committed policy objects as errors, never absent files.
+  Worktree ownership checks no longer require Git's `--path-format` option.
+- Persist failed project cleanup for retry after repair or daemon restart;
+  doctor reports pending cleanup, and superseded executions cannot be cleaned up.
+- Isolate GitHub issue collisions and verification failures so healthy issues
+  still sync, launch and receive lifecycle updates. Source-wide authentication
+  and rate-limit failures still pause the source.
+- Keep cached project policies through temporary override errors and deduplicate
+  repeated policy failure events.
+
 ## [0.16.0] - 2026-10-12
 
 Set up one local queue for multiple GitHub repositories with project registration,

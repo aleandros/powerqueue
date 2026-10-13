@@ -42,7 +42,7 @@ use crate::worktree::{BasePreference, FastForward, Repo, run_commands};
 
 use super::commands;
 use super::launch::{self, Candidate, LaunchContext, LaunchPlanner};
-use super::lifecycle::cleanup_task;
+use super::lifecycle::{PENDING_CLEANUP_KEY, PendingCleanup, cleanup_task};
 use super::relay::{self, PostedQuestion, RelayState, relay_key};
 use super::review;
 pub use super::transitions::SKIP_REASON;
@@ -151,6 +151,7 @@ struct RuntimeState {
     repo: Repo,
     launcher: Launcher,
     project_rules: HashMap<String, PriorityRules>,
+    project_rule_errors: HashMap<String, String>,
     project_fetches: HashMap<String, ProjectFetch>,
     rules: PriorityRules,
     rules_loaded: bool,
@@ -241,6 +242,7 @@ impl Daemon {
             repo,
             launcher,
             project_rules: HashMap::new(),
+            project_rule_errors: HashMap::new(),
             project_fetches: HashMap::new(),
             rules: PriorityRules::default(),
             rules_loaded: false,
@@ -408,6 +410,8 @@ impl Daemon {
         self.report_phase("transcripts", r);
         let r = self.probe_sessions(now).await;
         self.report_phase("probes", r);
+        let r = self.retry_cleanups();
+        self.report_phase("cleanup", r);
         let r = self.finalize_terminal(now).await;
         self.report_phase("finalize", r);
         let r = self.watch_reviews(now).await;
@@ -661,8 +665,8 @@ impl Daemon {
     fn reload_config(&mut self) -> Result<()> {
         let mut cfg = Config::load(&self.paths)?;
         let repo = cfg.repo_path();
-        if cfg.projects.is_empty() && repo.exists() {
-            cfg.apply_repo_overrides(&repo)?;
+        if !cfg.repo.path.trim().is_empty() && (repo.exists() || !cfg.projects.is_empty()) {
+            cfg.apply_machine_repo_overrides(&repo)?;
         }
         cfg.ensure_valid()?;
         self.rt.tmux = Tmux::new(&cfg.tmux.binary, cfg.tmux.socket_name.clone());
@@ -808,10 +812,28 @@ impl Daemon {
         }
     }
 
+    fn project_policy_error(&mut self, id: &str, error: Option<String>) {
+        match error {
+            Some(error) => {
+                if self.rt.project_rule_errors.get(id) != Some(&error) {
+                    self.project_error(id, &error);
+                    self.rt.project_rule_errors.insert(id.to_owned(), error);
+                }
+            }
+            None => {
+                self.rt.project_rule_errors.remove(id);
+            }
+        }
+    }
+
     async fn refresh_project_rules(&mut self, now: DateTime<Utc>) -> Result<()> {
-        let previous_rules = std::mem::take(&mut self.rt.project_rules);
+        let ids = self.cfg.project_ids();
+        self.rt.project_rules.retain(|id, _| ids.contains(id));
+        self.rt.project_rule_errors.retain(|id, _| ids.contains(id));
+        let previous_rules = self.rt.project_rules.clone();
         let tasks = self.store.list_open_tasks()?;
-        for id in self.cfg.project_ids() {
+        for id in ids {
+            let mut policy_error = None;
             let resolved = self.cfg.for_project(&id, &self.paths).and_then(|cfg| {
                 let rules = if self.rt.rules_loaded
                     && !cfg.priority.live_reload
@@ -828,7 +850,7 @@ impl Daemon {
                                 Err(e) => format!("{e:#}"),
                                 _ => format!("{source} is missing"),
                             };
-                            self.project_error(&id, &format!("{error}; keeping the last valid policy, if available"));
+                            policy_error = Some(format!("{error}; keeping the last valid policy"));
                             let Some(previous) = previous_rules.get(&id) else {
                                 bail!("no valid policy for project {id}: {error}");
                             };
@@ -841,17 +863,11 @@ impl Daemon {
             let (cfg, rules) = match resolved {
                 Ok(pair) => pair,
                 Err(e) => {
-                    self.log(
-                        None,
-                        None,
-                        EventLevel::Error,
-                        "project.error",
-                        &format!("project {id}: {e:#}"),
-                        serde_json::json!({"project": id}),
-                    );
+                    self.project_policy_error(&id, Some(format!("{e:#}")));
                     continue;
                 }
             };
+            self.project_policy_error(&id, policy_error);
             for mut task in tasks.iter().filter(|t| t.execution_project == id).cloned() {
                 if task.state.has_live_session() || self.store.latest_session(task.id)?.is_some_and(|s| s.state.is_live()) {
                     continue;
@@ -963,7 +979,9 @@ impl Daemon {
     async fn refresh_overrides(&mut self, now: DateTime<Utc>) -> Result<()> {
         if !self.cfg.projects.is_empty() {
             self.refresh_project_fetches(now);
-            return Ok(());
+            if self.cfg.repo.path.trim().is_empty() {
+                return Ok(());
+            }
         }
         if self.rt.last_overrides_check.is_some_and(|t| now - t < Duration::seconds(OVERRIDES_CHECK_SECS)) {
             return Ok(());
@@ -1977,7 +1995,9 @@ impl Daemon {
                     match result {
                         Ok(admission) => admission,
                         Err(error) => {
-                            self.github_failure(&cfg, &error);
+                            if crate::github::client::source_failure(&error) {
+                                self.github_failure(&cfg, &error);
+                            }
                             GitHubAdmission::denied(format!("GitHub approval unavailable: {error:#}"))
                         }
                     }
@@ -2220,7 +2240,9 @@ impl Daemon {
                 &format!("GitHub lifecycle update failed: {error:#}; update the issue manually"),
                 serde_json::json!({}),
             );
-            self.github_failure(&cfg, &error);
+            if crate::github::client::source_failure(&error) {
+                self.github_failure(&cfg, &error);
+            }
             return false;
         }
         true
@@ -2378,9 +2400,71 @@ impl Daemon {
     }
 
     fn cleanup_project_task(&self, task: &mut Task, succeeded: bool, review: bool) -> Result<()> {
-        let cfg = self.cfg.for_task(task, &self.paths)?;
-        let repo = Repo::new(cfg.repo_path());
-        cleanup_task(&cfg, &self.store, &repo, &self.rt.tmux, task, succeeded, review)
+        let session = self.store.latest_session(task.id)?.map(|s| s.id);
+        let mut pending =
+            self.store.kv_get::<std::collections::BTreeMap<TaskId, PendingCleanup>>(PENDING_CLEANUP_KEY)?.unwrap_or_default();
+        pending.insert(task.id, PendingCleanup::new(task, session, succeeded, review));
+        self.store.kv_set(PENDING_CLEANUP_KEY, &pending)?;
+        self.attempt_cleanup(task, &mut pending)
+    }
+
+    fn attempt_cleanup(&self, task: &mut Task, pending: &mut std::collections::BTreeMap<TaskId, PendingCleanup>) -> Result<()> {
+        let request = pending.get(&task.id).expect("cleanup intent was recorded").clone();
+        let result = (|| {
+            let cfg = self.cfg.for_task(task, &self.paths)?;
+            let repo = Repo::new(cfg.repo_path());
+            cleanup_task(&cfg, &self.store, &repo, &self.rt.tmux, task, request.succeeded, request.review)?;
+            self.store.update_task(task)
+        })();
+        match result {
+            Ok(()) => {
+                pending.remove(&task.id);
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                if request.error.as_ref() != Some(&message) {
+                    self.log(
+                        Some(task.id),
+                        request.session,
+                        EventLevel::Warn,
+                        "cleanup.pending",
+                        &format!("cleanup will retry after its configuration is repaired: {message}"),
+                        serde_json::json!({"error": message}),
+                    );
+                }
+                let mut request = request;
+                request.error = Some(message);
+                pending.insert(task.id, request);
+            }
+        }
+        self.store.kv_set(PENDING_CLEANUP_KEY, pending)
+    }
+
+    fn retry_cleanups(&self) -> Result<()> {
+        let mut pending =
+            self.store.kv_get::<std::collections::BTreeMap<TaskId, PendingCleanup>>(PENDING_CLEANUP_KEY)?.unwrap_or_default();
+        for (id, request) in pending.clone() {
+            let task = self.store.get_task(id)?;
+            let session = self.store.latest_session(id)?;
+            if let Some(mut task) = task
+                && request.matches(&task, session.as_ref().map(|s| s.id))
+                && !session.as_ref().is_some_and(|s| s.state.is_live())
+            {
+                self.attempt_cleanup(&mut task, &mut pending)?;
+            } else {
+                pending.remove(&id);
+                self.store.kv_set(PENDING_CLEANUP_KEY, &pending)?;
+                self.log(
+                    Some(id),
+                    request.session,
+                    EventLevel::Info,
+                    "cleanup.superseded",
+                    "discarded cleanup for an execution that changed",
+                    serde_json::json!({}),
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Carry out effects requested by a transition. Runtime failures are
@@ -4980,5 +5064,231 @@ mod tests {
         daemon.refresh_overrides(now).await.unwrap();
         assert_eq!(daemon.cfg.scheduler.max_concurrent, 2);
         assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 2);
+    }
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+    use crate::{projects::ProjectConfig, secrets::FileBackend};
+
+    fn setup() -> (tempfile::TempDir, Paths, Store, Config) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        paths.ensure().unwrap();
+        let store = Store::open(&paths.database()).unwrap();
+        let checkout = dir.path().join("repo");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let mut cfg = Config::default();
+        cfg.linear.enabled = false;
+        let mut project = ProjectConfig::default();
+        project.repo.path = checkout.display().to_string();
+        cfg.projects.insert("api".into(), project);
+        (dir, paths, store, cfg)
+    }
+
+    fn daemon(cfg: Config, paths: &Paths, store: &Store) -> Daemon {
+        Daemon::new(cfg, paths.clone(), store.clone(), Secrets::with_backend(Box::new(FileBackend::new(paths.secrets_file()))))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn project_resolution_error_preserves_policy_and_deduplicates_events() {
+        let (_dir, paths, store, cfg) = setup();
+        let checkout = PathBuf::from(&cfg.projects["api"].repo.path);
+        let overrides = checkout.join(".powerqueue.toml");
+        let policy = checkout.join("priority.toml");
+        std::fs::write(&overrides, "priority_file = 'priority.toml'\n").unwrap();
+        std::fs::write(&policy, "version = 1\ndefault_criticality = 'high'\n").unwrap();
+        let mut daemon = daemon(cfg, &paths, &store);
+        daemon.refresh_rules(Utc::now()).await.unwrap();
+        std::fs::write(&overrides, "[broken").unwrap();
+        for _ in 0..3 {
+            daemon.refresh_rules(Utc::now()).await.unwrap();
+        }
+        assert_eq!(daemon.rt.project_rules["api"].default_criticality, crate::domain::Criticality::High);
+        assert_eq!(store.count_events_of_kind("project.error", daemon.started_at - Duration::seconds(1)).unwrap(), 1);
+        std::fs::write(&overrides, "priority_file = 'priority.toml'\n").unwrap();
+        std::fs::remove_file(&policy).unwrap();
+        for _ in 0..3 {
+            daemon.refresh_rules(Utc::now()).await.unwrap();
+        }
+        assert_eq!(daemon.rt.project_rules["api"].default_criticality, crate::domain::Criticality::High);
+        assert_eq!(store.count_events_of_kind("project.error", daemon.started_at - Duration::seconds(1)).unwrap(), 2);
+        std::fs::write(&policy, "version = 1\ndefault_criticality = 'low'\n").unwrap();
+        daemon.refresh_rules(Utc::now()).await.unwrap();
+        assert_eq!(daemon.rt.project_rules["api"].default_criticality, crate::domain::Criticality::Low);
+        assert!(daemon.rt.project_rule_errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn adding_a_project_and_reloading_keeps_legacy_source_restrictions() {
+        let (_dir, paths, store, mut cfg) = setup();
+        let project = cfg.projects.remove("api").unwrap();
+        cfg.repo = project.repo.clone();
+        let file = cfg.repo_path().join(".powerqueue.toml");
+        std::fs::write(
+            &file,
+            "[github]\ntrusted_approvers = ['lead']\n[linear]\nexcluded_labels = ['private']\n[scheduler]\nmax_concurrent = 99\n",
+        )
+        .unwrap();
+        cfg.save(&paths).unwrap();
+        let mut daemon = daemon(cfg.clone(), &paths, &store);
+        daemon.reload_config().unwrap();
+        assert_eq!(daemon.cfg.github.trusted_approvers, ["lead"]);
+        cfg.projects.insert("api".into(), project);
+        cfg.save(&paths).unwrap();
+        daemon.reload_config().unwrap();
+        assert_eq!(daemon.cfg.github.trusted_approvers, ["lead"]);
+        assert_eq!(daemon.cfg.linear.excluded_labels, ["private"]);
+        assert_eq!(daemon.cfg.scheduler.max_concurrent, cfg.scheduler.max_concurrent);
+        assert!(daemon.cfg.overrides.keys.contains(&"github.trusted_approvers".into()));
+        // Legacy source restrictions remain live-reloaded in multi-project mode.
+        std::fs::write(file, "[github]\ntrusted_approvers = ['second-lead']\n").unwrap();
+        daemon.refresh_overrides(Utc::now()).await.unwrap();
+        assert_eq!(daemon.cfg.github.trusted_approvers, ["second-lead"]);
+        std::fs::rename(cfg.repo_path(), cfg.repo_path().with_file_name("moved")).unwrap();
+        assert!(daemon.reload_config().is_err());
+        assert_eq!(
+            daemon.cfg.github.trusted_approvers,
+            ["second-lead"],
+            "unavailable legacy checkout must not drop restrictions"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_issue_verification_and_update_errors_do_not_back_off_healthy_tasks() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let (_dir, paths, store, mut cfg) = setup();
+        cfg.github.enabled = true;
+        cfg.github.repository = "owner/repo".into();
+        cfg.github.execution_project = "api".into();
+        cfg.github.endpoint = server.uri();
+        cfg.github.close_on_complete = true;
+        cfg.github.post_comments = false;
+        cfg.github.trusted_approvers = vec!["lead".into()];
+        let mut daemon = daemon(cfg.clone(), &paths, &store);
+        daemon.rt.github.insert(
+            "owner/repo".into(),
+            GitHubRuntime { client: Some(GitHubClient::new(&server.uri(), "test".into()).unwrap()), ..Default::default() },
+        );
+        let mut bad = Task::new(
+            "owner/repo#1",
+            "bad",
+            TaskSource::GitHub { repository: "owner/repo".into(), number: 1, url: String::new() },
+        );
+        bad.execution_project = "api".into();
+        store.insert_task(&bad).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/1"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/repo/issues/1"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        assert!(!daemon.refresh_launch_permissions(&mut bad).await.unwrap());
+        assert!(!daemon.github_backoff("owner/repo", Utc::now()));
+        assert!(!daemon.update_github(&bad, Some(LinearTarget::Done), None).await);
+        assert!(!daemon.github_backoff("owner/repo", Utc::now()));
+        let mut good = Task::new(
+            "owner/repo#2",
+            "good",
+            TaskSource::GitHub { repository: "owner/repo".into(), number: 2, url: String::new() },
+        );
+        good.execution_project = "api".into();
+        good.labels = vec!["agent:ready".into()];
+        store.insert_task(&good).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"number":2,"title":"good","body":"",
+                "html_url":"https://github.com/owner/repo/issues/2","state":"open", "labels":[{"name":"agent:ready"}],
+                "created_at":"2026-09-01T12:00:00Z","updated_at":"2026-09-01T12:01:00Z"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"repository":{"issue":{
+                "title":"good","body":"","state":"OPEN","updatedAt":"2026-09-01T12:01:00Z","lastEditedAt":null,
+                "timelineItems":{"nodes":[{"__typename":"LabeledEvent","id":"approval","createdAt":"2026-09-01T12:01:00Z",
+                "actor":{"login":"lead"},"label":{"name":"agent:ready"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+            }}}})))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/repo/issues/2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(daemon.refresh_launch_permissions(&mut good).await.unwrap());
+        assert!(daemon.update_github(&good, Some(LinearTarget::Done), None).await);
+    }
+
+    #[test]
+    fn failed_project_cleanup_retries_after_restart_and_repair() {
+        if which::which("git").is_err() {
+            return;
+        }
+        let (dir, paths, store, cfg) = setup();
+        let repo = Repo::new(&cfg.projects["api"].repo.path);
+        repo.git(None, &["init", "-b", "main"]).unwrap();
+        repo.git(
+            None,
+            &["-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "seed"],
+        )
+        .unwrap();
+        let wt = dir.path().join("worktree");
+        repo.add_worktree(&wt, "pq/test", "main").unwrap();
+        let mut task = Task::new("cleanup", "cleanup", TaskSource::Manual);
+        task.state = TaskState::Completed;
+        task.execution_project = "api".into();
+        task.execution_repo = Some(repo.path.canonicalize().unwrap().display().to_string());
+        task.worktree_path = Some(wt.canonicalize().unwrap().display().to_string());
+        task.branch = Some("pq/test".into());
+        store.insert_task(&task).unwrap();
+        let broken = repo.path.join(".powerqueue.toml");
+        std::fs::write(&broken, "[broken").unwrap();
+        let first = daemon(cfg.clone(), &paths, &store);
+        first.cleanup_project_task(&mut task, true, false).unwrap();
+        first.retry_cleanups().unwrap();
+        assert!(wt.exists());
+        assert_eq!(store.count_events_of_kind("cleanup.pending", first.started_at - Duration::seconds(1)).unwrap(), 1);
+        drop(first);
+        std::fs::write(broken, "").unwrap();
+        let reopened = Store::open(&paths.database()).unwrap();
+        let second = daemon(cfg, &paths, &reopened);
+        second.retry_cleanups().unwrap();
+        assert!(!wt.exists());
+        assert!(reopened.get_task(task.id).unwrap().unwrap().worktree_path.is_none());
+        let pending =
+            reopened.kv_get::<std::collections::BTreeMap<TaskId, PendingCleanup>>(PENDING_CLEANUP_KEY).unwrap().unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(reopened.count_events_of_kind("cleanup.done", second.started_at - Duration::seconds(2)).unwrap(), 1);
+    }
+
+    #[test]
+    fn delayed_cleanup_is_discarded_after_task_retry() {
+        let (_dir, paths, store, cfg) = setup();
+        let mut task = Task::new("retried", "retried", TaskSource::Manual);
+        task.execution_project = "api".into();
+        task.state = TaskState::Completed;
+        store.insert_task(&task).unwrap();
+        let request = PendingCleanup::new(&task, None, true, false);
+        store.kv_set(PENDING_CLEANUP_KEY, &std::collections::BTreeMap::from([(task.id, request)])).unwrap();
+        commands::on_retry(&mut task, None, Utc::now());
+        store.update_task(&task).unwrap();
+        let daemon = daemon(cfg, &paths, &store);
+        daemon.retry_cleanups().unwrap();
+        assert_eq!(store.get_task(task.id).unwrap().unwrap().state, TaskState::Queued);
+        assert_eq!(store.count_events_of_kind("cleanup.done", daemon.started_at - Duration::seconds(1)).unwrap(), 0);
+        assert!(
+            store.kv_get::<std::collections::BTreeMap<TaskId, PendingCleanup>>(PENDING_CLEANUP_KEY).unwrap().unwrap().is_empty()
+        );
     }
 }
