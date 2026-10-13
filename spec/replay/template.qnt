@@ -19,6 +19,7 @@ module replay {
       // assert, not a disabled action: a bad observation MUST fail the test.
       assert(if (creation) not(seen.contains(o.id)) else seen.contains(o.id)),
       assert(creation or allowed(t, o.op, o.time, o.until, o.maximum)),
+      assert(o.previous_state == "" or o.previous_state == t.state),
       assert(o.attempt == -1 or o.attempt == (if (o.op == "Start") t.attempts + 1 else t.attempts)),
       tasks' = if (o.op == "Create") tasks else tasks.set(o.id, advance(t, o.op, o.until)),
       seen' = seen.union(Set(o.id)), index' = index + 1, event' = o.event,

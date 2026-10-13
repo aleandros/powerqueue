@@ -36,6 +36,10 @@ const STUTTERS: &[&str] = &[
     "session.discovered",
     "session.discovery_failed",
     "review.lookup_failed",
+    "review.status",
+    // Typing a hint does not change task/session state; answers can, and
+    // remain prefix cutoffs along with the other unsupported relay events.
+    "relay.hint_sent",
     "session.marker_polled",
     "session.rate_limit_detected",
     "github.sync",
@@ -50,18 +54,17 @@ const STUTTERS: &[&str] = &[
 const STUTTER_PREFIXES: &[&str] =
     &["hook.", "worktree.", "cleanup.", "linear.", "repo.", "daemon.", "rules.", "tune.", "config.", "usage."];
 const OUT_OF_SCOPE: &[&str] = &[
-    "task.in_review",
-    "task.unblocked",
     "task.skipped",
     "task.unskipped",
     "task.needs_attention",
     "task.error",
     "launch.superseded",
     "session.exited",
-    "task.blocked",
     "task.blocked_by_command",
     "session.permission_prompt",
+    "session.ended",
 ];
+const REVIEW_ACTIONS: &[&str] = &["review.merged", "review.relaunch"];
 
 type Counts = BTreeMap<String, usize>;
 
@@ -90,6 +93,12 @@ enum Op {
     Retry,
     Progress,
     Wake,
+    DependencyBlock,
+    Unblock,
+    HandOff,
+    ReviewRelease,
+    ReviewRetry,
+    Merge,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -100,6 +109,8 @@ struct Observation {
     until: i64,
     attempt: i64,
     maximum: i64,
+    // Only fixed, validated state names; never arbitrary event text.
+    previous_state: &'static str,
     event: i64,
 }
 
@@ -143,6 +154,23 @@ fn deadline(event: &Event, key: &str, origin: DateTime<Utc>) -> Result<i64> {
     Ok(seconds(time.with_timezone(&Utc), origin))
 }
 
+// `task.blocked` is overloaded: dependency reconciliation includes
+// previous_state; an agent asking for help includes reason instead. Only the
+// former is modeled for non-container tasks. Never continue past an unsupported
+// human blocker, container completion, or automatic PR adoption.
+fn ends_prefix(event: &Event) -> bool {
+    let kind = event.kind.as_str();
+    OUT_OF_SCOPE.contains(&kind)
+        || (kind == "task.blocked"
+            && (event.data.get("previous_state").is_none()
+                || event.data.get("container").and_then(|v| v.as_bool()) == Some(true)))
+        || (kind == "task.completed" && event.data.get("children").is_some())
+        || (kind == "task.in_review" && event.data.get("adopted").and_then(|v| v.as_bool()) == Some(true))
+        || (["review.", "relay.", "inbox."].iter().any(|p| kind.starts_with(p))
+            && !STUTTERS.contains(&kind)
+            && !REVIEW_ACTIONS.contains(&kind))
+}
+
 /// Project complete task prefixes; refuse malformed data and vacuous schedules.
 fn project(mut events: Vec<Event>) -> Result<(Vec<Observation>, Coverage)> {
     ensure!(!events.is_empty(), "expected a nonempty JSON array from logs --events --json");
@@ -172,9 +200,7 @@ fn project(mut events: Vec<Event>) -> Result<(Vec<Observation>, Coverage)> {
         eligible.insert(task, eligible.len());
         for row in rows {
             let kind = row.kind.as_str();
-            if OUT_OF_SCOPE.contains(&kind)
-                || (["review.", "relay.", "inbox."].iter().any(|p| kind.starts_with(p)) && !STUTTERS.contains(&kind))
-            {
+            if ends_prefix(row) {
                 cutoff.insert(task, row.id);
                 count(&mut skipped, format!("prefix ends at {kind}"));
                 break;
@@ -202,6 +228,7 @@ fn project(mut events: Vec<Event>) -> Result<(Vec<Observation>, Coverage)> {
         let mut until = -1;
         let mut attempt = -1;
         let mut maximum = 0;
+        let mut previous_state = "";
         let op = match kind {
             "task.created" => {
                 if empty && creations.get(&task) == Some(&true) {
@@ -244,6 +271,25 @@ fn project(mut events: Vec<Event>) -> Result<(Vec<Observation>, Coverage)> {
             "task.completed" => Op::Finish,
             "task.completed_by_command" => Op::Complete,
             "session.finalized" => Op::Release,
+            "task.blocked" => {
+                previous_state = match data.get("previous_state").and_then(|v| v.as_str()) {
+                    Some("queued") => "queued",
+                    Some("throttled") => "throttled",
+                    _ => bail!("event {}: invalid dependency block payload", event.id),
+                };
+                ensure!(
+                    data.get("container").and_then(|v| v.as_bool()) == Some(false)
+                        && data.get("waiting_on").and_then(|v| v.as_array()).is_some(),
+                    "event {}: invalid dependency block payload",
+                    event.id
+                );
+                Op::DependencyBlock
+            }
+            "task.unblocked" => Op::Unblock,
+            "task.in_review" => Op::HandOff,
+            "session.released" => Op::ReviewRelease,
+            "review.relaunch" => Op::ReviewRetry,
+            "review.merged" => Op::Merge,
             "task.throttled" => Op::Throttle,
             "budget.rate_limited" | "session.waiting_for_reset" => Op::RateLimit,
             "task.paused" => Op::Pause,
@@ -283,7 +329,7 @@ fn project(mut events: Vec<Event>) -> Result<(Vec<Observation>, Coverage)> {
             Op::RateLimit => until = deadline(event, "until", origin)?,
             _ => {}
         }
-        observations.push(Observation { id, op, time, until, attempt, maximum, event: event.id });
+        observations.push(Observation { id, op, time, until, attempt, maximum, previous_state, event: event.id });
     }
     ensure!(observations.iter().any(|o| o.op == Op::Launch), "no in-scope launches; refusing a vacuous replay");
     let mut actions = Counts::new();
@@ -303,14 +349,14 @@ fn project(mut events: Vec<Event>) -> Result<(Vec<Observation>, Coverage)> {
     Ok((observations, report))
 }
 
-/// Render only typed numeric fields and fixed operation names, never event text.
+/// Render only typed numeric fields and fixed operation/state names, never event text.
 fn render(observations: &[Observation]) -> String {
     let rows = observations
         .iter()
         .map(|o| {
             format!(
-                "    {{ id: {}, op: \"{:?}\", time: {}, until: {}, attempt: {}, maximum: {}, event: {} }}",
-                o.id, o.op, o.time, o.until, o.attempt, o.maximum, o.event,
+                "    {{ id: {}, op: \"{:?}\", time: {}, until: {}, attempt: {}, maximum: {}, previous_state: \"{}\", event: {} }}",
+                o.id, o.op, o.time, o.until, o.attempt, o.maximum, o.previous_state, o.event,
             )
         })
         .collect::<Vec<_>>()

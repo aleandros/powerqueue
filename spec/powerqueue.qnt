@@ -1,7 +1,11 @@
-// First cut: queue/launch/crash/budget. See README for abstraction boundaries.
+// Queue/launch/crash/budget, dependency holds and PR review lifecycle.
+// See README for abstraction boundaries.
 module lifecycle {
-  type Task = { state: str, attempts: int, notBefore: int, live: bool, approved: bool, routed: bool, legalStarts: bool }
-  pure val fresh: Task = { state: "queued", attempts: 0, notBefore: -1, live: false, approved: true, routed: true, legalStarts: true }
+  type Task = { state: str, attempts: int, reviewBase: int, watching: bool, notBefore: int, live: bool, approved: bool, routed: bool, legalStarts: bool }
+  pure val fresh: Task = { state: "queued", attempts: 0, reviewBase: 0, watching: false, notBefore: -1, live: false, approved: true, routed: true, legalStarts: true }
+  // A requested review round gets a fresh crash allowance. Manual retries of
+  // terminal tasks reset attempts but can retain the review request in Rust.
+  pure def usedAttempts(t: Task): int = if (t.attempts >= t.reviewBase) t.attempts - t.reviewBase else 0
   pure def terminal(t: Task): bool = Set("completed", "cancelled", "failed").contains(t.state)
   pure def ready(t: Task, now: int): bool =
     Set("queued", "crashed", "throttled").contains(t.state) and t.approved and t.routed and not(t.live) and t.notBefore <= now
@@ -14,13 +18,18 @@ module lifecycle {
     else if (op == "Hold") t.state == "starting" and not(t.approved and t.routed) and not(t.live)
     else if (op == "Start") ready(t, now)
     else if (op == "Launch") t.state == "starting" and t.approved and t.routed and not(t.live)
-    else if (op == "Crash") (t.live or t.state == "starting") and t.attempts < maximum
-    else if (op == "Fail") (t.live or t.state == "starting") and t.attempts >= maximum
+    else if (op == "Crash") (t.live or t.state == "starting") and t.state != "in_review" and usedAttempts(t) < maximum
+    else if (op == "Fail") (t.live or t.state == "starting") and t.state != "in_review" and usedAttempts(t) >= maximum
     else if (op == "Finish") (t.state == "completed" and t.live) or Set("running", "idle", "paused", "throttled", "crashed", "failed", "needs_attention").contains(t.state)
-    else if (op == "Complete") Set("running", "idle", "paused", "throttled", "crashed", "failed", "needs_attention").contains(t.state)
+    else if (op == "Complete") Set("running", "idle", "paused", "throttled", "crashed", "failed", "needs_attention", "blocked", "in_review").contains(t.state)
     else if (op == "Release") t.live and terminal(t)
+    else if (op == "DependencyBlock") Set("queued", "throttled").contains(t.state) and not(t.live)
+    else if (op == "Unblock") t.state == "blocked"
+    else if (op == "HandOff") Set("running", "idle", "paused", "needs_attention", "in_review").contains(t.state)
+    else if (op == "ReviewRelease") t.state == "in_review" and t.live
+    else if (op == "ReviewRetry" or op == "Merge") t.state == "in_review" and not(t.live)
     else if (op == "Throttle") ready(t, now) and until >= now
-    else if (op == "RateLimit") t.live and not(terminal(t)) and until >= now
+    else if (op == "RateLimit") t.live and not(terminal(t)) and t.state != "in_review" and until >= now
     else if (op == "Wake") t.state == "throttled" and t.live and t.notBefore <= now
     else if (op == "Pause") not(terminal(t)) and t.state != "paused" and t.state != "starting"
     else if (op == "Resume") Set("paused", "needs_attention").contains(t.state)
@@ -47,11 +56,17 @@ module lifecycle {
     else if (op == "Finish") { ...t, state: "completed", live: false, notBefore: -1 }
     else if (op == "Complete") { ...t, state: "completed", notBefore: -1 }
     else if (op == "Release") { ...t, live: false }
+    else if (op == "DependencyBlock") { ...t, state: "blocked", notBefore: -1 }
+    else if (op == "Unblock") { ...t, state: "queued" }
+    else if (op == "HandOff") { ...t, state: "in_review", notBefore: -1, reviewBase: 0, watching: true }
+    else if (op == "ReviewRelease") { ...t, live: false }
+    else if (op == "ReviewRetry") { ...t, state: "queued", notBefore: -1, reviewBase: t.attempts, watching: false }
+    else if (op == "Merge") { ...t, state: "completed" }
     else if (op == "Throttle") { ...t, state: "throttled", notBefore: until }
     else if (op == "RateLimit") { ...t, state: "throttled", notBefore: until }
     else if (op == "Wake") { ...t, state: "running", notBefore: -1 }
     else if (op == "Pause") { ...t, state: "paused", notBefore: -1 }
-    else if (op == "Resume") { ...t, state: if (t.live) "running" else "queued", notBefore: -1 }
+    else if (op == "Resume") { ...t, state: if (t.live) "running" else if (t.watching) "in_review" else "queued", notBefore: -1 }
     else if (op == "SourceCancel") { ...t, state: "cancelled", notBefore: -1 }
     else if (op == "Cancel") { ...t, state: "cancelled", live: false, notBefore: -1 }
     else if (op == "Retry") { ...t, state: "queued", live: false, notBefore: -1,
@@ -188,10 +203,10 @@ module powerqueue {
     keepProjects,
     // A failed start is resolved within the pass; running crashes between passes.
     (tasks.get(id).state == "starting") or (stable and not(inPass)),
-    val op = if (tasks.get(id).attempts >= maxAttempts) "Fail" else "Crash"
+    val op = if (usedAttempts(tasks.get(id)) >= maxAttempts) "Fail" else "Crash"
     all {
-      allowed(tasks.get(id), op, now, now + delay(tasks.get(id).attempts), maxAttempts),
-      tasks' = tasks.set(id, advance(tasks.get(id), op, now + delay(tasks.get(id).attempts))),
+      allowed(tasks.get(id), op, now, now + delay(usedAttempts(tasks.get(id))), maxAttempts),
+      tasks' = tasks.set(id, advance(tasks.get(id), op, now + delay(usedAttempts(tasks.get(id))))),
     },
     keepPass, keepClock,
   }
@@ -277,7 +292,8 @@ module powerqueue {
     nondet p = projects.oneOf()
     nondet present = Set(false, true).oneOf()
     nondet revision = Set(0, 1).oneOf()
-    nondet op = Set("Finish", "Complete", "Release", "Wake", "Pause", "Resume", "Cancel", "Retry", "Idle", "Block", "Progress").oneOf()
+    nondet op = Set("Finish", "Complete", "Release", "Wake", "Pause", "Resume", "Cancel", "Retry", "Idle", "Block", "Progress",
+      "DependencyBlock", "Unblock", "HandOff", "ReviewRelease", "ReviewRetry", "Merge").oneOf()
     any { beginPass, endPass, start(id), launch(id), throttle(id), crash(id), command(id, op), rateLimit(id), tick, pauseScheduling, reassign(id, p), configure(p, present, revision), rejectCheckout(id), repositoryOp(id), admission(id, present), routing(id, present), hold(id) }
   }
 
@@ -310,6 +326,7 @@ module powerqueue {
         // CLI completion has a live session until the daemon's next sweep.
         t.state != "cancelled" and t.state != "failed" or not(t.live),
         t.state != "starting" or not(t.live),
+        not(Set("queued", "blocked").contains(t.state)) or not(t.live),
       }
     }),
   }
@@ -378,6 +395,18 @@ module powerqueue {
     .then(start(1)).then(launch(1)).then(endPass)
     .then(command(0, "Complete")).expect(tasks.get(0).live)
     .then(command(0, "Release")).expect(safety and not(tasks.get(0).live))
+  run dependencyHoldTest = init.then(command(0, "DependencyBlock"))
+    .expect(safety and not(allowed(tasks.get(0), "Start", now, -1, maxAttempts)))
+    .then(command(0, "Unblock")).then(beginPass).then(start(0)).then(launch(0))
+    .expect(safety and tasks.get(0).attempts == 1)
+  run reviewRoundTest = init.then(beginPass).then(start(0)).then(launch(0))
+    .then(start(1)).then(launch(1)).then(endPass).then(command(0, "HandOff"))
+    .expect(safety and tasks.get(0).live and not(allowed(tasks.get(0), "Merge", now, -1, maxAttempts)))
+    .then(command(0, "ReviewRelease")).then(command(0, "ReviewRetry"))
+    .then(beginPass).then(start(0)).then(launch(0)).then(endPass)
+    .expect(safety and tasks.get(0).attempts == 2 and usedAttempts(tasks.get(0)) == 1)
+    .then(command(0, "HandOff")).then(command(0, "ReviewRelease")).then(command(0, "Merge"))
+    .expect(safety and tasks.get(0).state == "completed" and not(tasks.get(0).live))
   run failedStartFreesSlotTest = init.then(beginPass).then(start(0)).then(crash(0))
     .then(start(1)).then(launch(1)).then(start(2)).then(launch(2))
     .expect(safety and live == 2 and spent.get(0) == 1)
