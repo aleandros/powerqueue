@@ -1,4 +1,4 @@
-# Quint: queue, launch, crash, budget, execution projects, admission, routing
+# Quint: queue, launch, crash, budget, dependencies, review, projects, admission, routing
 
 This specification models queue lifecycle and launch scheduling.
 It supplements the Rust properties and whole-daemon model. It does not replace
@@ -124,7 +124,18 @@ The model reflects two details of the Rust lifecycle:
   or source cancellation; cleanup releases it later.
 - `max_attempts` is a crash cutoff, not an unconditional lifetime bound. Manual
   retries of nonterminal throttled tasks preserve attempts. Retrying a terminal
-  task resets them. Review rounds, which also affect attempts, are out of scope.
+  task resets them. A requested review round records its starting attempt count;
+  only attempts since that base count against the round's crash limit.
+
+Dependency holds move queued/throttled tasks to `blocked`; a logged unblock
+returns them to `queued`. The model checks these state transitions, not the
+dependency graph, container completion, or whether upstream issues really cleared.
+PR handoff preserves a live session until a separate release. Merge and review
+relaunch require `in_review` with no live session, reflecting the daemon's
+release-before-poll ordering. Relaunch preserves total attempts and begins a new
+crash allowance. A paused review watch resumes watching, while a paused requested
+round resumes its queued work. The model does not validate GitHub's evidence,
+review-round caps, review parking/recovery, or automatic adoption of an open PR.
 
 The `progress` module isolates the liveness claim: with persistent approval, budget and
 a free slot, no competing tasks, and weak fairness for time and launch, a queued
@@ -133,7 +144,7 @@ time. This is a conditional property, not a starvation-freedom claim about the
 real priority scheduler. There is no per-task progress guarantee under arbitrary
 pause/cancel commands, competing higher-priority work, or perpetual budget exhaustion.
 
-Not modeled: PR review, relayed answers, dependency changes, configuration changes
+Not modeled: review parking/adoption, relayed answers, dependency graph changes, configuration changes
 beyond project availability/checkout identity, provider/model selection, observed usage, floating-point costing, or actual
 rolling spend. Rust properties still cover these arithmetic/policy details.
 
@@ -180,13 +191,20 @@ and routing decisions and launch ordering, not the underlying GitHub evidence or
 routing predicates. Older traces without routing events retain the legacy default
 of permitted routing. Source approval and routing are independent in every trace.
 
-At the first unsupported lifecycle event for a task (review, blocker, relay,
-dependency, launch error/supersession), replay **ends that task's prefix**. It
+At the first unsupported lifecycle event for a task (review parking/adoption,
+human blocker, relayed answer, launch error/supersession), replay **ends that task's prefix**. It
 never skips a state change and then resumes checking from stale state. The report
 names every cutoff. Known observational events stutter; unknown task/session
 kinds fail until explicitly classified. A `review.lookup_failed` is observational:
 it leaves the completed task unchanged. Linear sync's daemon echoes of creation
 and cancellation are recognized separately from the original transition.
+
+Dependency `task.blocked` events are distinguished by their structured
+`previous_state`, `waiting_on`, and `container` fields; agent-reported blockers
+with a `reason` still end the prefix. `review.status` and `relay.hint_sent` are
+observational; other unsupported review/relay events still end the prefix.
+The supported dependency/review events already exist in v0.14.0: replay tooling
+can validate those historical logs without upgrading or restarting the daemon.
 
 | Event kind | Action |
 | --- | --- |
@@ -198,6 +216,9 @@ and cancellation are recognized separately from the original transition.
 | `session.crashed`, `task.failed` | Crash, Fail (check logged attempt and limit) |
 | `task.completed`, `task.completed_by_command` | Finish, Complete |
 | `session.finalized` | Release |
+| dependency `task.blocked`, `task.unblocked` | DependencyBlock / Unblock |
+| `task.in_review`, `session.released` | HandOff / ReviewRelease |
+| `review.relaunch`, `review.merged` | ReviewRetry / Merge |
 | `task.throttled` | Throttle |
 | `budget.rate_limited` from a hook, `session.waiting_for_reset` | RateLimit (retains session) |
 | `budget.rate_limited` with `source=pane` | Stutter: provider mark alone does not change task |
@@ -229,6 +250,9 @@ lag the transition's clock. Older events without that field fall back to the
 logged timestamp plus the message's backoff duration; logging delays can make
 that approximation reject an otherwise valid restart. CI retains generated
 replay schedules alongside coverage reports and counterexamples for diagnosis.
+Dependency/review rejection tests also cover starts while blocked, missing
+handoffs or releases, duplicate merges, wrong relaunch attempts, paused review
+watches, and crash limits relative to a review round rather than lifetime attempts.
 
 ## Operational validation
 

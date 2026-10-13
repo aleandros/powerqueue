@@ -69,12 +69,191 @@ fn refuses_empty_vacuous_duplicate_and_unknown_events() {
 
 #[test]
 fn every_cutoff_ends_prefix_permanently() {
-    for kind in OUT_OF_SCOPE.iter().copied().chain(["review.requeued", "relay.answer", "inbox.complete"]) {
+    for kind in OUT_OF_SCOPE.iter().copied().chain(["task.blocked", "review.requeued", "relay.answer", "inbox.complete"]) {
         let rows =
             with_tail(vec![event(4, kind), event(5, "task.teleported"), payload(6, "task.starting", json!({"attempt": 2}))]);
         let (observations, report) = project(rows).unwrap();
         assert_eq!(observations.len(), 3, "{kind}");
         assert_eq!(report.truncated_or_skipped_tasks, BTreeMap::from([(format!("prefix ends at {kind}"), 1)]));
+    }
+}
+
+fn dependency_block(index: i64) -> Event {
+    payload(index, "task.blocked", json!({"previous_state": "queued", "waiting_on": ["EXAMPLE-2"], "container": false}))
+}
+
+fn dependency_review_history() -> Vec<Event> {
+    vec![
+        event(1, "task.created"),
+        dependency_block(2),
+        event(3, "task.unblocked"),
+        payload(4, "task.starting", json!({"attempt": 1})),
+        payload(5, "session.launched", json!({"attempt": 1})),
+        event(6, "task.in_review"),
+        event(7, "session.released"),
+        event(8, "review.status"),
+        event(9, "review.relaunch"),
+        payload(10, "task.starting", json!({"attempt": 2})),
+        payload(11, "session.launched", json!({"attempt": 2})),
+        event(12, "task.in_review"),
+        event(13, "session.released"),
+        event(14, "review.merged"),
+    ]
+}
+
+#[test]
+fn dependencies_and_review_rounds_are_projected_without_cutoffs() {
+    let (observations, report) = project(dependency_review_history()).unwrap();
+    assert_eq!(
+        observations.iter().map(|o| o.op).collect::<Vec<_>>(),
+        [
+            Op::Create,
+            Op::DependencyBlock,
+            Op::Unblock,
+            Op::Start,
+            Op::Launch,
+            Op::HandOff,
+            Op::ReviewRelease,
+            Op::ReviewRetry,
+            Op::Start,
+            Op::Launch,
+            Op::HandOff,
+            Op::ReviewRelease,
+            Op::Merge,
+        ]
+    );
+    assert!(report.truncated_or_skipped_tasks.is_empty());
+    assert_eq!(report.stutters, BTreeMap::from([("review.status".into(), 1)]));
+}
+
+#[test]
+fn human_blockers_remain_cutoffs_and_dependency_payloads_are_validated() {
+    let (observations, report) = project(with_tail(vec![
+        payload(4, "task.blocked", json!({"reason": "needs a human"})),
+        event(5, "task.unblocked"),
+        event(6, "task.completed"),
+    ]))
+    .unwrap();
+    assert_eq!(observations.len(), 3);
+    assert_eq!(report.truncated_or_skipped_tasks["prefix ends at task.blocked"], 1);
+    for (field, bad) in [
+        ("previous_state", json!("running")),
+        ("previous_state", Value::Null),
+        ("container", json!("false")),
+        ("waiting_on", Value::Null),
+    ] {
+        let mut row = dependency_block(4);
+        row.data[field] = bad;
+        rejects(with_tail(vec![row]), "invalid dependency block payload");
+    }
+}
+
+#[test]
+#[ignore = "requires Quint"]
+fn quint_checks_dependency_and_review_lifecycle_guards() {
+    check_trace(dependency_review_history(), true);
+    // Each mutation breaks a different guard; do not remove the offending
+    // observation just because it would have ended the old adapter's prefix.
+    for missing in [3, 6, 7, 9, 12, 13] {
+        let rows = dependency_review_history().into_iter().filter(|e| e.id != missing).collect();
+        check_trace(rows, false);
+    }
+    let mut rows = dependency_review_history();
+    rows.push(event(15, "review.merged"));
+    check_trace(rows, false);
+    check_trace(with_tail(vec![dependency_block(4)]), false);
+    check_trace(with_tail(vec![event(4, "task.unblocked")]), false);
+    check_trace(with_tail(vec![event(4, "session.released")]), false);
+    check_trace(with_tail(vec![event(4, "review.merged")]), false);
+    check_trace(with_tail(vec![event(4, "review.relaunch")]), false);
+    let mut rows = dependency_review_history();
+    rows[10].data["attempt"] = json!(1);
+    check_trace(rows, false);
+}
+
+#[test]
+#[ignore = "requires Quint"]
+fn quint_review_round_has_its_own_crash_allowance() {
+    // Total attempt 2, but the first attempt of this review round. The original
+    // task's attempt must not consume the round's two-attempt allowance.
+    let mut rows = dependency_review_history();
+    rows.retain(|e| e.id <= 11);
+    let retry_at = event(20, "").timestamp;
+    let crash = payload(12, "session.crashed", json!({"attempt": 2, "max_attempts": 2, "retry_at": retry_at}));
+    let fail_early = payload(12, "task.failed", json!({"attempt": 2, "max_attempts": 2}));
+    let mut early = rows.clone();
+    early.push(fail_early);
+    check_trace(early, false);
+    rows.extend([
+        crash,
+        payload(20, "task.starting", json!({"attempt": 3})),
+        payload(21, "session.launched", json!({"attempt": 3})),
+        payload(22, "task.failed", json!({"attempt": 3, "max_attempts": 2})),
+    ]);
+    check_trace(rows.clone(), true);
+    rows[14] = payload(22, "session.crashed", json!({"attempt": 3, "max_attempts": 2, "retry_at": event(30, "").timestamp}));
+    check_trace(rows, false);
+}
+
+#[test]
+#[ignore = "requires Quint"]
+fn quint_review_rearming_and_direct_completion() {
+    check_trace(
+        with_tail(vec![
+            event(4, "task.in_review"),
+            event(5, "session.released"),
+            event(6, "task.in_review"),
+            event(7, "review.merged"),
+        ]),
+        true,
+    );
+    check_trace(
+        with_tail(vec![event(4, "task.in_review"), event(5, "task.completed_by_command"), event(6, "session.finalized")]),
+        true,
+    );
+    check_trace(with_tail(vec![event(4, "task.in_review"), event(5, "task.completed")]), false);
+    // Resuming a paused watch must not launch a new agent. Pausing a requested
+    // review round, on the other hand, preserves its pending launch.
+    let mut watching = with_tail(vec![
+        event(4, "task.in_review"),
+        event(5, "session.released"),
+        event(6, "task.paused"),
+        event(7, "task.resumed"),
+    ]);
+    let mut merged = watching.clone();
+    merged.push(event(8, "review.merged"));
+    check_trace(merged, true);
+    watching.push(payload(8, "task.starting", json!({"attempt": 2})));
+    check_trace(watching, false);
+    check_trace(
+        with_tail(vec![
+            event(4, "task.in_review"),
+            event(5, "session.released"),
+            event(6, "review.relaunch"),
+            event(7, "task.paused"),
+            event(8, "task.resumed"),
+            payload(9, "task.starting", json!({"attempt": 2})),
+            payload(10, "session.launched", json!({"attempt": 2})),
+        ]),
+        true,
+    );
+}
+
+#[test]
+fn review_observations_do_not_hide_unsupported_review_or_relay_changes() {
+    for kind in ["review.error", "review.closed", "review.rounds_exhausted", "relay.answer_sent"] {
+        let (_, report) = project(with_tail(vec![
+            event(4, "relay.hint_sent"),
+            event(5, "task.in_review"),
+            event(6, "session.released"),
+            event(7, "review.status"),
+            event(8, kind),
+            event(9, "review.merged"),
+        ]))
+        .unwrap();
+        assert_eq!(report.actions.get("Merge"), None);
+        assert_eq!(report.stutters["relay.hint_sent"], 1);
+        assert_eq!(report.truncated_or_skipped_tasks[&format!("prefix ends at {kind}")], 1);
     }
 }
 
