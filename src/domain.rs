@@ -638,6 +638,9 @@ pub struct Task {
     pub source: TaskSource,
     #[serde(default)]
     pub github_admission: Option<GitHubAdmission>,
+    /// Latest deterministic routing decision, including blocked decisions.
+    #[serde(default)]
+    pub routing: Option<crate::routing::RoutingDecision>,
     /// Stable execution project ID, independent of source/Linear project metadata.
     #[serde(default = "default_execution_project")]
     pub execution_project: String,
@@ -718,6 +721,7 @@ impl Task {
             description: String::new(),
             source,
             github_admission: None,
+            routing: None,
             execution_project: default_execution_project(),
             execution_repo: None,
             state: TaskState::Queued,
@@ -751,9 +755,10 @@ impl Task {
         }
     }
 
-    /// Whether source approval permits scheduling. GitHub tasks without evidence fail closed.
+    /// Whether routing and source approval permit scheduling. GitHub tasks without evidence fail closed.
     pub fn execution_approved(&self) -> bool {
-        !matches!(self.source, TaskSource::GitHub { .. }) || self.github_admission.as_ref().is_some_and(|a| a.approved)
+        self.routing.as_ref().is_none_or(|r| r.permitted)
+            && (!matches!(self.source, TaskSource::GitHub { .. }) || self.github_admission.as_ref().is_some_and(|a| a.approved))
     }
 
     /// True for a task the PR watcher parked (stale PR, closed PR, rounds

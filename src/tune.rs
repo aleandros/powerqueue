@@ -615,13 +615,37 @@ pub fn undo(draft: &mut Draft) -> Result<Vec<PathBuf>> {
     if draft.meta.status != DraftStatus::Applied {
         bail!("draft {} is {}, not applied; nothing to undo", draft.dir.display(), draft.meta.status);
     }
-    let mut touched = Vec::new();
+    // Older drafts used PRIORITY.md as the executable policy. Do not infer
+    // absence from looking for a snapshot under the new filename.
+    if draft.meta.scope.includes_priority() && draft.original_path(INTENT_FILE).exists() {
+        bail!("draft {} predates TOML policies; restore manually from {}", draft.meta.id, draft.dir.join(ORIGINAL_DIR).display());
+    }
+    let mut restores = Vec::new();
     let scope = draft.meta.scope;
     for (name, live) in [(PRIORITY_FILE, draft.meta.live_priority.clone()), (CONFIG_FILE, draft.meta.live_config.clone())] {
         if !in_scope(scope, name) || draft.meta.applied_files.as_ref().is_some_and(|files| !files.iter().any(|f| f == name)) {
             continue;
         }
-        match read_optional(&draft.original_path(name))? {
+        let original = read_optional(&draft.original_path(name))?;
+        if original.is_none() && (name == CONFIG_FILE || draft.meta.had_priority) {
+            bail!("missing original snapshot {}; refusing undo", draft.original_path(name).display());
+        }
+        let live_text = read_optional(&live)?;
+        if live_text == original {
+            continue;
+        }
+        let applied = read_optional(&draft.dir.join(name))?
+            .with_context(|| format!("missing applied snapshot {}", draft.dir.join(name).display()))?;
+        if live_text.as_deref() != Some(applied.as_str()) {
+            bail!("{} changed since applying the draft; refusing undo", live.display());
+        }
+        restores.push((name, live, original));
+    }
+    // Validate all targets before restoring any, so stale config cannot leave
+    // an otherwise valid policy partly undone.
+    let mut touched = Vec::new();
+    for (name, live, original) in restores {
+        match original {
             Some(text) => {
                 if read_optional(&live)?.as_deref() == Some(text.as_str()) {
                     continue; // already what it was
@@ -1103,12 +1127,39 @@ mod tests {
         let ch = changes(&draft).unwrap();
         assert!(ch.iter().find(|c| c.name == CONFIG_FILE).unwrap().live_changed_since_draft);
 
+        assert!(undo(&mut draft).unwrap_err().to_string().contains("changed since applying"));
+        assert_eq!(draft.meta.status, DraftStatus::Applied);
+        assert!(paths.priority_file().exists(), "no file may be restored before every target is validated");
+        assert!(std::fs::read_to_string(paths.config_file()).unwrap().contains("/tmp/other"));
+        std::fs::write(paths.config_file(), std::fs::read_to_string(draft.config_path()).unwrap()).unwrap();
+
         let touched = undo(&mut draft).unwrap();
         assert_eq!(touched.len(), 2);
         assert_eq!(draft.meta.status, DraftStatus::Undone);
         assert!(!paths.priority_file().exists(), "priority.toml did not exist before, so undo removes it");
         assert_eq!(std::fs::read_to_string(paths.config_file()).unwrap(), "[repo]\npath = \"/tmp/repo\"\n");
         assert!(undo(&mut draft).is_err(), "cannot undo twice");
+    }
+
+    #[test]
+    fn undo_refuses_legacy_and_missing_originals_without_touching_live_files() {
+        let (_tmp, paths) = paths();
+        let mut draft = make_draft(&paths, "legacy", Some("version = 1\n"));
+        let intent = paths.config_dir.join(INTENT_FILE);
+        std::fs::write(&intent, "keep this intent").unwrap();
+        std::fs::rename(draft.original_path(PRIORITY_FILE), draft.original_path(INTENT_FILE)).unwrap();
+        draft.meta.live_priority = intent.clone();
+        draft.meta.status = DraftStatus::Applied;
+        draft.meta.applied_files = None;
+        draft.save_meta().unwrap();
+        let mut draft = Draft::load(&draft.dir).unwrap();
+        let config_before = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert!(undo(&mut draft).unwrap_err().to_string().contains("predates TOML"));
+        assert_eq!(std::fs::read_to_string(&intent).unwrap(), "keep this intent");
+        assert_eq!(std::fs::read_to_string(paths.config_file()).unwrap(), config_before);
+        std::fs::remove_file(draft.original_path(INTENT_FILE)).unwrap();
+        assert!(undo(&mut draft).unwrap_err().to_string().contains("missing original snapshot"));
+        assert_eq!(std::fs::read_to_string(intent).unwrap(), "keep this intent");
     }
 
     #[test]

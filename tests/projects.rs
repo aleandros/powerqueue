@@ -287,3 +287,42 @@ required_labels = ["powerqueue"]
     assert!(!cfg.github.enabled);
     assert_eq!(cfg.github.execution_project, "default");
 }
+
+#[test]
+fn adding_second_project_preserves_legacy_repository_source_overrides() {
+    use assert_cmd::Command;
+    if which::which("git").is_err() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = powerqueue::paths::Paths::rooted(tmp.path());
+    paths.ensure().unwrap();
+    let legacy = tmp.path().join("legacy");
+    let extra = tmp.path().join("extra");
+    for repo in [&legacy, &extra] {
+        assert!(std::process::Command::new("git").args(["init", "-q"]).arg(repo).status().unwrap().success());
+    }
+    std::fs::write(paths.config_file(), format!("[repo]\npath = {:?}\n", legacy.display().to_string())).unwrap();
+    std::fs::write(
+        legacy.join(".powerqueue.toml"),
+        "[github]\nrepository = 'owner/repo'\ntrusted_approvers = ['lead']\n[linear]\nexcluded_labels = ['private']\n",
+    )
+    .unwrap();
+    let command = || {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("powerqueue"));
+        cmd.env("POWERQUEUE_HOME", tmp.path()).env("POWERQUEUE_SECRETS", "file");
+        cmd
+    };
+    for registered in [false, true] {
+        if registered {
+            command().args(["project", "register", "extra"]).arg(&extra).assert().success();
+        }
+        let out = command().args(["config", "show", "--json"]).assert().success().get_output().stdout.clone();
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["github"]["trusted_approvers"], serde_json::json!(["lead"]));
+        assert_eq!(value["linear"]["excluded_labels"], serde_json::json!(["private"]));
+    }
+    let before = std::fs::read_to_string(paths.config_file()).unwrap();
+    command().args(["project", "register", "extra"]).arg(&extra).args(["--github", "owner/repo"]).assert().failure();
+    assert_eq!(std::fs::read_to_string(paths.config_file()).unwrap(), before);
+}

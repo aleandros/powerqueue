@@ -612,3 +612,52 @@ lines or the daemon restarts. Provider quota percentages appear separately in
 Legacy `PRIORITY.md` policies must be migrated explicitly; see
 [policy migration and reload recovery](priority.md#migration-from-markdown).
 Invalid reloads retain the last valid policy until repaired.
+
+## A task is held by routing
+
+Run `powerqueue task explain <task>` and `powerqueue doctor --offline`. Routing
+holds appear as `routing.blocked` events independently of GitHub approval. A
+conflict lists every matching rule and destination; narrow the conditions so all
+matches agree. An unmatched issue needs a source fallback or a matching rule.
+Unknown projects must be registered in machine `config.toml`.
+
+Saved assignments are stable. If updated labels, Linear team/project metadata,
+or configuration select another project, restore the original route or explicitly
+use `powerqueue task project <task> <id>` on unstarted work. Initially unmatched
+work also needs this explicit assignment after the rules are fixed. Work with
+execution history cannot move projects; create a new task instead. Reload the
+configuration and preview `github sync` / `linear sync` before applying changes.
+
+### Cleanup waiting for project repair
+
+If `doctor` reports **pending cleanup**, the task has finished but its checkout
+or repository overrides could not be resolved safely. Inspect `cleanup.pending`
+in `task show`, restore the registered checkout or fix `.powerqueue.toml`, and
+keep the daemon running. Cleanup retries automatically, including after a restart.
+The finished session's window is closed while repository cleanup waits, so an
+untracked agent cannot continue running; a newer live session is never closed.
+Cleanup commands should tolerate reruns after an interrupted cleanup.
+A manual retry or new execution supersedes the old cleanup request; it cannot
+remove a newer session's worktree. Push and cleanup-command failures still retain
+the worktree for inspection under the existing cleanup policy.
+
+### One GitHub issue cannot be verified
+
+`github sync --json` includes per-issue `problems`; applied sync logs
+`github.issue_failed`. An inaccessible issue or inconsistent approval snapshot
+holds only that issue. Other issues continue to sync and execute. Restore access
+or sync again after edits settle. A manual task with the same `owner/repo#number`
+key is left untouched; use a distinct manual key. Repeated identical issue
+warnings are suppressed until recovery. Source-wide list, authentication, server,
+transport and rate-limit failures still trigger API backoff; GraphQL throttling
+also honors the reset/retry headers on HTTP 200 error responses.
+
+### Legacy checkout unavailable in a multi-project installation
+
+The legacy `[repo]` checkout can still supply machine-wide `[github]` approval
+restrictions and `[linear]` filters. Startup refuses to discard those settings
+when the checkout or its overrides cannot be read, even if machine config lists
+the sources as disabled (the overrides can enable them). Restore the checkout
+and fix its overrides. To retire it, first migrate its source settings into
+`config.toml`, then remove the legacy `[repo]` entry and deliberately update any
+remaining tasks/source mappings. `doctor` identifies unreadable legacy overrides.

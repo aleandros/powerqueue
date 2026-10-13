@@ -686,6 +686,48 @@ pub fn policy_task() -> impl Strategy<Value = Task> {
         })
 }
 
+/// Routing policies and source metadata with independent, possibly conflicting labels.
+pub fn routing_case() -> impl Strategy<Value = (crate::config::Config, Task)> {
+    (task(), any::<bool>(), any::<bool>(), any::<bool>()).prop_map(|(mut task, api, web, reverse)| {
+        let mut cfg = crate::config::Config::default();
+        cfg.repo.path = "/repos/default".into();
+        for id in ["api", "web"] {
+            cfg.projects.insert(
+                id.into(),
+                crate::projects::ProjectConfig {
+                    repo: crate::config::RepoConfig { path: format!("/repos/{id}"), ..Default::default() },
+                    ..Default::default()
+                },
+            );
+        }
+        cfg.routing = toml::from_str(
+            r#"
+            [[rules]]
+            name = "api label"
+            project = "api"
+            all = [{field = "label", op = "eq", value = "repo/api"}]
+            [[rules]]
+            name = "web label"
+            project = "web"
+            all = [{field = "label", op = "eq", value = "repo/web"}]
+        "#,
+        )
+        .unwrap();
+        if reverse {
+            cfg.routing.rules.reverse();
+        }
+        task.source = TaskSource::Linear {
+            issue_id: "id".into(),
+            identifier: "ENG-1".into(),
+            url: "https://linear.app/ENG-1".into(),
+            team_key: "ENG".into(),
+        };
+        task.labels =
+            [(api, "repo/api"), (web, "repo/web")].into_iter().filter(|(yes, _)| *yes).map(|(_, label)| label.into()).collect();
+        (cfg, task)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

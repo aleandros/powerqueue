@@ -7,10 +7,58 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{CleanupConfig, Config};
-use crate::domain::{EventLevel, Task};
+use crate::domain::{EventLevel, Task, TaskState};
 use crate::store::Store;
 use crate::tmux::Tmux;
 use crate::worktree::{Repo, run_commands};
+
+/// Durable cleanup outbox, retried across daemon restarts.
+pub const PENDING_CLEANUP_KEY: &str = "cleanup.pending";
+
+/// Cleanup intent tied to the exact execution that requested it. A retry or
+/// reassignment must never let old cleanup remove a new execution's artifacts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingCleanup {
+    pub succeeded: bool,
+    pub review: bool,
+    pub state: TaskState,
+    pub attempts: u32,
+    pub execution_project: String,
+    pub execution_repo: Option<String>,
+    pub worktree_path: Option<String>,
+    pub branch: Option<String>,
+    pub session: Option<uuid::Uuid>,
+    pub error: Option<String>,
+}
+
+impl PendingCleanup {
+    /// Capture the execution identity without changing task or session state.
+    pub fn new(task: &Task, session: Option<uuid::Uuid>, succeeded: bool, review: bool) -> Self {
+        Self {
+            succeeded,
+            review,
+            state: task.state,
+            attempts: task.attempts,
+            execution_project: task.execution_project.clone(),
+            execution_repo: task.execution_repo.clone(),
+            worktree_path: task.worktree_path.clone(),
+            branch: task.branch.clone(),
+            session,
+            error: None,
+        }
+    }
+
+    /// Whether this intent still belongs to this task and its latest session.
+    pub fn matches(&self, task: &Task, session: Option<uuid::Uuid>) -> bool {
+        self.state == task.state
+            && self.attempts == task.attempts
+            && self.execution_project == task.execution_project
+            && self.execution_repo == task.execution_repo
+            && self.worktree_path == task.worktree_path
+            && self.branch == task.branch
+            && self.session == session
+    }
+}
 
 /// Choose the next task to start: highest score among schedulable tasks whose
 /// `not_before` has passed and that wait on nothing ([`Task::is_waiting`]:
@@ -500,5 +548,30 @@ mod tests {
         assert_eq!(tail("ab", 3), "ab");
         assert_eq!(tail("aé", 1), "");
         assert_eq!(worktree_dir(Path::new("/w"), &t), std::path::PathBuf::from("/w/eng-9"));
+    }
+}
+
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use crate::strategies;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn cleanup_intent_never_matches_a_different_execution(task in strategies::task()) {
+            let request = PendingCleanup::new(&task, None, true, false);
+            prop_assert!(request.matches(&task, None));
+            prop_assert!(!request.matches(&task, Some(uuid::Uuid::nil())));
+            let mut newer = task.clone();
+            newer.attempts = newer.attempts.wrapping_add(1);
+            prop_assert!(!request.matches(&newer, None));
+            newer = task.clone();
+            newer.execution_project.push_str("-other");
+            prop_assert!(!request.matches(&newer, None));
+            newer = task.clone();
+            newer.worktree_path = Some(format!("{}/new", newer.worktree_path.unwrap_or_default()));
+            prop_assert!(!request.matches(&newer, None));
+        }
     }
 }

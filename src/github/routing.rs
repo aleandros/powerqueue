@@ -26,7 +26,7 @@ impl Config {
         if !source.enabled {
             bail!("GitHub source `{repository}` is disabled");
         }
-        if !self.project_ids().contains(&source.execution_project) {
+        if !source.execution_project.is_empty() && !self.project_ids().contains(&source.execution_project) {
             bail!("GitHub source `{repository}` maps to unknown execution project `{}`", source.execution_project);
         }
         Ok(source)
@@ -45,7 +45,7 @@ impl Config {
                     source.repository
                 ));
             }
-            if !projects.contains(&source.execution_project) {
+            if !source.execution_project.is_empty() && !projects.contains(&source.execution_project) {
                 problems.push(format!(
                     "GitHub source `{}` maps to unknown execution project `{}`",
                     source.repository, source.execution_project

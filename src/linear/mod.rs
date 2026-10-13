@@ -12,4 +12,4 @@ pub use client::{
     CycleInfo, CycleScope, CycleStatus, IssueComment, IssueFilter, LinearClient, LinearIssue, Team, Viewer, WorkflowState,
 };
 pub use parents::{WATCHED_PARENTS_KEY, WatchedParents, container_comment, container_finished, parents_to_watch};
-pub use sync::{SyncReport, sync_issues};
+pub use sync::{SyncReport, sync_issues, sync_issues_routed};

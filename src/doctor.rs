@@ -2144,6 +2144,13 @@ pub async fn run_all(
     results.push(check_terminal());
 
     results.push(check_config(cfg, paths));
+    if !cfg.projects.is_empty()
+        && !cfg.repo.path.trim().is_empty()
+        && let Some(error) = &cfg.overrides.error
+    {
+        results.push(CheckResult::fail(CONF, "legacy source overrides", error,
+            "restore the legacy checkout and its overrides; before retiring [repo], migrate its GitHub/Linear source restrictions into config.toml"));
+    }
     for id in cfg.project_ids() {
         match cfg.for_project(&id, paths) {
             Ok(project) => {
@@ -2175,6 +2182,16 @@ pub async fn run_all(
     let isolation = check_project_isolation(cfg, paths);
     let isolated = isolation.status == Status::Ok;
     results.push(isolation);
+    let pending = store
+        .kv_get::<std::collections::BTreeMap<crate::domain::TaskId, crate::scheduler::lifecycle::PendingCleanup>>(
+            crate::scheduler::lifecycle::PENDING_CLEANUP_KEY,
+        )?
+        .unwrap_or_default();
+    for (id, cleanup) in pending {
+        results.push(CheckResult::fail(STATE, &format!("{id} pending cleanup"),
+            cleanup.error.unwrap_or_else(|| "cleanup interrupted; waiting for the daemon to retry".into()),
+            "repair the project's checkout or overrides and run the daemon; cleanup retries automatically, including after restart"));
+    }
     for task in store.list_tasks()? {
         if let Err(e) = cfg.for_task(&task, paths) {
             results.push(CheckResult::fail(STATE, &format!("{} execution project", task.key), format!("{e:#}"),
@@ -2191,18 +2208,12 @@ pub async fn run_all(
 
     results.extend(check_secrets(cfg, secrets, online).await);
     for task in store.list_open_tasks()? {
-        if let crate::domain::TaskSource::GitHub { repository, .. } = &task.source {
-            let problem = match cfg.github_source(repository) {
-                Ok(source) if source.execution_project != task.execution_project => {
-                    Some(format!("source maps to `{}`; task retains `{}`", source.execution_project, task.execution_project))
-                }
-                Err(error) => Some(format!("{error:#}")),
-                _ => None,
-            };
-            if let Some(problem) = problem {
-                results.push(CheckResult::fail(STATE, &format!("{} source routing", task.key), problem,
-                    "restore the source mapping; use task project only for deliberate reassignment of unstarted work; active work keeps its saved project"));
-            }
+        let mut routed = task.clone();
+        let decision = cfg.route(&task);
+        crate::scheduler::transitions::on_routing(&mut routed, decision, false);
+        if let Some(routing) = routed.routing.filter(|r| !r.permitted) {
+            results.push(CheckResult::fail(STATE, &format!("{} source routing", task.key), routing.explanation(),
+                "fix routing rules/source fallback and registered destinations; restore the saved route or deliberately use task project for unstarted work; active work retains its checkout"));
         }
     }
     if cfg.github_sources().iter().any(|s| s.enabled) {
@@ -2222,7 +2233,10 @@ pub async fn run_all(
     let unapproved: Vec<_> = store
         .list_open_tasks()?
         .into_iter()
-        .filter(|t| !t.execution_approved())
+        .filter(|t| {
+            matches!(t.source, crate::domain::TaskSource::GitHub { .. })
+                && !t.github_admission.as_ref().is_some_and(|a| a.approved)
+        })
         .map(|t| {
             format!(
                 "{}: {}",

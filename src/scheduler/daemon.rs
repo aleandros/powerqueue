@@ -23,11 +23,11 @@ use crate::domain::{
     BRANCH_CREATED_EVENT, DaemonCommand, EventLevel, ModelTier, Provider, SCHEDULING_PAUSE_KEY, SchedulingPause, Session,
     SessionState, Task, TaskId, TaskSource, TaskState, is_closed_state_type,
 };
-use crate::github::{Gh, GitHubClient, PrRef, apply_plan, plan_sync};
+use crate::github::{Gh, GitHubClient, PrRef, apply_plan, plan_sync_routed};
 use crate::jev::{JevClient, JevQuestion, content_hash};
 use crate::linear::{
     IssueFilter, LinearClient, LinearIssue, WATCHED_PARENTS_KEY, WatchedParents, container_comment, container_finished,
-    parents_to_watch, sync_issues,
+    parents_to_watch, sync_issues_routed,
 };
 use crate::paths::Paths;
 use crate::priority::{PriorityRules, RulesWatcher};
@@ -42,7 +42,7 @@ use crate::worktree::{BasePreference, FastForward, Repo, run_commands};
 
 use super::commands;
 use super::launch::{self, Candidate, LaunchContext, LaunchPlanner};
-use super::lifecycle::cleanup_task;
+use super::lifecycle::{PENDING_CLEANUP_KEY, PendingCleanup, cleanup_task};
 use super::relay::{self, PostedQuestion, RelayState, relay_key};
 use super::review;
 pub use super::transitions::SKIP_REASON;
@@ -151,6 +151,7 @@ struct RuntimeState {
     repo: Repo,
     launcher: Launcher,
     project_rules: HashMap<String, PriorityRules>,
+    project_rule_errors: HashMap<String, String>,
     project_fetches: HashMap<String, ProjectFetch>,
     rules: PriorityRules,
     rules_loaded: bool,
@@ -241,6 +242,7 @@ impl Daemon {
             repo,
             launcher,
             project_rules: HashMap::new(),
+            project_rule_errors: HashMap::new(),
             project_fetches: HashMap::new(),
             rules: PriorityRules::default(),
             rules_loaded: false,
@@ -408,6 +410,8 @@ impl Daemon {
         self.report_phase("transcripts", r);
         let r = self.probe_sessions(now).await;
         self.report_phase("probes", r);
+        let r = self.retry_cleanups();
+        self.report_phase("cleanup", r);
         let r = self.finalize_terminal(now).await;
         self.report_phase("finalize", r);
         let r = self.watch_reviews(now).await;
@@ -661,8 +665,8 @@ impl Daemon {
     fn reload_config(&mut self) -> Result<()> {
         let mut cfg = Config::load(&self.paths)?;
         let repo = cfg.repo_path();
-        if cfg.projects.is_empty() && repo.exists() {
-            cfg.apply_repo_overrides(&repo)?;
+        if !cfg.repo.path.trim().is_empty() && (repo.exists() || !cfg.projects.is_empty()) {
+            cfg.apply_machine_repo_overrides(&repo)?;
         }
         cfg.ensure_valid()?;
         self.rt.tmux = Tmux::new(&cfg.tmux.binary, cfg.tmux.socket_name.clone());
@@ -780,6 +784,10 @@ impl Daemon {
 
     fn refresh_project_fetches(&mut self, now: DateTime<Utc>) {
         for id in self.cfg.project_ids() {
+            // The legacy checkout has one fetch timer in refresh_overrides.
+            if id == "default" && !self.cfg.repo.path.trim().is_empty() {
+                continue;
+            }
             let cfg = self.cfg.projects.get(&id).map(|p| &p.repo).unwrap_or(&self.cfg.repo);
             let state = self.rt.project_fetches.entry(id).or_default();
             if state.handle.as_ref().is_some_and(|h| h.is_finished())
@@ -808,10 +816,28 @@ impl Daemon {
         }
     }
 
+    fn project_policy_error(&mut self, id: &str, error: Option<String>) {
+        match error {
+            Some(error) => {
+                if self.rt.project_rule_errors.get(id) != Some(&error) {
+                    self.project_error(id, &error);
+                    self.rt.project_rule_errors.insert(id.to_owned(), error);
+                }
+            }
+            None => {
+                self.rt.project_rule_errors.remove(id);
+            }
+        }
+    }
+
     async fn refresh_project_rules(&mut self, now: DateTime<Utc>) -> Result<()> {
-        let previous_rules = std::mem::take(&mut self.rt.project_rules);
+        let ids = self.cfg.project_ids();
+        self.rt.project_rules.retain(|id, _| ids.contains(id));
+        self.rt.project_rule_errors.retain(|id, _| ids.contains(id));
+        let previous_rules = self.rt.project_rules.clone();
         let tasks = self.store.list_open_tasks()?;
-        for id in self.cfg.project_ids() {
+        for id in ids {
+            let mut policy_error = None;
             let resolved = self.cfg.for_project(&id, &self.paths).and_then(|cfg| {
                 let rules = if self.rt.rules_loaded
                     && !cfg.priority.live_reload
@@ -828,7 +854,7 @@ impl Daemon {
                                 Err(e) => format!("{e:#}"),
                                 _ => format!("{source} is missing"),
                             };
-                            self.project_error(&id, &format!("{error}; keeping the last valid policy, if available"));
+                            policy_error = Some(format!("{error}; keeping the last valid policy"));
                             let Some(previous) = previous_rules.get(&id) else {
                                 bail!("no valid policy for project {id}: {error}");
                             };
@@ -841,17 +867,11 @@ impl Daemon {
             let (cfg, rules) = match resolved {
                 Ok(pair) => pair,
                 Err(e) => {
-                    self.log(
-                        None,
-                        None,
-                        EventLevel::Error,
-                        "project.error",
-                        &format!("project {id}: {e:#}"),
-                        serde_json::json!({"project": id}),
-                    );
+                    self.project_policy_error(&id, Some(format!("{e:#}")));
                     continue;
                 }
             };
+            self.project_policy_error(&id, policy_error);
             for mut task in tasks.iter().filter(|t| t.execution_project == id).cloned() {
                 if task.state.has_live_session() || self.store.latest_session(task.id)?.is_some_and(|s| s.state.is_live()) {
                     continue;
@@ -963,7 +983,9 @@ impl Daemon {
     async fn refresh_overrides(&mut self, now: DateTime<Utc>) -> Result<()> {
         if !self.cfg.projects.is_empty() {
             self.refresh_project_fetches(now);
-            return Ok(());
+            if self.cfg.repo.path.trim().is_empty() {
+                return Ok(());
+            }
         }
         if self.rt.last_overrides_check.is_some_and(|t| now - t < Duration::seconds(OVERRIDES_CHECK_SECS)) {
             return Ok(());
@@ -1252,7 +1274,7 @@ impl Daemon {
             }
         };
 
-        // `sync_issues` takes a synchronous state lookup, so fetch the states
+        // `sync_issues_routed` takes a synchronous state lookup, so fetch the states
         // of open tasks whose issues are no longer in the queued set up front.
         // Those still open in Linear are synced too, so their dependencies
         // stay current while they sit outside the queued states.
@@ -1312,7 +1334,7 @@ impl Daemon {
         }
         self.mark_merged_blockers(&client, &mut issues, &open, now).await;
 
-        let report = sync_issues(&self.store, &self.cfg.linear, &issues, |id| states.get(id).cloned())?;
+        let report = sync_issues_routed(&self.store, &self.cfg, &issues, |id| states.get(id).cloned())?;
         self.rt.linear_backoff = Duration::zero();
         self.rt.linear_next_allowed = None;
         if !report.created.is_empty() || !report.updated.is_empty() || !report.cancelled.is_empty() {
@@ -1935,17 +1957,23 @@ impl Daemon {
         self.rt.github.get(&repository.to_ascii_lowercase()).and_then(|s| s.next_allowed).is_some_and(|at| now < at)
     }
 
-    async fn refresh_github_admission(&mut self, task: &mut Task) -> Result<bool> {
+    async fn refresh_launch_permissions(&mut self, task: &mut Task) -> Result<bool> {
         use crate::domain::GitHubAdmission;
-        let TaskSource::GitHub { repository, number, .. } = &task.source else { return Ok(true) };
+        let before = task.clone();
+        let decision = self.cfg.route(task);
+        let mut effects = transitions::on_routing(task, decision, false);
+        let TaskSource::GitHub { repository, number, .. } = &before.source else {
+            if !self.store.record_routing(&before, task)? {
+                return Ok(false);
+            }
+            self.log_only(task, None, effects);
+            return Ok(task.execution_approved());
+        };
         let source = self.cfg.github_source(repository).cloned();
         let admission = match source {
             Err(error) => GitHubAdmission::denied(format!("{error:#}")),
             Ok(_) if self.offline => GitHubAdmission::denied("GitHub approval verification disabled or offline"),
-            Ok(cfg) if cfg.execution_project != task.execution_project => GitHubAdmission::denied(format!(
-                "source maps to project `{}` but task retains `{}`; restore the mapping or deliberately reassign unstarted work",
-                cfg.execution_project, task.execution_project
-            )),
+
             Ok(_) if self.github_backoff(repository, Utc::now()) => {
                 GitHubAdmission::denied("GitHub approval unavailable during API backoff")
             }
@@ -1956,13 +1984,24 @@ impl Daemon {
                         if issue.title != task.title || issue.body.as_deref().unwrap_or_default() != task.description {
                             return Ok(GitHubAdmission::denied("issue title/body changed; sync and reapproval required"));
                         }
+                        let mut observed = task.clone();
+                        observed.labels = issue.labels.iter().map(|l| l.name.clone()).collect();
+                        let mut decision = self.cfg.route(&observed);
+                        if observed.labels != task.labels {
+                            decision = crate::routing::RoutingDecision::blocked(
+                                "issue labels changed; source sync required before launch",
+                            );
+                        }
+                        effects.extend(transitions::on_routing(task, decision, false));
                         client.admission(&cfg, &issue).await
                     }
                     .await;
                     match result {
                         Ok(admission) => admission,
                         Err(error) => {
-                            self.github_failure(&cfg, &error);
+                            if crate::github::client::source_failure(&error) {
+                                self.github_failure(&cfg, &error);
+                            }
                             GitHubAdmission::denied(format!("GitHub approval unavailable: {error:#}"))
                         }
                     }
@@ -1971,8 +2010,7 @@ impl Daemon {
                 }
             }
         };
-        let before = task.clone();
-        let effects = transitions::on_github_admission(task, admission);
+        effects.extend(transitions::on_github_admission(task, admission));
         if !self.store.record_github_admission(&before, task)? {
             return Ok(false);
         }
@@ -2001,7 +2039,7 @@ impl Daemon {
             state.last_poll = Some(now);
             let Some(client) = self.github_client(&cfg) else { continue };
             let result = async {
-                let plan = plan_sync(&self.store, &cfg, &client).await?;
+                let plan = plan_sync_routed(&self.store, &cfg, &client, &self.cfg).await?;
                 apply_plan(&self.store, &plan)?;
                 anyhow::Ok(plan)
             }
@@ -2206,7 +2244,9 @@ impl Daemon {
                 &format!("GitHub lifecycle update failed: {error:#}; update the issue manually"),
                 serde_json::json!({}),
             );
-            self.github_failure(&cfg, &error);
+            if crate::github::client::source_failure(&error) {
+                self.github_failure(&cfg, &error);
+            }
             return false;
         }
         true
@@ -2364,9 +2404,99 @@ impl Daemon {
     }
 
     fn cleanup_project_task(&self, task: &mut Task, succeeded: bool, review: bool) -> Result<()> {
-        let cfg = self.cfg.for_task(task, &self.paths)?;
-        let repo = Repo::new(cfg.repo_path());
-        cleanup_task(&cfg, &self.store, &repo, &self.rt.tmux, task, succeeded, review)
+        let session = self.store.latest_session(task.id)?.map(|s| s.id);
+        let mut pending =
+            self.store.kv_get::<std::collections::BTreeMap<TaskId, PendingCleanup>>(PENDING_CLEANUP_KEY)?.unwrap_or_default();
+        pending.insert(task.id, PendingCleanup::new(task, session, succeeded, review));
+        self.store.kv_set(PENDING_CLEANUP_KEY, &pending)?;
+        self.attempt_cleanup(task, &mut pending)
+    }
+
+    fn attempt_cleanup(&self, task: &mut Task, pending: &mut std::collections::BTreeMap<TaskId, PendingCleanup>) -> Result<()> {
+        let request = pending.get(&task.id).expect("cleanup intent was recorded").clone();
+        let result = (|| {
+            let cfg = self.cfg.for_task(task, &self.paths)?;
+            let repo = Repo::new(cfg.repo_path());
+            cleanup_task(&cfg, &self.store, &repo, &self.rt.tmux, task, request.succeeded, request.review)?;
+            self.store.update_task(task)
+        })();
+        match result {
+            Ok(()) => {
+                pending.remove(&task.id);
+            }
+            Err(error) => {
+                // A finished session must not keep executing while its git
+                // cleanup waits for configuration repair.
+                self.close_cleanup_session(task.id, &request)?;
+                let message = format!("{error:#}");
+                if request.error.as_ref() != Some(&message) {
+                    self.log(
+                        Some(task.id),
+                        request.session,
+                        EventLevel::Warn,
+                        "cleanup.pending",
+                        &format!("cleanup will retry after its configuration is repaired: {message}"),
+                        serde_json::json!({"error": message}),
+                    );
+                }
+                let mut request = request;
+                request.error = Some(message);
+                pending.insert(task.id, request);
+            }
+        }
+        self.store.kv_set(PENDING_CLEANUP_KEY, pending)
+    }
+
+    fn retry_cleanups(&self) -> Result<()> {
+        let mut pending =
+            self.store.kv_get::<std::collections::BTreeMap<TaskId, PendingCleanup>>(PENDING_CLEANUP_KEY)?.unwrap_or_default();
+        for (id, request) in pending.clone() {
+            let task = self.store.get_task(id)?;
+            let session = self.store.latest_session(id)?;
+            if let Some(mut task) = task
+                && request.matches(&task, session.as_ref().map(|s| s.id))
+                && !session.as_ref().is_some_and(|s| s.state.is_live())
+            {
+                self.attempt_cleanup(&mut task, &mut pending)?;
+            } else {
+                self.close_cleanup_session(id, &request)?;
+                pending.remove(&id);
+                self.store.kv_set(PENDING_CLEANUP_KEY, &pending)?;
+                self.log(
+                    Some(id),
+                    request.session,
+                    EventLevel::Info,
+                    "cleanup.superseded",
+                    "discarded cleanup for an execution that changed",
+                    serde_json::json!({}),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn close_cleanup_session(&self, task: TaskId, request: &PendingCleanup) -> Result<()> {
+        let Some(id) = request.session else { return Ok(()) };
+        let Some(session) = self.store.get_session(id)? else { return Ok(()) };
+        if session.task_id != task || session.state.is_live() {
+            return Ok(());
+        }
+        // A restarted tmux server can reuse window IDs; never close a window
+        // now owned by another live execution.
+        if self.store.list_live_sessions()?.iter().any(|s| s.tmux_window == session.tmux_window) {
+            return Ok(());
+        }
+        if self.rt.tmux.kill_window(&session.tmux_window).is_ok() {
+            self.log(
+                Some(task),
+                Some(id),
+                EventLevel::Info,
+                "cleanup.window_closed",
+                "closed the finished session's window independently of repository cleanup",
+                serde_json::json!({}),
+            );
+        }
+        Ok(())
     }
 
     /// Carry out effects requested by a transition. Runtime failures are
@@ -3022,7 +3152,17 @@ impl Daemon {
             return Ok(());
         }
         let busy: HashSet<TaskId> = live.iter().map(|s| s.task_id).collect();
-        let tasks: Vec<Task> = self.store.list_open_tasks()?.into_iter().filter(|t| !busy.contains(&t.id)).collect();
+        let mut tasks = Vec::new();
+        for mut task in self.store.list_open_tasks()?.into_iter().filter(|t| !busy.contains(&t.id)) {
+            let before = task.clone();
+            let decision = self.cfg.route(&task);
+            let effects = transitions::on_routing(&mut task, decision, false);
+            if !self.store.record_routing(&before, &task)? {
+                continue;
+            }
+            self.log_only(&task, None, effects);
+            tasks.push(task);
+        }
         if !tasks.iter().any(|t| t.state.is_schedulable()) {
             return Ok(());
         }
@@ -3084,7 +3224,7 @@ impl Daemon {
     /// `starting` row was written leaves that row without a session (no
     /// phase picks a `starting` task up again; `task retry` does).
     async fn start_task(&mut self, mut task: Task, model: ModelTier, decision: &Decision, now: DateTime<Utc>) -> Result<Started> {
-        if !self.refresh_github_admission(&mut task).await? {
+        if !self.refresh_launch_permissions(&mut task).await? {
             return Ok(Started::CrashedBeforeLaunch);
         }
         let cfg = self.cfg.for_task(&task, &self.paths)?;
@@ -3134,17 +3274,25 @@ impl Daemon {
         }
 
         // Setup may take minutes. Recheck immediately before preparing the agent,
-        // preserving any work already created if approval was revoked meanwhile.
-        if matches!(task.source, TaskSource::GitHub { .. }) {
+        // preserving any work already created if routing or approval changed meanwhile.
+        {
             let Some(mut fresh) = self.store.get_task(task.id)? else { return Ok(Started::CrashedBeforeLaunch) };
             if fresh.state != TaskState::Starting {
                 return Ok(Started::CrashedBeforeLaunch);
             }
-            if !self.refresh_github_admission(&mut fresh).await? {
+            if !self.refresh_launch_permissions(&mut fresh).await? {
                 // Reload so a concurrent cancellation/pause is never replaced by our hold.
                 if let Some(mut current) = self.store.get_task(task.id)? {
                     let before = current.clone();
-                    let mut effects = if current.execution_approved() {
+                    let mut effects = if current.execution_approved() && !matches!(current.source, TaskSource::GitHub { .. }) {
+                        transitions::on_routing(
+                            &mut current,
+                            crate::routing::RoutingDecision::blocked(
+                                "task changed during routing verification; retry after sync",
+                            ),
+                            false,
+                        )
+                    } else if current.execution_approved() {
                         transitions::on_github_admission(
                             &mut current,
                             crate::domain::GitHubAdmission::denied("task changed during approval verification; retry after sync"),
@@ -3481,7 +3629,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
-        for mode in ["removed", "edited", "unavailable", "offline", "disabled", "backoff", "wrong-repository"] {
+        for mode in ["removed", "edited", "labels-changed", "unavailable", "offline", "disabled", "backoff", "wrong-repository"] {
             server.reset().await;
             let dir = tempfile::tempdir().unwrap();
             let mut daemon = github_daemon(dir.path(), &server.uri());
@@ -3501,7 +3649,7 @@ mod tests {
             } else {
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "number":1, "title": if mode == "edited" { "Different work" } else { "Fix bug" }, "body":"",
-                    "html_url":"https://github.com/acme/app/issues/1", "state":"open", "labels":[],
+                    "html_url":"https://github.com/acme/app/issues/1", "state":"open", "labels": if mode == "labels-changed" { serde_json::json!([{ "name": "repo/other" }]) } else { serde_json::json!([]) },
                     "created_at":"2026-09-01T12:00:00Z", "updated_at":"2026-09-01T12:01:00Z"
                 }))
             };
@@ -3515,9 +3663,14 @@ mod tests {
                 "wrong-repository" => daemon.cfg.github.repository = "other/repo".into(),
                 _ => {}
             }
-            assert!(!daemon.refresh_github_admission(&mut task).await.unwrap(), "{mode}");
+            assert!(!daemon.refresh_launch_permissions(&mut task).await.unwrap(), "{mode}");
             let saved = daemon.store.get_task(task.id).unwrap().unwrap();
             assert!(!saved.execution_approved(), "{mode}");
+            if mode == "labels-changed" {
+                assert!(!saved.routing.as_ref().unwrap().permitted);
+                assert!(saved.routing.as_ref().unwrap().reason.contains("labels changed"));
+                assert_eq!(saved.execution_project, "default");
+            }
             assert_eq!(saved.state, TaskState::Queued);
             assert!(saved.worktree_path.is_none());
             assert!(daemon.store.list_live_sessions().unwrap().is_empty());
@@ -3611,7 +3764,7 @@ mod tests {
         daemon.poll_github(Utc::now()).await.unwrap();
         let mut task = daemon.store.get_task_by_key("acme/api#1").unwrap().unwrap();
         assert_eq!(task.execution_project, "api");
-        assert!(daemon.refresh_github_admission(&mut task).await.unwrap(), "source A backoff cannot block B");
+        assert!(daemon.refresh_launch_permissions(&mut task).await.unwrap(), "source A backoff cannot block B");
         assert_eq!(daemon.store.list_tasks().unwrap().len(), 1);
         assert!(daemon.github_backoff("ACME/APP", Utc::now()));
         assert!(!daemon.github_backoff("acme/api", Utc::now()));
@@ -3634,11 +3787,11 @@ mod tests {
         assert!(daemon.update_github(&task, Some(LinearTarget::Done), Some("not posted".into())).await);
         assert!(!server.received_requests().await.unwrap().iter().any(|r| r.url.path().ends_with("/comments")));
         daemon.cfg.github_sources[0].execution_project = "default".into();
-        assert!(!daemon.refresh_github_admission(&mut task).await.unwrap());
+        assert!(!daemon.refresh_launch_permissions(&mut task).await.unwrap());
         assert_eq!(task.execution_project, "api");
-        assert!(task.github_admission.as_ref().unwrap().reason.contains("task retains"));
+        assert!(task.routing.as_ref().unwrap().explanation().contains("task retains"));
         daemon.cfg.github_sources.clear();
-        assert!(!daemon.refresh_github_admission(&mut task).await.unwrap());
+        assert!(!daemon.refresh_launch_permissions(&mut task).await.unwrap());
         assert!(!daemon.update_github(&task, Some(LinearTarget::Done), None).await);
         assert!(daemon.store.events_for_task(task.id, 30).unwrap().iter().any(|e| e.kind == "github.update_skipped"));
     }
@@ -4943,5 +5096,294 @@ mod tests {
         daemon.refresh_overrides(now).await.unwrap();
         assert_eq!(daemon.cfg.scheduler.max_concurrent, 2);
         assert_eq!(store.count_events_of_kind("daemon.reloaded", since).unwrap(), 2);
+    }
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+    use crate::{projects::ProjectConfig, secrets::FileBackend};
+
+    fn setup() -> (tempfile::TempDir, Paths, Store, Config) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        paths.ensure().unwrap();
+        let store = Store::open(&paths.database()).unwrap();
+        let checkout = dir.path().join("repo");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let mut cfg = Config::default();
+        cfg.linear.enabled = false;
+        let mut project = ProjectConfig::default();
+        project.repo.path = checkout.display().to_string();
+        cfg.projects.insert("api".into(), project);
+        (dir, paths, store, cfg)
+    }
+
+    fn daemon(cfg: Config, paths: &Paths, store: &Store) -> Daemon {
+        Daemon::new(cfg, paths.clone(), store.clone(), Secrets::with_backend(Box::new(FileBackend::new(paths.secrets_file()))))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn project_resolution_error_preserves_policy_and_deduplicates_events() {
+        let (_dir, paths, store, cfg) = setup();
+        let checkout = PathBuf::from(&cfg.projects["api"].repo.path);
+        let overrides = checkout.join(".powerqueue.toml");
+        let policy = checkout.join("priority.toml");
+        std::fs::write(&overrides, "priority_file = 'priority.toml'\n").unwrap();
+        std::fs::write(&policy, "version = 1\ndefault_criticality = 'high'\n").unwrap();
+        let mut daemon = daemon(cfg, &paths, &store);
+        daemon.refresh_rules(Utc::now()).await.unwrap();
+        std::fs::write(&overrides, "[broken").unwrap();
+        for _ in 0..3 {
+            daemon.refresh_rules(Utc::now()).await.unwrap();
+        }
+        assert_eq!(daemon.rt.project_rules["api"].default_criticality, crate::domain::Criticality::High);
+        assert_eq!(store.count_events_of_kind("project.error", daemon.started_at - Duration::seconds(1)).unwrap(), 1);
+        std::fs::write(&overrides, "priority_file = 'priority.toml'\n").unwrap();
+        std::fs::remove_file(&policy).unwrap();
+        for _ in 0..3 {
+            daemon.refresh_rules(Utc::now()).await.unwrap();
+        }
+        assert_eq!(daemon.rt.project_rules["api"].default_criticality, crate::domain::Criticality::High);
+        assert_eq!(store.count_events_of_kind("project.error", daemon.started_at - Duration::seconds(1)).unwrap(), 2);
+        std::fs::write(&policy, "version = 1\ndefault_criticality = 'low'\n").unwrap();
+        daemon.refresh_rules(Utc::now()).await.unwrap();
+        assert_eq!(daemon.rt.project_rules["api"].default_criticality, crate::domain::Criticality::Low);
+        assert!(daemon.rt.project_rule_errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn adding_a_project_and_reloading_keeps_legacy_source_restrictions() {
+        let (_dir, paths, store, mut cfg) = setup();
+        let project = cfg.projects.remove("api").unwrap();
+        cfg.repo = project.repo.clone();
+        let file = cfg.repo_path().join(".powerqueue.toml");
+        std::fs::write(
+            &file,
+            "[github]\ntrusted_approvers = ['lead']\n[linear]\nexcluded_labels = ['private']\n[scheduler]\nmax_concurrent = 99\n",
+        )
+        .unwrap();
+        cfg.save(&paths).unwrap();
+        let mut daemon = daemon(cfg.clone(), &paths, &store);
+        daemon.reload_config().unwrap();
+        assert_eq!(daemon.cfg.github.trusted_approvers, ["lead"]);
+        cfg.projects.insert("api".into(), project);
+        cfg.save(&paths).unwrap();
+        daemon.reload_config().unwrap();
+        assert_eq!(daemon.cfg.github.trusted_approvers, ["lead"]);
+        assert_eq!(daemon.cfg.linear.excluded_labels, ["private"]);
+        assert_eq!(daemon.cfg.scheduler.max_concurrent, cfg.scheduler.max_concurrent);
+        assert!(daemon.cfg.overrides.keys.contains(&"github.trusted_approvers".into()));
+        // Legacy source restrictions remain live-reloaded in multi-project mode.
+        std::fs::write(file, "[github]\ntrusted_approvers = ['second-lead']\n").unwrap();
+        daemon.refresh_overrides(Utc::now()).await.unwrap();
+        assert_eq!(daemon.cfg.github.trusted_approvers, ["second-lead"]);
+        std::fs::rename(cfg.repo_path(), cfg.repo_path().with_file_name("moved")).unwrap();
+        assert!(daemon.reload_config().is_err());
+        assert_eq!(
+            daemon.cfg.github.trusted_approvers,
+            ["second-lead"],
+            "unavailable legacy checkout must not drop restrictions"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_issue_verification_and_update_errors_do_not_back_off_healthy_tasks() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let (_dir, paths, store, mut cfg) = setup();
+        cfg.github.enabled = true;
+        cfg.github.repository = "owner/repo".into();
+        cfg.github.execution_project = "api".into();
+        cfg.github.endpoint = server.uri();
+        cfg.github.close_on_complete = true;
+        cfg.github.post_comments = false;
+        cfg.github.trusted_approvers = vec!["lead".into()];
+        let mut daemon = daemon(cfg.clone(), &paths, &store);
+        daemon.rt.github.insert(
+            "owner/repo".into(),
+            GitHubRuntime { client: Some(GitHubClient::new(&server.uri(), "test".into()).unwrap()), ..Default::default() },
+        );
+        let mut bad = Task::new(
+            "owner/repo#1",
+            "bad",
+            TaskSource::GitHub { repository: "owner/repo".into(), number: 1, url: String::new() },
+        );
+        bad.execution_project = "api".into();
+        store.insert_task(&bad).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/1"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/repo/issues/1"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        assert!(!daemon.refresh_launch_permissions(&mut bad).await.unwrap());
+        assert!(!daemon.github_backoff("owner/repo", Utc::now()));
+        assert!(!daemon.update_github(&bad, Some(LinearTarget::Done), None).await);
+        assert!(!daemon.github_backoff("owner/repo", Utc::now()));
+        let mut good = Task::new(
+            "owner/repo#2",
+            "good",
+            TaskSource::GitHub { repository: "owner/repo".into(), number: 2, url: String::new() },
+        );
+        good.execution_project = "api".into();
+        good.labels = vec!["agent:ready".into()];
+        store.insert_task(&good).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"number":2,"title":"good","body":"",
+                "html_url":"https://github.com/owner/repo/issues/2","state":"open", "labels":[{"name":"agent:ready"}],
+                "created_at":"2026-09-01T12:00:00Z","updated_at":"2026-09-01T12:01:00Z"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":{"repository":{"issue":{
+                "title":"good","body":"","state":"OPEN","updatedAt":"2026-09-01T12:01:00Z","lastEditedAt":null,
+                "timelineItems":{"nodes":[{"__typename":"LabeledEvent","id":"approval","createdAt":"2026-09-01T12:01:00Z",
+                "actor":{"login":"lead"},"label":{"name":"agent:ready"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+            }}}})))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/repo/issues/2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(daemon.refresh_launch_permissions(&mut good).await.unwrap());
+        assert!(daemon.update_github(&good, Some(LinearTarget::Done), None).await);
+    }
+
+    #[test]
+    fn failed_project_cleanup_retries_after_restart_and_repair() {
+        if which::which("git").is_err() {
+            return;
+        }
+        let (dir, paths, store, cfg) = setup();
+        let repo = Repo::new(&cfg.projects["api"].repo.path);
+        repo.git(None, &["init", "-b", "main"]).unwrap();
+        repo.git(
+            None,
+            &["-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "seed"],
+        )
+        .unwrap();
+        let wt = dir.path().join("worktree");
+        repo.add_worktree(&wt, "pq/test", "main").unwrap();
+        let mut task = Task::new("cleanup", "cleanup", TaskSource::Manual);
+        task.state = TaskState::Completed;
+        task.execution_project = "api".into();
+        task.execution_repo = Some(repo.path.canonicalize().unwrap().display().to_string());
+        task.worktree_path = Some(wt.canonicalize().unwrap().display().to_string());
+        task.branch = Some("pq/test".into());
+        store.insert_task(&task).unwrap();
+        let broken = repo.path.join(".powerqueue.toml");
+        std::fs::write(&broken, "[broken").unwrap();
+        let first = daemon(cfg.clone(), &paths, &store);
+        first.cleanup_project_task(&mut task, true, false).unwrap();
+        first.retry_cleanups().unwrap();
+        assert!(wt.exists());
+        assert_eq!(store.count_events_of_kind("cleanup.pending", first.started_at - Duration::seconds(1)).unwrap(), 1);
+        drop(first);
+        std::fs::write(broken, "").unwrap();
+        let reopened = Store::open(&paths.database()).unwrap();
+        let second = daemon(cfg, &paths, &reopened);
+        second.retry_cleanups().unwrap();
+        assert!(!wt.exists());
+        assert!(reopened.get_task(task.id).unwrap().unwrap().worktree_path.is_none());
+        let pending =
+            reopened.kv_get::<std::collections::BTreeMap<TaskId, PendingCleanup>>(PENDING_CLEANUP_KEY).unwrap().unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(reopened.count_events_of_kind("cleanup.done", second.started_at - Duration::seconds(2)).unwrap(), 1);
+    }
+
+    #[test]
+    fn pending_cleanup_closes_only_its_finished_session_window() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let (dir, paths, store, mut cfg) = setup();
+        cfg.tmux.socket_name = Some(format!("powerqueue-test-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
+        let daemon = daemon(cfg, &paths, &store);
+        let tmux = daemon.rt.tmux.clone();
+        struct Guard(Tmux);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = self.0.command().arg("kill-server").output();
+            }
+        }
+        let _guard = Guard(tmux.clone());
+        tmux.ensure_session("pq-review", dir.path()).unwrap();
+        let old = tmux.new_window("pq-review", "old", dir.path(), "sleep 60", true).unwrap();
+        let mut task = Task::new("window-cleanup", "window", TaskSource::Manual);
+        task.execution_project = "api".into();
+        task.state = TaskState::Completed;
+        store.insert_task(&task).unwrap();
+        let now = Utc::now();
+        let mut session = Session {
+            id: uuid::Uuid::new_v4(),
+            task_id: task.id,
+            attempt: 1,
+            model: ModelTier::sonnet(),
+            state: SessionState::Exited,
+            tmux_session: "pq-review".into(),
+            tmux_window: old.window_id,
+            pane_id: Some(old.pane_id.clone()),
+            pid: Some(old.pane_pid),
+            transcript_path: None,
+            exit_code: None,
+            started_at: now,
+            ended_at: Some(now),
+            last_activity_at: now,
+            error: None,
+            agent_session_id: None,
+            waiting_since: None,
+            waited_secs: 0,
+        };
+        store.insert_session(&session).unwrap();
+        std::fs::write(dir.path().join("repo/.powerqueue.toml"), "[broken").unwrap();
+        daemon.cleanup_project_task(&mut task, true, false).unwrap();
+        assert!(tmux.find_pane("pq-review", &old.pane_id).unwrap().is_none());
+        let new = tmux.new_window("pq-review", "new", dir.path(), "sleep 60", true).unwrap();
+        let mut current = session.clone();
+        current.id = uuid::Uuid::new_v4();
+        current.state = SessionState::Running;
+        current.ended_at = None;
+        current.started_at = now + Duration::seconds(1);
+        current.tmux_window = new.window_id.clone();
+        current.pane_id = Some(new.pane_id.clone());
+        store.insert_session(&current).unwrap();
+        // Even if tmux reused a historical window ID, live ownership wins.
+        session.tmux_window = new.window_id;
+        store.update_session(&session).unwrap();
+        daemon.retry_cleanups().unwrap();
+        assert!(tmux.find_pane("pq-review", &new.pane_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn delayed_cleanup_is_discarded_after_task_retry() {
+        let (_dir, paths, store, cfg) = setup();
+        let mut task = Task::new("retried", "retried", TaskSource::Manual);
+        task.execution_project = "api".into();
+        task.state = TaskState::Completed;
+        store.insert_task(&task).unwrap();
+        let request = PendingCleanup::new(&task, None, true, false);
+        store.kv_set(PENDING_CLEANUP_KEY, &std::collections::BTreeMap::from([(task.id, request)])).unwrap();
+        commands::on_retry(&mut task, None, Utc::now());
+        store.update_task(&task).unwrap();
+        let daemon = daemon(cfg, &paths, &store);
+        daemon.retry_cleanups().unwrap();
+        assert_eq!(store.get_task(task.id).unwrap().unwrap().state, TaskState::Queued);
+        assert_eq!(store.count_events_of_kind("cleanup.done", daemon.started_at - Duration::seconds(1)).unwrap(), 0);
+        assert!(
+            store.kv_get::<std::collections::BTreeMap<TaskId, PendingCleanup>>(PENDING_CLEANUP_KEY).unwrap().unwrap().is_empty()
+        );
     }
 }

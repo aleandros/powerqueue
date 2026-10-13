@@ -72,9 +72,8 @@ impl Context {
 
     fn with_repo_overrides(&self, mut cfg: Config) -> Config {
         let repo = cfg.repo_path();
-        if cfg.projects.is_empty()
-            && !cfg.repo.path.trim().is_empty()
-            && repo.exists()
+        if !cfg.repo.path.trim().is_empty()
+            && (repo.exists() || !cfg.projects.is_empty())
             && let Some(error) = cfg.apply_repo_overrides_or_record(&repo)
         {
             eprintln!("warning: {error}; running with config.toml alone (see `powerqueue doctor`)");
@@ -84,6 +83,15 @@ impl Context {
 
     pub fn config_cloned(&mut self) -> Result<Config> {
         Ok(self.config()?.clone())
+    }
+
+    /// Refuse mutations when repository overrides could not be resolved.
+    /// Diagnostic commands may still inspect the fallback configuration.
+    pub fn require_valid_overrides(&mut self) -> Result<()> {
+        if let Some(error) = &self.config_or_default()?.overrides.error {
+            anyhow::bail!("cannot edit policy with invalid repository overrides: {error}; fix .powerqueue.toml first");
+        }
+        Ok(())
     }
 
     pub fn store(&mut self) -> Result<&Store> {

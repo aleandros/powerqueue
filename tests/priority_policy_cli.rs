@@ -98,3 +98,25 @@ fn project_selection_explanation_and_simulation_agree() {
     assert_eq!(json["rows"].as_array().unwrap().len(), 1);
     assert_eq!(json["rows"][0]["key"], "web");
 }
+
+#[test]
+fn intent_prose_allows_initial_policy_but_legacy_directives_require_migration() {
+    use powerqueue::config::RulesSource;
+    let home = tempfile::tempdir().unwrap();
+    let policy = home.path().join("priority.toml");
+    let intent = home.path().join("PRIORITY.md");
+    for text in [
+        powerqueue::priority::intent_template(),
+        "# Intent\n## Goals\n- Fix outages first.\n",
+        "<!--\n## Models\n- low: haiku\n-->\n",
+    ] {
+        std::fs::write(&intent, text).unwrap();
+        assert_eq!(RulesSource::File(policy.clone()).read().unwrap(), None);
+    }
+    for text in
+        ["## Models\n- low: haiku\n", "## Default\n- normal\n", "## Jev\n- enabled: false\n", "## High\n- invalid condition\n"]
+    {
+        std::fs::write(&intent, text).unwrap();
+        assert!(RulesSource::File(policy.clone()).read().unwrap_err().to_string().contains("priority migrate"));
+    }
+}

@@ -55,6 +55,27 @@ pub fn sync_issues(
     issues: &[LinearIssue],
     fetch_state: impl Fn(&str) -> Option<String>,
 ) -> Result<SyncReport> {
+    sync_issues_inner(store, cfg, issues, fetch_state, None)
+}
+
+/// Sync Linear issues with deterministic routing to the execution registry.
+/// Routing failures are persisted as held decisions, never guessed destinations.
+pub fn sync_issues_routed(
+    store: &Store,
+    cfg: &crate::config::Config,
+    issues: &[LinearIssue],
+    fetch_state: impl Fn(&str) -> Option<String>,
+) -> Result<SyncReport> {
+    sync_issues_inner(store, &cfg.linear, issues, fetch_state, Some(cfg))
+}
+
+fn sync_issues_inner(
+    store: &Store,
+    cfg: &LinearConfig,
+    issues: &[LinearIssue],
+    fetch_state: impl Fn(&str) -> Option<String>,
+    routing: Option<&crate::config::Config>,
+) -> Result<SyncReport> {
     let mut report = SyncReport::default();
     debug!(target: "powerqueue::linear", issues = issues.len(), teams = ?cfg.team_keys, "sync start");
 
@@ -70,7 +91,9 @@ pub fn sync_issues(
                     report.unchanged += 1;
                     continue;
                 }
-                let task = task_from_issue(issue);
+                let mut task = task_from_issue(issue);
+                let effects = route_issue(&mut task, routing, true);
+
                 store.insert_task(&task).with_context(|| format!("create task for {}", issue.identifier))?;
                 store.log_event(
                     Some(task.id),
@@ -80,6 +103,7 @@ pub fn sync_issues(
                     &format!("created from Linear issue {} ({})", issue.identifier, issue.state_name),
                     serde_json::json!({ "identifier": issue.identifier, "url": issue.url, "team": issue.team_key }),
                 )?;
+                log_routing(store, &task, effects)?;
                 info!(target: "powerqueue::linear", task = %task.key, "task created from Linear");
                 report.created.push(task.id);
             }
@@ -87,13 +111,20 @@ pub fn sync_issues(
                 debug!(target: "powerqueue::linear", task = %existing.key, state = %existing.state, "terminal task; left alone");
             }
             Some(mut existing) => {
-                let changed = apply_issue(&mut existing, issue);
+                let before = existing.clone();
+                let mut changed = apply_issue(&mut existing, issue);
+                let effects = route_issue(&mut existing, routing, false);
+                if !effects.is_empty() {
+                    changed.push("routing");
+                }
                 if changed.is_empty() {
                     report.unchanged += 1;
                     continue;
                 }
                 existing.updated_at = Utc::now();
-                store.update_task(&existing).with_context(|| format!("update task {}", existing.key))?;
+                if !store.update_source_task(&before, &existing).with_context(|| format!("update task {}", existing.key))? {
+                    continue;
+                }
                 store.log_event(
                     Some(existing.id),
                     None,
@@ -103,6 +134,7 @@ pub fn sync_issues(
                     serde_json::json!({ "fields": changed }),
                 )?;
                 debug!(target: "powerqueue::linear", task = %existing.key, fields = ?changed, "task updated from Linear");
+                log_routing(store, &existing, effects)?;
                 report.updated.push(existing.id);
             }
         }
@@ -131,12 +163,15 @@ pub fn sync_issues(
             Some(t) => format!("{CLOSED_IN_LINEAR} ({t})"),
             None => format!("{CLOSED_IN_LINEAR} (issue deleted)"),
         };
+        let before = task.clone();
         let previous = task.state;
         task.state = TaskState::Cancelled;
         task.last_error = Some(CLOSED_IN_LINEAR.to_string());
         task.completed_at = Some(Utc::now());
         task.updated_at = Utc::now();
-        store.update_task(&task).with_context(|| format!("cancel task {}", task.key))?;
+        if !store.update_source_task(&before, &task).with_context(|| format!("cancel task {}", task.key))? {
+            continue;
+        }
         store.log_event(
             Some(task.id),
             None,
@@ -158,6 +193,28 @@ pub fn sync_issues(
         "sync done"
     );
     Ok(report)
+}
+
+fn route_issue(
+    task: &mut Task,
+    config: Option<&crate::config::Config>,
+    fresh: bool,
+) -> Vec<crate::scheduler::transitions::Effect> {
+    config
+        .map(|cfg| {
+            let decision = cfg.route(task);
+            crate::scheduler::transitions::on_routing(task, decision, fresh)
+        })
+        .unwrap_or_default()
+}
+
+fn log_routing(store: &Store, task: &Task, effects: Vec<crate::scheduler::transitions::Effect>) -> Result<()> {
+    for effect in effects {
+        if let crate::scheduler::transitions::Effect::Log { level, kind, message, data } = effect {
+            store.log_event(Some(task.id), None, level, &kind, &message, data)?;
+        }
+    }
+    Ok(())
 }
 
 /// Build a fresh queued task from an issue.

@@ -55,9 +55,13 @@ resolve from that project's checkout, as in single-repository mode.
 
 Without a named project table, the global setting is inherited. Repository-local
 setup, agent options, prompts, priority file, cleanup and task/review limits
-apply only to that project. With a registry configured, repository overrides
-for source admission (`linear`/`github`), total `max_concurrent`, `tick_secs`,
-and `resource_sample_secs` are ignored. Provider budgets, cooldowns and usage
+apply only to that project. With a registry configured, named repositories'
+source admission (`linear`/`github`) overrides are ignored. The legacy `[repo]`
+checkout's source overrides remain machine-wide, preserving existing approval
+restrictions and intake filters when projects are added. Its source overrides
+continue to reload; `config show` identifies the applied keys. Repository
+overrides for total `max_concurrent`, `tick_secs`, and `resource_sample_secs`
+are ignored in registry mode. Provider budgets, cooldowns and usage
 ledgers are always machine-wide; projects cannot declare a budget or scheduler
 table in config.toml. One launch pass allocates slots and reserves predicted
 usage across all projects in priority order.
@@ -75,9 +79,9 @@ existing tasks with execution history are pinned to its canonical path. A task
 is otherwise pinned before its first repository operation. Retry, daemon
 restart and PR review preserve that binding and existing worktree paths.
 You may use `[projects.default.repo]` instead of `[repo]`, but cannot configure
-both. A named-only registry is supported with Linear disabled. Register `default`
-for Linear intake and `add` without `--project`. Dashboard additions use the
-selected `--project`, otherwise `default`; a missing selection fails. GitHub sources
+both. A named-only registry works with explicit source routing. Register `default`
+for `add` without `--project`; Linear can use `linear.execution_project` or routing
+rules. Dashboard additions use the selected `--project`, otherwise `default`; a missing selection fails. GitHub sources
 select their configured `execution_project` (also `default` when omitted).
 
 `powerqueue task project <task> <id>` deliberately reassigns an unstarted task,
@@ -177,7 +181,7 @@ Intake uses the [GitHub Issues REST API](https://docs.github.com/en/rest/issues/
 |-----|---------|---------|
 | `enabled` | `false` | enable daemon intake and lifecycle updates |
 | `repository` | `""` | explicit source `owner/repo`; required when enabled or using GitHub helpers |
-| `execution_project` | `"default"` | registered execution project ID; never inferred from labels or issue text |
+| `execution_project` | `"default"` | fallback registered execution project ID; matching routing rules override it; `""` requires a rule match |
 | `token_env` | unset | source-specific token environment variable; if set, missing/empty values fail without falling back to the global token |
 | `required_labels` | `["agent:ready"]` | configurable execution approval labels; **all** require current label-application events; cannot be empty when enabled |
 | `trusted_approvers` | `[]` | optional GitHub login allowlist (case insensitive); every effective approval event must be by an allowed actor; empty allows any verifiable actor |
@@ -242,7 +246,7 @@ admission, and `doctor` reports each source's access and routing conflicts.
 changes. Omitted `execution_project` means `default`; existing task assignments
 are preserved. Routing applies when a task is created. Later mapping changes do
 not retarget queued, running, retried or review tasks. A mismatch blocks future
-launches and appears in admission diagnostics. Restore the mapping or deliberately
+launches and appears in routing diagnostics. Restore the mapping or deliberately
 reassign unstarted tasks using `task project`; started work stays bound to its
 original project. Source lifecycle writes still target the original issue when
 that source remains configured and enabled. Removing or disabling a source blocks
@@ -251,7 +255,7 @@ launches and reports skipped lifecycle writes.
 Manual `add --project ID` validates registration. Omitting `--project` always
 selects `default`, even with multiple projects; it never guesses from the current
 directory or source metadata. An unknown ID fails without creating a task.
-Linear routing is unchanged: Linear intake continues to select `default`.
+Linear uses `linear.execution_project` (default `"default"`) when no routing rule matches.
 
 Task keys are `owner/repo#123`; use quoted keys in commands, for example
 `powerqueue task show 'owner/repo#123'`. Priority rules accept `source: github` and
@@ -324,6 +328,7 @@ when `github.enabled = false`, so you can preview configuration before enabling 
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `enabled` | `true` | poll Linear at all |
+| `execution_project` | `"default"` | registered fallback execution project; `""` requires a routing rule match |
 | `team_keys` | `[]` | team keys to pull from; empty = every team the key can see |
 | `assignee` | none | only issues assigned to this user id, or `"me"` |
 | `queued_states` | `["Todo"]` | workflow state names that mean "ready for the agent" |
@@ -375,6 +380,77 @@ asked again at most every 5 minutes.
 
 `powerqueue doctor` reports blocked tasks, `blocked by` cycles between open
 tasks (which would wait forever) and failed attempts to close a parent.
+
+## `[routing]`
+
+Routing is machine configuration in `config.toml`. Its default is `rules = []`.
+It selects only registered execution-project IDs; source admission still decides
+whether an issue is approved, `priority.toml` decides ordering/models, and the
+selected project's settings decide checkout, setup and cleanup.
+
+```toml
+# Register [projects.api.repo] and [projects.web.repo] first.
+[linear]
+execution_project = "" # require an explicit rule match (default: "default")
+
+[[routing.rules]]
+name = "API team backend work"
+project = "api"
+all = [
+  { field = "source", op = "eq", value = "linear" },
+  { field = "team", op = "eq", value = "API" },
+  { field = "project", op = "eq", value = "Backend" },
+]
+
+[[routing.rules]]
+name = "Shared GitHub feed web work"
+project = "web"
+all = [
+  { field = "repository", op = "eq", value = "acme/issues" },
+  { field = "label", op = "eq", value = "repo/web" },
+]
+```
+
+Each rule has `name` (nonempty, unique), `project` (registered destination), and
+`all` (at least one condition). These keys default to empty and validation rejects
+incomplete rules. Conditions use the same strict `{field, op, value}` schema and
+matching as [priority policy](priority.md): `eq`, `ne`, or `matches`
+(regex) on `source`, `repository` (GitHub owner/repo), `team` (Linear team key),
+`project` (Linear project name), or `label`. Equality and regexes ignore case;
+qualified labels and child labels follow policy matching. A missing field does
+not match `eq`/`matches`, but does match `ne`. Use `source` to scope negative rules.
+Routing never evaluates title/body text or treats issue content as a checkout path.
+
+Selection is independent of rule order:
+
+1. Evaluate every rule; every condition in a rule must match.
+2. If all matching rules name the same project, select it. These rules override
+   `github.execution_project`, each `github_sources` fallback, or `linear.execution_project`.
+3. If matching rules name different projects, hold the task and list the rules
+   and destinations. There is no first-match tie breaker or fallback on conflict.
+4. If no rule matches, use the source fallback. An explicit empty fallback holds
+   unmatched work. Unknown destinations and malformed rules are configuration
+   errors; previews and doctor explain them. No arbitrary repository is selected.
+
+The initial decision and subsequent evaluations are stored with the task and logged
+as `routing.selected` or `routing.blocked`. A saved assignment never changes during
+sync, retry, restart or PR review, even while queued. Changed metadata/configuration
+that selects another destination holds future starts; active sessions continue in
+their original checkout. Restore the original route or deliberately run
+`task project <task> <id>` for work without execution history. Unmatched intake has
+an empty saved assignment: fix the routing and explicitly assign it before launch.
+Started work requires a new task to move to another project. Manual tasks keep the
+project explicitly chosen by `add --project` and do not use these rules.
+
+`github sync` and `linear sync` are dry-run previews unless `--apply` is supplied;
+`--json` includes each proposed routing decision. `task show` and `task explain`
+show saved and current decisions; current routing uses locally stored metadata.
+`doctor` diagnoses missing destinations, unmatched work and assignment conflicts.
+The daemon re-evaluates routing before each launch pass and after setup; GitHub
+also verifies current remote labels and approval before launching. Linear routing
+uses the most recent successful source sync. A routing hold created during setup
+logs `routing.launch_held` and preserves the worktree. Reload machine configuration
+with `reload` (or restart) after changing rules.
 
 ## `[priority]` and `[priority.jev]`
 
@@ -724,7 +800,7 @@ replace the global value (lists are not merged), `instructions` and
 `prompt_template` and `priority_file` (relative to the repo root) replace
 `prompt.template` and `priority.file`. Secrets, `[budget]`, `[repo]` (except
 `setup`, `default_branch` and `branch_template`), `[tmux]`, `[logging]`,
-`[tune]`, `linear.endpoint`, `github.endpoint`, `github.execution_project`,
+`[tune]`, `[routing]`, `linear.endpoint`, `linear.execution_project`, `github.endpoint`, `github.execution_project`,
 `github.token_env`, `github_sources` and `scheduler.gh_binary` stay
 global: they describe the host, not the project. Unknown keys are rejected,
 and the daemon then keeps its previous configuration (event
@@ -740,7 +816,7 @@ instructions = "Run `npm test` before you finish. Never touch migrations."
 prompt_template = "docs/agent-prompt.md"   # see [prompt] above
 priority_file = "docs/priority.toml"         # the rules file, versioned with the code
 
-[linear]                     # everything in [linear] but endpoint
+[linear]                     # everything in [linear] but endpoint and execution_project
 queued_states = ["Todo"]
 excluded_labels = ["agent/skip"]
 assignee = "me"

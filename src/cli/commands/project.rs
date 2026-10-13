@@ -36,7 +36,11 @@ pub fn run(ctx: &mut Context, cmd: ProjectCommand) -> Result<i32> {
                 // A GitHub/manual installation does not require a Linear account.
                 "[linear]\nenabled = false\n".into()
             };
-            let old = Config::from_toml(&text)?;
+            let mut old = Config::from_toml(&text)?;
+            let legacy = old.repo_path();
+            if !old.repo.path.trim().is_empty() && legacy.exists() {
+                old.apply_machine_repo_overrides(&legacy)?;
+            }
             let mut doc: DocumentMut = text.parse().context("parse config.toml for project registration")?;
             super::config::migrate_legacy_document(&mut doc);
             let repo = if id == "default" && !old.repo.path.is_empty() {
@@ -115,6 +119,9 @@ pub fn run(ctx: &mut Context, cmd: ProjectCommand) -> Result<i32> {
             let updated = doc.to_string();
             let mut cfg = Config::from_toml(&updated)?;
             cfg.prompt.base_dir = Some(ctx.paths.config_dir.clone());
+            if !cfg.repo.path.trim().is_empty() {
+                cfg.apply_machine_repo_overrides(&cfg.repo_path())?;
+            }
             cfg.ensure_valid()?;
             cfg.for_project(&id, &ctx.paths)?;
             // A setup command must not redirect already-bound work on a reload.

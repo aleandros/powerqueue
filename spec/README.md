@@ -1,4 +1,4 @@
-# Quint: queue, launch, crash, budget, execution projects, admission
+# Quint: queue, launch, crash, budget, execution projects, admission, routing
 
 This specification models queue lifecycle and launch scheduling.
 It supplements the Rust properties and whole-daemon model. It does not replace
@@ -83,8 +83,11 @@ checking that refused launches consume neither a slot nor a budget reservation
 and do not alter other tasks. These operations exercise the production routing
 admission transition. Registry lookup, source credentials, multi-repository
 identity, HTTP failures and preview/apply races remain integration-test concerns;
-Quint abstracts routing conflicts as denied admission rather than modeling the
-source registry or network.
+Quint models routing eligibility independently from source approval rather than
+modeling the source registry or network. Both are required at Start and Launch;
+restoring one cannot bypass a hold from the other. RouteAllow/RouteBlock can
+interleave with setup and active work, and Hold preserves prepared artifacts.
+Retry/resume do not restore either prerequisite.
 
 `Start` combines `on_starting` with `claim`: the observed attempt is reserved
 at that point. The daemon finishes a start within a tick. Commands in this
@@ -168,11 +171,14 @@ Timestamps are coarse and record logging time rather than transition time.
 
 Replay distinguishes GitHub creation (initially unverified) from ordinary creation
 (initially admitted). It consumes `github.admitted`, `github.revoked`,
-`github.admission_blocked` and `github.launch_held`; unknown GitHub events must be
+`github.admission_blocked`, `routing.selected`, `routing.blocked`, and both
+`github.launch_held` and `routing.launch_held`; unknown GitHub/routing events must be
 classified explicitly. Denial/reapproval schedules are tested both positively and
 negatively, including attempts to bypass approval through pause/resume/retry and
-launches after revocation during setup. Replay verifies the **logged** admission
-decision and launch ordering, not the correctness of the underlying GitHub evidence.
+launches after revocation during setup. Replay verifies the **logged** approval
+and routing decisions and launch ordering, not the underlying GitHub evidence or
+routing predicates. Older traces without routing events retain the legacy default
+of permitted routing. Source approval and routing are independent in every trace.
 
 At the first unsupported lifecycle event for a task (review, blocker, relay,
 dependency, launch error/supersession), replay **ends that task's prefix**. It
@@ -186,7 +192,8 @@ and cancellation are recognized separately from the original transition.
 | --- | --- |
 | `task.created` | Create / CreateGitHub (unverified) |
 | `github.admitted`, `github.revoked`, `github.admission_blocked` | Approve / Revoke |
-| `github.launch_held` | Hold (preserves setup artifacts) |
+| `routing.selected`, `routing.blocked` | RouteAllow / RouteBlock (independent of approval) |
+| `github.launch_held`, `routing.launch_held` | Hold (preserves setup artifacts) |
 | `task.starting`, `session.launched` | Start, Launch |
 | `session.crashed`, `task.failed` | Crash, Fail (check logged attempt and limit) |
 | `task.completed`, `task.completed_by_command` | Finish, Complete |

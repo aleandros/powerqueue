@@ -60,6 +60,8 @@ pub struct Config {
     pub github: GitHubConfig,
     /// Additional independent GitHub intake sources; the legacy `github` is retained.
     pub github_sources: Vec<GitHubConfig>,
+    /// Deterministic routing, separate from admission and priority policy.
+    pub routing: crate::routing::RoutingConfig,
     pub priority: PriorityConfig,
     pub prompt: PromptConfig,
     pub scheduler: SchedulerConfig,
@@ -195,6 +197,8 @@ impl AppliedOverrides {
 #[serde(default, deny_unknown_fields)]
 pub struct LinearConfig {
     pub enabled: bool,
+    /// Fallback execution project; empty requires a matching routing rule.
+    pub execution_project: String,
     /// Team keys to pull issues from (e.g. `["ENG"]`). Empty = all teams visible to the key.
     pub team_keys: Vec<String>,
     /// Only issues assigned to this user id, or `"me"`. `None` = any assignee.
@@ -240,6 +244,7 @@ impl Default for LinearConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            execution_project: "default".into(),
             team_keys: Vec::new(),
             assignee: None,
             queued_states: vec!["Todo".to_string()],
@@ -395,9 +400,7 @@ impl GitHubConfig {
         {
             problems.push("github.repository must be owner/repo".into());
         }
-        if self.execution_project.is_empty()
-            || !self.execution_project.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c))
-        {
+        if !self.execution_project.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c)) {
             problems.push("github.execution_project must be a registered project ID".into());
         }
         if self.token_env.as_ref().is_some_and(|name| {
@@ -1544,7 +1547,13 @@ impl RulesSource {
             Self::File(path) => match std::fs::read_to_string(path) {
                 Ok(t) => Ok(Some(t)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    if path.file_name().is_some_and(|n| n == "priority.toml") && path.with_file_name("PRIORITY.md").exists() {
+                    let intent = path.with_file_name("PRIORITY.md");
+                    if path.file_name().is_some_and(|n| n == "priority.toml")
+                        && intent.exists()
+                        && crate::priority::PriorityRules::has_legacy_directives(
+                            &std::fs::read_to_string(&intent).with_context(|| format!("read {}", intent.display()))?,
+                        )
+                    {
                         bail!(
                             "{} is a legacy policy; run `powerqueue priority migrate --from {} --to {}` and update configured policy paths; Markdown prose alone is not executable",
                             path.with_file_name("PRIORITY.md").display(),
@@ -1616,8 +1625,8 @@ impl Config {
         let mut cfg = Self::from_toml(&text).with_context(|| format!("invalid config {}", file.display()))?;
         cfg.prompt.base_dir = Some(paths.config_dir.clone());
         let repo = cfg.repo_path();
-        if cfg.projects.is_empty() && !cfg.repo.path.trim().is_empty() && repo.exists() {
-            cfg.apply_repo_overrides(&repo)?;
+        if !cfg.repo.path.trim().is_empty() && (repo.exists() || !cfg.projects.is_empty()) {
+            cfg.apply_machine_repo_overrides(&repo)?;
         }
         Ok(cfg)
     }
@@ -1764,6 +1773,27 @@ impl Config {
         Ok(Some(loaded.file))
     }
 
+    /// Apply the legacy checkout's machine-level source settings. In a
+    /// multi-project installation, execution settings remain project-local;
+    /// existing GitHub approval and Linear intake restrictions stay effective.
+    /// An unreadable override fails without changing this configuration.
+    pub fn apply_machine_repo_overrides(&mut self, repo_path: &Path) -> Result<Option<PathBuf>> {
+        if self.projects.is_empty() {
+            return self.apply_repo_overrides(repo_path);
+        }
+        if !repo_path.exists() {
+            bail!("legacy source checkout {} is unavailable; restore it before loading source restrictions", repo_path.display());
+        }
+        let mut resolved = self.clone();
+        let file = resolved.apply_repo_overrides(repo_path)?;
+        self.github = resolved.github;
+        self.linear = resolved.linear;
+        self.overrides = resolved.overrides;
+        self.overrides.priority_file_in_repo = None;
+        self.overrides.keys.retain(|key| key.starts_with("github.") || key.starts_with("linear."));
+        Ok(file)
+    }
+
     /// [`Config::apply_repo_overrides`] for commands that must keep working
     /// when the repository's `.powerqueue.toml` cannot be read (the default
     /// branch is missing, git fails, the file does not parse): the error is
@@ -1772,7 +1802,7 @@ impl Config {
     /// `doctor` report it; `run` refuses to start). Returns the error that
     /// was recorded, if any.
     pub fn apply_repo_overrides_or_record(&mut self, repo_path: &Path) -> Option<String> {
-        match self.apply_repo_overrides(repo_path) {
+        match self.apply_machine_repo_overrides(repo_path) {
             Ok(_) => None,
             Err(e) => {
                 let error = format!("{e:#}");
@@ -2029,11 +2059,7 @@ impl Config {
         if self.repo.path.trim().is_empty() && self.projects.is_empty() {
             problems.push("repo.path is empty".to_string());
         }
-        if self.linear.enabled && !self.projects.is_empty() && !self.project_ids().contains("default") {
-            problems.push(
-                "Linear intake requires a default execution project; register default or set linear.enabled = false".into(),
-            );
-        }
+        problems.extend(self.routing_problems());
         if !self.repo.branch_template.contains("{key}") && !self.repo.branch_template.contains("{id}") {
             problems.push("repo.branch_template must contain {key} or {id}".to_string());
         }

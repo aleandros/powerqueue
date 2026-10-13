@@ -1,10 +1,11 @@
 //! Typed TOML policies, a shared evaluator, and explicit Markdown migration.
 
 pub mod migration;
-mod policy;
+pub(crate) mod policy;
 pub mod rules;
 pub mod watcher;
 
+pub use policy::Predicate;
 pub use rules::{Condition, Evaluation, JevSection, ModelRule, PriorityRules, Rule, RuleError, ScoringRule, fmt_conditions};
 pub use watcher::RulesWatcher;
 

@@ -7,8 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-12
+
 ### Added
 
+- Deterministic repository routing from source repository, Linear team/project
+  metadata and labels, using typed conditions in `config.toml`. Matching rules
+  override source fallbacks; conflicting, unmatched and invalid destinations hold
+  future launches with persisted reasons. Sync previews, task show/explain and
+  doctor expose routing decisions. Saved assignments and pinned checkouts survive
+  metadata changes, retries and review; reassignment remains explicit.
+- Routing properties and integration coverage for conflicting labels, unknown
+  projects, metadata changes, database restart, project isolation and stale
+  sync/launch races. Quint trace replay models routing holds independently from
+  source approval and validates the real daemon routing events.
 - Tune free-form Markdown intent into validated TOML proposals, with project
   selection, intent-change diagnostics, scoped queue simulation and reviewable
   working-copy changes for committed repository policies. Stale drafts refuse
@@ -26,6 +38,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rust API: `PriorityRules::parse` now accepts TOML; Markdown conversion is
   `priority::migration::migrate`. Priority show/edit/path command variants now
   carry `PolicyArgs`, and check/simulate arguments include an optional project.
+
+### Fixed
+
+- Refuse legacy or stale tune undo operations before touching live files; policy
+  mutation commands refuse unresolved repository overrides instead of editing
+  the machine policy by mistake. Intent-only Markdown can seed a new TOML policy.
+- Preserve the legacy checkout's GitHub approver restrictions and Linear intake
+  filters when adding execution projects, including daemon reloads.
+- Treat unreadable committed policy objects as errors, never absent files.
+  Worktree ownership checks no longer require Git's `--path-format` option.
+- Persist failed project cleanup for retry after repair or daemon restart;
+  doctor reports pending cleanup, finished session windows close independently,
+  and superseded executions cannot be cleaned up.
+- Isolate GitHub issue collisions and verification failures so healthy issues
+  still sync, launch and receive lifecycle updates. Source-wide authentication
+  and rate-limit failures still pause the source, including GraphQL HTTP 200
+  errors. Repeated issue warnings are deduplicated.
+- Keep cached project policies through temporary override errors and deduplicate
+  repeated policy failure events.
 
 ## [0.16.0] - 2026-10-12
 
@@ -977,7 +1008,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/aleandros/powerqueue/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.16.0
 [0.15.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.15.0
 [0.14.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.14.0

@@ -47,7 +47,7 @@ Project filters on `status`, `task list` and `dashboard` affect only the task li
 |---------|--------------|
 | `add "title" [-d DESC\|-] [-c CRIT] [-m MODEL] [-k KEY] [-l LABEL]... [--paused] [--project ID]` | enqueue a manual task in a registered execution project; omitted `--project` always selects `default`, unknown IDs fail; `-d -` reads stdin |
 | `task project <task> <id>` | reassign an unstarted task to a registered execution project; refuses tasks with previous execution history; validates again when the daemon applies the command |
-| `task show <task>` | details, execution project/configured checkout, source route and timeline |
+| `task show <task>` | details, execution project/configured checkout, saved/current routing decisions and timeline |
 | `task list [-a] [--project ID]` | same as `status` |
 | `task complete <task> [-s SUMMARY] [--pr URL]` | mark completed (Claude calls this from inside the session); with `--pr` hand it off for review instead: `in_review`, slot and worktree released, the daemon watches the PR (see [Review](task-lifecycle.md#review-pull-requests)). Refused while the task is `starting` (the daemon is launching it; try again once it is running) |
 | `task block <task> [-r REASON]` | mark blocked / needs a human; refused while the task is `starting` |
@@ -55,7 +55,7 @@ Project filters on `status`, `task list` and `dashboard` affect only the task li
 | `task pause <task>` | do not schedule; a running session stops after its turn |
 | `task resume <task>` | resume a paused or needs-attention task; one the PR watcher parked goes back to `in_review` |
 | `task retry <task>` | re-queue a failed, cancelled or completed task (also crashed, throttled, paused, needs-attention); one parked with its review rounds used up runs one more round; one `in_review` resumes its session for a review round now; in any other state the daemon ignores it (`task.retry_ignored`, debug) |
-| `task explain <task>` | execution project/configured checkout, current score and model decision, with reasons; for Linear tasks also what it waits on (pending `blocked by` issues, open sub-issues of a parent) |
+| `task explain <task>` | execution project/configured checkout, saved/current routing decisions, current score and model decision, with reasons; for Linear tasks also what it waits on (pending `blocked by` issues, open sub-issues of a parent) |
 | `task model <task> <model\|auto>` | force (or clear) the model for the next attempt (`fable`, `opus`, `sonnet`, `haiku`, or another provider's model such as `gpt-6.1-sol`, `gemini-3-pro`, `codex:<name>`); the policy may still downgrade it within the same provider when the model is out of budget |
 | `task prompt <task>` | print the prompt the next attempt would receive (renders `prompt.template` with attempt = attempts + 1, the task's last error and its forced/last model); nothing is launched. `--json` prints `{"task", "template", "prompt", "warnings"}` |
 | `task output <task> [-n LINES]` | last screen of the task's tmux pane (default 60 lines) |
@@ -78,7 +78,7 @@ state machine allows it. `complete` and `block` always write directly.
 | `priority simulate [--project ID] [--file PATH] [--config PATH] [--all] [--linear] [--reasons] [--no-budget] [-n LIMIT]` | dry-run ranking and budget decisions; live policies resolve per task, `--file` applies a draft; no state changes |
 | `tune "what you expect" [--project ID] [--intent PATH] [--scope priority\|config\|all] [-m MODEL] [-y] [--dry-run] [--no-budget] [--timeout SECS]` | describe the change in plain words ("ENG-12 should run before ENG-40", "chores are low and use sonnet", "run three tasks at once") and let a headless Claude Code session edit **drafts** of `priority.toml` and `config.toml` under `<state>/tune/<id>/`; powerqueue validates the result, prints Claude's summary, the diff and the simulated queue with the drafts, then asks before writing the live files (`-y` applies directly, `--dry-run` never applies). Exit 0 applied/unchanged/dry run, 1 failed/invalid/declined, 3 proposed but not applied (no terminal, no `-y`). `-` reads the instruction from stdin |
 | `tune --apply [DIR] [--project ID]` | apply the newest proposed draft (or `DIR`) after reviewing it; `-y` skips the question |
-| `tune --undo [--project ID]` | restore the files the most recent apply replaced (a running daemon is asked to reload) |
+| `tune --undo [--project ID]` | restore the files the most recent apply replaced; refuses legacy drafts, missing snapshots or subsequent live edits before changing any file (a running daemon is asked to reload) |
 
 `tune` reads free-form `PRIORITY.md` beside the selected policy (or `--intent PATH`)
 and snapshots it with the current executable TOML. `--project ID` selects the
@@ -102,6 +102,12 @@ review, commit and merge it into the configured branch before the daemon sees
 it. No branch, commit or push is performed by tune. Undo restores that working
 copy too; reverting an already merged policy requires the same commit workflow.
 Applied drafts are retained for undo and intent comparison.
+Drafts from before the TOML migration must be restored manually from their
+`original/` directory. Undo checks all affected files before restoring any, so
+newer config edits cannot cause a partial policy rollback. `tune` and
+`priority edit` require valid repository overrides; fix `.powerqueue.toml`
+before using either command. A missing TOML policy beside ordinary Markdown
+intent is allowed; executable legacy Markdown directives still require migration.
 
 ## Budget
 
@@ -142,3 +148,10 @@ Applied drafts are retained for undo and intent comparison.
 | `secrets unset <name>` | remove a key |
 | `secrets list` | which keys are configured and where they come from |
 | `hook --task ID [--session SID] --event EVENT [--provider P] [PAYLOAD]` | internal; called by agent CLI hooks (hidden); `--event StatusLine` is the Claude status line (stores rate limits, prints a short status); `PAYLOAD` replaces stdin (Codex `notify`) |
+
+Routing previews are included in `github sync` and `linear sync` (dry run by
+default, `--apply` persists). Conflicting matches and unmatched work with no
+source fallback are held with reasons. `task show`/`task explain --json` expose
+saved and current routing; see [routing configuration](configuration.md#routing).
+`task project` reassigns only unstarted work, and routing must agree with the new
+assignment before it can launch.

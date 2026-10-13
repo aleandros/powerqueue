@@ -261,6 +261,7 @@ fn print_model_lists(rules: &PriorityRules) {
 }
 
 fn edit(ctx: &mut Context, project: Option<&str>) -> Result<i32> {
+    ctx.require_valid_overrides()?;
     let source = live_source(ctx, project)?;
     let path = source.path();
     if let Some(rev) = source.rev() {

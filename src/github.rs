@@ -11,7 +11,7 @@ pub mod routing;
 pub mod sync;
 
 pub use client::GitHubClient;
-pub use sync::{apply_plan, plan_sync};
+pub use sync::{apply_plan, plan_sync, plan_sync_routed};
 
 use std::fmt;
 use std::process::{Command, Stdio};

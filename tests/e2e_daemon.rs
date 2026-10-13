@@ -1402,7 +1402,7 @@ run = ['test "$POWERQUEUE_PROJECT" = "{id}" && echo {id} > cleanup-{id}']
         let fixture = GitHubFixture(std::sync::Arc::new(std::sync::Mutex::new(GitHubFixtureState {
             issue: json!({"number": 1, "title": format!("Implement {id}"), "body": format!("Work only in {id}."),
                 "html_url": format!("https://github.com/acme/{id}/issues/1"), "state": "open",
-                "labels": [{"name":"agent:ready"},{"name":"bug"}], "created_at":"2026-09-01T12:00:00Z", "updated_at":"2026-09-01T12:01:00Z"}),
+                "labels": [{"name":"agent:ready"},{"name":"bug"},{"name":format!("repo/{id}")}], "created_at":"2026-09-01T12:00:00Z", "updated_at":"2026-09-01T12:01:00Z"}),
             comments: Vec::new(),
             operations: Vec::new(),
         })));
@@ -1420,6 +1420,23 @@ run = ['test "$POWERQUEUE_PROJECT" = "{id}" && echo {id} > cleanup-{id}']
         source.in_progress_label = Some("agent:working".into());
         source.done_label = Some("agent:review".into());
         source.close_on_complete = true;
+    }
+    // Deliberately different fallbacks prove that explicit rules select the actual
+    // project through launch, PR review and cleanup, not just in a preview.
+    for (source, fallback) in cfg.github_sources.iter_mut().zip(["web", "worker", "api"]) {
+        source.execution_project = fallback.into();
+    }
+    for id in ["api", "web", "worker"] {
+        cfg.routing.rules.push(
+            toml::from_str(&format!(
+                r#"
+            name = "route {id}"
+            project = "{id}"
+            all = [{{field="repository",op="eq",value="acme/{id}"}}, {{field="label",op="eq",value="repo/{id}"}}]
+        "#
+            ))
+            .unwrap(),
+        );
     }
     std::fs::write(&config_path, cfg.to_toml().unwrap()).unwrap();
     env.run_ok(&["secrets", "set", "github", "github-e2e-token"]);

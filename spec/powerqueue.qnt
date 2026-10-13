@@ -1,19 +1,19 @@
 // First cut: queue/launch/crash/budget. See README for abstraction boundaries.
 module lifecycle {
-  type Task = { state: str, attempts: int, notBefore: int, live: bool, approved: bool, legalStarts: bool }
-  pure val fresh: Task = { state: "queued", attempts: 0, notBefore: -1, live: false, approved: true, legalStarts: true }
+  type Task = { state: str, attempts: int, notBefore: int, live: bool, approved: bool, routed: bool, legalStarts: bool }
+  pure val fresh: Task = { state: "queued", attempts: 0, notBefore: -1, live: false, approved: true, routed: true, legalStarts: true }
   pure def terminal(t: Task): bool = Set("completed", "cancelled", "failed").contains(t.state)
   pure def ready(t: Task, now: int): bool =
-    Set("queued", "crashed", "throttled").contains(t.state) and t.approved and not(t.live) and t.notBefore <= now
+    Set("queued", "crashed", "throttled").contains(t.state) and t.approved and t.routed and not(t.live) and t.notBefore <= now
 
   // Retry can preserve attempts on a nonterminal task. Consequently attempts
   // need not be <= maxAttempts: repeated manual retries of throttled sessions
   // can exceed it. The bound is checked when a crash occurs, as in Rust.
   pure def allowed(t: Task, op: str, now: int, until: int, maximum: int): bool = {
-    if (op == "Approve" or op == "Revoke") true
-    else if (op == "Hold") t.state == "starting" and not(t.approved) and not(t.live)
+    if (Set("Approve", "Revoke", "RouteAllow", "RouteBlock").contains(op)) true
+    else if (op == "Hold") t.state == "starting" and not(t.approved and t.routed) and not(t.live)
     else if (op == "Start") ready(t, now)
-    else if (op == "Launch") t.state == "starting" and t.approved and not(t.live)
+    else if (op == "Launch") t.state == "starting" and t.approved and t.routed and not(t.live)
     else if (op == "Crash") (t.live or t.state == "starting") and t.attempts < maximum
     else if (op == "Fail") (t.live or t.state == "starting") and t.attempts >= maximum
     else if (op == "Finish") (t.state == "completed" and t.live) or Set("running", "idle", "paused", "throttled", "crashed", "failed", "needs_attention").contains(t.state)
@@ -36,10 +36,12 @@ module lifecycle {
   pure def advance(t: Task, op: str, until: int): Task = {
     if (op == "CreateGitHub" or op == "Revoke") { ...t, approved: false }
     else if (op == "Approve") { ...t, approved: true }
+    else if (op == "RouteAllow") { ...t, routed: true }
+    else if (op == "RouteBlock") { ...t, routed: false }
     else if (op == "Hold") { ...t, state: "queued" }
     // History witness: catches a start/launch guard accidentally weakened later.
-    else if (op == "Start") { ...t, state: "starting", attempts: t.attempts + 1, notBefore: -1, legalStarts: t.legalStarts and t.approved }
-    else if (op == "Launch") { ...t, state: "running", live: true, legalStarts: t.legalStarts and t.approved }
+    else if (op == "Start") { ...t, state: "starting", attempts: t.attempts + 1, notBefore: -1, legalStarts: t.legalStarts and t.approved and t.routed }
+    else if (op == "Launch") { ...t, state: "running", live: true, legalStarts: t.legalStarts and t.approved and t.routed }
     else if (op == "Crash") { ...t, state: "crashed", live: false, notBefore: until }
     else if (op == "Fail") { ...t, state: "failed", live: false, notBefore: -1 }
     else if (op == "Finish") { ...t, state: "completed", live: false, notBefore: -1 }
@@ -260,6 +262,11 @@ module powerqueue {
     tasks' = tasks.set(id, advance(tasks.get(id), if (approved) "Approve" else "Revoke", -1)),
     keepProjects, keepPass, keepClock,
   }
+  // Routing and source approval are independent prerequisites for new execution.
+  action routing(id: int, permitted: bool): bool = all {
+    tasks' = tasks.set(id, advance(tasks.get(id), if (permitted) "RouteAllow" else "RouteBlock", -1)),
+    keepProjects, keepPass, keepClock,
+  }
   action hold(id: int): bool = all {
     allowed(tasks.get(id), "Hold", now, -1, maxAttempts),
     tasks' = tasks.set(id, advance(tasks.get(id), "Hold", -1)),
@@ -271,7 +278,7 @@ module powerqueue {
     nondet present = Set(false, true).oneOf()
     nondet revision = Set(0, 1).oneOf()
     nondet op = Set("Finish", "Complete", "Release", "Wake", "Pause", "Resume", "Cancel", "Retry", "Idle", "Block", "Progress").oneOf()
-    any { beginPass, endPass, start(id), launch(id), throttle(id), crash(id), command(id, op), rateLimit(id), tick, pauseScheduling, reassign(id, p), configure(p, present, revision), rejectCheckout(id), repositoryOp(id), admission(id, present), hold(id) }
+    any { beginPass, endPass, start(id), launch(id), throttle(id), crash(id), command(id, op), rateLimit(id), tick, pauseScheduling, reassign(id, p), configure(p, present, revision), rejectCheckout(id), repositoryOp(id), admission(id, present), routing(id, present), hold(id) }
   }
 
   val projectSafety = all {
@@ -306,6 +313,20 @@ module powerqueue {
       }
     }),
   }
+
+  run approvalCannotBypassRoutingTest = init.then(routing(0, false)).then(admission(0, true)).then(beginPass)
+    .expect(safety and not(allowed(tasks.get(0), "Start", now, -1, maxAttempts)))
+    .then(routing(0, true)).then(start(0)).then(launch(0)).expect(safety and tasks.get(0).live)
+  run routingCannotBypassApprovalTest = init.then(admission(0, false)).then(routing(0, true)).then(beginPass)
+    .expect(safety and not(allowed(tasks.get(0), "Start", now, -1, maxAttempts)))
+  run routingConflictDuringSetupTest = init.then(beginPass).then(start(0)).then(routing(0, false))
+    .expect(not(allowed(tasks.get(0), "Launch", now, -1, maxAttempts)))
+    .then(hold(0)).then(start(1)).then(launch(1))
+    .expect(safety and tasks.get(0).state == "queued" and boundProject.get(0) == 0 and spent.get(0) == 0)
+  run activeRoutingConflictPreservesSessionTest = init.then(beginPass).then(start(0)).then(launch(0))
+    .then(routing(0, false)).expect(safety and tasks.get(0).live and tasks.get(0).state == "running")
+  run retryCannotRestoreRoutingTest = init.then(routing(0, false)).then(command(0, "Cancel")).then(command(0, "Retry"))
+    .expect(safety and not(ready(tasks.get(0), now)))
 
   run unapprovedCannotStartTest = init.then(admission(0, false)).then(beginPass)
     .expect(safety and not(allowed(tasks.get(0), "Start", now, -1, maxAttempts)))

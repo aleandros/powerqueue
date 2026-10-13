@@ -207,8 +207,20 @@ pub struct Evaluation {
 pub const MAX_AGE_BOOST: f64 = 200.0;
 
 /// Fields a condition may reference.
-pub(super) const FIELDS: [&str; 11] =
-    ["label", "priority", "estimate", "project", "cycle", "cycle_number", "team", "title", "description", "source", "key"];
+pub(super) const FIELDS: [&str; 12] = [
+    "label",
+    "priority",
+    "estimate",
+    "project",
+    "cycle",
+    "cycle_number",
+    "team",
+    "title",
+    "description",
+    "source",
+    "key",
+    "repository",
+];
 /// Fields that support `>` / `<`.
 pub(super) const NUMERIC_FIELDS: [&str; 3] = ["priority", "estimate", "cycle_number"];
 /// Values `cycle` may be compared with (the status word stored on the task).
@@ -226,6 +238,29 @@ enum Section {
 }
 
 impl PriorityRules {
+    /// Whether Markdown contains directives in a retired executable section.
+    /// Ordinary intent prose (including bullets outside those sections) is not
+    /// a policy. Malformed directives still require explicit migration.
+    pub(crate) fn has_legacy_directives(markdown: &str) -> bool {
+        let mut executable_section = false;
+        let mut in_comment = false;
+        for raw in markdown.lines() {
+            let line = strip_comments(raw, &mut in_comment);
+            let line = line.trim();
+            if let Some(heading) = line.strip_prefix("## ") {
+                executable_section = matches!(
+                    heading.trim().trim_end_matches('#').trim().to_ascii_lowercase().as_str(),
+                    "critical" | "high" | "normal" | "low" | "default" | "scoring" | "overrides" | "models" | "jev"
+                );
+            } else if executable_section
+                && line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")).is_some_and(|s| !s.trim().is_empty())
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Read and parse `path`. Missing file or parse errors are a single
     /// `anyhow` error listing every problem with its line number.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -581,6 +616,10 @@ fn field_text(field: &str, task: &Task) -> Option<String> {
         "description" => Some(task.description.clone()),
         "source" => Some(task.source.kind().to_string()),
         "key" => Some(task.key.clone()),
+        "repository" => match &task.source {
+            TaskSource::GitHub { repository, .. } => Some(repository.clone()),
+            _ => None,
+        },
         _ => None,
     }
 }

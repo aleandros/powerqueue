@@ -10,7 +10,7 @@ use crate::cli::output::{table, truncate};
 use crate::cli::{Context, LinearCommand};
 use crate::domain::TaskState;
 use crate::linear::sync::apply_issue;
-use crate::linear::{IssueFilter, LinearClient, LinearIssue, sync_issues};
+use crate::linear::{IssueFilter, LinearClient, LinearIssue, sync_issues_routed};
 use crate::secrets::SecretKind;
 
 /// Dispatch a `linear` subcommand. Returns the exit code.
@@ -106,6 +106,7 @@ struct Planned {
     key: String,
     title: String,
     detail: String,
+    routing: Option<crate::routing::RoutingDecision>,
 }
 
 fn sync(ctx: &mut Context, apply: bool) -> Result<i32> {
@@ -132,7 +133,7 @@ fn sync(ctx: &mut Context, apply: bool) -> Result<i32> {
     };
 
     if apply {
-        let report = sync_issues(&store, &cfg.linear, &issues, fetch_state)?;
+        let report = sync_issues_routed(&store, &cfg, &issues, fetch_state)?;
         let keys = |ids: &[crate::domain::TaskId]| -> Vec<String> {
             ids.iter().filter_map(|id| store.get_task(*id).ok().flatten()).map(|t| t.key).collect()
         };
@@ -165,7 +166,7 @@ fn sync(ctx: &mut Context, apply: bool) -> Result<i32> {
         return Ok(0);
     }
 
-    let planned = plan(&store, &issues, fetch_state)?;
+    let planned = plan(&store, &issues, fetch_state, Some(&cfg))?;
     if ctx.json {
         println!(
             "{}",
@@ -181,7 +182,7 @@ fn sync(ctx: &mut Context, apply: bool) -> Result<i32> {
         return Ok(0);
     }
     let mut t = table();
-    t.set_header(["ACTION", "KEY", "TITLE", "DETAILS"]);
+    t.set_header(["ACTION", "KEY", "TITLE", "DETAILS", "ROUTING"]);
     for p in &planned {
         let action = match p.action {
             "create" => p.action.if_supports_color(Stream::Stdout, |t| t.green()).to_string(),
@@ -189,7 +190,13 @@ fn sync(ctx: &mut Context, apply: bool) -> Result<i32> {
             "cancel" => p.action.if_supports_color(Stream::Stdout, |t| t.red()).to_string(),
             other => other.to_string(),
         };
-        t.add_row([action, p.key.clone(), truncate(&p.title, 60), p.detail.clone()]);
+        t.add_row([
+            action,
+            p.key.clone(),
+            truncate(&p.title, 60),
+            p.detail.clone(),
+            p.routing.as_ref().map(|r| r.explanation()).unwrap_or_default(),
+        ]);
     }
     println!("{t}");
     println!("Re-run with --apply to make these changes.");
@@ -230,11 +237,12 @@ async fn add_dependencies(client: &LinearClient, store: &crate::store::Store, is
     Ok(())
 }
 
-/// Compute what [`sync_issues`] would do without touching the store.
+/// Compute what [`sync_issues_routed`] would do without touching the store.
 fn plan(
     store: &crate::store::Store,
     issues: &[LinearIssue],
     fetch_state: impl Fn(&str) -> Option<String>,
+    config: Option<&crate::config::Config>,
 ) -> Result<Vec<Planned>> {
     let mut out = Vec::new();
     let mut seen: HashSet<&str> = HashSet::new();
@@ -244,6 +252,7 @@ fn plan(
             None => {
                 if store.get_task_by_key(&issue.identifier)?.is_none() {
                     out.push(Planned {
+                        routing: config.map(|cfg| cfg.route(&crate::linear::sync::task_from_issue(issue))),
                         action: "create",
                         key: issue.identifier.clone(),
                         title: issue.title.clone(),
@@ -258,9 +267,16 @@ fn plan(
             }
             Some(existing) if existing.state.is_terminal() => {}
             Some(mut existing) => {
-                let changed = apply_issue(&mut existing, issue);
+                let mut changed = apply_issue(&mut existing, issue);
+                if let Some(cfg) = config {
+                    let decision = cfg.route(&existing);
+                    if !crate::scheduler::transitions::on_routing(&mut existing, decision, false).is_empty() {
+                        changed.push("routing");
+                    }
+                }
                 if !changed.is_empty() {
                     out.push(Planned {
+                        routing: existing.routing.clone(),
                         action: "update",
                         key: existing.key,
                         title: issue.title.clone(),
@@ -282,6 +298,7 @@ fn plan(
         );
         if closed {
             out.push(Planned {
+                routing: task.routing.clone(),
                 action: "cancel",
                 key: task.key.clone(),
                 title: task.title.clone(),

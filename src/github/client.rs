@@ -18,6 +18,49 @@ pub struct RateLimited {
     pub retry_at: DateTime<Utc>,
 }
 
+/// A failed HTTP request, retaining status so callers can distinguish a
+/// source-wide authentication failure from one inaccessible issue.
+#[derive(Debug, thiserror::Error)]
+#[error("GitHub {method} {path} returned HTTP {status}; check repository access, token permissions and API rate limits")]
+pub struct ApiFailure {
+    pub status: StatusCode,
+    pub method: Method,
+    pub path: String,
+}
+
+/// A GraphQL query/permission failure affecting the configured source.
+#[derive(Debug, thiserror::Error)]
+#[error("GitHub approval query returned errors; check GraphQL access")]
+pub struct GraphQlFailure;
+
+/// Whether an issue request indicates a source-wide API or transport failure.
+pub(crate) fn source_failure(error: &anyhow::Error) -> bool {
+    error.is::<RateLimited>()
+        || error.is::<GraphQlFailure>()
+        || error.is::<reqwest::Error>()
+        || error
+            .downcast_ref::<ApiFailure>()
+            .is_some_and(|e| e.status.is_server_error() || matches!(e.status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN))
+}
+
+fn rate_retry_at(headers: &reqwest::header::HeaderMap) -> DateTime<Utc> {
+    let seconds = headers.get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<i64>().ok());
+    let reset = headers
+        .get("x-ratelimit-reset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<i64>().ok())
+        .and_then(|v| DateTime::from_timestamp(v, 0));
+    let now = Utc::now();
+    seconds
+        .and_then(Duration::try_seconds)
+        .and_then(|d| now.checked_add_signed(d))
+        .into_iter()
+        .chain(reset)
+        .max()
+        .unwrap_or(now + Duration::seconds(60))
+        .max(now + Duration::seconds(1))
+}
+
 /// Issue metadata used by the queue. Pull requests are filtered out by the client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubIssue {
@@ -106,29 +149,12 @@ impl GitHubClient {
             || (status == StatusCode::FORBIDDEN
                 && (headers.contains_key("retry-after") || headers.get("x-ratelimit-remaining").is_some_and(|v| v == "0")))
         {
-            let seconds = headers.get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<i64>().ok());
-            let reset = headers
-                .get("x-ratelimit-reset")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<i64>().ok())
-                .and_then(|v| DateTime::from_timestamp(v, 0));
-            let now = Utc::now();
-            let retry_at = seconds
-                .and_then(Duration::try_seconds)
-                .and_then(|d| now.checked_add_signed(d))
-                .into_iter()
-                .chain(reset)
-                .max()
-                .unwrap_or(now + Duration::seconds(60))
-                .max(now + Duration::seconds(1));
+            let retry_at = rate_retry_at(headers);
             return Err(RateLimited { retry_at }.into());
         }
         if !status.is_success() {
             // Do not copy response bodies (which can contain private issue data) to logs.
-            bail!(
-                "GitHub {method} {} returned HTTP {status}; check repository access, token permissions and API rate limits",
-                url.path()
-            );
+            return Err(ApiFailure { status, method, path: url.path().to_owned() }.into());
         }
         Ok(response)
     }
@@ -245,7 +271,7 @@ impl GitHubClient {
         let mut events = Vec::new();
         let mut revision = None;
         for _ in 0..100 {
-            let value: serde_json::Value = self
+            let response = self
                 .request(
                     Method::POST,
                     url.clone(),
@@ -253,12 +279,27 @@ impl GitHubClient {
                         "query": query, "variables": {"owner": owner, "name": name, "number": issue.number, "after": cursor}
                     })),
                 )
-                .await?
-                .json()
-                .await
-                .context("decode GitHub approval response")?;
-            if value.get("errors").is_some_and(|e| !e.is_null() && e.as_array().is_none_or(|a| !a.is_empty())) {
-                bail!("GitHub approval query returned errors; check GraphQL access");
+                .await?;
+            // GraphQL can report throttling in an HTTP 200 error response.
+            // Save retry headers before consuming the body.
+            let retry_at = rate_retry_at(response.headers());
+            let exhausted = response.headers().get("x-ratelimit-remaining").is_some_and(|v| v == "0")
+                || response.headers().contains_key("retry-after");
+            let value: serde_json::Value = response.json().await.context("decode GitHub approval response")?;
+            if let Some(errors) = value.get("errors").filter(|e| !e.is_null() && e.as_array().is_none_or(|a| !a.is_empty())) {
+                let kinds: Vec<_> = errors
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|e| e.get("type").or_else(|| e.pointer("/extensions/code")).and_then(|v| v.as_str()).unwrap_or(""))
+                    .collect();
+                if exhausted || kinds.contains(&"RATE_LIMITED") {
+                    return Err(RateLimited { retry_at }.into());
+                }
+                if !kinds.is_empty() && kinds.iter().all(|kind| *kind == "NOT_FOUND") {
+                    bail!("GitHub approval issue unavailable");
+                }
+                return Err(GraphQlFailure.into());
             }
             let remote = value.pointer("/data/repository/issue").context("GitHub approval issue unavailable")?;
             let title = remote.get("title").and_then(|v| v.as_str()).context("GitHub approval title unavailable")?;

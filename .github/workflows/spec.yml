@@ -9,6 +9,8 @@ on:
       - 'src/github/**'
       - 'src/config.rs'
       - 'src/projects.rs'
+      - 'src/routing.rs'
+      - 'tests/routing.rs'
       - 'src/cli/commands/project.rs'
       - 'tests/projects.rs'
       - 'tests/fixtures/**'

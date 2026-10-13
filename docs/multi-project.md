@@ -33,6 +33,9 @@ unrelated settings and comments, and requests reload when the daemon is running.
 A new installation disables Linear. A named-only registry needs explicit
 `add --project ID`; Linear intake requires a registered `default` project.
 Existing `[repo]` and `[github]` settings retain their identities and behavior.
+GitHub approval restrictions and Linear intake filters in the legacy checkout's
+`.powerqueue.toml` remain effective for the machine after adding a project.
+Named repositories cannot override source admission settings.
 
 Repeat the same registration command to reconfigure a checkout. Unspecified
 project settings, source filters and credentials remain unchanged. The command
