@@ -784,6 +784,10 @@ impl Daemon {
 
     fn refresh_project_fetches(&mut self, now: DateTime<Utc>) {
         for id in self.cfg.project_ids() {
+            // The legacy checkout has one fetch timer in refresh_overrides.
+            if id == "default" && !self.cfg.repo.path.trim().is_empty() {
+                continue;
+            }
             let cfg = self.cfg.projects.get(&id).map(|p| &p.repo).unwrap_or(&self.cfg.repo);
             let state = self.rt.project_fetches.entry(id).or_default();
             if state.handle.as_ref().is_some_and(|h| h.is_finished())
@@ -2421,6 +2425,9 @@ impl Daemon {
                 pending.remove(&task.id);
             }
             Err(error) => {
+                // A finished session must not keep executing while its git
+                // cleanup waits for configuration repair.
+                self.close_cleanup_session(task.id, &request)?;
                 let message = format!("{error:#}");
                 if request.error.as_ref() != Some(&message) {
                     self.log(
@@ -2452,6 +2459,7 @@ impl Daemon {
             {
                 self.attempt_cleanup(&mut task, &mut pending)?;
             } else {
+                self.close_cleanup_session(id, &request)?;
                 pending.remove(&id);
                 self.store.kv_set(PENDING_CLEANUP_KEY, &pending)?;
                 self.log(
@@ -2463,6 +2471,30 @@ impl Daemon {
                     serde_json::json!({}),
                 );
             }
+        }
+        Ok(())
+    }
+
+    fn close_cleanup_session(&self, task: TaskId, request: &PendingCleanup) -> Result<()> {
+        let Some(id) = request.session else { return Ok(()) };
+        let Some(session) = self.store.get_session(id)? else { return Ok(()) };
+        if session.task_id != task || session.state.is_live() {
+            return Ok(());
+        }
+        // A restarted tmux server can reuse window IDs; never close a window
+        // now owned by another live execution.
+        if self.store.list_live_sessions()?.iter().any(|s| s.tmux_window == session.tmux_window) {
+            return Ok(());
+        }
+        if self.rt.tmux.kill_window(&session.tmux_window).is_ok() {
+            self.log(
+                Some(task),
+                Some(id),
+                EventLevel::Info,
+                "cleanup.window_closed",
+                "closed the finished session's window independently of repository cleanup",
+                serde_json::json!({}),
+            );
         }
         Ok(())
     }
@@ -5270,6 +5302,69 @@ mod review_regressions {
             reopened.kv_get::<std::collections::BTreeMap<TaskId, PendingCleanup>>(PENDING_CLEANUP_KEY).unwrap().unwrap();
         assert!(pending.is_empty());
         assert_eq!(reopened.count_events_of_kind("cleanup.done", second.started_at - Duration::seconds(2)).unwrap(), 1);
+    }
+
+    #[test]
+    fn pending_cleanup_closes_only_its_finished_session_window() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let (dir, paths, store, mut cfg) = setup();
+        cfg.tmux.socket_name = Some(format!("powerqueue-test-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
+        let daemon = daemon(cfg, &paths, &store);
+        let tmux = daemon.rt.tmux.clone();
+        struct Guard(Tmux);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = self.0.command().arg("kill-server").output();
+            }
+        }
+        let _guard = Guard(tmux.clone());
+        tmux.ensure_session("pq-review", dir.path()).unwrap();
+        let old = tmux.new_window("pq-review", "old", dir.path(), "sleep 60", true).unwrap();
+        let mut task = Task::new("window-cleanup", "window", TaskSource::Manual);
+        task.execution_project = "api".into();
+        task.state = TaskState::Completed;
+        store.insert_task(&task).unwrap();
+        let now = Utc::now();
+        let mut session = Session {
+            id: uuid::Uuid::new_v4(),
+            task_id: task.id,
+            attempt: 1,
+            model: ModelTier::sonnet(),
+            state: SessionState::Exited,
+            tmux_session: "pq-review".into(),
+            tmux_window: old.window_id,
+            pane_id: Some(old.pane_id.clone()),
+            pid: Some(old.pane_pid),
+            transcript_path: None,
+            exit_code: None,
+            started_at: now,
+            ended_at: Some(now),
+            last_activity_at: now,
+            error: None,
+            agent_session_id: None,
+            waiting_since: None,
+            waited_secs: 0,
+        };
+        store.insert_session(&session).unwrap();
+        std::fs::write(dir.path().join("repo/.powerqueue.toml"), "[broken").unwrap();
+        daemon.cleanup_project_task(&mut task, true, false).unwrap();
+        assert!(tmux.find_pane("pq-review", &old.pane_id).unwrap().is_none());
+        let new = tmux.new_window("pq-review", "new", dir.path(), "sleep 60", true).unwrap();
+        let mut current = session.clone();
+        current.id = uuid::Uuid::new_v4();
+        current.state = SessionState::Running;
+        current.ended_at = None;
+        current.started_at = now + Duration::seconds(1);
+        current.tmux_window = new.window_id.clone();
+        current.pane_id = Some(new.pane_id.clone());
+        store.insert_session(&current).unwrap();
+        // Even if tmux reused a historical window ID, live ownership wins.
+        session.tmux_window = new.window_id;
+        store.update_session(&session).unwrap();
+        daemon.retry_cleanups().unwrap();
+        assert!(tmux.find_pane("pq-review", &new.pane_id).unwrap().is_some());
     }
 
     #[test]

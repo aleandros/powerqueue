@@ -634,6 +634,9 @@ If `doctor` reports **pending cleanup**, the task has finished but its checkout
 or repository overrides could not be resolved safely. Inspect `cleanup.pending`
 in `task show`, restore the registered checkout or fix `.powerqueue.toml`, and
 keep the daemon running. Cleanup retries automatically, including after a restart.
+The finished session's window is closed while repository cleanup waits, so an
+untracked agent cannot continue running; a newer live session is never closed.
+Cleanup commands should tolerate reruns after an interrupted cleanup.
 A manual retry or new execution supersedes the old cleanup request; it cannot
 remove a newer session's worktree. Push and cleanup-command failures still retain
 the worktree for inspection under the existing cleanup policy.
@@ -644,5 +647,17 @@ the worktree for inspection under the existing cleanup policy.
 `github.issue_failed`. An inaccessible issue or inconsistent approval snapshot
 holds only that issue. Other issues continue to sync and execute. Restore access
 or sync again after edits settle. A manual task with the same `owner/repo#number`
-key is left untouched; use a distinct manual key. Source-wide list, authentication
-and rate-limit failures still trigger API backoff.
+key is left untouched; use a distinct manual key. Repeated identical issue
+warnings are suppressed until recovery. Source-wide list, authentication, server,
+transport and rate-limit failures still trigger API backoff; GraphQL throttling
+also honors the reset/retry headers on HTTP 200 error responses.
+
+### Legacy checkout unavailable in a multi-project installation
+
+The legacy `[repo]` checkout can still supply machine-wide `[github]` approval
+restrictions and `[linear]` filters. Startup refuses to discard those settings
+when the checkout or its overrides cannot be read, even if machine config lists
+the sources as disabled (the overrides can enable them). Restore the checkout
+and fix its overrides. To retire it, first migrate its source settings into
+`config.toml`, then remove the legacy `[repo]` entry and deliberately update any
+remaining tasks/source mappings. `doctor` identifies unreadable legacy overrides.

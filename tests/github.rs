@@ -157,7 +157,7 @@ async fn missing_access_and_server_failures_never_cancel_or_partially_import() {
     let store = Store::open_in_memory().unwrap();
     let tracked = task(1);
     store.insert_task(&tracked).unwrap();
-    for status in [401, 403, 429] {
+    for status in [401, 403, 429, 500] {
         server.reset().await;
         list(&server, vec![issue(2)]).await;
         Mock::given(method("GET"))
@@ -1016,7 +1016,7 @@ async fn routing_unknown_destination_and_stale_preview_never_reassign() {
 
 #[tokio::test]
 async fn one_inaccessible_issue_or_collision_does_not_block_healthy_intake() {
-    for status in [404, 500] {
+    for status in [404, 410] {
         let server = MockServer::start().await;
         let store = Store::open_in_memory().unwrap();
         let mut inaccessible = task(1);
@@ -1059,4 +1059,55 @@ async fn inconsistent_issue_snapshot_denies_only_that_issue() {
     apply_plan(&store, &plan).unwrap();
     assert!(!store.get_task_by_key("acme/app#1").unwrap().unwrap().execution_approved());
     assert!(store.get_task_by_key("acme/app#2").unwrap().unwrap().execution_approved());
+}
+
+#[tokio::test]
+async fn graphql_source_errors_abort_the_plan_and_preserve_rate_reset() {
+    use powerqueue::github::client::GraphQlFailure;
+    for kind in ["RATE_LIMITED", "SECONDARY_LIMIT", "FORBIDDEN", "INSUFFICIENT_SCOPES"] {
+        let server = MockServer::start().await;
+        let store = Store::open_in_memory().unwrap();
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/app/issues"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![issue(1), issue(2)]))
+            .mount(&server)
+            .await;
+        let reset = chrono::Utc::now() + chrono::Duration::minutes(10);
+        let mut response = ResponseTemplate::new(200).set_body_json(json!({"errors":[{"type":kind}]}));
+        if kind == "RATE_LIMITED" {
+            response = response
+                .insert_header("x-ratelimit-remaining", "0")
+                .insert_header("x-ratelimit-reset", reset.timestamp().to_string());
+        }
+        if kind == "SECONDARY_LIMIT" {
+            response = response.insert_header("retry-after", "600");
+        }
+        Mock::given(method("POST")).and(path("/graphql")).respond_with(response).expect(1).mount(&server).await;
+        let error = plan_sync(&store, &config(&server), &client(&server)).await.unwrap_err();
+        if kind == "RATE_LIMITED" {
+            assert_eq!(error.downcast_ref::<RateLimited>().unwrap().retry_at.timestamp(), reset.timestamp());
+        } else if kind == "SECONDARY_LIMIT" {
+            assert!(error.downcast_ref::<RateLimited>().unwrap().retry_at >= reset);
+        } else {
+            assert!(error.is::<GraphQlFailure>());
+        }
+        assert!(store.list_tasks().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn repeated_issue_problems_are_logged_once_until_recovery() {
+    use powerqueue::github::sync::{Change, SyncPlan, SyncProblem};
+    let store = Store::open_in_memory().unwrap();
+    let after = chrono::Utc::now() - chrono::Duration::seconds(1);
+    let bad =
+        SyncPlan { problems: vec![SyncProblem { key: "acme/app#1".into(), reason: "unavailable".into() }], ..Default::default() };
+    for _ in 0..3 {
+        apply_plan(&store, &bad).unwrap();
+    }
+    assert_eq!(store.count_events_of_kind("github.issue_failed", after).unwrap(), 1);
+    let good = SyncPlan { changes: vec![Change { action: "create", task: task(1) }], ..Default::default() };
+    apply_plan(&store, &good).unwrap();
+    apply_plan(&store, &bad).unwrap();
+    assert_eq!(store.count_events_of_kind("github.issue_failed", after).unwrap(), 2);
 }

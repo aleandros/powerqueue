@@ -49,10 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Treat unreadable committed policy objects as errors, never absent files.
   Worktree ownership checks no longer require Git's `--path-format` option.
 - Persist failed project cleanup for retry after repair or daemon restart;
-  doctor reports pending cleanup, and superseded executions cannot be cleaned up.
+  doctor reports pending cleanup, finished session windows close independently,
+  and superseded executions cannot be cleaned up.
 - Isolate GitHub issue collisions and verification failures so healthy issues
   still sync, launch and receive lifecycle updates. Source-wide authentication
-  and rate-limit failures still pause the source.
+  and rate-limit failures still pause the source, including GraphQL HTTP 200
+  errors. Repeated issue warnings are deduplicated.
 - Keep cached project policies through temporary override errors and deduplicate
   repeated policy failure events.
 

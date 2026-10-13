@@ -2144,6 +2144,13 @@ pub async fn run_all(
     results.push(check_terminal());
 
     results.push(check_config(cfg, paths));
+    if !cfg.projects.is_empty()
+        && !cfg.repo.path.trim().is_empty()
+        && let Some(error) = &cfg.overrides.error
+    {
+        results.push(CheckResult::fail(CONF, "legacy source overrides", error,
+            "restore the legacy checkout and its overrides; before retiring [repo], migrate its GitHub/Linear source restrictions into config.toml"));
+    }
     for id in cfg.project_ids() {
         match cfg.for_project(&id, paths) {
             Ok(project) => {

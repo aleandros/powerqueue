@@ -188,16 +188,12 @@ async fn plan_sync_inner(store: &Store, cfg: &GitHubConfig, client: &GitHubClien
 /// cannot overwrite execution state with the preview's snapshot.
 pub fn apply_plan(store: &Store, plan: &SyncPlan) -> Result<()> {
     for problem in &plan.problems {
-        store.log_event(
-            None,
-            None,
-            EventLevel::Warn,
-            "github.issue_failed",
-            &format!("{}: {}", problem.key, problem.reason),
-            serde_json::to_value(problem)?,
-        )?;
+        record_problem(store, problem)?;
     }
     for change in &plan.changes {
+        if !plan.problems.iter().any(|p| p.key == change.task.key) {
+            store.kv_delete(&format!("github.sync_problem.{}", change.task.key))?;
+        }
         let mut task = change.task.clone();
         let admission = task.github_admission.take();
         let routing = task.routing.take();
@@ -208,16 +204,12 @@ pub fn apply_plan(store: &Store, plan: &SyncPlan) -> Result<()> {
                     (TaskSource::GitHub { repository: a, number: an, .. }, TaskSource::GitHub { repository: b, number: bn, .. })
                     if a.eq_ignore_ascii_case(b) && an == bn);
                 if !same_source || current.execution_project != task.execution_project {
-                    store.log_event(
-                        None,
-                        None,
-                        EventLevel::Warn,
-                        "github.issue_failed",
-                        &format!(
-                            "GitHub task {} acquired a conflicting source or execution project after preview; sync again",
-                            task.key
-                        ),
-                        serde_json::json!({"key": task.key}),
+                    record_problem(
+                        store,
+                        &SyncProblem {
+                            key: task.key.clone(),
+                            reason: "conflicting source or execution project acquired after preview; sync again".into(),
+                        },
                     )?;
                 }
                 continue;
@@ -266,6 +258,22 @@ pub fn apply_plan(store: &Store, plan: &SyncPlan) -> Result<()> {
                 store.log_event(Some(task.id), None, level, &kind, &message, data)?;
             }
         }
+    }
+    Ok(())
+}
+
+fn record_problem(store: &Store, problem: &SyncProblem) -> Result<()> {
+    let key = format!("github.sync_problem.{}", problem.key);
+    if store.kv_get::<String>(&key)?.as_ref() != Some(&problem.reason) {
+        store.log_event(
+            None,
+            None,
+            EventLevel::Warn,
+            "github.issue_failed",
+            &format!("{}: {}", problem.key, problem.reason),
+            serde_json::to_value(problem)?,
+        )?;
+        store.kv_set(&key, &problem.reason)?;
     }
     Ok(())
 }
