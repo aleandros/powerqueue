@@ -14,6 +14,43 @@ use std::process::{Command, Output};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+/// Durable tmux destination of a claimed launch. Recovery must inspect the
+/// original socket/session even if configuration changed after the claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchTarget {
+    pub binary: String,
+    pub socket_name: Option<String>,
+    pub session_name: String,
+    pub window_name: String,
+    pub shell_command: String,
+}
+
+impl LaunchTarget {
+    /// Store key scoped to the stable task id, independent of repository names.
+    pub fn key(id: crate::domain::TaskId) -> String {
+        format!("launch.target.{id}")
+    }
+
+    /// Whether a live pane may belong to this launch. Window names handle legacy
+    /// launches; the original command also finds renamed windows. Probe errors
+    /// are returned so recovery cannot interpret an unreadable server as absence.
+    pub fn has_live_pane(&self) -> Result<bool> {
+        let tmux = Tmux::new(&self.binary, self.socket_name.clone());
+        for pane in tmux.list_panes(&self.session_name)?.into_iter().filter(|p| !p.dead) {
+            if pane.window_name == self.window_name {
+                return Ok(true);
+            }
+            let command = tmux.run(&["display-message", "-p", "-t", &pane.pane_id, "-F", "#{pane_start_command}"])?;
+            if !self.shell_command.is_empty()
+                && shlex::split(&command).is_some_and(|parts| parts.iter().any(|s| s == &self.shell_command))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
 /// Describes a pane as reported by `tmux list-panes`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneInfo {
@@ -134,7 +171,17 @@ impl Tmux {
     pub fn has_session(&self, session: &str) -> Result<bool> {
         let target = format!("={session}");
         let out = self.output(&["has-session", "-t", &target])?;
-        Ok(out.status.success())
+        if out.status.success() {
+            return Ok(true);
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("can't find session")
+            || stderr.contains("no server running")
+            || (stderr.contains("error connecting to") && stderr.contains("No such file or directory"))
+        {
+            return Ok(false);
+        }
+        bail!("cannot check tmux session {session}: {}", stderr.trim())
     }
 
     /// Create the hosting session (detached) if needed. The first window is a

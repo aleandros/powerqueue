@@ -3,7 +3,7 @@
 Start with `powerqueue doctor`. It checks the environment, configuration,
 secrets, database state and the scheduling algorithm, and prints a fix hint for
 every problem. `doctor --fix` applies the safe repairs (`src/doctor.rs`):
-tasks that look live without a live session are marked `crashed` so the
+tasks that look live without a live session (except `starting`) are marked `crashed` so the
 daemon relaunches them; orphan worktrees that are clean and pushed are
 removed; dead orphan tmux windows are closed; a stale `daemon.lock`/`daemon.pid`
 pair with no live process is deleted. Nothing else is changed automatically.
@@ -185,6 +185,44 @@ powerqueue task show 'owner/repo#123'
   handed off for PR review close their issue when the PR merges.
 - Reply to agent questions with `task send` or `attach`; GitHub issue comments
   are not read back into sessions.
+
+## A task stays in `starting` without a session
+
+A database write can fail after an attempt was claimed but before its session
+was saved. `powerqueue doctor` reports these attempts with their execution
+project, attempt number and saved tmux destination. A slow `repo.setup` also
+has no session yet; age or a stale heartbeat alone does not prove a failed launch.
+
+The daemon checks these tasks between launches while holding its exclusive lock,
+including on its first tick after restart. It waits if a live session, a tmux pane,
+or an inherited setup lease is still held. Setup shells inherit a lock on
+`<state>/tasks/<id>/setup.lock`, so their work remains protected if the daemon is
+killed. Normal completion of the foreground setup commands releases the lease.
+The original tmux
+socket/session is saved atomically with the start claim, so configuration changes
+do not hide an unrecorded agent. Renamed windows are also matched by their launch
+command. Legacy starts without a saved destination use the current configuration.
+
+Once no launch remains, recovery consumes no additional attempt: the claimed
+attempt counts as a crash, with the usual backoff and `max_attempts` (including
+the review round's allowance). Exhausted tasks become `failed`; recovery keeps
+their branch and worktree for inspection. After fixing the cause, use
+`powerqueue task retry <task>` to restart a failed task with a fresh allowance.
+
+Check `powerqueue task show <task>` for `task.start_recovered`,
+`task.start_recovery_deferred` or `task.start_recovery_superseded`. Deferred events
+include whether setup still holds its lease and the saved tmux destination. Let surviving work
+finish, or inspect and stop it before retrying. If tmux or the database cannot be
+read, repair that error first. Restore a missing or changed project checkout to
+the task's persisted binding. `doctor --fix` leaves starting rows untouched;
+start the daemon with `powerqueue run` to reconcile them safely.
+
+Do not delete `setup.lock` to clear a hold: the operating system releases it when
+the surviving setup exits. Custom setup programs that deliberately close inherited
+file descriptors or daemonize outside the foreground setup lifetime need operator
+inspection after an abrupt exit. Legacy starts from older versions have no setup
+lease. An unrecorded live agent is held rather than adopted because its session
+metadata may never have reached the database.
 
 ## A task keeps crashing
 

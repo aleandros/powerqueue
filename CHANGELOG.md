@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Recover abandoned `starting` tasks after launch persistence failures or daemon
+  restarts using normal attempt limits and backoff. Recovery preserves work,
+  rejects stale task/session observations, and waits for surviving setup processes
+  or unrecorded agents. Doctor explains the hold and the saved tmux destination;
+  `doctor --fix` no longer interrupts starting tasks.
+
 ### Added
 
 - Quint simulation and event replay cover dependency blocking/unblocking and PR

@@ -551,15 +551,74 @@ pub fn branch_name(template: &str, key_slug: &str, short_id: &str) -> String {
 /// Returns combined output of all commands; a failure's error carries the
 /// output collected so far, including the failing command's.
 pub fn run_commands(cwd: &Path, commands: &[String], env: &[(String, String)]) -> Result<String> {
+    run_commands_inner(cwd, commands, env, None)
+}
+
+/// Run setup while holding a task-specific lease. On Unix the shell inherits
+/// the locked file description, so setup children keep the lease if the daemon
+/// dies, even before exec or when their environment cannot be inspected.
+/// Fails without running commands if the lease cannot be acquired.
+pub fn run_commands_with_lease(cwd: &Path, commands: &[String], env: &[(String, String)], path: &Path) -> Result<String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create setup lease directory {}", parent.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open setup lease {}", path.display()))?;
+    let mut lock = fd_lock::RwLock::new(file);
+    let guard = lock
+        .try_write()
+        .with_context(|| format!("acquire setup lease {}; another setup may still be running", path.display()))?;
+    run_commands_inner(cwd, commands, env, Some(&guard))
+}
+
+/// Whether a previous setup still holds its lease. Missing lease files mean
+/// no leased setup; other open/lock failures are returned, never treated as free.
+pub fn setup_in_progress(path: &Path) -> Result<bool> {
+    let file = match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("open setup lease {}", path.display())),
+    };
+    let mut lock = fd_lock::RwLock::new(file);
+    match lock.try_write() {
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+        Err(e) => Err(e).with_context(|| format!("probe setup lease {}", path.display())),
+    }
+}
+
+fn run_commands_inner(
+    cwd: &Path,
+    commands: &[String],
+    env: &[(String, String)],
+    lease: Option<&std::fs::File>,
+) -> Result<String> {
     let mut combined = String::new();
     for cmd in commands {
         tracing::debug!(cwd = %cwd.display(), command = %cmd, "running command");
-        let out = Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .envs(env.iter().map(|(k, v)| (k, v)))
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(cmd).current_dir(cwd).stdin(Stdio::null()).envs(env.iter().map(|(k, v)| (k, v)));
+        #[cfg(unix)]
+        if let Some(lease) = lease {
+            use std::os::unix::process::CommandExt;
+            let inherited = lease.try_clone().context("duplicate setup lease for child")?;
+            // SAFETY: the child hook performs only the async-signal-safe fcntl
+            // syscall. Cloning and all allocation happen before fork. Clearing
+            // CLOEXEC in the child alone prevents unrelated daemon children
+            // from inheriting this lease. The File is live throughout spawn.
+            unsafe {
+                command.pre_exec(move || {
+                    rustix::io::fcntl_setfd(&inherited, rustix::io::FdFlags::empty()).map_err(std::io::Error::from)
+                });
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = lease;
+        let out = command
             .output()
             .with_context(|| format!("cannot run `sh -c {}` in {}", crate::tmux::shell_quote(cmd), cwd.display()))?;
         combined.push_str(&format!("$ {cmd}\n"));

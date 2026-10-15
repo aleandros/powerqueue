@@ -12,6 +12,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context as _, Result, bail};
+
+#[cfg(all(test, unix))]
+#[path = "start_recovery_tests.rs"]
+mod start_recovery_tests;
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::Notify;
 
@@ -38,7 +42,7 @@ use crate::session::{
 };
 use crate::store::{JevCached, PendingHookEvent, Store};
 use crate::tmux::Tmux;
-use crate::worktree::{BasePreference, FastForward, Repo, run_commands};
+use crate::worktree::{BasePreference, FastForward, Repo};
 
 use super::commands;
 use super::launch::{self, Candidate, LaunchContext, LaunchPlanner};
@@ -410,6 +414,8 @@ impl Daemon {
         self.report_phase("transcripts", r);
         let r = self.probe_sessions(now).await;
         self.report_phase("probes", r);
+        let r = self.recover_starting(now);
+        self.report_phase("starting recovery", r);
         let r = self.retry_cleanups();
         self.report_phase("cleanup", r);
         let r = self.finalize_terminal(now).await;
@@ -3217,12 +3223,92 @@ impl Daemon {
         Ok(())
     }
 
+    /// Called only between launches under the exclusive daemon lock. Unlike a
+    /// heartbeat/age timeout this cannot mistake a long setup for abandonment;
+    /// after restart, acquiring that same lock proves the previous owner exited.
+    /// Its setup children may survive, so their inherited lease is checked too.
+    fn recover_starting(&self, now: DateTime<Utc>) -> Result<()> {
+        for mut task in self.store.list_tasks_in_states(&[TaskState::Starting])? {
+            let sessions = self.store.list_sessions_for_task(task.id)?;
+            if sessions.iter().any(|s| s.state.is_live()) {
+                continue;
+            }
+            let cfg = match self.cfg.for_task(&task, &self.paths) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    self.project_error(&task.execution_project, &format!("{}: cannot recover starting attempt: {e:#}", task.key));
+                    continue;
+                }
+            };
+            let target = self
+                .store
+                .kv_get::<crate::tmux::LaunchTarget>(&crate::tmux::LaunchTarget::key(task.id))?
+                .unwrap_or_else(|| self.launch_target(&cfg, &task));
+            let live_pane = match target.has_live_pane() {
+                Ok(live) => live,
+                Err(e) => {
+                    self.log(
+                        Some(task.id),
+                        None,
+                        EventLevel::Warn,
+                        "task.start_recovery_deferred",
+                        &format!("cannot check tmux before recovering start: {e:#}"),
+                        serde_json::json!({ "attempt": task.attempts, "project": task.execution_project }),
+                    );
+                    continue;
+                }
+            };
+            let setup_active = crate::worktree::setup_in_progress(&self.paths.task_dir(&task.id.to_string()).join("setup.lock"))?;
+            let activity = if live_pane {
+                launch::StartActivity::LivePane
+            } else if setup_active {
+                launch::StartActivity::LiveSetup
+            } else {
+                launch::StartActivity::Abandoned
+            };
+            let before = task.clone();
+            let mut effects = launch::on_abandoned_start(&mut task, &sessions, activity, &cfg.scheduler, now);
+            for effect in &mut effects {
+                if let Effect::Log { data, .. } = effect {
+                    data["setup_active"] = serde_json::json!(setup_active);
+                    data["tmux_target"] = serde_json::json!(target);
+                }
+            }
+            if task == before || self.store.recover_task_start(&before, &task)? {
+                self.log_only(&task, None, effects);
+            } else {
+                self.log(
+                    Some(task.id),
+                    None,
+                    EventLevel::Info,
+                    "task.start_recovery_superseded",
+                    "starting recovery discarded: task or session changed since observation",
+                    serde_json::json!({ "attempt": before.attempts, "project": before.execution_project }),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn launch_target(&self, cfg: &Config, task: &Task) -> crate::tmux::LaunchTarget {
+        crate::tmux::LaunchTarget {
+            binary: cfg.tmux.binary.clone(),
+            socket_name: cfg.tmux.socket_name.clone(),
+            session_name: cfg.tmux.session_name.clone(),
+            window_name: task.slug(),
+            shell_command: format!(
+                "sh {}",
+                crate::tmux::shell_quote(&self.paths.task_dir(&task.id.to_string()).join("launch.sh").to_string_lossy())
+            ),
+        }
+    }
+
     /// Create the worktree, run setup, launch the agent and record the
     /// session. A worktree, setup or launcher failure is not an error: the
     /// task is crashed with a backoff and [`Started::CrashedBeforeLaunch`]
     /// says its slot is free again. `Err` is a store failure; one after the
-    /// `starting` row was written leaves that row without a session (no
-    /// phase picks a `starting` task up again; `task retry` does).
+    /// `starting` row was written can leave it without a session; the next
+    /// tick's recovery phase reconciles it before launching more work.
     async fn start_task(&mut self, mut task: Task, model: ModelTier, decision: &Decision, now: DateTime<Utc>) -> Result<Started> {
         if !self.refresh_launch_permissions(&mut task).await? {
             return Ok(Started::CrashedBeforeLaunch);
@@ -3240,7 +3326,7 @@ impl Daemon {
         let start = launch::on_starting(&mut task, &model, decision, &cfg, &root, relaunch.is_some() || answer.is_some())
             .context("source approval is required before launch")?;
         launch::claim(&mut task, &start);
-        if !self.store.claim_task_start(&before, &task)? {
+        if !self.store.claim_task_start_with_target(&before, &task, Some(&self.launch_target(&cfg, &task)))? {
             bail!("task {} changed before launch; its project and state will be reconsidered next tick", task.key);
         }
         self.log_only(&task, None, start.effects.clone());
@@ -3543,7 +3629,9 @@ impl Daemon {
                 ("POWERQUEUE_DATA_DIR".to_string(), self.paths.data_dir.display().to_string()),
                 ("POWERQUEUE_STATE_DIR".to_string(), self.paths.state_dir.display().to_string()),
             ];
-            let output = run_commands(worktree, &cfg.repo.setup, &env).context("repo.setup commands")?;
+            let lease = self.paths.task_dir(&task.id.to_string()).join("setup.lock");
+            let output = crate::worktree::run_commands_with_lease(worktree, &cfg.repo.setup, &env, &lease)
+                .context("repo.setup commands")?;
             self.log(Some(task.id), None, EventLevel::Debug, "worktree.setup", "setup commands finished", serde_json::json!({ "output": output.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect::<String>() }));
         }
         // A reused branch keeps the base recorded when it was created.
