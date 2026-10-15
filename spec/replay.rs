@@ -18,6 +18,10 @@ use serde::Serialize;
 
 const SPEC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/spec");
 const STUTTERS: &[&str] = &[
+    // Circuit events do not change task lifecycle; pass admission is not replayed.
+    "launch.failure",
+    "launch.claim_superseded",
+    "launch.recovered",
     "task.updated",
     "task.models_changed",
     "task.project_bound",

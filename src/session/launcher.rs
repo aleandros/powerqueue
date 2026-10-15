@@ -31,6 +31,11 @@ use crate::session::agent::{LaunchContext, agent_for};
 use crate::tmux::{Tmux, shell_quote};
 use crate::worktree::branch_name;
 
+/// Typed evidence that shared tmux infrastructure failed during launch.
+#[derive(Debug, thiserror::Error)]
+#[error("tmux launch infrastructure failed")]
+pub struct RuntimeLaunchFailure;
+
 /// Tool rules every session gets so the completion protocol never waits on a
 /// permission prompt. Users extend the list with `claude.allowed_tools`.
 pub const ALWAYS_ALLOWED_TOOLS: [&str; 1] = ["Bash(powerqueue task *)"];
@@ -546,8 +551,11 @@ impl Launcher {
             .pre_launch(cfg, &cfg.repo_path(), worktree)
             .with_context(|| format!("pre-launch step of {} for {}", plan.provider, task.key))?;
         let tmux_session = cfg.tmux.session_name.clone();
-        self.tmux.ensure_session(&tmux_session, &cfg.repo_path())?;
-        let window = self.tmux.new_window(&tmux_session, &task.slug(), worktree, &plan.shell_command, cfg.tmux.remain_on_exit)?;
+        self.tmux.ensure_session(&tmux_session, &cfg.repo_path()).context(RuntimeLaunchFailure)?;
+        let window = self
+            .tmux
+            .new_window(&tmux_session, &task.slug(), worktree, &plan.shell_command, cfg.tmux.remain_on_exit)
+            .context(RuntimeLaunchFailure)?;
         let now = Utc::now();
         tracing::info!(
             task = %task.key,

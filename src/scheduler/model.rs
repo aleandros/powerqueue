@@ -863,6 +863,7 @@ proptest! {
 /// How a start that the planner handed out ends in `start_task`.
 #[derive(Debug, Clone)]
 enum LaunchOutcome {
+    ClaimLost,
     ApprovalLost,
     RouteChanged,
     /// The session launched (`on_launched`).
@@ -870,14 +871,15 @@ enum LaunchOutcome {
         answered: bool,
     },
     /// The worktree or the launcher failed first (`on_crash` without a session).
-    Failed(String),
+    Failed(String, super::launch_failures::FailureScope),
 }
 
 fn launch_outcome() -> impl Strategy<Value = LaunchOutcome> {
     prop_oneof![
         3 => any::<bool>().prop_map(|answered| LaunchOutcome::Launched { answered }),
-        1 => line().prop_map(LaunchOutcome::Failed),
+        2 => (line(), crate::strategies::launch_failure_scope()).prop_map(|(reason, scope)| LaunchOutcome::Failed(reason, scope)),
         1 => Just(LaunchOutcome::ApprovalLost),
+        1 => Just(LaunchOutcome::ClaimLost),
         1 => Just(LaunchOutcome::RouteChanged),
     ]
 }
@@ -939,6 +941,7 @@ struct DaemonWorld {
     rate_limits: RateLimitState,
     estimator: Estimator,
     scheduling_paused: bool,
+    launch_failures: super::launch_failures::LaunchFailures,
 }
 
 impl DaemonWorld {
@@ -1068,7 +1071,10 @@ impl DaemonWorld {
         let margin = (1.0 - self.cfg.budget.safety_margin).max(0.0);
         let mut planner = LaunchPlanner::new(self.estimator.clone(), self.ledgers.clone(), candidates, slots);
         let mut outcomes = outcomes.iter();
-        while let Some(candidate) = planner.next_for_projects(&self.cfg.budget, &self.rules, &self.rate_limits, now) {
+        loop {
+            planner.set_failures(self.launch_failures.clone());
+            let Some(candidate) = planner.next_for_projects(&self.cfg.budget, &self.rules, &self.rate_limits, now) else { break };
+            prop_assert!(self.launch_failures.permits(&candidate.task.execution_project, now), "held project was considered");
             let idx = self.tasks.iter().position(|t| t.task.id == candidate.task.id).expect("a candidate is one of the tasks");
             prop_assert_eq!(
                 &candidate.preferred,
@@ -1099,13 +1105,34 @@ impl DaemonWorld {
                         let mut rejected = task.clone();
                         prop_assert!(commands::bind_project(&mut rejected, checkout).is_err());
                         prop_assert_eq!(&rejected, task);
+                        self.launch_failures.failed(
+                            task,
+                            super::launch_failures::FailureScope::Project,
+                            "checkout binding changed".into(),
+                            now,
+                        );
+                        continue;
+                    }
+                    let outcome = outcomes.next().cloned().unwrap_or(LaunchOutcome::Launched { answered: false });
+                    if matches!(outcome, LaunchOutcome::ClaimLost) {
+                        let attempts = self.tasks[idx].task.attempts;
+                        let failures = self.launch_failures.clone();
+                        self.step(step, idx, &Op::Pause)?;
+                        prop_assert_eq!(self.tasks[idx].task.attempts, attempts);
+                        prop_assert_eq!(&self.launch_failures, &failures);
                         continue;
                     }
                     let started = self.step(step, idx, &Op::Start(model, candidate.decision.clone()))?;
                     prop_assert!(started.is_some(), "{what}: the start was refused");
                     prop_assert!(self.step(step, idx, &Op::Claim)?.is_some(), "{what}: the claim was refused");
-                    match outcomes.next().cloned().unwrap_or(LaunchOutcome::Launched { answered: false }) {
-                        LaunchOutcome::Failed(reason) => {
+                    match outcome {
+                        LaunchOutcome::Failed(reason, scope) => {
+                            let before_failure = planner.ledgers().clone();
+                            self.launch_failures.failed(&candidate.task, scope, reason.clone(), now);
+                            // Model daemon restart/persistence at every failure boundary.
+                            self.launch_failures =
+                                serde_json::from_str(&serde_json::to_string(&self.launch_failures).unwrap()).unwrap();
+                            prop_assert_eq!(planner.ledgers(), &before_failure, "failed start reserved budget");
                             prop_assert!(self.step(step, idx, &Op::LaunchFailed(reason))?.is_some(), "{what}: crash refused");
                             let state = self.tasks[idx].task.state;
                             prop_assert!(
@@ -1142,6 +1169,7 @@ impl DaemonWorld {
                             let answered = matches!(outcome, LaunchOutcome::Launched { answered: true });
                             prop_assert!(self.step(step, idx, &Op::Launched { answered })?.is_some(), "{what}: launch refused");
                             prop_assert_eq!(self.tasks[idx].task.state, TaskState::Running, "{}", what);
+                            self.launch_failures.succeeded(&candidate.task);
                             planner.started(&self.cfg.budget, &candidate);
                             pass.starts += 1;
                         }
@@ -1183,6 +1211,10 @@ impl DaemonWorld {
         // handed out (started, failed to start, or throttled).
         if pass.starts < slots {
             for id in &ready {
+                let task = &self.tasks.iter().find(|t| t.task.id == *id).unwrap().task;
+                if !self.launch_failures.permits(&task.execution_project, now) {
+                    continue;
+                }
                 prop_assert!(
                     pass.handed.iter().any(|(h, ..)| h == id),
                     "step {step} pass: a slot was free but {id} was not considered"
@@ -1335,6 +1367,7 @@ fn daemon_world() -> impl Strategy<Value = DaemonWorld> {
                 rate_limits,
                 estimator: Estimator::from_summaries(&[]),
                 scheduling_paused: false,
+                launch_failures: Default::default(),
             };
             for (id, settings) in ["default", "api", "web"].into_iter().zip(projects) {
                 world.set_project(id, &settings);

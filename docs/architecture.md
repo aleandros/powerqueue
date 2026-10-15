@@ -74,7 +74,13 @@ share `LaunchPlanner` with the daemon (`budget plan` runs `plan_all`). The
 planner owns the estimator and a copy of the ledgers (reservations within a
 pass) and borrows the budget config, rules and rate limits per step through
 `LaunchContext`, so a rate limit marked by a failed start is seen by the next
-candidate of the same pass. `task pause|resume|cancel|retry` applied offline by
+candidate of the same pass. The daemon supplies persisted project/global launch
+holds through `set_failures` before each selection. The pure `launch_failures`
+policy escalates repeated setup failures, computes backoff and reports recovery;
+the daemon classifies operation errors, saves the state and logs its effects.
+Failed launches reserve no budget or slots. See [failure scopes and recovery](troubleshooting.md#launch-failures-shared-by-a-project-or-machine).
+`budget plan` and priority simulations remain hypothetical successful launches;
+they do not read these runtime infrastructure holds. `task pause|resume|cancel|retry` applied offline by
 the CLI (no daemon) call the same `commands::*` transitions.
 
 ### Testing the core

@@ -766,6 +766,12 @@ pub fn routing_case() -> impl Strategy<Value = (crate::config::Config, Task)> {
     })
 }
 
+/// Failure domains seen while starting a task.
+pub fn launch_failure_scope() -> impl Strategy<Value = crate::scheduler::launch_failures::FailureScope> {
+    use crate::scheduler::launch_failures::FailureScope;
+    prop::sample::select(vec![FailureScope::Task, FailureScope::Project, FailureScope::Global])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

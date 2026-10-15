@@ -699,3 +699,45 @@ the sources as disabled (the overrides can enable them). Restore the checkout
 and fix its overrides. To retire it, first migrate its source settings into
 `config.toml`, then remove the legacy `[repo]` entry and deliberately update any
 remaining tasks/source mappings. `doctor` identifies unreadable legacy overrides.
+
+### Launch failures shared by a project or machine
+
+`doctor` reports **Launch backoff** with the original error, affected project (or
+`global`), failure count and next probe time. `launch.failure` and
+`launch.recovered` events record the decisions. Deferred tasks stay in their
+existing states and consume no attempts, slots or predicted budget.
+
+The scheduler uses the following failure scopes:
+
+| Evidence | Action |
+| --- | --- |
+| One `repo.setup` command failure | Crash that task under its normal attempt limit/backoff and continue the pass, including its project. |
+| Two consecutive setup failures in a project without a successful launch | Defer that project; keep launching unrelated projects. |
+| Checkout, worktree, project config, prompt preparation or provider pre-launch error | Immediately defer that project. |
+| tmux launch infrastructure failure, resource exhaustion, or unexpected launch/store error | Stop launching globally. |
+| Approval/routing hold or a concurrent task change detected after setup | Preserve the existing hold; this is not infrastructure failure evidence. |
+
+A setup command's nonzero exit is ambiguous: it can depend on a task's branch,
+so one failure is allowed through. Two failures in the same project are treated
+conservatively as shared even if their error text differs. A successful launch
+in that project resets its failure streak; successes elsewhere do not.
+
+Project/global deferrals start at 30 seconds, double with consecutive failures,
+and cap at 15 minutes. Escalation after two setup failures starts at 60 seconds.
+After expiry the next eligible task probes recovery. A failed probe renews the
+hold before another affected candidate is tried. A successful probe clears its
+project hold and any global hold. Holds and streaks persist in SQLite across
+passes/restarts; expiry alone never resets the streak. Existing task retry times,
+attempt limits, source approval and project routing still apply. There is no
+automatic resurrection of failed tasks: repair permanent configuration errors
+and use `task retry` on exhausted tasks. Retrying does not bypass a circuit hold.
+`doctor --fix` does not clear it either.
+
+Storage exhaustion is recognized from OS errors and common subprocess stderr
+messages (`No space left on device`, `Disk quota exceeded`, `Too many open files`).
+Opaque subprocess errors remain scoped to their operation; no general error-text
+heuristic can identify every machine outage. A tmux failure conservatively stops
+all new launches because the daemon shares that runtime. Existing sessions keep
+being monitored. If storage cannot save the hold, the running daemon retains it
+in memory and reports the persistence error; durability across a restart requires
+the database to accept writes again.

@@ -23,6 +23,7 @@
 pub mod commands;
 pub mod daemon;
 pub mod launch;
+pub mod launch_failures;
 pub mod lifecycle;
 #[cfg(test)]
 mod model;
