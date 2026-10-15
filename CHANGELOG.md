@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-15
+
 ### Fixed
+
+- Bound shared launch failures with persistent project/global backoff. Isolated
+  setup failures allow other work; repeated setup failures defer that project,
+  and shared runtime or storage failures stop launching globally. Failed starts
+  reserve no capacity or predicted budget. Doctor and events expose the failure,
+  retry deadline and recovery; Rust stateful properties, Quint simulations and
+  daemon integration tests cover isolation, restart, bounded attempts and recovery.
 
 - Accept dead tmux panes whose process ID has been cleared after exit, so crash
   detection and retry continue to work on current macOS tmux versions.
@@ -1031,7 +1040,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/aleandros/powerqueue/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/aleandros/powerqueue/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.16.0
 [0.15.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.15.0

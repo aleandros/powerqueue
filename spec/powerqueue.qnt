@@ -98,6 +98,14 @@ module powerqueue {
   var considered: Set[int]
   var inPass: bool
   var schedulingPaused: bool
+  // Abstract seconds: backoff 1,2,4,8 represents production 30s..15m.
+  // -1 is the machine; other keys are execution projects.
+  val failureDomains = projects.union(Set(-1))
+  var failureCount: int -> int
+  var failureUntil: int -> int
+  val failureVars = (failureCount, failureUntil)
+  def launchPermitted(id: int): bool = failureUntil.get(-1) <= now and failureUntil.get(project.get(id)) <= now
+  action keepFailures = all { failureCount' = failureCount, failureUntil' = failureUntil }
   // A checkout is an opaque identity, distinct from a project ID. Moving a
   // configured checkout must never redirect an already-bound task.
   var project: int -> int
@@ -134,10 +142,11 @@ module powerqueue {
   val live = ids.filter(i => tasks.get(i).live).size()
   val starting = ids.filter(i => tasks.get(i).state == "starting")
   val stable = starting.size() == 0
-  val vars = (tasks, now, spent, limitedUntil, considered, inPass, schedulingPaused, projectVars)
+  val vars = (tasks, now, spent, limitedUntil, considered, inPass, schedulingPaused, projectVars, failureVars)
 
   action init = all {
     tasks' = ids.mapBy(_ => fresh), now' = 0,
+    failureCount' = failureDomains.mapBy(_ => 0), failureUntil' = failureDomains.mapBy(_ => -1),
     spent' = providers.mapBy(_ => 0), limitedUntil' = providers.mapBy(_ => -1),
     considered' = Set(), inPass' = false, schedulingPaused' = false,
     project' = ids.mapBy(i => i), checkout' = projects.mapBy(p => p), available' = projects,
@@ -147,7 +156,7 @@ module powerqueue {
     lastRepoTask' = -1, lastRepoProject' = -1, lastRepoCheckout' = -1,
   }
 
-  action keepClock = all { now' = now, limitedUntil' = limitedUntil }
+  action keepClock = all { now' = now, limitedUntil' = limitedUntil, keepFailures }
   action keepPass = all { spent' = spent, considered' = considered, inPass' = inPass, schedulingPaused' = schedulingPaused }
 
   action beginPass = all {
@@ -159,11 +168,12 @@ module powerqueue {
   action endPass = all {
     keepProjects,
     stable, inPass,
-    ids.forall(i => not(ready(tasks.get(i), now)) or not(available.contains(project.get(i))) or considered.contains(i) or live >= maxConcurrent),
+    ids.forall(i => not(ready(tasks.get(i), now)) or not(launchPermitted(i)) or not(available.contains(project.get(i))) or considered.contains(i) or live >= maxConcurrent),
     inPass' = false, considered' = considered, spent' = spent,
     tasks' = tasks, schedulingPaused' = schedulingPaused, keepClock,
   }
   action start(id: int): bool = all {
+    launchPermitted(id),
     available.contains(project.get(id)), checkoutMatches(id),
     project' = project, checkout' = checkout, available' = available,
     boundProject' = boundProject.set(id, project.get(id)),
@@ -185,9 +195,12 @@ module powerqueue {
     allowed(tasks.get(id), "Launch", now, -1, maxAttempts),
     tasks' = tasks.set(id, advance(tasks.get(id), "Launch", -1)),
     spent' = spent.setBy(provider(id), n => n + 1),
-    considered' = considered, inPass' = inPass, schedulingPaused' = schedulingPaused, keepClock,
+    considered' = considered, inPass' = inPass, schedulingPaused' = schedulingPaused, now' = now, limitedUntil' = limitedUntil,
+    failureCount' = failureCount.set(-1, 0).set(project.get(id), 0),
+    failureUntil' = failureUntil.set(-1, -1).set(project.get(id), -1),
   }
   action throttle(id: int): bool = all {
+    launchPermitted(id),
     keepProjects, available.contains(project.get(id)),
     stable, inPass, not(considered.contains(id)), live < maxConcurrent,
     limitedUntil.get(provider(id)) > now or spent.get(provider(id)) + 1 > budget,
@@ -199,7 +212,9 @@ module powerqueue {
     considered' = considered.union(Set(id)), spent' = spent, inPass' = inPass,
     schedulingPaused' = schedulingPaused, keepClock,
   }
-  action crash(id: int): bool = all {
+  action crash(id: int): bool = crashScoped(id, "task")
+  action crashScoped(id: int, scope: str): bool = all {
+    scope == "task" or tasks.get(id).state == "starting",
     keepProjects,
     // A failed start is resolved within the pass; running crashes between passes.
     (tasks.get(id).state == "starting") or (stable and not(inPass)),
@@ -208,7 +223,15 @@ module powerqueue {
       allowed(tasks.get(id), op, now, now + delay(usedAttempts(tasks.get(id))), maxAttempts),
       tasks' = tasks.set(id, advance(tasks.get(id), op, now + delay(usedAttempts(tasks.get(id))))),
     },
-    keepPass, keepClock,
+    keepPass, now' = now, limitedUntil' = limitedUntil,
+    val startingFailure = tasks.get(id).state == "starting"
+    val domain = if (scope == "global") -1 else project.get(id)
+    val count = if (failureCount.get(domain) < 4) failureCount.get(domain) + 1 else 4
+    all {
+      failureCount' = if (startingFailure) failureCount.set(domain, count) else failureCount,
+      failureUntil' = if (startingFailure and (scope != "task" or count >= 2))
+        failureUntil.set(domain, now + List(1, 2, 4, 8).nth(count - 1)) else failureUntil,
+    },
   }
   action command(id: int, op: str): bool = all {
     keepProjects,
@@ -216,12 +239,14 @@ module powerqueue {
     tasks' = tasks.set(id, advance(tasks.get(id), op, -1)), keepPass, keepClock,
   }
   action rateLimit(id: int): bool = all {
+    keepFailures,
     keepProjects,
     stable, not(inPass), allowed(tasks.get(id), "RateLimit", now, now + 2, maxAttempts),
     tasks' = tasks.set(id, advance(tasks.get(id), "RateLimit", now + 2)),
     limitedUntil' = limitedUntil.set(provider(id), now + 2), now' = now, keepPass,
   }
   action tick = all {
+    keepFailures,
     keepProjects,
     stable, not(inPass), now' = now + 1,
     limitedUntil' = providers.mapBy(p => if (limitedUntil.get(p) <= now + 1) -1 else limitedUntil.get(p)),
@@ -288,13 +313,14 @@ module powerqueue {
     keepProjects, keepPass, keepClock,
   }
   action step = {
+    nondet scope = Set("task", "project", "global").oneOf()
     nondet id = ids.oneOf()
     nondet p = projects.oneOf()
     nondet present = Set(false, true).oneOf()
     nondet revision = Set(0, 1).oneOf()
     nondet op = Set("Finish", "Complete", "Release", "Wake", "Pause", "Resume", "Cancel", "Retry", "Idle", "Block", "Progress",
       "DependencyBlock", "Unblock", "HandOff", "ReviewRelease", "ReviewRetry", "Merge").oneOf()
-    any { beginPass, endPass, start(id), launch(id), throttle(id), crash(id), command(id, op), rateLimit(id), tick, pauseScheduling, reassign(id, p), configure(p, present, revision), rejectCheckout(id), repositoryOp(id), admission(id, present), routing(id, present), hold(id) }
+    any { beginPass, endPass, start(id), launch(id), throttle(id), crashScoped(id, scope), command(id, op), rateLimit(id), tick, pauseScheduling, reassign(id, p), configure(p, present, revision), rejectCheckout(id), repositoryOp(id), admission(id, present), routing(id, present), hold(id) }
   }
 
   val projectSafety = all {
@@ -407,6 +433,19 @@ module powerqueue {
     .expect(safety and tasks.get(0).attempts == 2 and usedAttempts(tasks.get(0)) == 1)
     .then(command(0, "HandOff")).then(command(0, "ReviewRelease")).then(command(0, "Merge"))
     .expect(safety and tasks.get(0).state == "completed" and not(tasks.get(0).live))
+  run projectFailureDefersPeersTest = init.then(reassign(2, 0))
+    .then(beginPass).then(start(0)).then(crashScoped(0, "project"))
+    .expect(not(launchPermitted(2)) and launchPermitted(1) and spent.get(0) == 0 and live == 0)
+    .then(start(1)).then(launch(1)).then(endPass).then(tick)
+    .then(beginPass).then(start(0)).then(launch(0))
+    .expect(safety and failureCount.get(0) == 0 and launchPermitted(2))
+  run globalFailureStopsPassTest = init.then(beginPass).then(start(0)).then(crashScoped(0, "global"))
+    .then(endPass).expect(safety and ids.forall(i => not(launchPermitted(i))) and live == 0 and spent.get(0) == 0)
+    .then(tick).then(beginPass).then(start(0)).then(launch(0))
+    .expect(safety and failureCount.get(-1) == 0 and launchPermitted(1))
+  run repeatedSetupFailureDefersProjectTest = init.then(reassign(1, 0)).then(reassign(2, 0))
+    .then(beginPass).then(start(0)).then(crash(0)).then(start(1)).then(crash(1)).then(endPass)
+    .expect(safety and tasks.get(2).attempts == 0 and failureCount.get(0) == 2 and spent.get(0) == 0 and spent.get(1) == 0)
   run failedStartFreesSlotTest = init.then(beginPass).then(start(0)).then(crash(0))
     .then(start(1)).then(launch(1)).then(start(2)).then(launch(2))
     .expect(safety and live == 2 and spent.get(0) == 1)

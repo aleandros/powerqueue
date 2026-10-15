@@ -1292,6 +1292,76 @@ fn execution_project_failure_does_not_prevent_another_project_launch() {
 }
 
 #[test]
+fn launch_failure_scope_task_setup_continues_same_project() {
+    let Some(mut env) = Env::new("complete", "max_concurrent = 1\nmax_attempts = 1\npr_poll_secs = 0") else { return };
+    let failed = add_task(&env, "Task-specific setup", &[]);
+    let healthy = add_task(&env, "Healthy same project", &[]);
+    std::fs::write(
+        env.root.path().join("repo/.powerqueue.toml"),
+        format!("setup = ['test \"$POWERQUEUE_TASK_KEY\" != \"{failed}\"']\n"),
+    )
+    .unwrap();
+    env.start_daemon();
+    assert_eq!(env.wait_for_state(&healthy, "completed", Duration::from_secs(60)), "completed", "{}", env.daemon_log());
+    assert_eq!(env.task_state(&failed), "failed");
+    let show = env.wait_for_show(&failed, |v| has_event(v, "launch.failure"));
+    assert!(has_event(&show, "launch.failure"));
+}
+
+#[test]
+fn launch_failure_scope_shared_setup_bounds_attempts_and_recovers_after_restart() {
+    use powerqueue::scheduler::launch_failures::{KEY, LaunchFailures};
+    let Some(mut env) = Env::new("complete", "max_concurrent = 1\nmax_attempts = 1\npr_poll_secs = 0") else { return };
+    register_execution_project(&env);
+    let config = env.root.path().join("repo/.powerqueue.toml");
+    std::fs::write(&config, "setup = ['exit 1']\n").unwrap();
+    let failed: Vec<_> = (0..5).map(|i| add_task(&env, &format!("Broken setup {i}"), &[])).collect();
+    let healthy = add_task(&env, "Unrelated project", &["--project", "api"]);
+    env.start_daemon();
+    assert_eq!(env.wait_for_state(&healthy, "completed", Duration::from_secs(60)), "completed", "{}", env.daemon_log());
+    assert_eq!(failed.iter().filter(|k| env.task_state(k) == "failed").count(), 2);
+    assert_eq!(failed.iter().filter(|k| env.task_state(k) == "queued").count(), 3);
+    let doctor = env.cmd().args(["doctor", "--offline", "--json"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("Launch backoff"));
+    env.daemon.as_mut().unwrap().kill().unwrap();
+    env.daemon.as_mut().unwrap().wait().unwrap();
+    env.start_daemon();
+    // Let the restarted daemon run several ticks inside the persisted hold.
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(failed.iter().filter(|k| env.task_state(k) == "queued").count(), 3);
+    env.daemon.as_mut().unwrap().kill().unwrap();
+    env.daemon.as_mut().unwrap().wait().unwrap();
+    std::fs::write(&config, "setup = []\n").unwrap();
+    let store = powerqueue::store::Store::open(&env.home().join("data/powerqueue.db")).unwrap();
+    let mut state: LaunchFailures = store.kv_get(KEY).unwrap().unwrap();
+    // Advance only the circuit deadline, avoiding a minute-long wall-clock test.
+    state.projects.get_mut("default").unwrap().retry_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+    store.kv_set(KEY, &state).unwrap();
+    env.start_daemon();
+    for key in &failed[2..] {
+        assert_eq!(env.wait_for_state(key, "completed", Duration::from_secs(60)), "completed", "{}", env.daemon_log());
+    }
+    assert!(store.kv_get::<LaunchFailures>(KEY).unwrap().unwrap().projects.is_empty());
+}
+
+#[test]
+fn launch_failure_scope_full_disk_stops_all_projects() {
+    let Some(mut env) = Env::new("complete", "max_concurrent = 1\nmax_attempts = 1\npr_poll_secs = 0") else { return };
+    register_execution_project(&env);
+    std::fs::write(env.root.path().join("repo/.powerqueue.toml"), "setup = ['echo No space left on device >&2; exit 1']\n")
+        .unwrap();
+    let failed = add_task(&env, "Full disk", &[]);
+    let untouched = add_task(&env, "Other project", &["--project", "api"]);
+    env.start_daemon();
+    let show = env.wait_for_show(&failed, |v| has_event(v, "launch.failure"));
+    assert!(has_event(&show, "launch.failure"), "{}", env.daemon_log());
+    std::thread::sleep(Duration::from_secs(3));
+    let show: serde_json::Value = serde_json::from_str(&env.run_ok(&["--json", "task", "show", &untouched])).unwrap();
+    assert_eq!(show["task"]["attempts"], 0);
+    assert_eq!(show["task"]["state"], "queued");
+}
+
+#[test]
 fn execution_projects_push_and_clean_up_only_their_own_repositories() {
     let Some(mut env) = Env::new("complete", "max_concurrent = 2\npr_poll_secs = 0") else { return };
     let second_repo = register_execution_project(&env);

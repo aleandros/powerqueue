@@ -46,6 +46,7 @@ use crate::worktree::{BasePreference, FastForward, Repo};
 
 use super::commands;
 use super::launch::{self, Candidate, LaunchContext, LaunchPlanner};
+use super::launch_failures::{FailureScope, LaunchFailures};
 use super::lifecycle::{PENDING_CLEANUP_KEY, PendingCleanup, cleanup_task};
 use super::relay::{self, PostedQuestion, RelayState, relay_key};
 use super::review;
@@ -166,6 +167,7 @@ struct RuntimeState {
     readers: HashMap<uuid::Uuid, TranscriptReader>,
     nudged: HashSet<uuid::Uuid>,
     rate_limits: RateLimitState,
+    launch_failures: LaunchFailures,
     github: HashMap<String, GitHubRuntime>,
     linear: Option<LinearClient>,
     linear_warned: bool,
@@ -222,14 +224,35 @@ pub struct Daemon {
 }
 
 /// How [`Daemon::start_task`] ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Started {
     /// The session launched: its slot is used and its cost reserved.
     Launched,
-    /// The worktree, the setup or the launcher failed first; the task is
-    /// crashed with a backoff and its slot is free for the next candidate
-    /// of the pass.
-    CrashedBeforeLaunch,
+    /// Admission or a concurrent task update superseded this candidate.
+    Skipped,
+    /// A failed operation; no slot or predicted budget was reserved.
+    Failed(FailureScope, String),
+}
+
+/// Typed stage evidence; a command's nonzero exit alone does not prove a shared outage.
+#[derive(Debug, thiserror::Error)]
+#[error("repo.setup commands")]
+struct SetupCommandFailure;
+
+fn failure_scope(error: &anyhow::Error, fallback: FailureScope) -> FailureScope {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    if error.downcast_ref::<crate::session::launcher::RuntimeLaunchFailure>().is_some()
+        || error
+            .chain()
+            .any(|e| e.downcast_ref::<std::io::Error>().is_some_and(|e| matches!(e.raw_os_error(), Some(28 | 23 | 24))))
+        || ["no space left on device", "disk quota exceeded", "too many open files"].iter().any(|s| message.contains(s))
+    {
+        FailureScope::Global
+    } else if error.downcast_ref::<SetupCommandFailure>().is_some() {
+        FailureScope::Task
+    } else {
+        fallback
+    }
 }
 
 impl Daemon {
@@ -257,6 +280,10 @@ impl Daemon {
             readers: HashMap::new(),
             nudged: HashSet::new(),
             rate_limits,
+            launch_failures: store
+                .kv_get(super::launch_failures::KEY)
+                .context("read launch failure backoff")?
+                .unwrap_or_default(),
             github: HashMap::new(),
             linear: None,
             linear_warned: false,
@@ -3177,6 +3204,7 @@ impl Daemon {
         self.rt.rate_limits.clear_expired(now);
         let mut planner = LaunchPlanner::new(estimator, ledgers, tasks, slots);
         loop {
+            planner.set_failures(self.rt.launch_failures.clone());
             let candidate = if self.cfg.projects.is_empty() {
                 planner.next(self.launch_context(), now)
             } else {
@@ -3189,10 +3217,24 @@ impl Daemon {
                 Some(model) => {
                     let (key, id) = (task.key.clone(), task.id);
                     match self.start_task(task, model, &decision, now).await {
-                        Ok(Started::Launched) => planner.started(&self.cfg.budget, &candidate),
+                        Ok(Started::Launched) => {
+                            planner.started(&self.cfg.budget, &candidate);
+                            let effects = self.rt.launch_failures.succeeded(&candidate.task);
+                            self.log_only(&candidate.task, None, effects);
+                            self.store.kv_set(super::launch_failures::KEY, &self.rt.launch_failures)?;
+                        }
+                        Ok(Started::Failed(scope, reason)) => {
+                            self.record_launch_failure(&candidate.task, scope, reason, now.max(Utc::now()))?;
+                        }
                         // The slot and the budget go to the next candidate.
-                        Ok(Started::CrashedBeforeLaunch) => {}
+                        Ok(Started::Skipped) => {}
                         Err(e) => {
+                            self.record_launch_failure(
+                                &candidate.task,
+                                FailureScope::Global,
+                                format!("{e:#}"),
+                                now.max(Utc::now()),
+                            )?;
                             tracing::error!(task = %key, error = %format!("{e:#}"), "start failed");
                             self.log(
                                 Some(id),
@@ -3208,6 +3250,13 @@ impl Daemon {
             }
         }
         Ok(())
+    }
+
+    fn record_launch_failure(&mut self, task: &Task, scope: FailureScope, reason: String, now: DateTime<Utc>) -> Result<()> {
+        let effects = self.rt.launch_failures.failed(task, scope, reason, now);
+        self.log_only(task, None, effects);
+        // Keep the in-memory hold even if the same disk failure prevents saving it.
+        self.store.kv_set(super::launch_failures::KEY, &self.rt.launch_failures).context("persist launch failure backoff")
     }
 
     fn throttle(&mut self, mut task: Task, decision: &Decision, now: DateTime<Utc>) -> Result<()> {
@@ -3305,15 +3354,18 @@ impl Daemon {
 
     /// Create the worktree, run setup, launch the agent and record the
     /// session. A worktree, setup or launcher failure is not an error: the
-    /// task is crashed with a backoff and [`Started::CrashedBeforeLaunch`]
-    /// says its slot is free again. `Err` is a store failure; one after the
+    /// task is crashed with a backoff and [`Started::Failed`]
+    /// reports the scope without reserving a slot or budget. `Err` is a store failure; one after the
     /// `starting` row was written can leave it without a session; the next
     /// tick's recovery phase reconciles it before launching more work.
     async fn start_task(&mut self, mut task: Task, model: ModelTier, decision: &Decision, now: DateTime<Utc>) -> Result<Started> {
         if !self.refresh_launch_permissions(&mut task).await? {
-            return Ok(Started::CrashedBeforeLaunch);
+            return Ok(Started::Skipped);
         }
-        let cfg = self.cfg.for_task(&task, &self.paths)?;
+        let cfg = match self.cfg.for_task(&task, &self.paths) {
+            Ok(cfg) => cfg,
+            Err(e) => return Ok(Started::Failed(failure_scope(&e, FailureScope::Project), format!("{e:#}"))),
+        };
         // A review round resumes the session that armed the merge, in the
         // same worktree path, told only what changed on the PR.
         let relaunch = task.review_relaunch().cloned();
@@ -3327,7 +3379,15 @@ impl Daemon {
             .context("source approval is required before launch")?;
         launch::claim(&mut task, &start);
         if !self.store.claim_task_start_with_target(&before, &task, Some(&self.launch_target(&cfg, &task)))? {
-            bail!("task {} changed before launch; its project and state will be reconsidered next tick", task.key);
+            self.log(
+                Some(task.id),
+                None,
+                EventLevel::Info,
+                "launch.claim_superseded",
+                "task changed before launch; reconsider its project and state next tick",
+                serde_json::json!({}),
+            );
+            return Ok(Started::Skipped);
         }
         self.log_only(&task, None, start.effects.clone());
         // The claim is durable before setup and the second approval read,
@@ -3356,15 +3416,15 @@ impl Daemon {
             let effects =
                 transitions::on_crash(&mut task, None, &format!("worktree setup failed: {e:#}"), None, &cfg.scheduler, now, None);
             self.commit(&before, &mut task, None, effects).await?;
-            return Ok(Started::CrashedBeforeLaunch);
+            return Ok(Started::Failed(failure_scope(&e, FailureScope::Project), format!("{e:#}")));
         }
 
         // Setup may take minutes. Recheck immediately before preparing the agent,
         // preserving any work already created if routing or approval changed meanwhile.
         {
-            let Some(mut fresh) = self.store.get_task(task.id)? else { return Ok(Started::CrashedBeforeLaunch) };
+            let Some(mut fresh) = self.store.get_task(task.id)? else { return Ok(Started::Skipped) };
             if fresh.state != TaskState::Starting {
-                return Ok(Started::CrashedBeforeLaunch);
+                return Ok(Started::Skipped);
             }
             if !self.refresh_launch_permissions(&mut fresh).await? {
                 // Reload so a concurrent cancellation/pause is never replaced by our hold.
@@ -3389,7 +3449,7 @@ impl Daemon {
                     effects.extend(transitions::on_github_launch_held(&mut current));
                     self.commit(&before, &mut current, None, effects).await?;
                 }
-                return Ok(Started::CrashedBeforeLaunch);
+                return Ok(Started::Skipped);
             }
             task = fresh;
         }
@@ -3457,7 +3517,7 @@ impl Daemon {
                 let effects =
                     transitions::on_crash(&mut task, None, &format!("launch failed: {e:#}"), None, &cfg.scheduler, now, None);
                 self.commit(&before, &mut task, None, effects).await?;
-                return Ok(Started::CrashedBeforeLaunch);
+                return Ok(Started::Failed(failure_scope(&e, FailureScope::Project), format!("{e:#}")));
             }
         };
         if resume && let Some(p) = previous.as_ref().filter(|p| p.id == session.id) {
@@ -3630,8 +3690,8 @@ impl Daemon {
                 ("POWERQUEUE_STATE_DIR".to_string(), self.paths.state_dir.display().to_string()),
             ];
             let lease = self.paths.task_dir(&task.id.to_string()).join("setup.lock");
-            let output = crate::worktree::run_commands_with_lease(worktree, &cfg.repo.setup, &env, &lease)
-                .context("repo.setup commands")?;
+            let output =
+                crate::worktree::run_commands_with_lease(worktree, &cfg.repo.setup, &env, &lease).context(SetupCommandFailure)?;
             self.log(Some(task.id), None, EventLevel::Debug, "worktree.setup", "setup commands finished", serde_json::json!({ "output": output.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect::<String>() }));
         }
         // A reused branch keeps the base recorded when it was created.
@@ -4343,11 +4403,56 @@ mod tests {
         assert_ne!(t.state, TaskState::Queued, "resumed: the task was considered (started or failed to start): {:?}", t.state);
     }
 
-    /// A start that fails before the launch (here: the repository does not
-    /// exist, so the worktree cannot be created) crashes its task and hands
-    /// the slot to the next candidate of the same pass.
+    #[test]
+    fn launch_failure_classification_uses_stage_and_resource_evidence() {
+        for errno in [28, 23, 24] {
+            let error = anyhow::Error::new(std::io::Error::from_raw_os_error(errno)).context(SetupCommandFailure);
+            assert_eq!(failure_scope(&error, FailureScope::Project), FailureScope::Global);
+        }
+        let setup = anyhow::anyhow!("command exited 1").context(SetupCommandFailure);
+        assert_eq!(failure_scope(&setup, FailureScope::Project), FailureScope::Task);
+        let disk = anyhow::anyhow!("git: No space left on device");
+        assert_eq!(failure_scope(&disk, FailureScope::Project), FailureScope::Global);
+        let config = anyhow::anyhow!("unknown configuration field");
+        assert_eq!(failure_scope(&config, FailureScope::Project), FailureScope::Project);
+        let tmux = config.context(crate::session::launcher::RuntimeLaunchFailure);
+        assert_eq!(failure_scope(&tmux, FailureScope::Project), FailureScope::Global);
+    }
+
     #[tokio::test]
-    async fn a_failed_start_frees_its_slot_for_the_next_candidate() {
+    async fn superseded_claim_does_not_open_a_launch_circuit() {
+        use crate::domain::{Criticality, Task, TaskSource};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let store = Store::open(&db).unwrap();
+        let (mut daemon, _mock, _server) = dependency_daemon(&store, dir.path()).await;
+        let now = Utc::now();
+        daemon.refresh_rules(now).await.unwrap();
+        let mut task = Task::new("RACE", "paused during claim", TaskSource::Manual);
+        task.criticality = Criticality::Critical;
+        store.insert_task(&task).unwrap();
+        // Interleave a legitimate pause exactly at the claim boundary.
+        let writer = rusqlite::Connection::open(&db).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TRIGGER supersede_start BEFORE UPDATE ON tasks
+            WHEN NEW.state = 'starting' BEGIN
+            UPDATE tasks SET state = 'paused' WHERE id = NEW.id;
+            SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+        daemon.launch_tasks(now).await.unwrap();
+        let fresh = store.get_task(task.id).unwrap().unwrap();
+        assert_eq!(fresh.state, TaskState::Paused);
+        assert_eq!(fresh.attempts, 0);
+        assert_eq!(daemon.rt.launch_failures, LaunchFailures::default());
+        assert_eq!(store.count_events_of_kind("launch.claim_superseded", now - Duration::minutes(1)).unwrap(), 1);
+        assert_eq!(store.count_events_of_kind("launch.failure", now - Duration::minutes(1)).unwrap(), 0);
+    }
+
+    /// A missing checkout consumes one attempt, then defers that project.
+    #[tokio::test]
+    async fn shared_checkout_failure_defers_remaining_tasks_across_passes_and_restart() {
         use crate::domain::{Criticality, Task, TaskSource};
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory().unwrap();
@@ -4364,18 +4469,25 @@ mod tests {
 
         daemon.launch_tasks(now).await.unwrap();
 
-        for key in ["SLOT-1", "SLOT-2"] {
-            let t = store.get_task_by_key(key).unwrap().unwrap();
-            assert_eq!(t.state, TaskState::Crashed, "{key}: {:?} {:?}", t.state, t.last_error);
-            assert_eq!(t.attempts, 1, "{key} was tried once");
-            assert!(t.last_error.as_deref().is_some_and(|e| e.contains("worktree setup failed")), "{key}: {:?}", t.last_error);
+        let first = store.get_task_by_key("SLOT-1").unwrap().unwrap();
+        assert_eq!(first.state, TaskState::Crashed);
+        assert_eq!(first.attempts, 1);
+        for _ in 0..10 {
+            daemon.launch_tasks(now).await.unwrap();
         }
+        // Reconstruct the daemon from the same database: backoff must survive.
+        let mut daemon =
+            Daemon::new(daemon.cfg.clone(), daemon.paths.clone(), store.clone(), Secrets::auto(&daemon.paths)).unwrap();
+        daemon.refresh_rules(now).await.unwrap();
+        daemon.launch_tasks(now).await.unwrap();
+        let second = store.get_task_by_key("SLOT-2").unwrap().unwrap();
+        assert_eq!(second.state, TaskState::Queued);
+        assert_eq!(second.attempts, 0);
         assert!(store.list_live_sessions().unwrap().is_empty());
-        assert_eq!(
-            store.count_events_of_kind("task.starting", now - Duration::minutes(1)).unwrap(),
-            2,
-            "both candidates were started in one pass"
-        );
+        let failures = store.kv_get::<LaunchFailures>(super::super::launch_failures::KEY).unwrap().unwrap();
+        assert!(!failures.permits("default", now));
+        assert!(failures.permits("api", now));
+        assert_eq!(store.count_events_of_kind("launch.failure", now - Duration::minutes(1)).unwrap(), 1);
     }
 
     #[tokio::test]

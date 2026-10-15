@@ -3,7 +3,8 @@
 //!
 //! The daemon drives a [`LaunchPlanner`] one candidate at a time ([`next`],
 //! then [`started`] once the session really launched, so a failed start
-//! frees its slot for the next candidate in the same tick); `budget plan`
+//! frees its slot for the next eligible candidate in the same tick). The daemon
+//! supplies persistent failure holds through [`LaunchPlanner::set_failures`]; `budget plan`
 //! takes the whole plan at once ([`plan_all`]). Everything in between
 //! (`git`, the launcher, tmux) stays in the daemon and reports back through
 //! [`on_starting`] / [`claim`] / [`on_launched`] /
@@ -83,6 +84,7 @@ pub struct LaunchPlanner {
     candidates: Vec<Task>,
     considered: HashSet<TaskId>,
     slots: u32,
+    failures: super::launch_failures::LaunchFailures,
 }
 
 impl LaunchPlanner {
@@ -90,7 +92,7 @@ impl LaunchPlanner {
     /// many sessions may still start. Expired rate-limit marks should be
     /// cleared by the caller first.
     pub fn new(estimator: Estimator, ledgers: Ledgers, candidates: Vec<Task>, slots: u32) -> Self {
-        Self { estimator, ledgers, candidates, considered: HashSet::new(), slots }
+        Self { estimator, ledgers, candidates, considered: HashSet::new(), slots, failures: Default::default() }
     }
 
     /// The next task to consider and the policy's decision for it: the best
@@ -102,7 +104,12 @@ impl LaunchPlanner {
             return None;
         }
         let task = {
-            let remaining: Vec<Task> = self.candidates.iter().filter(|t| !self.considered.contains(&t.id)).cloned().collect();
+            let remaining: Vec<Task> = self
+                .candidates
+                .iter()
+                .filter(|t| !self.considered.contains(&t.id) && self.failures.permits(&t.execution_project, now))
+                .cloned()
+                .collect();
             pick_next(&remaining, now).cloned()?
         };
         Some(self.decide(ctx, task, now))
@@ -123,12 +130,21 @@ impl LaunchPlanner {
         let remaining: Vec<_> = self
             .candidates
             .iter()
-            .filter(|t| !self.considered.contains(&t.id) && rules.contains_key(&t.execution_project))
+            .filter(|t| {
+                !self.considered.contains(&t.id)
+                    && rules.contains_key(&t.execution_project)
+                    && self.failures.permits(&t.execution_project, now)
+            })
             .cloned()
             .collect();
         let task = pick_next(&remaining, now)?.clone();
         let selected = rules.get(&task.execution_project)?;
         Some(self.decide(LaunchContext { budget, rules: selected, rate_limits: limits }, task, now))
+    }
+
+    /// Apply the current persistent failure holds before selecting the next task.
+    pub fn set_failures(&mut self, failures: super::launch_failures::LaunchFailures) {
+        self.failures = failures;
     }
 
     fn decide(&mut self, ctx: LaunchContext<'_>, task: Task, now: DateTime<Utc>) -> Candidate {

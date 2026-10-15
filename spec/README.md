@@ -273,3 +273,24 @@ rather than weakening the model to accept them.
 Use synthetic regression fixtures for invalid schedules, such as a second
 completion after a session has ended. Keep raw operational logs and generated
 traces outside version control.
+
+## Shared launch failures (0.18.0)
+
+The scheduler simulation includes project and global launch circuits. One setup
+failure continues the pass; a second consecutive failure in the project holds
+its remaining tasks. Explicit project/global failures hold immediately. Successful
+launches reset that project's streak and the global circuit; expiry only permits
+another probe. Abstract delays 1/2/4/8 represent production exponential backoff
+(30 seconds through 15 minutes), rather than wall-clock equivalence. Scenarios
+check same-project deferral, unrelated-project progress, global stop, no failed
+start reservation and recovery. Runtime crashes between passes do not open a
+launch circuit. The Rust whole-daemon model uses production circuit decisions,
+generated failure scopes and JSON persistence round trips; separate properties
+bound attempts over repeated passes and check recovery after time advances.
+
+Event replay treats `launch.failure` and `launch.recovered` as observational:
+they do not change a task's lifecycle, and replay has no pass boundary or complete
+queue with which to validate circuit admission. Simulation and integration tests
+cover that policy. Integration uses real git/tmux/setup commands, missing checkout
+and task-specific failures, and simulated full-disk stderr (without exhausting the
+host disk); native OS resource-error classification is tested separately.

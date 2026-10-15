@@ -1609,6 +1609,40 @@ fn pane_ids(tmux: &Tmux, session: &str) -> Option<Vec<crate::tmux::PaneInfo>> {
 
 /// Starting is owned by the daemon's serial launch loop. Doctor must not
 /// rewrite it while setup is in progress, even with a stale heartbeat.
+fn check_launch_failures(store: &Store) -> CheckResult {
+    use crate::scheduler::launch_failures::{KEY, LaunchFailures};
+    match store.kv_get::<LaunchFailures>(KEY) {
+        Err(e) => CheckResult::fail(
+            STATE,
+            "Launch backoff",
+            format!("cannot read launch backoff: {e:#}"),
+            "repair the state database before restarting the daemon",
+        ),
+        Ok(state) => {
+            let state = state.unwrap_or_default();
+            let holds: Vec<_> = state
+                .global
+                .iter()
+                .map(|h| ("global", h))
+                .chain(state.projects.iter().map(|(p, h)| (p.as_str(), h)))
+                .filter_map(|(scope, h)| {
+                    h.retry_at.map(|at| format!("{scope}: {} failure(s), probe eligible at {at}: {}", h.failures, h.reason))
+                })
+                .collect();
+            if holds.is_empty() {
+                CheckResult::ok(STATE, "Launch backoff", "no shared launch failures")
+            } else {
+                CheckResult::warn(
+                    STATE,
+                    "Launch backoff",
+                    holds.join("; "),
+                    "repair the named checkout, setup command, runtime or storage error; the next eligible launch probes recovery after backoff (30s–15m). A successful launch clears its project/global hold. Failed tasks still require task retry after max_attempts; doctor --fix does not clear holds",
+                )
+            }
+        }
+    }
+}
+
 fn check_starting_tasks(store: &Store) -> CheckResult {
     let pending = (|| -> Result<Vec<String>> {
         let mut pending = Vec::new();
@@ -2299,6 +2333,7 @@ pub async fn run_all(
     results.push(check_service(cfg));
     results.push(check_scheduling_pause(store));
     results.push(check_starting_tasks(store));
+    results.push(check_launch_failures(store));
     results.push(check_stuck_tasks(cfg, store, fix));
     results.push(check_dependencies(cfg, store));
     results.push(check_reviews(cfg, store));
@@ -2359,6 +2394,25 @@ mod tests {
         cfg.tmux.binary = "/nonexistent-test-tmux".into();
         assert!(!check_stuck_tasks(&cfg, &store, true).fixed);
         assert_eq!(store.get_task(task.id).unwrap().unwrap(), before);
+    }
+
+    #[test]
+    fn launch_backoff_reports_persisted_scope_reason_and_recovery() {
+        use crate::scheduler::launch_failures::{FailureScope, KEY, LaunchFailures};
+        let store = Store::open_in_memory().unwrap();
+        let task = Task::new("OUTAGE", "missing checkout", crate::domain::TaskSource::Manual);
+        let mut failures = LaunchFailures::default();
+        assert_eq!(check_launch_failures(&store).status, Status::Ok);
+        failures.failed(&task, FailureScope::Project, "checkout /missing unavailable".into(), Utc::now());
+        store.kv_set(KEY, &failures).unwrap();
+        let check = check_launch_failures(&store);
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("default: 1 failure(s)"));
+        assert!(check.detail.contains("/missing"));
+        assert!(check.detail.contains("probe eligible at"));
+        failures.succeeded(&task);
+        store.kv_set(KEY, &failures).unwrap();
+        assert_eq!(check_launch_failures(&store).status, Status::Ok);
     }
 
     #[test]
