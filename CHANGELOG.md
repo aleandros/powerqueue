@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Accept dead tmux panes whose process ID has been cleared after exit, so crash
+  detection and retry continue to work on current macOS tmux versions.
+- Update the locked rustls dependency to 0.23.46 to resolve the security
+  advisories reported by CI.
+
+- Recover abandoned `starting` tasks after launch persistence failures or daemon
+  restarts using normal attempt limits and backoff. Recovery preserves work,
+  rejects stale task/session observations, and waits for surviving setup processes
+  or unrecorded agents. Doctor explains the hold and the saved tmux destination;
+  `doctor --fix` no longer interrupts starting tasks.
+
 ### Added
 
 - Quint simulation and event replay cover dependency blocking/unblocking and PR

@@ -504,11 +504,24 @@ impl Store {
     /// the planner read. Returns false
     /// when another command superseded it; no repository operation may follow.
     pub fn claim_task_start(&self, before: &Task, starting: &Task) -> Result<bool> {
+        self.claim_task_start_with_target(before, starting, None)
+    }
+
+    /// Claim a start and atomically remember where its agent will run. The
+    /// saved target survives configuration changes and daemon restarts.
+    /// Returns false for a superseded candidate; no launch may follow it.
+    pub fn claim_task_start_with_target(
+        &self,
+        before: &Task,
+        starting: &Task,
+        target: Option<&crate::tmux::LaunchTarget>,
+    ) -> Result<bool> {
         if !before.execution_approved() || !starting.execution_approved() {
             return Ok(false);
         }
-        let changed = self
-            .lock()
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = tx
             .execute(
                 "UPDATE tasks SET state=?5, model=?6, not_before=?7, review=?8, updated_at=?9,
              attempts=?13, branch=?14, worktree_path=?15
@@ -538,7 +551,59 @@ impl Store {
                 ],
             )
             .context("claim task start in its execution project")?;
+        if changed != 0
+            && let Some(target) = target
+        {
+            tx.execute(
+                "INSERT INTO kv(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                params![crate::tmux::LaunchTarget::key(before.id), json(target), ts(&Utc::now())],
+            )
+            .context("remember launch tmux target")?;
+        }
+        tx.commit().context("commit task start and tmux target")?;
         Ok(changed != 0)
+    }
+
+    /// Commit a pure abandoned-start recovery only while its entire observed
+    /// task row is unchanged and no live session has appeared. An immediate
+    /// transaction serializes the check with CLI/source writers and session
+    /// insertion, including other connections.
+    /// Returns false for superseded observations; errors leave the row unchanged.
+    pub fn recover_task_start(&self, before: &Task, recovered: &Task) -> Result<bool> {
+        if before.state != TaskState::Starting || recovered.id != before.id {
+            return Ok(false);
+        }
+        let mut conn = self.lock();
+        let tx =
+            conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).context("begin abandoned start recovery")?;
+        let sql = format!("SELECT {} FROM tasks WHERE id=?1", Self::TASK_COLS);
+        let current = tx.query_row(&sql, [before.id.to_string()], Self::row_to_task).optional()?;
+        if current.as_ref() != Some(before) {
+            return Ok(false);
+        }
+        let occupied: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE task_id=?1
+             AND state IN ('launching','running','idle'))",
+            params![before.id.to_string()],
+            |r| r.get(0),
+        )?;
+        if occupied {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE tasks SET state=?2, not_before=?3, last_error=?4, completed_at=?5, updated_at=?6 WHERE id=?1",
+            params![
+                before.id.to_string(),
+                recovered.state.as_str(),
+                recovered.not_before.as_ref().map(ts),
+                recovered.last_error,
+                recovered.completed_at.as_ref().map(ts),
+                ts(&Utc::now())
+            ],
+        )
+        .context("persist abandoned start recovery")?;
+        tx.commit().context("commit abandoned start recovery")?;
+        Ok(true)
     }
 
     fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {

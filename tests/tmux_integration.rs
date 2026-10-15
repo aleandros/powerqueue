@@ -159,7 +159,7 @@ fn new_window_runs_command_and_is_listed() {
     let pane = wait_for_pane(t, "pq", &w.pane_id, |_| true).expect("pane listed");
     assert_eq!(pane.window_id, w.window_id);
     assert_eq!(pane.window_name, "eng-1");
-    assert_eq!(pane.pane_pid, w.pane_pid);
+    assert_eq!(pane.pane_pid, Some(w.pane_pid));
     assert!(!pane.dead);
     assert_eq!(pane.dead_status, None);
 

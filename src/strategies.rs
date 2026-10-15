@@ -68,6 +68,44 @@ pub fn session_state() -> impl Strategy<Value = SessionState> {
     ])
 }
 
+/// Launch/recovery observations, including a slow setup and an unrecorded agent.
+pub fn start_activity() -> impl Strategy<Value = crate::scheduler::launch::StartActivity> {
+    use crate::scheduler::launch::StartActivity::*;
+    prop::sample::select(vec![InProgress, LivePane, LiveSetup, Abandoned])
+}
+
+/// Persistence and concurrent writes interleaved with abandoned-start recovery.
+#[derive(Debug, Clone, Copy)]
+pub enum StartRecoveryOp {
+    Observe,
+    Recover,
+    FailRecovery,
+    Restart,
+    Complete,
+    NewAttempt,
+    RecordSession,
+    EndSession,
+    ChangeProject,
+}
+
+pub fn start_recovery_ops() -> impl Strategy<Value = Vec<StartRecoveryOp>> {
+    use StartRecoveryOp::*;
+    vec(
+        prop::sample::select(vec![
+            Observe,
+            Recover,
+            FailRecovery,
+            Restart,
+            Complete,
+            NewAttempt,
+            RecordSession,
+            EndSession,
+            ChangeProject,
+        ]),
+        1..60,
+    )
+}
+
 pub fn criticality() -> impl Strategy<Value = Criticality> {
     prop::sample::select(Criticality::ALL.to_vec())
 }

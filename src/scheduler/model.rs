@@ -46,6 +46,10 @@
 //! additionally checks claims against stale approval and material-issue snapshots.
 //! Source mapping decisions interleave with lifecycle operations and launch setup:
 //! conflicts deny future starts without retargeting tasks, sessions or artifacts.
+//! A SQLite recovery model interleaves abandoned-start observations with injected
+//! write failures, restarts, project changes, later attempts/completion and session
+//! writes, checking that recovery never consumes an extra attempt or replaces
+//! a superseding task/session.
 //!
 //! The ops are generated without preconditions and skipped when one does
 //! not hold, which keeps the generator simple and lets shrinking drop any
@@ -69,6 +73,118 @@ use crate::strategies::*;
 use super::launch::LaunchPlanner;
 use super::transitions::{Effect, ProbeContext};
 use super::{commands, launch, review, transitions};
+
+proptest! {
+    /// Real SQLite transactions, a separate writer connection, and reopenings
+    /// exercise the gap between observing a start and committing its recovery.
+    #[test]
+    fn starting_recovery_survives_failures_restarts_and_stale_observations(
+        (mut task, mut session) in task_with_session(),
+        ops in start_recovery_ops(),
+    ) {
+        use StartRecoveryOp::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut store = crate::store::Store::open(&path).unwrap();
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        task.state = TaskState::Starting;
+        task.attempts = 1;
+        task.max_attempts = Some(100);
+        task.review = None;
+        store.insert_task(&task).unwrap();
+        let mut version = 0usize;
+        let mut live = false;
+        let mut inserted = false;
+        let mut saved = None;
+        let cfg = SchedulerConfig::default();
+        for op in ops {
+            let current = store.get_task(task.id).unwrap().unwrap();
+            match op {
+                Observe => {
+                    saved = Some((current.clone(), store.list_sessions_for_task(task.id).unwrap(), version, live));
+                }
+                Recover | FailRecovery => {
+                    if let Some((snapshot, sessions, observed_version, observed_live)) = &saved {
+                        let mut recovered = snapshot.clone();
+                        let effects = launch::on_abandoned_start(&mut recovered, sessions, launch::StartActivity::Abandoned, &cfg, origin());
+                        let transition = snapshot.state == TaskState::Starting && !observed_live;
+                        prop_assert_eq!(recovered != *snapshot, transition);
+                        if transition {
+                            // Reversible metadata changes can return to an
+                            // identical row within SQLite's timestamp precision.
+                            // Such an equivalent observation is still valid.
+                            let accepts = (*observed_version == version || *snapshot == current) && !live;
+                            if matches!(op, FailRecovery) {
+                                writer.execute_batch("CREATE TRIGGER fail_recovery BEFORE UPDATE ON tasks BEGIN SELECT RAISE(ABORT, 'injected recovery failure'); END;").unwrap();
+                            }
+                            let result = store.recover_task_start(snapshot, &recovered);
+                            writer.execute_batch("DROP TRIGGER IF EXISTS fail_recovery;").unwrap();
+                            if matches!(op, FailRecovery) && accepts {
+                                prop_assert!(result.is_err());
+                                prop_assert_eq!(store.get_task(task.id).unwrap().unwrap(), current);
+                            } else {
+                                prop_assert_eq!(result.unwrap(), accepts);
+                                let after = store.get_task(task.id).unwrap().unwrap();
+                                if accepts {
+                                    version += 1;
+                                    prop_assert_eq!(after.state, TaskState::Crashed);
+                                    prop_assert_eq!(after.attempts, snapshot.attempts);
+                                    prop_assert_eq!(after.execution_project, snapshot.execution_project.clone());
+                                    prop_assert_eq!(after.execution_repo, snapshot.execution_repo.clone());
+                                    prop_assert!(effects.iter().all(|e| matches!(e, Effect::Log { .. })), "recovery effects only log");
+                                } else {
+                                    prop_assert_eq!(after, current);
+                                }
+                            }
+                        }
+                    }
+                }
+                Restart => {
+                    drop(store);
+                    store = crate::store::Store::open(&path).unwrap();
+                    prop_assert_eq!(store.get_task(task.id).unwrap().unwrap(), current);
+                }
+                Complete if current.state != TaskState::Completed => {
+                    let mut changed = current;
+                    // A later valid launch and completion both occur before
+                    // recovery tries to commit its old starting observation.
+                    changed.state = TaskState::Running;
+                    commands::on_complete(&mut changed, Some("concurrent completion"), origin()).unwrap();
+                    store.update_task(&changed).unwrap();
+                    version += 1;
+                }
+                NewAttempt => {
+                    let mut changed = current;
+                    changed.state = TaskState::Starting;
+                    changed.attempts += 1;
+                    store.update_task(&changed).unwrap();
+                    version += 1;
+                }
+                ChangeProject => {
+                    let mut changed = current;
+                    changed.execution_project = if changed.execution_project == "api" { "web" } else { "api" }.into();
+                    changed.execution_repo = Some(format!("/repos/{}", changed.execution_project));
+                    store.update_task(&changed).unwrap();
+                    version += 1;
+                }
+                RecordSession if !live => {
+                    session.attempt = current.attempts;
+                    session.state = SessionState::Launching;
+                    if inserted { store.update_session(&session).unwrap(); }
+                    else { store.insert_session(&session).unwrap(); }
+                    inserted = true;
+                    live = true;
+                }
+                EndSession if live => {
+                    session.state = SessionState::Exited;
+                    store.update_session(&session).unwrap();
+                    live = false;
+                }
+                _ => {}
+            }
+        }
+    }
+}
 
 /// One call into the core, as the daemon or the CLI would make it.
 #[derive(Debug, Clone)]

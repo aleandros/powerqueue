@@ -1607,6 +1607,49 @@ fn pane_ids(tmux: &Tmux, session: &str) -> Option<Vec<crate::tmux::PaneInfo>> {
     tmux.list_panes(session).ok()
 }
 
+/// Starting is owned by the daemon's serial launch loop. Doctor must not
+/// rewrite it while setup is in progress, even with a stale heartbeat.
+fn check_starting_tasks(store: &Store) -> CheckResult {
+    let pending = (|| -> Result<Vec<String>> {
+        let mut pending = Vec::new();
+        for task in store.list_tasks_in_states(&[TaskState::Starting])? {
+            if !store.list_sessions_for_task(task.id)?.iter().any(|s| s.state.is_live()) {
+                let destination = store
+                    .kv_get::<crate::tmux::LaunchTarget>(&crate::tmux::LaunchTarget::key(task.id))?
+                    .map(|target| {
+                        let tmux = Tmux::new(target.binary, target.socket_name);
+                        let mut command = tmux.command_prefix();
+                        command.extend(["attach-session".into(), "-t".into(), format!("={}", target.session_name)]);
+                        format!(
+                            "; inspect with `{}`",
+                            command.iter().map(|s| crate::tmux::shell_quote(s)).collect::<Vec<_>>().join(" ")
+                        )
+                    })
+                    .unwrap_or_default();
+                pending
+                    .push(format!("{} (project {}, attempt {}{destination})", task.key, task.execution_project, task.attempts));
+            }
+        }
+        Ok(pending)
+    })();
+    match pending {
+        Err(e) => CheckResult::fail(STATE, "starting attempts", format!("{e:#}"), "check the database"),
+        Ok(pending) if pending.is_empty() => {
+            CheckResult::ok(STATE, "starting attempts", "no starting attempts without a live session")
+        }
+        Ok(pending) => CheckResult::warn(
+            STATE,
+            "starting attempts",
+            format!(
+                "{} starting attempt(s) without a live session: {}. Setup may still be running, or persistence failed after the start was claimed.",
+                pending.len(),
+                pending.join(", ")
+            ),
+            "let setup finish; run/restart `powerqueue run` if the daemon stopped. At its next phase boundary it retries abandoned starts with normal backoff and attempt limits. A surviving setup process or live unrecorded tmux pane holds recovery: inspect it and let it finish or stop it. Check `powerqueue task show <task>` for task.start_recovery_* events and database/tmux errors. Doctor --fix leaves starting attempts untouched",
+        ),
+    }
+}
+
 fn check_stuck_tasks(cfg: &Config, store: &Store, fix: bool) -> CheckResult {
     let tmux = Tmux::new(cfg.tmux.binary.clone(), cfg.tmux.socket_name.clone());
     let panes = pane_ids(&tmux, &cfg.tmux.session_name);
@@ -1615,7 +1658,7 @@ fn check_stuck_tasks(cfg: &Config, store: &Store, fix: bool) -> CheckResult {
         Err(e) => return CheckResult::fail(STATE, "stuck tasks", format!("{e:#}"), "check the database"),
     };
     let mut stuck = Vec::new();
-    for task in tasks.into_iter().filter(|t| t.state.has_live_session()) {
+    for task in tasks.into_iter().filter(|t| t.state.has_live_session() && t.state != TaskState::Starting) {
         let session = store.latest_session(task.id).ok().flatten();
         let reason = match &session {
             None => Some("no session row".to_string()),
@@ -2255,6 +2298,7 @@ pub async fn run_all(
     results.push(check_config_reload(store));
     results.push(check_service(cfg));
     results.push(check_scheduling_pause(store));
+    results.push(check_starting_tasks(store));
     results.push(check_stuck_tasks(cfg, store, fix));
     results.push(check_dependencies(cfg, store));
     results.push(check_reviews(cfg, store));
@@ -2286,6 +2330,36 @@ pub fn exit_code(results: &[CheckResult]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn starting_diagnostic_reports_saved_target_and_fix_does_not_interrupt_setup() {
+        let store = Store::open_in_memory().unwrap();
+        let mut task = Task::new("START-1", "setup in progress", crate::domain::TaskSource::Manual);
+        task.state = TaskState::Starting;
+        task.attempts = 2;
+        task.execution_project = "api".into();
+        store.insert_task(&task).unwrap();
+        let target = crate::tmux::LaunchTarget {
+            binary: "tmux".into(),
+            socket_name: Some("original-socket".into()),
+            session_name: "original-session".into(),
+            window_name: task.slug(),
+            shell_command: String::new(),
+        };
+        store.kv_set(&crate::tmux::LaunchTarget::key(task.id), &target).unwrap();
+        let before = store.get_task(task.id).unwrap().unwrap();
+        let result = check_starting_tasks(&store);
+        assert_eq!(result.status, Status::Warn);
+        assert!(result.detail.contains("project api, attempt 2"));
+        assert!(result.detail.contains("original-socket"));
+        assert!(result.detail.contains("attach-session -t"));
+        assert!(result.detail.contains("=original-session"));
+        assert!(result.fix_hint.unwrap().contains("Doctor --fix leaves starting attempts untouched"));
+        let mut cfg = Config::default();
+        cfg.tmux.binary = "/nonexistent-test-tmux".into();
+        assert!(!check_stuck_tasks(&cfg, &store, true).fixed);
+        assert_eq!(store.get_task(task.id).unwrap().unwrap(), before);
+    }
 
     #[test]
     fn project_isolation_checks_effective_roots_and_checkout_aliases() {

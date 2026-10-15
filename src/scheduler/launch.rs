@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::budget::{Decision, Estimator, Ledgers, Policy, RateLimitState, WINDOW_RECHECK, tier_weight};
-use crate::config::{BudgetConfig, Config};
+use crate::config::{BudgetConfig, Config, SchedulerConfig};
 use crate::domain::{EventLevel, ModelTier, ReviewRelaunch, Session, SessionState, Task, TaskId, TaskSource, TaskState};
 use crate::priority::PriorityRules;
 use crate::session::agent_for;
@@ -293,6 +293,63 @@ pub fn claim(task: &mut Task, start: &Start) {
     task.attempts = start.attempt;
 }
 
+/// Evidence collected at a serial daemon phase boundary, while holding the
+/// daemon lock. A slow setup is still in progress regardless of its age.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartActivity {
+    InProgress,
+    /// A launched agent may exist without its session row. Wait for it to exit
+    /// or complete the task; never launch a second agent alongside it.
+    LivePane,
+    /// A setup child can outlive the daemon that owned its launch call.
+    LiveSetup,
+    /// No launch call is outstanding and tmux was successfully checked.
+    Abandoned,
+}
+
+/// Recover an abandoned start with no live session. Historical ended sessions
+/// may reuse attempt numbers after a manual retry. The claimed attempt remains
+/// consumed; normal crash backoff, review attempt allowances and exhaustion apply.
+/// Recovery preserves artifacts
+/// even on exhaustion, since an unrecorded agent may have done useful work.
+/// Returns only log effects; callers must atomically recheck the snapshot and
+/// session absence before persisting, and discard effects when that check fails.
+pub fn on_abandoned_start(
+    task: &mut Task,
+    sessions: &[Session],
+    activity: StartActivity,
+    cfg: &SchedulerConfig,
+    now: DateTime<Utc>,
+) -> Vec<Effect> {
+    if task.state != TaskState::Starting
+        || sessions.iter().any(|s| s.task_id == task.id && s.state.is_live())
+        || activity == StartActivity::InProgress
+    {
+        return Vec::new();
+    }
+    if matches!(activity, StartActivity::LivePane | StartActivity::LiveSetup) {
+        return vec![Effect::log(
+            EventLevel::Warn,
+            "task.start_recovery_deferred",
+            "starting attempt has no live session row but a task process or tmux pane is live; waiting to avoid overlapping work",
+            serde_json::json!({ "attempt": task.attempts, "project": task.execution_project }),
+        )];
+    }
+    let reason = "abandoned starting attempt: launch ended without recording a session";
+    let mut effects = super::transitions::on_crash(task, None, reason, None, cfg, now, None);
+    // Do not remove an unrecorded agent's work or apply source updates from a
+    // stale recovery snapshot. A failed task remains available for inspection.
+    effects.retain(|effect| matches!(effect, Effect::Log { .. }));
+    effects.push(Effect::log(
+        EventLevel::Warn,
+        "task.start_recovered",
+        format!("{reason}; attempt {} remains consumed; task is {}", task.attempts, task.state),
+        serde_json::json!({ "attempt": task.attempts, "project": task.execution_project,
+            "state": task.state, "retry_at": task.not_before, "artifacts_preserved": true }),
+    ));
+    effects
+}
+
 /// How to start the next attempt: `(session id, resume?, provider session id)`.
 ///
 /// A crashed previous session — or, for a review round (`review`), the
@@ -477,6 +534,50 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-10-01T12:00:00Z").unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn abandoned_start_consumes_attempt_and_preserves_artifacts_on_exhaustion() {
+        let cfg = SchedulerConfig { max_attempts: 2, restart_backoff_secs: vec![17], ..SchedulerConfig::default() };
+        let mut t = task("START-1", TaskState::Starting, 1.0);
+        t.attempts = 1;
+        t.execution_project = "api".into();
+        t.execution_repo = Some("/repos/api".into());
+        t.worktree_path = Some("/wt/api/start-1".into());
+        t.branch = Some("pq/start-1".into());
+        let effects = on_abandoned_start(&mut t, &[], StartActivity::Abandoned, &cfg, now());
+        assert_eq!(t.state, TaskState::Crashed);
+        assert_eq!(t.attempts, 1);
+        assert_eq!(t.not_before, Some(now() + Duration::seconds(17)));
+        assert!(effects.iter().any(|e| matches!(e, Effect::Log { kind, .. } if kind == "task.start_recovered")));
+        t.state = TaskState::Starting;
+        t.attempts = 2;
+        let effects = on_abandoned_start(&mut t, &[], StartActivity::Abandoned, &cfg, now());
+        assert_eq!(t.state, TaskState::Failed);
+        assert_eq!(t.completed_at, Some(now()));
+        assert_eq!(t.not_before, None);
+        assert_eq!(t.execution_project, "api");
+        assert_eq!(t.execution_repo.as_deref(), Some("/repos/api"));
+        assert_eq!(t.worktree_path.as_deref(), Some("/wt/api/start-1"));
+        assert_eq!(t.branch.as_deref(), Some("pq/start-1"));
+        assert!(effects.iter().all(|e| matches!(e, Effect::Log { .. })));
+    }
+
+    #[test]
+    fn abandoned_review_start_uses_round_allowance_and_ignores_historical_attempt_numbers() {
+        let mut t = task("REVIEW-1", TaskState::Starting, 1.0);
+        t.attempts = 5;
+        t.pr_url = Some("https://github.com/acme/app/pull/1".into());
+        t.review = Some(ReviewWatch {
+            attempt_base: 4,
+            relaunch: Some(ReviewRelaunch { pr_number: 1, reason: "review".into(), detail: String::new(), requested_at: now() }),
+            ..ReviewWatch::armed(now(), None)
+        });
+        let mut old = session(&t, SessionState::Exited, ModelTier::sonnet(), None);
+        old.attempt = 10;
+        on_abandoned_start(&mut t, &[old], StartActivity::Abandoned, &SchedulerConfig::default(), now());
+        assert_eq!(t.state, TaskState::Crashed);
+        assert_eq!(t.attempts, 5);
     }
 
     fn task(key: &str, state: TaskState, score: f64) -> Task {
@@ -854,6 +955,35 @@ mod properties {
     }
 
     proptest! {
+        #[test]
+        fn start_recovery_requires_quiescence_and_is_idempotent(
+            (mut task, session) in task_with_session(),
+            cfg in scheduler_config(),
+            activity in start_activity(),
+            recorded in any::<bool>(),
+        ) {
+            let sessions = if recorded { vec![session] } else { vec![] };
+            let before = task.clone();
+            let eligible = before.state == TaskState::Starting
+                && !sessions.iter().any(|s| s.state.is_live())
+                && activity == StartActivity::Abandoned;
+            let effects = on_abandoned_start(&mut task, &sessions, activity, &cfg, origin());
+            if !eligible {
+                prop_assert_eq!(&task, &before);
+            } else {
+                prop_assert!(matches!(task.state, TaskState::Crashed | TaskState::Failed));
+                prop_assert_eq!(task.attempts, before.attempts);
+                prop_assert_eq!(&task.execution_project, &before.execution_project);
+                prop_assert_eq!(&task.execution_repo, &before.execution_repo);
+                prop_assert_eq!(&task.branch, &before.branch);
+                prop_assert_eq!(&task.worktree_path, &before.worktree_path);
+                prop_assert!(effects.iter().all(|e| matches!(e, Effect::Log { .. })), "recovery effects only log");
+                let after = task.clone();
+                prop_assert!(on_abandoned_start(&mut task, &sessions, activity, &cfg, origin()).is_empty());
+                prop_assert_eq!(task, after);
+            }
+        }
+
         #[test]
         fn unapproved_github_tasks_never_start(mut task in github_task(), decision in decision()) {
             task.github_admission = None;
