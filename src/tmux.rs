@@ -57,7 +57,8 @@ pub struct PaneInfo {
     pub window_id: String,
     pub window_name: String,
     pub pane_id: String,
-    pub pane_pid: u32,
+    /// Dead panes may no longer have a process ID after tmux reaps them.
+    pub pane_pid: Option<u32>,
     pub dead: bool,
     /// Exit status of the pane's command once dead.
     pub dead_status: Option<i32>,
@@ -411,8 +412,12 @@ fn parse_pane_line(line: &str) -> Result<PaneInfo> {
     if fields.len() < 7 {
         bail!("unexpected `tmux list-panes` line `{line}` ({} fields, expected 7)", fields.len());
     }
-    let pane_pid = fields[3].trim().parse::<u32>().with_context(|| format!("bad pane pid in `{line}`"))?;
     let dead = matches!(fields[4].trim(), "1" | "on" | "yes");
+    let pane_pid = if dead && fields[3].trim().is_empty() {
+        None
+    } else {
+        Some(fields[3].trim().parse::<u32>().with_context(|| format!("bad pane pid in `{line}`"))?)
+    };
     let dead_status = fields[5].trim().parse::<i32>().ok();
     Ok(PaneInfo {
         window_id: fields[0].trim().to_string(),
@@ -460,7 +465,7 @@ mod tests {
         let dead = parse_pane_line("@2\teng-123\t%2\t101\t1\t3\tsh").unwrap();
         assert!(dead.dead);
         assert_eq!(dead.dead_status, Some(3));
-        assert_eq!(dead.pane_pid, 101);
+        assert_eq!(dead.pane_pid, Some(101));
 
         let no_status = parse_pane_line("@2\tx\t%2\t101\t1\t\tsh").unwrap();
         assert!(no_status.dead);
@@ -468,6 +473,19 @@ mod tests {
 
         assert!(parse_pane_line("@2\tx\t%2").is_err());
         assert!(parse_pane_line("@2\tx\t%2\tnope\t0\t\tsh").is_err());
+    }
+
+    #[test]
+    fn reaped_dead_panes_preserve_exit_status_without_a_pid() {
+        // Captured from the macOS CI runner: rejecting this row prevents all
+        // probes in the session, leaving crashed agents stuck as running.
+        let pane = parse_pane_line("@1\tmanual-01a14196\t%1\t\t1\t1\tsh").unwrap();
+        assert!(pane.dead);
+        assert_eq!(pane.dead_status, Some(1));
+        assert_eq!(pane.pane_pid, None);
+        assert_eq!(pane.pane_id, "%1");
+        assert!(parse_pane_line("@1\tx\t%1\t\t0\t\tsh").is_err());
+        assert!(parse_pane_line("@1\tx\t%1\tinvalid\t1\t1\tsh").is_err());
     }
 
     #[test]

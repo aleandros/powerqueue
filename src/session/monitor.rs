@@ -45,7 +45,7 @@ pub fn probe_session(tmux: &Tmux, session: &Session) -> Result<SessionProbe> {
             pane_exists: true,
             pane_dead: p.dead,
             exit_status: p.dead_status,
-            pane_pid: Some(p.pane_pid),
+            pane_pid: p.pane_pid,
             current_command: Some(p.current_command),
         },
         None => SessionProbe::missing(),
