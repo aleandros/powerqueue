@@ -183,7 +183,9 @@ adds project ownership and admission invariants, plus a finite reassignment/clai
 Admission changes also require the replay rejection checks
 (`cargo test --example quint-replay -- --include-ignored`). The advisory workflow
 captures and replays a real GitHub approval/launch trace as well as the existing
-completion, crash and rate-limit traces.
+completion, crash and rate-limit traces. It also requires PR conflict/relaunch/merge
+and closed-PR resume traces; see the [bounded review scope](spec/README.md) for
+the modeled guards, remaining cutoffs, fairness assumptions and measured cost.
 
 The same file tests the container transport (`<provider>.shim`, see
 docs/containers.md): `shim_routes_hooks_and_completion_through_the_inbox`

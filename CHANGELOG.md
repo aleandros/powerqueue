@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Advisory Quint coverage for closed/stale PR review parking and recovery,
+  including shared simulation/replay guards and negative schedules. Real-daemon
+  conflict/relaunch/merge and closed-PR resume traces are now required replay
+  artifacts; unsupported review errors, exhausted rounds and relayed answers
+  remain explicit cutoffs.
+
 ## [0.18.1] - 2026-10-16
 
 ### Fixed

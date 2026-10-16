@@ -27,7 +27,7 @@ module lifecycle {
     else if (op == "Unblock") t.state == "blocked"
     else if (op == "HandOff") Set("running", "idle", "paused", "needs_attention", "in_review").contains(t.state)
     else if (op == "ReviewRelease") t.state == "in_review" and t.live
-    else if (op == "ReviewRetry" or op == "Merge") t.state == "in_review" and not(t.live)
+    else if (op == "ReviewRetry" or op == "Merge" or op == "ReviewPark") t.state == "in_review" and not(t.live)
     else if (op == "Throttle") ready(t, now) and until >= now
     else if (op == "RateLimit") t.live and not(terminal(t)) and t.state != "in_review" and until >= now
     else if (op == "Wake") t.state == "throttled" and t.live and t.notBefore <= now
@@ -60,6 +60,9 @@ module lifecycle {
     else if (op == "Unblock") { ...t, state: "queued" }
     else if (op == "HandOff") { ...t, state: "in_review", notBefore: -1, reviewBase: 0, watching: true }
     else if (op == "ReviewRelease") { ...t, live: false }
+    // Closed/stale watches retain their review identity. Resume watches again;
+    // Retry queues work without granting a new review-round crash allowance.
+    else if (op == "ReviewPark") { ...t, state: "needs_attention", notBefore: -1 }
     else if (op == "ReviewRetry") { ...t, state: "queued", notBefore: -1, reviewBase: t.attempts, watching: false }
     else if (op == "Merge") { ...t, state: "completed" }
     else if (op == "Throttle") { ...t, state: "throttled", notBefore: until }
@@ -319,7 +322,7 @@ module powerqueue {
     nondet present = Set(false, true).oneOf()
     nondet revision = Set(0, 1).oneOf()
     nondet op = Set("Finish", "Complete", "Release", "Wake", "Pause", "Resume", "Cancel", "Retry", "Idle", "Block", "Progress",
-      "DependencyBlock", "Unblock", "HandOff", "ReviewRelease", "ReviewRetry", "Merge").oneOf()
+      "DependencyBlock", "Unblock", "HandOff", "ReviewRelease", "ReviewRetry", "Merge", "ReviewPark").oneOf()
     any { beginPass, endPass, start(id), launch(id), throttle(id), crashScoped(id, scope), command(id, op), rateLimit(id), tick, pauseScheduling, reassign(id, p), configure(p, present, revision), rejectCheckout(id), repositoryOp(id), admission(id, present), routing(id, present), hold(id) }
   }
 
@@ -433,6 +436,23 @@ module powerqueue {
     .expect(safety and tasks.get(0).attempts == 2 and usedAttempts(tasks.get(0)) == 1)
     .then(command(0, "HandOff")).then(command(0, "ReviewRelease")).then(command(0, "Merge"))
     .expect(safety and tasks.get(0).state == "completed" and not(tasks.get(0).live))
+  run parkedReviewResumeTest = init.then(beginPass).then(start(0)).then(launch(0))
+    .then(start(1)).then(launch(1)).then(endPass).then(command(0, "HandOff"))
+    .expect(not(allowed(tasks.get(0), "ReviewPark", now, -1, maxAttempts)))
+    .then(command(0, "ReviewRelease")).then(command(0, "ReviewPark"))
+    .expect(safety and tasks.get(0).state == "needs_attention" and not(tasks.get(0).live)
+      and not(allowed(tasks.get(0), "Start", now, -1, maxAttempts))
+      and not(allowed(tasks.get(0), "Merge", now, -1, maxAttempts)))
+    .then(command(0, "Pause")).then(command(0, "Resume"))
+    .expect(tasks.get(0).state == "in_review" and tasks.get(0).attempts == 1)
+    .then(command(0, "Merge")).expect(safety and tasks.get(0).state == "completed")
+  run parkedReviewRetryTest = init.then(beginPass).then(start(0)).then(launch(0))
+    .then(start(1)).then(launch(1)).then(endPass).then(command(0, "HandOff"))
+    .then(command(0, "ReviewRelease")).then(command(0, "ReviewPark")).then(command(0, "Retry"))
+    .then(beginPass).then(start(0)).then(launch(0)).then(endPass)
+    .expect(safety and tasks.get(0).attempts == 2 and usedAttempts(tasks.get(0)) == 2)
+    .then(command(0, "HandOff")).then(command(0, "ReviewRelease")).then(command(0, "Merge"))
+    .expect(safety and tasks.get(0).state == "completed")
   run projectFailureDefersPeersTest = init.then(reassign(2, 0))
     .then(beginPass).then(start(0)).then(crashScoped(0, "project"))
     .expect(not(launchPermitted(2)) and launchPermitted(1) and spent.get(0) == 0 and live == 0)
