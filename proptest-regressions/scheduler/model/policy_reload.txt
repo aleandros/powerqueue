@@ -1,0 +1,3 @@
+# Minimized regressions found by the issue #48 stateful scheduler scenarios.
+cc 324e6a9ca41a380baaf0c25b15f0a35b5cdd80dbffdd5f0c5bf20ff5f68d69ec # shrinks to old_attempt = 2
+cc d5b4dcc39e1499d2a0a47da4fa4bbfa864c16f326f89f89fc097f0b7c75b238e # shrinks to ops = [0, 1]

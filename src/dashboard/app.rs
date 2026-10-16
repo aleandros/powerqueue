@@ -76,7 +76,7 @@ impl Snapshot {
                 weighted_tokens.insert(task.id, usage.weighted());
             }
             if task.state.has_live_session()
-                && let Some(session) = sessions.iter().filter(|s| s.task_id == task.id).max_by_key(|s| s.attempt)
+                && let Some(session) = sessions.iter().filter(|s| s.task_id == task.id).max_by_key(|s| s.started_at)
                 && session.state.is_live()
                 && let Some(sample) = store.latest_resource_sample(session.id)?
             {
@@ -140,9 +140,10 @@ impl Snapshot {
         self.tasks.iter().filter(|t| t.state.has_live_session()).count()
     }
 
-    /// Latest session of a task, if any.
+    /// Most recently started session of a task. Equal timestamps use the
+    /// last row in the snapshot (the store orders ties by insertion).
     pub fn latest_session(&self, task_id: TaskId) -> Option<&Session> {
-        self.sessions.iter().filter(|s| s.task_id == task_id).max_by_key(|s| s.attempt)
+        self.sessions.iter().filter(|s| s.task_id == task_id).max_by_key(|s| s.started_at)
     }
 
     /// Last `n` events of a task, oldest first.

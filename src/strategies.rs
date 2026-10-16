@@ -772,6 +772,29 @@ pub fn launch_failure_scope() -> impl Strategy<Value = crate::scheduler::launch_
     prop::sample::select(vec![FailureScope::Task, FailureScope::Project, FailureScope::Global])
 }
 
+/// Reloadable model preference rules: the first matching conditional wins,
+/// otherwise the criticality table supplies the fallback.
+pub fn conditional_model_policy() -> impl Strategy<Value = String> {
+    (model(), model()).prop_map(|(preferred, fallback)| format!(
+        "version = 1\n[[model_rules]]\nmodels = [\"{preferred}\"]\nall = [{{ field = \"label\", op = \"eq\", value = \"model/special\" }}]\n[models]\nnormal = [\"{fallback}\"]\n"
+    ))
+}
+
+/// Boundary-focused time advances for rolling windows and weekly resets.
+pub fn budget_tick() -> impl Strategy<Value = i64> {
+    prop_oneof![3 => 1i64..3 * 3600, 1 => prop::sample::select(vec![1, 5 * 3600 - 1, 5 * 3600, 5 * 3600 + 1, 7 * 86400])]
+}
+
+/// A provider reading, including exhausted windows and missing reset timestamps.
+pub fn provider_reading() -> impl Strategy<Value = (Provider, f64, bool)> {
+    (provider(), prop::sample::select(vec![0.0, 0.5, 0.95, 1.0]), any::<bool>())
+}
+
+/// Commands that can also be written by the CLI while the daemon is stopped.
+pub fn offline_control() -> impl Strategy<Value = u8> {
+    0u8..4
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

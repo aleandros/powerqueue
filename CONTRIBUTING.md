@@ -72,6 +72,50 @@ just test
 Run one test with `cargo test name_of_test -- --nocapture`. Set
 `RUST_LOG=powerqueue=debug` for stderr logging in tests.
 
+### Stateful policy and reload coverage
+
+`cargo test --lib scheduler::model` is the fast default gate. The whole-daemon
+walk uses 128 cases of up to 39 operations; focused policy/reload scenarios use
+32 cases each and guarantee successful launch passes before changing inputs.
+The model drives production transitions and `LaunchPlanner`, and checks slot
+and budget reservations, retry deadlines, terminal states and session ownership.
+It now includes:
+
+- Conditional model rules, label changes, policy reloads and per-task model
+  overrides. Reloads re-evaluate inactive tasks and leave active sessions alone.
+- Concurrency changes between passes. Lower limits take effect by attrition:
+  existing sessions survive, and no work starts until the count is below the
+  new limit. Raising the limit makes capacity available at the next pass.
+- Dated transcript records (including duplicate reads and late tails), real
+  SQLite usage aggregation and `Ledgers::load`/`Ledger::build`, rolling-window
+  expiry and period rollover, plus provider window observations with and
+  without reset times. Pass reservations never become persisted usage.
+- Offline CLI controls through `apply_offline`, including a surviving agent,
+  and terminal retries followed by a new launch with historical session rows.
+  The latter catches attempt counters resetting below an older session's count.
+
+For a larger search, separate from the default gate:
+
+```sh
+PROPTEST_CASES=512 POWERQUEUE_MODEL_STEPS=160 cargo test --lib scheduler::model
+```
+
+`PROPTEST_CASES` overrides the model's default case counts;
+`POWERQUEUE_MODEL_STEPS` sets the exclusive operation-count bound for the
+whole-daemon walk. Keep minimized regression seeds with any bug fixes.
+
+Limits: this is a sequential model of daemon phase boundaries, not a simulation
+of OS processes or simultaneous writers. Reload operations model successfully
+loaded settings/policies; file watching, invalid-file fallback, network probes,
+real tmux termination and command-queue delivery belong to integration tests.
+The budget model generates window observations; observed period-anchor changes
+and rate-learning accuracy remain in budget module properties. Historical
+session coverage targets terminal retries and selection of the latest row;
+arbitrary delayed hooks from every historical session, transcript identity
+changes, relay/container behavior, CPU/RSS pressure and crash-time persistence
+of every effect are outside this model. Project, routing, admission and starting
+recovery invariants remain covered by their existing feature models.
+
 ### End-to-end tests
 
 `tests/fixtures/fake-claude.sh` stands in for Claude Code. It accepts the

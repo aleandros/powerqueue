@@ -51,6 +51,13 @@
 //! writes, checking that recovery never consumes an extra attempt or replaces
 //! a superseding task/session.
 //!
+//! Policy/reload operations include conditional preferences, label updates and
+//! concurrency changes. Lowered capacity drains existing sessions without killing
+//! them. Dated usage and window observations go through SQLite and the production
+//! ledger loader; reservations stay local to a pass. `policy_reload` forces
+//! non-vacuous launch sequences and exercises offline CLI writers and historical
+//! session selection. See CONTRIBUTING.md for stress knobs and explicit limits.
+//!
 //! The ops are generated without preconditions and skipped when one does
 //! not hold, which keeps the generator simple and lets shrinking drop any
 //! op.
@@ -62,7 +69,7 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::test_runner::Config as ProptestConfig;
 
-use crate::budget::{Decision, Estimator, Ledgers, Period, RateLimitState, WINDOW_RECHECK};
+use crate::budget::{Decision, Estimator, Ledgers, RateLimitState, WINDOW_RECHECK};
 use crate::config::{Config, SchedulerConfig};
 use crate::domain::{Criticality, LinkedIssue, ModelTier, Session, SessionState, Task, TaskId, TaskSource, TaskState};
 use crate::github::PrStatus;
@@ -186,6 +193,18 @@ proptest! {
     }
 }
 
+/// Keep the default gate small while allowing explicit stress runs.
+fn model_config(cases: u32) -> ProptestConfig {
+    ProptestConfig {
+        cases: std::env::var("PROPTEST_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(cases),
+        ..ProptestConfig::default()
+    }
+}
+
+fn model_steps() -> usize {
+    std::env::var("POWERQUEUE_MODEL_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(40).max(2)
+}
+
 /// One call into the core, as the daemon or the CLI would make it.
 #[derive(Debug, Clone)]
 enum Op {
@@ -232,6 +251,8 @@ enum Op {
         blocked_by: Vec<LinkedIssue>,
         children: Vec<LinkedIssue>,
     },
+    /// A real parsed policy evaluation, including its model/reason trail.
+    PolicyEvaluation(Evaluation),
     /// priority.toml re-scored the task.
     Evaluate {
         criticality: Criticality,
@@ -507,6 +528,12 @@ impl TaskWorld {
                 self.task.children = children.clone();
                 Some(Vec::new())
             }
+            Op::PolicyEvaluation(eval) => {
+                if self.task.state.has_live_session() || live {
+                    return None;
+                }
+                Some(transitions::on_evaluation(&mut self.task, eval))
+            }
             Op::Evaluate { criticality, score, skip } => {
                 // The daemon never re-scores under a live session (a
                 // throttled or paused task may keep one).
@@ -753,7 +780,7 @@ fn check(
     }
 
     // After a re-score, the dependency state matches the links.
-    if matches!(op, Op::Evaluate { .. }) {
+    if matches!(op, Op::Evaluate { .. } | Op::PolicyEvaluation(_)) {
         if a.state == TaskState::Blocked {
             prop_assert!(a.is_waiting(), "{}", ctx("blocked while waiting on nothing"));
         }
@@ -790,7 +817,7 @@ fn check(
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+    #![proptest_config(model_config(256))]
 
     /// Any sequence of daemon calls keeps the task, its session and the
     /// effect trace consistent (see the module doc for the invariants).
@@ -894,11 +921,16 @@ enum DaemonOp {
     /// `launch_tasks`: the outcomes are consumed by the starts in order
     /// (a launch, when the list runs out).
     LaunchPass(Vec<LaunchOutcome>),
-    /// Usage of a live session reached the store (`Ledger::add_spend`).
+    /// Dated transcript usage reached the store, possibly after the session ended.
     SpendRecorded {
         task: usize,
-        weighted: f64,
+        tokens: u64,
+        age_secs: i64,
     },
+    Observation(crate::domain::Provider, f64, bool),
+    ReloadConcurrency(u32),
+    ReloadPolicy(String, String),
+    SpecialLabel(usize, bool),
     ProjectSettings(String, (bool, bool, ModelTier)),
     PauseScheduling,
     ResumeScheduling,
@@ -909,11 +941,15 @@ fn daemon_op() -> impl Strategy<Value = DaemonOp> {
     prop_oneof![
         40 => (0usize..4, task_op()).prop_map(|(i, op)| DaemonOp::Task(i, op)),
         20 => vec(launch_outcome(), 0..4).prop_map(DaemonOp::LaunchPass),
-        4 => (0usize..4, 0u64..2_000_000).prop_map(|(task, w)| DaemonOp::SpendRecorded { task, weighted: w as f64 }),
+        4 => (0usize..4, 1u64..2_000_000, 0i64..6 * 3600).prop_map(|(task, tokens, age_secs)| DaemonOp::SpendRecorded { task, tokens, age_secs }),
+        3 => provider_reading().prop_map(|(p, fraction, reset)| DaemonOp::Observation(p, fraction, reset)),
+        3 => (1u32..=4).prop_map(DaemonOp::ReloadConcurrency),
+        3 => (execution_project(), conditional_model_policy()).prop_map(|(p, rules)| DaemonOp::ReloadPolicy(p, rules)),
+        3 => (0usize..4, any::<bool>()).prop_map(|(i, enabled)| DaemonOp::SpecialLabel(i, enabled)),
         5 => (execution_project(), execution_project_settings()).prop_map(|(id, settings)| DaemonOp::ProjectSettings(id, settings)),
         1 => Just(DaemonOp::PauseScheduling),
         2 => Just(DaemonOp::ResumeScheduling),
-        6 => (1i64..3 * 3600).prop_map(DaemonOp::Tick),
+        6 => budget_tick().prop_map(DaemonOp::Tick),
     ]
 }
 
@@ -929,7 +965,7 @@ struct Pass {
 }
 
 /// Everything the daemon holds across its tasks.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct DaemonWorld {
     cfg: Config,
     rules: HashMap<String, PriorityRules>,
@@ -938,10 +974,24 @@ struct DaemonWorld {
     tasks: Vec<TaskWorld>,
     /// The stored usage (what `Ledgers::load` returns at the next pass).
     ledgers: Ledgers,
+    budget_store: crate::store::Store,
     rate_limits: RateLimitState,
     estimator: Estimator,
     scheduling_paused: bool,
     launch_failures: super::launch_failures::LaunchFailures,
+}
+
+// Store clones share only persisted budget input. Reversed launch passes read
+// that input and reserve on their own ledger copies; they never write the store.
+impl std::fmt::Debug for DaemonWorld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonWorld")
+            .field("cfg", &self.cfg)
+            .field("tasks", &self.tasks)
+            .field("now", &self.now)
+            .field("ledgers", &self.ledgers)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DaemonWorld {
@@ -982,36 +1032,10 @@ impl DaemonWorld {
             .any(|t| !keys.insert((t.task.score.to_bits(), t.task.criticality, t.task.created_at)))
     }
 
-    /// What `Ledgers::load` would return now: the ledgers stamped with the
-    /// current time, a period that has ended rolled over with nothing
-    /// spent in the new one yet, the window ending now. Window spend is
-    /// kept while the new window overlaps the old one (the model does not
-    /// date its spends) and dropped once the whole window has passed.
+    /// Use the real usage writer, SQL range aggregation, clock resolution and
+    /// pure ledger builder. Pass reservations remain outside this stored history.
     fn refresh_ledgers(&mut self) {
-        let now = self.now;
-        for ledger in self.ledgers.by_provider.values_mut() {
-            ledger.now = now;
-            let new_period = now >= ledger.period.end;
-            if new_period {
-                let len = ledger.period.len();
-                while now >= ledger.period.end {
-                    ledger.period = Period { start: ledger.period.end, end: ledger.period.end + len };
-                }
-                for t in &mut ledger.tiers {
-                    t.period_weighted = 0.0;
-                }
-                ledger.total_period_weighted = 0.0;
-                ledger.spent_since_observation = 0.0;
-            }
-            let window = Period { start: now - Duration::hours(5), end: now };
-            if new_period || window.start >= ledger.window.end {
-                for t in &mut ledger.tiers {
-                    t.window_weighted = 0.0;
-                }
-                ledger.total_window_weighted = 0.0;
-            }
-            ledger.window = window;
-        }
+        self.ledgers = Ledgers::load(&self.budget_store, &self.cfg.budget, self.now).unwrap();
     }
 
     /// The daemon carries out the effects that feed the next pass.
@@ -1178,6 +1202,7 @@ impl DaemonWorld {
             }
         }
 
+        prop_assert_eq!(&self.ledgers, &at_start, "pass reservations leaked into persisted usage");
         // Slots.
         prop_assert!(pass.starts <= slots, "step {step} pass: {} starts for {slots} slots", pass.starts);
         // Budget: every ledger the pass reserved on stays within the
@@ -1247,12 +1272,60 @@ impl DaemonWorld {
                 }
                 Ok(true)
             }
-            DaemonOp::SpendRecorded { task, weighted } => {
+            DaemonOp::SpendRecorded { task, tokens, age_secs } => {
                 let idx = task % self.tasks.len();
-                let Some(session) = self.tasks[idx].session.as_ref().filter(|s| s.state.is_live()) else { return Ok(false) };
-                let tier = session.model.clone();
-                let Some(ledger) = self.ledgers.for_model_mut(&tier) else { return Ok(false) };
-                ledger.add_spend(&tier, *weighted);
+                let Some(session) = self.tasks[idx].session.as_ref() else { return Ok(false) };
+                // Late transcript tails may belong to an already ended session.
+                if self.budget_store.get_session(session.id).unwrap().is_none() {
+                    self.budget_store.insert_session(session).unwrap();
+                }
+                let usage = crate::domain::UsageRecord {
+                    session_id: session.id,
+                    task_id: session.task_id,
+                    message_id: format!("{}-{step}", session.id),
+                    model_id: session.model.to_string(),
+                    tier: session.model.clone(),
+                    usage: crate::domain::TokenUsage { input_tokens: *tokens, ..Default::default() },
+                    timestamp: (self.now - Duration::seconds(*age_secs)).max(session.started_at.min(self.now)),
+                };
+                prop_assert!(self.budget_store.record_usage(&usage).unwrap());
+                prop_assert!(!self.budget_store.record_usage(&usage).unwrap(), "transcript replay charged twice");
+                self.refresh_ledgers();
+                Ok(true)
+            }
+            DaemonOp::Observation(provider, fraction, reset) => {
+                let obs = crate::budget::probe::ObservedUsage {
+                    window_used: Some(*fraction),
+                    window_resets_at: reset.then_some(self.now + Duration::hours(5)),
+                    ..crate::budget::probe::ObservedUsage::empty(self.now)
+                };
+                crate::budget::io::save_observed(&self.budget_store, *provider, &obs).unwrap();
+                self.refresh_ledgers();
+                Ok(true)
+            }
+            DaemonOp::ReloadConcurrency(max) => {
+                self.cfg.scheduler.max_concurrent = *max;
+                Ok(true)
+            }
+            DaemonOp::ReloadPolicy(project, document) => {
+                let rules = PriorityRules::parse(document).unwrap();
+                for idx in 0..self.tasks.len() {
+                    let t = &self.tasks[idx];
+                    if t.task.execution_project != *project || t.task.state.has_live_session() || t.session_live() {
+                        continue;
+                    }
+                    let eval = rules.evaluate(&t.task, self.now, None, 0.0, 0.0);
+                    self.step(step, idx, &Op::PolicyEvaluation(eval))?;
+                }
+                self.rules.insert(project.clone(), rules);
+                Ok(true)
+            }
+            DaemonOp::SpecialLabel(i, enabled) => {
+                let idx = i % self.tasks.len();
+                self.tasks[idx].task.labels.retain(|l| l != "model/special");
+                if *enabled {
+                    self.tasks[idx].task.labels.push("model/special".into());
+                }
                 Ok(true)
             }
             DaemonOp::ProjectSettings(id, settings) => {
@@ -1348,14 +1421,21 @@ fn daemon_world() -> impl Strategy<Value = DaemonWorld> {
         vec(daemon_task(), 1..=4),
         scheduler_config(),
         budget_config(),
-        ledgers(),
         rate_limits(),
         1u32..=3,
         prop::array::uniform3(execution_project_settings()),
     )
-        .prop_map(|(mut tasks, scheduler, budget, ledgers, rate_limits, max_concurrent, projects)| {
+        .prop_map(|(mut tasks, scheduler, budget, rate_limits, max_concurrent, projects)| {
             let mut seen = HashSet::new();
             tasks.retain(|t| seen.insert(t.task.id));
+            // The store enforces distinct keys and session IDs. Preserve that
+            // constraint even when independent generators shrink to equal text/IDs.
+            for (i, task) in tasks.iter_mut().enumerate() {
+                task.task.key = format!("{}-{i}", task.task.key);
+                if let Some(session) = task.session.as_mut() {
+                    session.id = task.task.id.0;
+                }
+            }
             let cfg = Config { scheduler: SchedulerConfig { max_concurrent, ..scheduler }, budget, ..Config::default() };
             let mut world = DaemonWorld {
                 cfg,
@@ -1363,12 +1443,17 @@ fn daemon_world() -> impl Strategy<Value = DaemonWorld> {
                 checkouts: HashMap::new(),
                 now: origin(),
                 tasks,
-                ledgers,
+                ledgers: Ledgers::default(),
+                budget_store: crate::store::Store::open_in_memory().unwrap(),
                 rate_limits,
                 estimator: Estimator::from_summaries(&[]),
                 scheduling_paused: false,
                 launch_failures: Default::default(),
             };
+            for task in &world.tasks {
+                world.budget_store.insert_task(&task.task).unwrap();
+            }
+            world.refresh_ledgers();
             for (id, settings) in ["default", "api", "web"].into_iter().zip(projects) {
                 world.set_project(id, &settings);
             }
@@ -1379,7 +1464,8 @@ fn daemon_world() -> impl Strategy<Value = DaemonWorld> {
 fn check_daemon(step: usize, op: &DaemonOp, before: &DaemonWorld, after: &DaemonWorld) -> Result<(), TestCaseError> {
     for (idx, (b, a)) in before.tasks.iter().zip(&after.tasks).enumerate() {
         let may_change = match op {
-            DaemonOp::Task(target, _) => idx == target % before.tasks.len(),
+            DaemonOp::Task(target, _) | DaemonOp::SpecialLabel(target, _) => idx == target % before.tasks.len(),
+            DaemonOp::ReloadPolicy(project, _) => &b.task.execution_project == project,
             DaemonOp::LaunchPass(_) => before.rules.contains_key(&b.task.execution_project),
             _ => false,
         };
@@ -1407,13 +1493,13 @@ fn check_daemon(step: usize, op: &DaemonOp, before: &DaemonWorld, after: &Daemon
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
+    #![proptest_config(model_config(128))]
 
     /// Any interleaving of launch passes, per-task calls, recorded usage,
     /// the scheduling pause and time keeps every task consistent and the
     /// passes within slots and budget (see the module doc).
     #[test]
-    fn the_daemon_survives_any_sequence_of_ticks(world in daemon_world(), ops in vec(daemon_op(), 1..40)) {
+    fn the_daemon_survives_any_sequence_of_ticks(world in daemon_world(), ops in vec(daemon_op(), 1..model_steps())) {
         let mut world = world;
         for (step, op) in ops.iter().enumerate() {
             let before = world.clone();
@@ -1564,3 +1650,5 @@ proptest! {
         prop_assert_eq!(saved.github_admission, loaded.github_admission);
     }
 }
+
+mod policy_reload;

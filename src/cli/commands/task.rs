@@ -97,16 +97,22 @@ pub fn offline_target(cmd: &DaemonCommand) -> Option<TaskState> {
 }
 
 /// Apply a control command directly (used when no daemon is running).
-/// Returns `Ok(false)` when the transition is not allowed from the current state.
+/// Returns `Ok(false)` when the transition is not allowed from the current state,
+/// or cancel/retry needs the daemon to stop a recorded live session. A missing
+/// heartbeat does not mean agents stopped: tmux sessions survive the daemon.
 pub fn apply_offline(store: &Store, task: &mut Task, cmd: &DaemonCommand) -> Result<bool> {
     let Some(target) = offline_target(cmd) else { return Ok(false) };
     let now = Utc::now();
     let before = task.clone();
-    // The daemon's own transitions, with no live session to end (there is
-    // no daemon to have one; a stale `running` row is left to it).
+    let live = store.list_sessions_for_task(task.id)?.iter().any(|s| s.state.is_live());
+    // Cancel/retry must kill the pane as well as close its row. Keep the
+    // queued command for the daemon, which owns those runtime effects.
+    if live && matches!(cmd, DaemonCommand::Cancel { .. } | DaemonCommand::Retry { .. }) {
+        return Ok(false);
+    }
     let effects = match cmd {
-        DaemonCommand::Pause { .. } => commands::on_pause(task, false),
-        DaemonCommand::Resume { .. } => commands::on_resume(task, false, now),
+        DaemonCommand::Pause { .. } => commands::on_pause(task, live),
+        DaemonCommand::Resume { .. } => commands::on_resume(task, live, now),
         DaemonCommand::Cancel { .. } => commands::on_cancel(task, None, now),
         DaemonCommand::Retry { .. } => commands::on_retry(task, None, now),
         _ => return Ok(false),

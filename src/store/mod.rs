@@ -883,9 +883,16 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// The most recent session for a task, if any.
+    /// The most recently started session for a task, if any. Attempts reset
+    /// on a terminal-task retry, so they cannot order execution history. For
+    /// equal start timestamps, prefer the row inserted later. Fails on a DB error.
     pub fn latest_session(&self, task_id: TaskId) -> Result<Option<Session>> {
-        Ok(self.list_sessions_for_task(task_id)?.into_iter().last())
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT {} FROM sessions WHERE task_id = ?1 ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            Self::SESSION_COLS
+        );
+        Ok(conn.query_row(&sql, params![task_id.to_string()], Self::row_to_session).optional()?)
     }
 
     pub fn list_live_sessions(&self) -> Result<Vec<Session>> {
@@ -914,7 +921,7 @@ impl Store {
 
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
         let conn = self.lock();
-        let sql = format!("SELECT {} FROM sessions ORDER BY started_at ASC", Self::SESSION_COLS);
+        let sql = format!("SELECT {} FROM sessions ORDER BY started_at ASC, rowid ASC", Self::SESSION_COLS);
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], Self::row_to_session)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
