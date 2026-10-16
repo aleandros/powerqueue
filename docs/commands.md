@@ -65,7 +65,11 @@ Project filters on `status`, `task list` and `dashboard` affect only the task li
 `<task>` is a key (`ENG-123`, `manual-1a2b3c4d`), a full id, or an id prefix.
 `pause`, `resume`, `cancel` and `retry` are queued for the daemon; with no
 daemon running (no heartbeat for 30 s) they are applied directly when the
-state machine allows it. `complete` and `block` always write directly.
+state machine allows it. Agent sessions can survive the daemon: offline
+`resume` returns a task with a recorded live session to `running`, and
+`cancel`/`retry` remain queued until the daemon can stop that session. Restart
+`powerqueue run` to process those queued controls. `complete` and `block` always
+write directly.
 
 ## Priority rules
 

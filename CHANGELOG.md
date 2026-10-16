@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-10-16
+
+### Fixed
+
+- Preserve live session ownership when task controls run without a daemon:
+  resume returns to the surviving session, and cancel/retry stay queued until
+  the daemon can stop it. Select the latest session by start time, so resetting
+  attempts on a terminal-task retry cannot hide the new session behind history
+  in the scheduler or dashboard (including attachment and resource samples).
+
+### Added
+
+- Stateful scheduler coverage for conditional model preferences, policy and
+  concurrency reloads, dated rolling-window spend, observed provider usage,
+  historical sessions and offline CLI writers. Forced launch scenarios exercise
+  draining a lowered concurrency limit, budget expiry and retry deadlines;
+  minimized bug regressions and an opt-in larger stress run accompany the fixes.
+
 ## [0.18.0] - 2026-10-15
 
 ### Fixed
@@ -1040,7 +1058,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.18.1...HEAD
+[0.18.1]: https://github.com/aleandros/powerqueue/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/aleandros/powerqueue/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/aleandros/powerqueue/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/aleandros/powerqueue/releases/tag/v0.16.0

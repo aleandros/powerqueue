@@ -504,7 +504,7 @@ without it the session has no way to tell powerqueue it is done.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `max_concurrent` | `2` | parallel sessions |
+| `max_concurrent` | `2` | parallel sessions; lowering this on reload keeps existing sessions alive and admits new work only after the live count falls below the new limit |
 | `max_attempts` | `3` | attempts before a task is `failed` |
 | `tick_secs` | `5` | main loop period |
 | `idle_timeout_secs` | `600` | silent after a turn without a marker: nudge once, then `needs_attention` |
