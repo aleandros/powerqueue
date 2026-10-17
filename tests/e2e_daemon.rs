@@ -885,6 +885,13 @@ fn gh_pr(number: u64, state: &str, mergeable: &str) -> String {
     .to_string()
 }
 
+/// Publish a complete response atomically while the fake gh may be reading it.
+fn write_pr_response(path: &Path, response: &str) {
+    let temp = tempfile::NamedTempFile::new_in(path.parent().unwrap()).unwrap();
+    std::fs::write(temp.path(), response).unwrap();
+    temp.persist(path).expect("replace fake gh response");
+}
+
 #[test]
 fn completion_without_a_pr_link_adopts_the_branch_open_pr() {
     // AVS-1652: the agent printed the done marker without `--pr`; its
@@ -925,8 +932,8 @@ fn review_in_project(multi: bool) {
     let state = env.root.path().join("fakestate");
     std::fs::create_dir_all(&state).unwrap();
     env.vars.push(("FAKE_GH_DIR".into(), state.display().to_string()));
-    std::fs::write(state.join("pr-7.json"), gh_pr(7, "OPEN", "MERGEABLE")).unwrap();
-    std::fs::write(state.join("pr-8.json"), gh_pr(8, "OPEN", "MERGEABLE")).unwrap();
+    write_pr_response(&state.join("pr-7.json"), &gh_pr(7, "OPEN", "MERGEABLE"));
+    write_pr_response(&state.join("pr-8.json"), &gh_pr(8, "OPEN", "MERGEABLE"));
     let a = add_task(&env, "Ship A", if multi { &["--project", "api"] } else { &[] });
     std::fs::write(state.join(format!("pr-{a}")), "7").unwrap();
     let b = add_task(&env, "Ship B", &[]);
@@ -942,8 +949,8 @@ fn review_in_project(multi: bool) {
 
     // A's PR now conflicts. The resumed session "resolves" it (the next gh
     // answer is MERGED), re-arms, and the watcher completes the task.
-    std::fs::write(state.join("pr-7.next.json"), gh_pr(7, "MERGED", "UNKNOWN")).unwrap();
-    std::fs::write(state.join("pr-7.json"), gh_pr(7, "OPEN", "CONFLICTING")).unwrap();
+    write_pr_response(&state.join("pr-7.next.json"), &gh_pr(7, "MERGED", "UNKNOWN"));
+    write_pr_response(&state.join("pr-7.json"), &gh_pr(7, "OPEN", "CONFLICTING"));
     let v = env.wait_for_show(&a, |v| v["task"]["state"] == "completed" && has_event(v, "cleanup.branch_deleted"));
     assert_eq!(v["task"]["state"].as_str(), Some("completed"), "{}", env.daemon_log());
     assert_eq!(v["task"]["execution_project"], if multi { "api" } else { "default" });
@@ -968,6 +975,40 @@ fn review_in_project(multi: bool) {
     let branches = Command::new("git").args(["branch", "--list", &format!("pq/{a}")]).current_dir(&repo).output().unwrap();
     assert!(String::from_utf8_lossy(&branches.stdout).trim().is_empty(), "local branch deleted after the merge");
     assert_eq!(env.task_state(&b), "in_review", "B's PR is still open");
+    env.export_events(if multi { "review-project" } else { "review-round" });
+}
+
+#[test]
+fn closed_review_resumes_watching_without_launching_an_agent() {
+    let gh = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-gh.sh");
+    let extra = format!("pr_poll_secs = 1\ngh_binary = \"{}\"", gh.display());
+    let Some(mut env) = Env::new("pr", &extra) else { return };
+    let state = env.root.path().join("fakestate");
+    std::fs::create_dir_all(&state).unwrap();
+    env.vars.push(("FAKE_GH_DIR".into(), state.display().to_string()));
+    write_pr_response(&state.join("pr-7.json"), &gh_pr(7, "CLOSED", "UNKNOWN"));
+    let key = add_task(&env, "Closed review recovery", &[]);
+    env.start_daemon();
+    let parked = env.wait_for_show(&key, |v| v["task"]["state"] == "needs_attention" && has_event(v, "review.closed"));
+    assert_eq!(parked["task"]["state"], "needs_attention", "{}", env.daemon_log());
+    assert!(has_event(&parked, "session.released"));
+    assert_eq!(parked["sessions"][0]["session"]["state"], "exited");
+    assert_eq!(parked["task"]["attempts"], 1);
+
+    // Reopen the synthetic PR before resuming its watch. The original agent
+    // must remain released, and no second attempt or review round is needed.
+    write_pr_response(&state.join("pr-7.json"), &gh_pr(7, "OPEN", "MERGEABLE"));
+    env.run_ok(&["task", "resume", &key]);
+    let resumed = env.wait_for_show(&key, |v| v["task"]["state"] == "in_review" && has_event(v, "task.resumed"));
+    assert_eq!(resumed["task"]["state"], "in_review", "{}", env.daemon_log());
+    write_pr_response(&state.join("pr-7.json"), &gh_pr(7, "MERGED", "UNKNOWN"));
+    let merged = env.wait_for_show(&key, |v| v["task"]["state"] == "completed" && has_event(v, "cleanup.branch_deleted"));
+    assert_eq!(merged["task"]["state"], "completed", "{}", env.daemon_log());
+    assert_eq!(merged["task"]["attempts"], 1);
+    assert_eq!(merged["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(merged["events"].as_array().unwrap().iter().filter(|e| e["kind"] == "session.launched").count(), 1);
+    assert!(has_event(&merged, "review.merged"));
+    env.export_events("review-closed-resume");
 }
 
 /// Stateful REST fixture: the daemon must observe labels changed by earlier

@@ -135,7 +135,24 @@ relaunch require `in_review` with no live session, reflecting the daemon's
 release-before-poll ordering. Relaunch preserves total attempts and begins a new
 crash allowance. A paused review watch resumes watching, while a paused requested
 round resumes its queued work. The model does not validate GitHub's evidence,
-review-round caps, review parking/recovery, or automatic adoption of an open PR.
+review-round caps or automatic adoption of an open PR. Closed and stale
+reviews now park in `needs_attention` only after session release. `Resume`
+(including after `Pause`) returns to `in_review`, whereas `Retry` queues agent
+work and preserves the attempt count without granting a fresh crash allowance.
+These transitions share `lifecycle.allowed`/`advance` between simulation and replay.
+
+This extension deliberately covers **closed/stale parking and recovery**, plus
+real-daemon replay of the existing hand-off/conflict/relaunch/merge path.
+`ReviewPark` collapses `review.closed` and `review.stale`: it assumes the logged
+GitHub decision or staleness decision is correct, without modeling the PR API,
+fingerprints, staleness clock, labels, or elapsed-hour threshold. `watching` is
+the abstract resume destination, not proof of a live poller. `review.hold` only
+changes watch metadata and stutters in replay. Exhausted review rounds retain
+a pending request with different crash-accounting/recovery semantics; they
+remain a cutoff rather than being conflated with closed/stale parking.
+`review.error` is also a cutoff because it can mean either an unusable PR
+(parking) or a transient fetch failure (no state change) with the same payload
+shape. Relayed answers and automatic PR adoption remain outside this scope.
 
 The `progress` module isolates the liveness claim: with persistent approval, budget and
 a free slot, no competing tasks, and weak fairness for time and launch, a queued
@@ -144,7 +161,7 @@ time. This is a conditional property, not a starvation-freedom claim about the
 real priority scheduler. There is no per-task progress guarantee under arbitrary
 pause/cancel commands, competing higher-priority work, or perpetual budget exhaustion.
 
-Not modeled: review parking/adoption, relayed answers, dependency graph changes, configuration changes
+Not modeled: exhausted-round recovery, review errors/adoption, relayed answers, dependency graph changes, configuration changes
 beyond project availability/checkout identity, provider/model selection, observed usage, floating-point costing, or actual
 rolling spend. Rust properties still cover these arithmetic/policy details.
 
@@ -191,7 +208,7 @@ and routing decisions and launch ordering, not the underlying GitHub evidence or
 routing predicates. Older traces without routing events retain the legacy default
 of permitted routing. Source approval and routing are independent in every trace.
 
-At the first unsupported lifecycle event for a task (review parking/adoption,
+At the first unsupported lifecycle event for a task (exhausted review rounds, review errors/adoption,
 human blocker, container lifecycle, relayed answer, live-session retry release,
 launch error/supersession), replay **ends that task's prefix**. It
 never skips a state change and then resumes checking from stale state. The report
@@ -208,7 +225,7 @@ model's state, and a live session prevents dependency blocking. Container holds
 end the prefix, as does `task.in_review` with `adopted: true`. A live-session retry
 emits `session.ended` before `task.retried` or `review.relaunch`; the adapter ends
 that prefix rather than ignoring the session mutation. Retries after a normal
-review release remain supported. `review.status` and `relay.hint_sent` are
+review release remain supported. `review.status`, `review.hold`, and `relay.hint_sent` are
 observational; other unsupported review/relay events still end the prefix.
 The supported dependency/review events already exist in v0.14.0: replay tooling
 can validate those historical logs without upgrading or restarting the daemon.
@@ -226,23 +243,24 @@ can validate those historical logs without upgrading or restarting the daemon.
 | dependency `task.blocked`, `task.unblocked` | DependencyBlock / Unblock |
 | `task.in_review`, `session.released` | HandOff / ReviewRelease |
 | `review.relaunch`, `review.merged` | ReviewRetry / Merge |
+| `review.closed`, `review.stale` | ReviewPark (released watch → needs_attention) |
 | `task.throttled` | Throttle |
 | `budget.rate_limited` from a hook, `session.waiting_for_reset` | RateLimit (retains session) |
 | `budget.rate_limited` with `source=pane` | Stutter: provider mark alone does not change task |
 | `task.resumed` after cooldown | Wake |
 | `task.paused`, ordinary `task.resumed`, `task.cancelled`, `task.retried` | Pause, Resume, Cancel/SourceCancel, Retry |
 
-To capture the four supported real-daemon scenarios without adding Quint to
+To capture the six required real-daemon scenarios without adding Quint to
 `cargo test`:
 
 ```sh
 POWERQUEUE_TRACE_DIR=/tmp/pq-traces cargo test --test e2e_daemon
-for name in completion crash-resume rate-limit github-approved; do
+for name in completion crash-resume rate-limit github-approved review-round review-closed-resume; do
   cargo run --quiet --example quint-replay -- "/tmp/pq-traces/$name.json" --name "$name" --run
 done
 ```
 
-The advisory workflow requires all four artifacts, so skipped e2e tests cannot
+The advisory workflow requires all six artifacts, so skipped e2e tests cannot
 produce a false success. Adapter tests include negative schedules: double launch,
 wrong attempt, premature restart, early failure, crash past the limit, and duplicate
 completion after a session has ended. Projection tests run with ordinary
@@ -259,7 +277,48 @@ that approximation reject an otherwise valid restart. CI retains generated
 replay schedules alongside coverage reports and counterexamples for diagnosis.
 Dependency/review rejection tests also cover starts while blocked, missing
 handoffs or releases, duplicate merges, wrong relaunch attempts, paused review
-watches, and crash limits relative to a review round rather than lifetime attempts.
+watches, and crash limits relative to a review round rather than lifetime attempts. Closed/stale schedules additionally reject
+parking before hand-off/release, duplicate parking, polling/launching while
+parked, launching after resume-to-watch, parking completed work, and resetting
+the crash allowance on a plain retry. Each negative schedule is projected and
+must fail a Quint assertion; a cutoff or adapter rejection is not a passing test.
+
+The `review-round` e2e artifact observes two tasks sharing one slot, session
+release, a conflict-driven resumed session, re-arming, and merge.
+`review-closed-resume` observes a closed PR parking, an explicit resume after
+reopening, and merge with exactly one launch. Both use the real daemon, git,
+tmux and CLI with fake Claude/GitHub responses; stale parking uses synthetic
+Quint schedules and existing Rust review tests instead of waiting hours in CI.
+The optional `review-project` export exercises the same round across execution
+projects; it is not an additional mandatory advisory artifact. These checks
+assert observable event order and attempts only, not session identity,
+unlogged reservations, complete database state, or implementation equivalence.
+No review fairness or eventual-merge claim is made: recovery depends on user
+commands and external PR changes. The separate conditional `progress` fairness
+assumptions above are unchanged.
+
+## Measured test cost
+
+Single local macOS runs for this extension (warm npm dependencies; background
+Rust builds/tests also ran, so these are observations, not stable CI estimates):
+
+| Check | Before / added cost |
+| --- | --- |
+| `npm --prefix spec test` | 4.25 s before, 6.73 s after (+2.48 s); two added scenarios |
+| Existing replay test group | 44.48 s test time |
+| New parked-review replay test | 42.23 s test time for 26 schedules (requires Quint) |
+| Two newly required daemon captures | 4.37 s conflict/relaunch + 5.08 s closed/resume test time |
+| Two newly required real-trace replays | 1.59 s + 1.84 s wall time using the built adapter |
+
+The replay groups run concurrently in the normal test harness, so their times
+are not additive. Compilation and Cargo lock waits are excluded from Rust test
+times. Ordinary `cargo test` gains one daemon scenario and a cheap projection
+test; the conflict scenario already existed. Quint installation, simulations,
+26 new assertion schedules, and mandatory trace replays remain in the separate
+**advisory** workflow (`continue-on-error: true`); no release or Rust gate now
+requires Quint. CI additionally checks that both new required traces have no
+cutoffs and contain their expected review actions, preventing partial replay
+from being mistaken for review coverage.
 
 ## Operational validation
 

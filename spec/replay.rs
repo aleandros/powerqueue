@@ -41,6 +41,7 @@ const STUTTERS: &[&str] = &[
     "session.discovery_failed",
     "review.lookup_failed",
     "review.status",
+    "review.hold",
     // Typing a hint does not change task/session state; answers can, and
     // remain prefix cutoffs along with the other unsupported relay events.
     "relay.hint_sent",
@@ -68,7 +69,7 @@ const OUT_OF_SCOPE: &[&str] = &[
     "session.permission_prompt",
     "session.ended",
 ];
-const REVIEW_ACTIONS: &[&str] = &["review.merged", "review.relaunch"];
+const REVIEW_ACTIONS: &[&str] = &["review.merged", "review.relaunch", "review.closed", "review.stale"];
 
 type Counts = BTreeMap<String, usize>;
 
@@ -102,6 +103,7 @@ enum Op {
     HandOff,
     ReviewRelease,
     ReviewRetry,
+    ReviewPark,
     Merge,
 }
 
@@ -294,6 +296,7 @@ fn project(mut events: Vec<Event>) -> Result<(Vec<Observation>, Coverage)> {
             "session.released" => Op::ReviewRelease,
             "review.relaunch" => Op::ReviewRetry,
             "review.merged" => Op::Merge,
+            "review.closed" | "review.stale" => Op::ReviewPark,
             "task.throttled" => Op::Throttle,
             "budget.rate_limited" | "session.waiting_for_reset" => Op::RateLimit,
             "task.paused" => Op::Pause,

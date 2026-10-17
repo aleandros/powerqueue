@@ -241,7 +241,7 @@ fn quint_review_rearming_and_direct_completion() {
 
 #[test]
 fn review_observations_do_not_hide_unsupported_review_or_relay_changes() {
-    for kind in ["review.error", "review.closed", "review.rounds_exhausted", "relay.answer_sent"] {
+    for kind in ["review.error", "review.rounds_exhausted", "review.unknown", "relay.answer_sent"] {
         let (_, report) = project(with_tail(vec![
             event(4, "relay.hint_sent"),
             event(5, "task.in_review"),
@@ -254,6 +254,75 @@ fn review_observations_do_not_hide_unsupported_review_or_relay_changes() {
         assert_eq!(report.actions.get("Merge"), None);
         assert_eq!(report.stutters["relay.hint_sent"], 1);
         assert_eq!(report.truncated_or_skipped_tasks[&format!("prefix ends at {kind}")], 1);
+    }
+}
+
+fn parked_review(kind: &str) -> Vec<Event> {
+    with_tail(vec![event(4, "task.in_review"), event(5, "session.released"), event(6, kind)])
+}
+
+#[test]
+fn closed_and_stale_reviews_project_without_leaking_payloads() {
+    for kind in ["review.closed", "review.stale"] {
+        let mut rows = parked_review(kind);
+        rows[5].message = "private PR title, branch, and human comment".into();
+        rows[5].data = json!({"pr": "https://github.com/private/repo/pull/123"});
+        rows.extend([event(7, "task.resumed"), event(8, "review.hold"), event(9, "review.merged")]);
+        let (observations, report) = project(rows).unwrap();
+        assert_eq!(observations[5].op, Op::ReviewPark);
+        assert_eq!(report.actions["Merge"], 1);
+        assert_eq!(report.stutters["review.hold"], 1);
+        assert!(report.truncated_or_skipped_tasks.is_empty());
+        assert!(!render(&observations).contains("private"));
+        assert!(!serde_json::to_string(&report).unwrap().contains("private"));
+    }
+}
+
+#[test]
+#[ignore = "requires Quint"]
+fn quint_checks_parked_review_recovery_and_rejects_invalid_schedules() {
+    for kind in ["review.closed", "review.stale"] {
+        let parked = parked_review(kind);
+        // Recovery returns to watching without consuming another attempt.
+        let mut resumed = parked.clone();
+        resumed.extend([event(7, "task.resumed"), event(8, "review.merged")]);
+        check_trace(resumed.clone(), true);
+        let mut premature = parked.clone();
+        premature.extend([event(7, "task.resumed"), payload(8, "task.starting", json!({"attempt": 2}))]);
+        check_trace(premature, false);
+        // Missing handoff or release must fail in Quint, not end the prefix.
+        for missing in [4, 5] {
+            check_trace(resumed.iter().filter(|e| e.id != missing).cloned().collect(), false);
+        }
+        // A parked watch cannot poll/merge/relaunch or start an agent directly.
+        for invalid in [
+            event(7, "review.merged"),
+            event(7, "review.relaunch"),
+            event(7, kind),
+            payload(7, "task.starting", json!({"attempt": 2})),
+        ] {
+            let mut rows = parked.clone();
+            rows.push(invalid);
+            check_trace(rows, false);
+        }
+        let mut paused = parked.clone();
+        paused.extend([event(7, "task.paused"), event(8, "task.resumed"), event(9, "review.merged")]);
+        check_trace(paused, true);
+        // Explicit retry queues work, retaining lifetime attempts. It is not
+        // ReviewRetry, which would grant a fresh crash allowance.
+        let mut retried = parked;
+        retried.extend([
+            event(7, "task.retried"),
+            payload(8, "task.starting", json!({"attempt": 2})),
+            payload(9, "session.launched", json!({"attempt": 2})),
+            payload(10, "task.failed", json!({"attempt": 2, "max_attempts": 2})),
+        ]);
+        check_trace(retried.clone(), true);
+        retried[9] =
+            payload(10, "session.crashed", json!({"attempt": 2, "max_attempts": 2, "retry_at": event(20, "").timestamp}));
+        check_trace(retried, false);
+        check_trace(with_tail(vec![event(4, kind)]), false);
+        check_trace(with_tail(vec![event(4, "task.completed"), event(5, kind)]), false);
     }
 }
 
