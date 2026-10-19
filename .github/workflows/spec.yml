@@ -6,6 +6,8 @@ on:
       - 'src/scheduler/**'
       - 'src/budget/**'
       - 'src/domain.rs'
+      - 'src/execution.rs'
+      - 'src/strategies.rs'
       - 'src/github/**'
       - 'src/config.rs'
       - 'src/projects.rs'

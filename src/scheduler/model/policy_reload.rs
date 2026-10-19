@@ -3,7 +3,7 @@
 use super::*;
 use crate::domain::{DaemonCommand, Provider};
 
-fn ready_world(count: usize, slots: u32) -> DaemonWorld {
+pub(super) fn ready_world(count: usize, slots: u32) -> DaemonWorld {
     let mut cfg = Config::default();
     cfg.scheduler.max_concurrent = slots;
     // Keep pacing out of the slot/policy assertions; budget scenarios below

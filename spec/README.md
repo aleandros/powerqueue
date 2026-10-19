@@ -320,6 +320,41 @@ requires Quint. CI additionally checks that both new required traces have no
 cutoffs and contain their expected review actions, preventing partial replay
 from being mistaken for review coverage.
 
+## Dedicated triage queues
+
+`triage.qnt` is a separate bounded model with six tasks and two queues. The
+standard `typecheck`, `test`, and `check` npm scripts include it, so the existing
+advisory workflow runs its five deterministic scenarios and 1,000 seeded
+simulation traces of up to 100 steps. It checks:
+
+- Coding cannot borrow triage capacity, and failed launches consume no slot.
+- Lowering limits preserves existing sessions; new launches wait for capacity.
+- Saved queue/workflow bindings survive relabeling, policy edits, retry and
+  restart. Removing a bound triage queue holds future launches, including when
+  all queue configuration is removed.
+- An analysis requires a report/outcome, cannot hand off a PR, and keeps its
+  source issue open. A done marker preserves the report identity; retry clears
+  the old result before another analysis pass.
+
+This model abstracts launch as one atomic operation, reports as integer IDs,
+and persistence as retained state. It does not prove the Rust implementation
+equivalent, replay triage events, model budgets/cooldowns, or verify external
+Linear delivery and cleanup. `scheduler::model::triage` separately drives the
+production Rust planner/transitions and SQLite task reloads with generated
+interleavings; mocked Linear and daemon integration tests cover the external
+effects. No fairness or eventual-response claim is made. After a capacity
+reduction, existing sessions can exceed the new limits: the safety witness
+checks capacity at each launch rather than incorrectly requiring an immediate
+drop in the live-session count.
+
+Run the focused checks with:
+
+```sh
+cargo test --lib scheduler::model::triage
+spec/node_modules/.bin/quint test spec/triage.qnt
+spec/node_modules/.bin/quint run spec/triage.qnt --invariant=safety --max-samples=1000 --max-steps=100 --seed=42
+```
+
 ## Operational validation
 
 Replay logs from a consistent application version and retain task creation

@@ -800,6 +800,38 @@ pub fn queue_capacity_case() -> impl Strategy<Value = (u32, u32, u32, u32)> {
     (1u32..8, 1u32..8, 0u32..10, 0u32..10)
 }
 
+/// Operations in the stateful queue/workflow model.
+#[derive(Debug, Clone)]
+pub enum TriageModelOp {
+    Launch(bool),
+    Complete(usize, crate::execution::TriageOutcome),
+    Done(usize),
+    Retry(usize),
+    Release(usize),
+    Crash(usize),
+    Restart,
+    Reload { coding: u32, triage: u32, presence: u8 },
+    Relabel(usize, bool),
+    Tick(i64),
+}
+
+/// Queue/lifecycle interleavings, including removed queues and policy edits.
+pub fn triage_model_op() -> impl Strategy<Value = TriageModelOp> {
+    use TriageModelOp::*;
+    prop_oneof![
+        5 => any::<bool>().prop_map(Launch),
+        3 => (0usize..8, prop::sample::select(crate::execution::TriageOutcome::ALL.to_vec())).prop_map(|(i, o)| Complete(i, o)),
+        2 => (0usize..8).prop_map(Done),
+        2 => (0usize..8).prop_map(Retry),
+        2 => (0usize..8).prop_map(Release),
+        1 => (0usize..8).prop_map(Crash),
+        2 => Just(Restart),
+        3 => (1u32..=3, 1u32..=3, 0u8..3).prop_map(|(coding, triage, presence)| Reload { coding, triage, presence }),
+        2 => (0usize..8, any::<bool>()).prop_map(|(i, label)| Relabel(i, label)),
+        1 => (1i64..300).prop_map(Tick),
+    ]
+}
+
 /// Analysis tasks with a pinned workflow, ready to record a triage result.
 pub fn triage_task() -> impl Strategy<Value = Task> {
     task().prop_map(|mut task| {
