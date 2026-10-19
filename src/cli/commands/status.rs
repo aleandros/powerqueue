@@ -33,6 +33,9 @@ pub struct StatusRow {
     pub task: Task,
     /// Provider of the task's model (chosen or forced), if any.
     pub provider: Option<Provider>,
+    pub source_deferral: Option<crate::deferral::Deferral>,
+    pub deferral_error: Option<String>,
+    pub deferral_allows: bool,
     pub session: Option<Session>,
     pub usage: TokenUsage,
     pub weighted_tokens: f64,
@@ -88,7 +91,20 @@ pub fn load_rows(store: &Store, all: bool) -> Result<Vec<StatusRow>> {
             _ => None,
         };
         let provider = super::task::effective_model(&task).map(|m| m.provider());
-        rows.push(StatusRow { weighted_tokens: usage.weighted(), provider, task, session, usage, resource });
+        let source_deferral = task.source_deferral();
+        let deferral_allows = task.deferral_allows(Utc::now());
+        let deferral_error = source_deferral.as_ref().err().map(ToString::to_string);
+        rows.push(StatusRow {
+            source_deferral: source_deferral.ok().flatten(),
+            deferral_error,
+            deferral_allows,
+            weighted_tokens: usage.weighted(),
+            provider,
+            task,
+            session,
+            usage,
+            resource,
+        });
     }
     Ok(rows)
 }
@@ -117,6 +133,15 @@ pub fn cpu_rss(sample: Option<&ResourceSample>) -> String {
 /// (`PR #7`, `PR #7 (waiting for manual merge)`), for a pending review round
 /// the reason (`PR #7: conflict`); `-` otherwise.
 pub fn waiting_on(task: &Task) -> String {
+    let ordinary = waiting_on_without_deferral(task);
+    match task.deferral_summary(Utc::now()) {
+        Some(summary) if ordinary != "-" => format!("{ordinary}; {summary}"),
+        Some(summary) => summary,
+        None => ordinary,
+    }
+}
+
+fn waiting_on_without_deferral(task: &Task) -> String {
     let keys = task.waiting_on();
     let pr = || {
         let url = task.pr_url.as_deref().unwrap_or_default();
@@ -247,9 +272,12 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
     }
 
     let width = terminal_width();
-    let waiting = rows
-        .iter()
-        .any(|r| r.task.is_waiting() || !r.task.blocked_by.is_empty() || r.task.pr_url.is_some() && !r.task.state.is_terminal());
+    let waiting = rows.iter().any(|r| {
+        r.task.deferral_summary(Utc::now()).is_some()
+            || r.task.is_waiting()
+            || !r.task.blocked_by.is_empty()
+            || r.task.pr_url.is_some() && !r.task.state.is_terminal()
+    });
     let title_max = width.saturating_sub(if waiting { 92 } else { 78 }).clamp(16, 80);
     let mut table = output::table();
     table.set_width(width as u16);

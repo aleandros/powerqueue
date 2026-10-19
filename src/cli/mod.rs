@@ -257,6 +257,17 @@ pub struct AddArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum TaskCommand {
+    /// Set a local launch hold (RFC 3339 with offset, or relative duration); --clear removes it.
+    Defer {
+        #[command(flatten)]
+        task: TaskRef,
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        until: Option<String>,
+        #[arg(long, conflicts_with = "clear")]
+        reason: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
     /// Reassign an unstarted task to a registered execution project.
     Project {
         #[command(flatten)]

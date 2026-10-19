@@ -33,7 +33,8 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// * v8: persisted GitHub execution admission (legacy rows start unverified).
 /// * v9: tasks.routing (persisted deterministic routing evidence).
 /// * v10: pinned execution queue and workflow policy.
-pub const SCHEMA_VERSION: i64 = 10;
+/// * v11: explicit local deferral, independent of automatic not_before.
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// kv key of the Claude calibration before schema v2.
 const LEGACY_CALIBRATION_KEY: &str = "budget.calibration";
@@ -240,6 +241,7 @@ impl Store {
                 ("github_admission", "ALTER TABLE tasks ADD COLUMN github_admission TEXT"),
                 ("routing", "ALTER TABLE tasks ADD COLUMN routing TEXT"),
                 ("execution", "ALTER TABLE tasks ADD COLUMN execution TEXT"),
+                ("deferral", "ALTER TABLE tasks ADD COLUMN deferral TEXT"),
             ] {
                 if !cols.iter().any(|c| c == name) {
                     conn.execute(sql, []).with_context(|| format!("add tasks.{name}"))?;
@@ -275,9 +277,9 @@ impl Store {
             "INSERT INTO tasks (id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score,
                 labels, linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts,
                 not_before, last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number,
-                blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing, execution)
+                blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing, execution, deferral)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-                ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)",
+                ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)",
             params![
                 task.id.to_string(),
                 task.key,
@@ -319,16 +321,36 @@ impl Store {
                 task.github_admission.as_ref().map(json),
                 task.routing.as_ref().map(json),
                 task.execution.as_ref().map(json),
+                task.deferral.as_ref().map(json),
             ],
         )
         .with_context(|| format!("insert task {}", task.key))?;
         Ok(())
     }
 
-    /// Overwrite every column of an existing task. `updated_at` is set to now.
+    /// Update lifecycle/source columns; explicit deferral is only written by
+    /// `set_task_deferral`, so stale daemon snapshots cannot erase a user hold.
+    /// Source description edits that change deferral require `update_source_task`.
+    /// `updated_at` is set to now.
     pub fn update_task(&self, task: &Task) -> Result<()> {
-        let conn = self.lock();
-        let n = conn.execute(
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Source holds, like local holds, are explicit intent. Only source sync
+        // may change them; a lifecycle snapshot taken before sync cannot undo one.
+        let current = tx
+            .query_row(
+                &format!("SELECT {} FROM tasks WHERE id=?1", Self::TASK_COLS),
+                params![task.id.to_string()],
+                Self::row_to_task,
+            )
+            .context("load task before lifecycle update")?;
+        let description =
+            if current.source_deferral().map_err(|e| e.to_string()) != task.source_deferral().map_err(|e| e.to_string()) {
+                &current.description
+            } else {
+                &task.description
+            };
+        let n = tx.execute(
             "UPDATE tasks SET key=?2, title=?3, description=?4, source=?5, source_kind=?6, linear_issue_id=?7, state=?8,
                 criticality=?9, score=?10, labels=?11, linear_priority=?12, estimate=?13, project=?14, model_override=?15,
                 model=?16, worktree_path=?17, branch=?18, attempts=?19, max_attempts=?20, not_before=?21, last_error=?22,
@@ -339,7 +361,7 @@ impl Store {
                 task.id.to_string(),
                 task.key,
                 task.title,
-                task.description,
+                description,
                 json(&task.source),
                 task.source.kind(),
                 task.linear_issue_id(),
@@ -380,7 +402,37 @@ impl Store {
         if n == 0 {
             return Err(anyhow!("task {} not found", task.id));
         }
+        tx.commit().context("persist task lifecycle without overwriting explicit holds")?;
         Ok(())
+    }
+
+    /// Atomically apply a pure deferral transition and its log events to the latest
+    /// row. Only the local hold changes; concurrent source/lifecycle writes survive.
+    /// Fails if the task is absent, launching, or persistence fails (all rolled back).
+    pub fn set_task_deferral(&self, id: TaskId, deferral: Option<crate::deferral::Deferral>) -> Result<Task> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut task = tx
+            .query_row(&format!("SELECT {} FROM tasks WHERE id=?1", Self::TASK_COLS), params![id.to_string()], Self::row_to_task)
+            .context("load task for deferral")?;
+        let effects = crate::scheduler::commands::on_defer(&mut task, deferral)?;
+        if !effects.is_empty() {
+            task.updated_at = Utc::now();
+            tx.execute(
+                "UPDATE tasks SET deferral=?2, updated_at=?3 WHERE id=?1",
+                params![id.to_string(), task.deferral.as_ref().map(json), ts(&task.updated_at)],
+            )?;
+            for effect in effects {
+                if let crate::scheduler::transitions::Effect::Log { level, kind, message, data } = effect {
+                    tx.execute(
+                        "INSERT INTO events (task_id, timestamp, level, kind, message, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![id.to_string(), ts(&task.updated_at), level.as_str(), kind, message, json(&data)],
+                    )?;
+                }
+            }
+        }
+        tx.commit().context("persist task deferral and audit event")?;
+        Ok(task)
     }
 
     /// Atomically change an unstarted task's execution project. Refuses if a
@@ -431,8 +483,9 @@ impl Store {
     /// Apply source metadata and cancellation only if the inspected task is still current.
     /// A concurrent launch/reassignment wins; sync retries on the next poll.
     pub fn update_source_task(&self, before: &Task, task: &Task) -> Result<bool> {
-        let changed = self
-            .lock()
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = tx
             .execute(
                 "UPDATE tasks SET title=?2, description=?3, labels=?4, source=?5,
              linear_priority=?6, estimate=?7, project=?8, cycle=?9, cycle_number=?10,
@@ -471,6 +524,17 @@ impl Store {
                 ],
             )
             .context("apply source sync without overwriting concurrent execution")?;
+        if changed != 0 {
+            for effect in crate::scheduler::commands::source_deferral_events(before, task) {
+                if let crate::scheduler::transitions::Effect::Log { level, kind, message, data } = effect {
+                    tx.execute(
+                        "INSERT INTO events (task_id, timestamp, level, kind, message, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![task.id.to_string(), ts(&Utc::now()), level.as_str(), kind, message, json(&data)],
+                    )?;
+                }
+            }
+        }
+        tx.commit().context("persist source metadata and deferral audit")?;
         Ok(changed != 0)
     }
 
@@ -520,7 +584,20 @@ impl Store {
         starting: &Task,
         target: Option<&crate::tmux::LaunchTarget>,
     ) -> Result<bool> {
-        if !before.execution_approved() || !starting.execution_approved() {
+        self.claim_task_start_with_target_at(before, starting, target, Utc::now())
+    }
+
+    /// Claim against an explicit clock instant, preserving the same transactional
+    /// guards as production. Returns false for held or superseded candidates;
+    /// persistence errors roll back both the claim and saved launch target.
+    pub(crate) fn claim_task_start_with_target_at(
+        &self,
+        before: &Task,
+        starting: &Task,
+        target: Option<&crate::tmux::LaunchTarget>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        if !before.execution_approved() || !starting.execution_approved() || !before.deferral_allows(now) {
             return Ok(false);
         }
         let mut conn = self.lock();
@@ -531,7 +608,7 @@ impl Store {
              attempts=?13, branch=?14, worktree_path=?15, execution=?20
              WHERE id=?1 AND execution_project=?2 AND state=?3 AND attempts=?4
              AND github_admission IS ?10 AND title=?11 AND description=?12
-             AND routing IS ?16 AND labels=?17 AND project IS ?18 AND source=?19",
+             AND routing IS ?16 AND labels=?17 AND project IS ?18 AND source=?19 AND deferral IS ?21",
                 params![
                     before.id.to_string(),
                     before.execution_project,
@@ -541,7 +618,7 @@ impl Store {
                     starting.model.as_ref().map(|m| m.alias()),
                     starting.not_before.as_ref().map(ts),
                     starting.review.as_ref().map(json),
-                    ts(&Utc::now()),
+                    ts(&now),
                     before.github_admission.as_ref().map(json),
                     before.title,
                     before.description,
@@ -552,7 +629,8 @@ impl Store {
                     json(&before.labels),
                     before.project,
                     json(&before.source),
-                    starting.execution.as_ref().map(json)
+                    starting.execution.as_ref().map(json),
+                    before.deferral.as_ref().map(json)
                 ],
             )
             .context("claim task start in its execution project")?;
@@ -561,7 +639,7 @@ impl Store {
         {
             tx.execute(
                 "INSERT INTO kv(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
-                params![crate::tmux::LaunchTarget::key(before.id), json(target), ts(&Utc::now())],
+                params![crate::tmux::LaunchTarget::key(before.id), json(target), ts(&now)],
             )
             .context("remember launch tmux target")?;
         }
@@ -661,6 +739,7 @@ impl Store {
             attempts: row.get("attempts")?,
             max_attempts: row.get("max_attempts")?,
             not_before: opt_ts(row.get("not_before")?).map_err(conv)?,
+            deferral: row.get::<_, Option<String>>("deferral")?.as_deref().map(from_json).transpose().map_err(conv)?,
             last_error: row.get("last_error")?,
             summary: row.get("summary")?,
             score_reasons: from_json(&reasons).map_err(conv)?,
@@ -677,7 +756,7 @@ impl Store {
         "id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score, labels,
         linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts, not_before,
         last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number,
-        blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing, execution";
+        blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing, execution, deferral";
 
     pub fn get_task(&self, id: TaskId) -> Result<Option<Task>> {
         let conn = self.lock();

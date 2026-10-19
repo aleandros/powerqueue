@@ -436,6 +436,9 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     kv("updated", opt_ts(Some(task.updated_at)));
     kv("started", opt_ts(task.started_at));
     kv("completed", opt_ts(task.completed_at));
+    if let Some(summary) = task.deferral_summary(Utc::now()) {
+        kv("deferral", summary);
+    }
     if let Some(nb) = task.not_before {
         kv("not before", opt_ts(Some(nb)));
     }
@@ -551,6 +554,10 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
             "model_override": task.model_override,
             "provider": effective_model(&task).map(|m| m.provider()),
             "not_before": task.not_before,
+            "deferral": task.deferral,
+            "source_deferral": task.source_deferral().ok().flatten(),
+            "deferral_error": task.source_deferral().err().map(|e| e.to_string()),
+            "deferral_allows": task.deferral_allows(Utc::now()),
             "waiting_on": task.waiting_on(),
             "blocked_by": task.blocked_by,
             "children": task.children,
@@ -605,6 +612,9 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     }
     if let Some(nb) = task.not_before {
         println!("  not before   {}", opt_ts(Some(nb)));
+    }
+    if let Some(summary) = task.deferral_summary(Utc::now()) {
+        println!("  deferral     {summary}");
     }
     for line in dependency_lines(&task) {
         println!("{line}");
@@ -791,6 +801,30 @@ fn prompt(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
 pub fn run(ctx: &mut Context, cmd: TaskCommand) -> Result<i32> {
     ensure_initialised(ctx)?;
     match cmd {
+        TaskCommand::Defer { task, until, reason, clear: _ } => {
+            let store = ctx.store()?.clone();
+            let current = find_task(&store, &task.task)?;
+            let deferral = until
+                .map(|value| -> Result<_> {
+                    Ok(crate::deferral::Deferral {
+                        until: crate::deferral::parse_time(&value, Utc::now())?,
+                        reason: reason.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()),
+                    })
+                })
+                .transpose()?;
+            let updated = store.set_task_deferral(current.id, deferral)?;
+            if ctx.json {
+                println!("{}", serde_json::to_string_pretty(&updated)?);
+            } else {
+                println!(
+                    "{}: {}",
+                    updated.key,
+                    updated.deferral_summary(Utc::now()).unwrap_or_else(|| "local deferral cleared".into())
+                );
+                println!("Applies to future launches; active sessions and other scheduling restrictions are unchanged.");
+            }
+            Ok(0)
+        }
         TaskCommand::Project { task, project } => {
             let cfg = ctx.config_cloned()?;
             cfg.for_project(&project, &ctx.paths)?;

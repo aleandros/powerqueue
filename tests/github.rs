@@ -1111,3 +1111,37 @@ fn repeated_issue_problems_are_logged_once_until_recovery() {
     apply_plan(&store, &bad).unwrap();
     assert_eq!(store.count_events_of_kind("github.issue_failed", after).unwrap(), 2);
 }
+
+#[tokio::test]
+async fn deferral_survives_source_preview_apply_and_edits() {
+    use chrono::{Duration, Utc};
+    use powerqueue::deferral::Deferral;
+    let server = MockServer::start().await;
+    let store = Store::open_in_memory().unwrap();
+    let cfg = config(&server);
+    let mut remote = issue(1);
+    remote["body"] = json!("Powerqueue-Defer-Until: 2099-10-20T09:00:00-06:00");
+    list(&server, vec![remote.clone()]).await;
+    apply_plan(&store, &plan_sync(&store, &cfg, &client(&server)).await.unwrap()).unwrap();
+    let task = store.get_task_by_key("acme/app#1").unwrap().unwrap();
+    assert!(!task.deferral_allows(Utc::now()));
+    let local = Deferral { until: Utc::now() + Duration::hours(2), reason: Some("local hold".into()) };
+    for body in ["Powerqueue-Defer-Until: invalid", "Powerqueue-Defer-Until: 2000-01-01T00:00:00Z", ""] {
+        server.reset().await;
+        remote["body"] = json!(body);
+        list(&server, vec![remote.clone()]).await;
+        let preview = plan_sync(&store, &cfg, &client(&server)).await.unwrap();
+        // A CLI edit after preview must survive applying the stale remote snapshot.
+        store.set_task_deferral(task.id, Some(local.clone())).unwrap();
+        apply_plan(&store, &preview).unwrap();
+        let saved = store.get_task(task.id).unwrap().unwrap();
+        assert_eq!(saved.deferral, Some(local.clone()));
+        assert_eq!(saved.source_deferral().is_err(), body.ends_with("invalid"));
+        assert!(!saved.deferral_allows(Utc::now()));
+    }
+    assert!(store.set_task_deferral(task.id, None).unwrap().deferral_allows(Utc::now()));
+    assert_eq!(
+        store.events_for_task(task.id, 100).unwrap().iter().filter(|e| e.kind == "task.source_deferral_changed").count(),
+        3
+    );
+}

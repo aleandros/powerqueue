@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     attempts        INTEGER NOT NULL DEFAULT 0,
     max_attempts    INTEGER,
     not_before      TEXT,
+    deferral        TEXT, -- explicit local hold (v11)
     last_error      TEXT,
     summary         TEXT,
     score_reasons   TEXT NOT NULL DEFAULT '[]',

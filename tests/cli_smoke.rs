@@ -379,3 +379,34 @@ fn priority_simulate_ranks_without_writing() {
         .stdout(predicate::str::contains("The daemon still uses the live file"));
     pq(home.path()).args(["priority", "simulate", "--file", "/nonexistent/rules.md"]).assert().code(1);
 }
+
+#[test]
+fn deferral_set_inspect_change_clear_and_resume_preserves_hold() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    write_minimal_config(home.path(), repo.path());
+    pq(home.path()).args(["add", "Deferred work", "--key", "D-1"]).assert().success();
+    pq(home.path())
+        .args(["task", "defer", "D-1", "2099-10-20T09:00:00-06:00", "--reason", "maintenance"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2099-10-20T15:00:00+00:00"));
+    for args in [vec!["status"], vec!["task", "show", "D-1"], vec!["task", "explain", "D-1"]] {
+        pq(home.path()).args(args).assert().success().stdout(predicate::str::contains("maintenance"));
+    }
+    pq(home.path()).args(["task", "pause", "D-1"]).assert().success();
+    pq(home.path()).args(["task", "resume", "D-1"]).assert().success();
+    pq(home.path())
+        .args(["--json", "task", "show", "D-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2099-10-20T15:00:00Z"));
+    pq(home.path()).args(["task", "defer", "D-1", "2h"]).assert().success();
+    pq(home.path()).args(["task", "defer", "D-1", "2026-10-20T09:00:00"]).assert().failure();
+    pq(home.path()).args(["task", "defer", "D-1", "--clear", "2h"]).assert().failure();
+    pq(home.path())
+        .args(["--json", "task", "defer", "D-1", "--clear"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"deferral\": null"));
+}

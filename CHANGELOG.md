@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Explicit task deferral via `task defer`, with timezone-qualified timestamps,
+  relative durations and optional reasons. Linear and GitHub descriptions can
+  set independent source holds. Holds remain visible, survive restart and retry,
+  and never interrupt active sessions or bypass other scheduling restrictions.
+  Transactional audit events, doctor diagnostics, property tests and stateful
+  models cover expiry, source sync, stale writes and launch-claim races.
+
 - Dedicated execution queues and repository-backed workflows. Analysis workflows
   leave Linear tickets open, publish internal-prefix reports and recommendation
   labels with durable delivery retries, and share a repository with coding tasks.

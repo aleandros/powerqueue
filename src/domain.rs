@@ -691,6 +691,9 @@ pub struct Task {
     pub max_attempts: Option<u32>,
     /// Earliest time the scheduler should consider this task (backoff / throttling).
     pub not_before: Option<DateTime<Utc>>,
+    /// Explicit local hold, independent of automatic backoff and source metadata.
+    #[serde(default)]
+    pub deferral: Option<crate::deferral::Deferral>,
     pub last_error: Option<String>,
     /// Summary provided by Claude on completion.
     pub summary: Option<String>,
@@ -747,6 +750,7 @@ impl Task {
             attempts: 0,
             max_attempts: None,
             not_before: None,
+            deferral: None,
             last_error: None,
             summary: None,
             score_reasons: Vec::new(),

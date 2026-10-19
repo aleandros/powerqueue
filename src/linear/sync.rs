@@ -101,7 +101,7 @@ fn sync_issues_inner(
                     EventLevel::Info,
                     "task.created",
                     &format!("created from Linear issue {} ({})", issue.identifier, issue.state_name),
-                    serde_json::json!({ "identifier": issue.identifier, "url": issue.url, "team": issue.team_key }),
+                    serde_json::json!({ "identifier": issue.identifier, "url": issue.url, "team": issue.team_key, "source_deferral": task.source_deferral().map_err(|e| e.to_string()) }),
                 )?;
                 log_routing(store, &task, effects)?;
                 info!(target: "powerqueue::linear", task = %task.key, "task created from Linear");
@@ -310,6 +310,34 @@ pub fn apply_issue(task: &mut Task, issue: &LinearIssue) -> Vec<&'static str> {
 mod tests {
     use super::*;
     use crate::domain::{Criticality, LinkedIssue};
+
+    #[test]
+    fn source_deferral_sync_preserves_local_hold_and_audits_edits() {
+        use crate::deferral::Deferral;
+        let store = Store::open_in_memory().unwrap();
+        let cfg = LinearConfig::default();
+        let mut issue = issue("u1", "ENG-1", "One");
+        issue.description = "Powerqueue-Defer-Until: 2099-10-20T09:00:00-06:00".into();
+        sync_issues(&store, &cfg, &[issue.clone()], no_state).unwrap();
+        let task = store.get_task_by_key("ENG-1").unwrap().unwrap();
+        assert!(!task.deferral_allows(Utc::now()));
+        let local = Deferral { until: Utc::now() + chrono::Duration::days(1), reason: Some("local".into()) };
+        store.set_task_deferral(task.id, Some(local.clone())).unwrap();
+        for body in ["Powerqueue-Defer-Until: invalid", "Powerqueue-Defer-Until: 2000-01-01T00:00:00Z", ""] {
+            issue.description = body.into();
+            sync_issues(&store, &cfg, &[issue.clone()], no_state).unwrap();
+            let saved = store.get_task(task.id).unwrap().unwrap();
+            assert_eq!(saved.deferral, Some(local.clone()));
+            assert!(!saved.deferral_allows(Utc::now()));
+            assert_eq!(saved.source_deferral().is_err(), body.ends_with("invalid"));
+        }
+        let cleared = store.set_task_deferral(task.id, None).unwrap();
+        assert!(cleared.deferral_allows(Utc::now()));
+        assert_eq!(
+            store.events_for_task(task.id, 100).unwrap().iter().filter(|e| e.kind == "task.source_deferral_changed").count(),
+            3
+        );
+    }
 
     fn linked(key: &str, state_type: &str) -> LinkedIssue {
         LinkedIssue { key: key.into(), title: format!("Title {key}"), state_type: state_type.into(), pr_merged: false }

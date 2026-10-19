@@ -26,6 +26,7 @@ pub mod budget;
 pub mod cli;
 pub mod config;
 pub mod dashboard;
+pub mod deferral;
 pub mod doctor;
 pub mod domain;
 pub mod execution;

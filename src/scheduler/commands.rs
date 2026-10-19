@@ -23,6 +23,46 @@ use super::transitions::{Effect, SKIP_REASON};
 #[error("{0}")]
 pub struct Refused(pub String);
 
+/// Set/change/clear a local deferral without changing task or session state.
+/// Refuses an in-progress launch; active sessions otherwise continue untouched.
+/// Terminal tasks retain the hold for an explicit retry.
+pub fn on_defer(task: &mut Task, deferral: Option<crate::deferral::Deferral>) -> Result<Vec<Effect>, Refused> {
+    refuse_while_starting(task, "change deferral for")?;
+    if task.deferral == deferral {
+        return Ok(Vec::new());
+    }
+    let previous = std::mem::replace(&mut task.deferral, deferral);
+    Ok(vec![Effect::log(
+        EventLevel::Info,
+        "task.deferral_changed",
+        match &task.deferral {
+            Some(d) => format!("local deferral set until {}", d.until.to_rfc3339()),
+            None => "local deferral cleared; other scheduling restrictions still apply".into(),
+        },
+        serde_json::json!({"previous": previous, "deferral": task.deferral}),
+    )])
+}
+
+/// Audit changes in the effective source hold, including invalid directives.
+/// Source metadata remains owned by sync; this pure comparison only emits logs.
+pub fn source_deferral_events(before: &Task, after: &Task) -> Vec<Effect> {
+    let old = before.source_deferral().map_err(|e| e.to_string());
+    let new = after.source_deferral().map_err(|e| e.to_string());
+    if old == new {
+        return Vec::new();
+    }
+    vec![Effect::log(
+        EventLevel::Info,
+        "task.source_deferral_changed",
+        match &new {
+            Ok(Some(d)) => format!("{} deferral set until {}", after.source.kind(), d.until.to_rfc3339()),
+            Ok(None) => "source deferral cleared; local holds and other scheduling restrictions still apply".into(),
+            Err(error) => format!("source deferral invalid; future launches held: {error}"),
+        },
+        serde_json::json!({"source": after.source, "previous": old, "deferral": new}),
+    )]
+}
+
 /// Change an unstarted task's project after the caller validates the target.
 /// Refuses live, previously bound or artifact-bearing tasks: moving existing
 /// work requires a new task so transcripts and branches cannot cross repos.

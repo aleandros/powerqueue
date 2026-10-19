@@ -324,7 +324,8 @@ fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) 
                 }),
             ]);
         }
-        cells.push(Cell::from(sym.truncate(&r.title, title_width as usize)));
+        let title = if r.deferred { format!("[deferred] {}", r.title) } else { r.title.clone() };
+        cells.push(Cell::from(sym.truncate(&title, title_width as usize)));
         Row::new(cells)
     });
     let count = rows.len();
@@ -476,6 +477,9 @@ fn draw_detail(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols)
             Span::raw(format!("  score {:.0}  attempts {}", task.score, task.attempts)),
         ]),
     ];
+    if let Some(summary) = task.deferral_summary(Utc::now()) {
+        lines.push(Line::from(Span::styled(summary, Style::default().fg(Color::Yellow))));
+    }
     if let Some(b) = &task.branch {
         lines.push(Line::from(Span::styled(format!("branch {b}"), Style::default().fg(Color::DarkGray))));
     }
