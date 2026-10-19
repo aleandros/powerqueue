@@ -21,7 +21,7 @@ pub use binary::{BINARY_PLACEHOLDERS, BinaryTemplate, BinaryVars, host_command, 
 pub use hooks::{HookOutcome, interpret_hook};
 pub use launcher::{
     LaunchPlan, Launcher, PROMPT_PLACEHOLDERS, PromptContext, RenderedPrompt, build_prompt, hook_settings, prompt_variables,
-    render_prompt, render_template,
+    render_execution_prompt, render_prompt, render_template,
 };
 pub use monitor::{SessionProbe, probe_session, sample_resources};
 pub use transcript::{TranscriptReader, TranscriptState, transcript_path_for};

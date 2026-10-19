@@ -75,6 +75,8 @@ pub enum InboxHeader {
         #[serde(default)]
         pr: Option<String>,
         #[serde(default)]
+        outcome: Option<crate::execution::TriageOutcome>,
+        #[serde(default)]
         session: Option<String>,
     },
     /// `task block`; the body is the reason (may be empty).
@@ -372,11 +374,14 @@ case "$cmd" in
     case "$sub" in
       complete)
         usage="usage: powerqueue task complete <task> [--summary TEXT] [--pr URL]"
-        summary=; pr=
+        summary=; pr=; outcome=
         while [ $# -gt 0 ]; do
           case "$1" in
             --summary) summary="${{2:-}}"; shift; [ $# -gt 0 ] && shift ;;
             --summary=*) summary="${{1#--summary=}}"; shift ;;
+            --summary-file) [ $# -ge 2 ] || die "$usage"; summary=$(cat -- "$2") || die "cannot read summary file"; shift; shift ;;
+            --outcome) outcome="${{2:-}}"; shift; [ $# -gt 0 ] && shift ;;
+
             --pr) pr="${{2:-}}"; shift; [ $# -gt 0 ] && shift ;;
             --pr=*) pr="${{1#--pr=}}"; shift ;;
             *) die "unknown argument \`$1\` ($usage)" ;;
@@ -385,7 +390,13 @@ case "$cmd" in
         [ -n "$id" ] || die "$usage"
         task_ref task "$id"
         if [ -n "$pr" ]; then url pr "$pr"; pr_json="\"$pr\""; else pr_json=null; fi
-        printf '%s' "$summary" | emit "{{\"kind\":\"complete\",\"task\":\"$id\",\"pr\":$pr_json,\"session\":$(session_json)}}" complete || exit 2
+        case "$outcome" in
+          '') outcome_json=null ;;
+          needs-information|needs-decision|ready-for-agent|manual-action|no-action-recommended) outcome_json="\"$outcome\"" ;;
+          *) die "invalid triage outcome" ;;
+        esac
+        [ -z "$outcome" ] || [ -z "$pr" ] || die "--outcome conflicts with --pr"
+        printf '%s' "$summary" | emit "{{\"kind\":\"complete\",\"task\":\"$id\",\"pr\":$pr_json,\"outcome\":$outcome_json,\"session\":$(session_json)}}" complete || exit 2
         if [ -n "$pr" ]; then
           echo "in review: $id ($pr); the daemon releases its slot and worktree and watches the PR"
         else
@@ -455,7 +466,7 @@ mod tests {
 
     #[test]
     fn message_round_trip() {
-        let header = InboxHeader::Complete { task: "ENG-1".into(), pr: None, session: None };
+        let header = InboxHeader::Complete { task: "ENG-1".into(), pr: None, outcome: None, session: None };
         let text = render_message(&header, "all done\nsecond line");
         let msg = parse_message(&text).unwrap();
         assert_eq!(msg.header, header);
@@ -577,6 +588,29 @@ mod tests {
     }
 
     #[test]
+    fn shim_delivers_multiline_triage_report_and_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = write_shim(dir.path());
+        let report = dir.path().join("report with spaces.md");
+        std::fs::write(&report, "Findings\n\nDraft: ¿qué pedido?\n").unwrap();
+        let (code, _, error) = run(
+            &shim,
+            &["task", "complete", "IT-1", "--summary-file", report.to_str().unwrap(), "--outcome", "needs-information"],
+            None,
+            &[],
+        );
+        assert_eq!(code, 0, "{error}");
+        let messages = drain(&inbox_dir(&dir.path().join("task"))).unwrap();
+        assert_eq!(messages.len(), 1);
+        let message = messages[0].1.as_ref().unwrap();
+        assert!(matches!(
+            &message.header,
+            InboxHeader::Complete { outcome: Some(crate::execution::TriageOutcome::NeedsInformation), .. }
+        ));
+        assert_eq!(message.body, "Findings\n\nDraft: ¿qué pedido?");
+    }
+
+    #[test]
     fn shim_refuses_what_it_cannot_do() {
         if which::which("sh").is_err() {
             return;
@@ -658,7 +692,9 @@ mod tests {
     fn write_message_numbers_files_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let inbox = inbox_dir(dir.path());
-        let a = write_message(&inbox, &InboxHeader::Complete { task: "t".into(), pr: None, session: None }, "first").unwrap();
+        let a =
+            write_message(&inbox, &InboxHeader::Complete { task: "t".into(), pr: None, outcome: None, session: None }, "first")
+                .unwrap();
         let b = write_message(&inbox, &InboxHeader::Block { task: "t".into(), session: None }, "second").unwrap();
         assert!(a.file_name().unwrap().to_string_lossy().starts_with("00000001-"), "{}", a.display());
         assert!(b.file_name().unwrap().to_string_lossy().starts_with("00000002-"), "{}", b.display());
@@ -676,7 +712,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let inbox = inbox_dir(dir.path());
         assert_eq!(purge(&inbox).unwrap(), 0, "a missing inbox is fine");
-        write_message(&inbox, &InboxHeader::Complete { task: "t".into(), pr: None, session: None }, "late").unwrap();
+        write_message(&inbox, &InboxHeader::Complete { task: "t".into(), pr: None, outcome: None, session: None }, "late")
+            .unwrap();
         std::fs::write(inbox.join(".00000002-1-1-hook.msg.tmp"), "partial").unwrap();
         std::fs::create_dir_all(inbox.join(REJECTED_RELATIVE)).unwrap();
         std::fs::write(inbox.join(REJECTED_RELATIVE).join("x.msg"), "kept").unwrap();

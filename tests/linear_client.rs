@@ -511,3 +511,44 @@ async fn cli_linear_sync_keeps_relations() {
         assert_eq!(explain(&pq)["waiting_on"], json!(["ENG-2"]), "a second sync keeps the blocker");
     });
 }
+
+#[tokio::test]
+async fn independent_it_intake_preserves_avs_assignment_cycle_and_skip_filters() {
+    let server = server().await;
+    Mock::given(method("POST"))
+        .respond_with(|request: &Request| {
+            let body: Value = request.body_json().unwrap();
+            let filter = &body["variables"]["filter"];
+            let team = filter["team"]["key"]["in"][0].as_str().unwrap();
+            let (id, labels) = if team == "AVS" {
+                assert_eq!(filter["cycle"]["isActive"]["eq"], true);
+                assert!(filter.get("assignee").is_some());
+                ("AVS-1", vec![])
+            } else {
+                assert_eq!(team, "IT");
+                assert!(filter.get("cycle").is_none());
+                assert!(filter.get("assignee").is_none());
+                ("IT-1", vec!["agent/skip", "triage/requested"])
+            };
+            let mut item = issue(id, id, &labels);
+            item["team"]["key"] = json!(team);
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"data": {"issues": {"nodes": [item], "pageInfo": {"hasNextPage": false}}}}))
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let mut cfg = powerqueue::config::LinearConfig {
+        team_keys: vec!["AVS".into()],
+        assignee: Some("user-1".into()),
+        cycle: "active".into(),
+        excluded_labels: vec!["agent/skip".into()],
+        ..Default::default()
+    };
+    cfg.team_filters.insert(
+        "IT".into(),
+        powerqueue::config::LinearTeamFilter { required_labels: vec!["triage/requested".into()], ..Default::default() },
+    );
+    let issues = client(&server).fetch_configured_issues(&cfg).await.unwrap();
+    assert_eq!(issues.iter().map(|i| i.identifier.as_str()).collect::<Vec<_>>(), ["AVS-1", "IT-1"]);
+}

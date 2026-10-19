@@ -795,6 +795,29 @@ pub fn offline_control() -> impl Strategy<Value = u8> {
     0u8..4
 }
 
+/// Dedicated queue capacities and live counts, including over-capacity reloads.
+pub fn queue_capacity_case() -> impl Strategy<Value = (u32, u32, u32, u32)> {
+    (1u32..8, 1u32..8, 0u32..10, 0u32..10)
+}
+
+/// Analysis tasks with a pinned workflow, ready to record a triage result.
+pub fn triage_task() -> impl Strategy<Value = Task> {
+    task().prop_map(|mut task| {
+        task.state = TaskState::Running;
+        task.execution = Some(crate::execution::Execution {
+            queue: "triage".into(),
+            workflow: Some("triage".into()),
+            policy: Some(crate::execution::WorkflowConfig {
+                instructions: "triage.md".into(),
+                completion: crate::execution::Completion::LeaveTicketOpen,
+                comment_prefix: "[interno]".into(),
+            }),
+            outcome: None,
+        });
+        task
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

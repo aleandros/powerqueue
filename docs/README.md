@@ -32,3 +32,5 @@
 The [reference/](reference/) directory contains implementation research and
 historical design notes. Use the configuration and command references above
 for current behavior.
+
+- [Triage queues and repository workflows](triage.md): dedicated capacity, internal analysis reports, and application rollout.

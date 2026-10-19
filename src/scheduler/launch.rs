@@ -84,6 +84,7 @@ pub struct LaunchPlanner {
     candidates: Vec<Task>,
     considered: HashSet<TaskId>,
     slots: u32,
+    queues: crate::execution::QueueSlots,
     failures: super::launch_failures::LaunchFailures,
 }
 
@@ -92,7 +93,21 @@ impl LaunchPlanner {
     /// many sessions may still start. Expired rate-limit marks should be
     /// cleared by the caller first.
     pub fn new(estimator: Estimator, ledgers: Ledgers, candidates: Vec<Task>, slots: u32) -> Self {
-        Self { estimator, ledgers, candidates, considered: HashSet::new(), slots, failures: Default::default() }
+        Self {
+            estimator,
+            ledgers,
+            candidates,
+            considered: HashSet::new(),
+            slots,
+            queues: Default::default(),
+            failures: Default::default(),
+        }
+    }
+
+    /// Configure independent queue capacity for this scheduling pass.
+    pub fn with_queues(mut self, cfg: &Config, live: &[Task]) -> Self {
+        self.queues = crate::execution::QueueSlots::new(cfg, &self.candidates, live);
+        self
     }
 
     /// The next task to consider and the policy's decision for it: the best
@@ -107,7 +122,9 @@ impl LaunchPlanner {
             let remaining: Vec<Task> = self
                 .candidates
                 .iter()
-                .filter(|t| !self.considered.contains(&t.id) && self.failures.permits(&t.execution_project, now))
+                .filter(|t| {
+                    !self.considered.contains(&t.id) && self.queues.permits(t) && self.failures.permits(&t.execution_project, now)
+                })
                 .cloned()
                 .collect();
             pick_next(&remaining, now).cloned()?
@@ -132,6 +149,7 @@ impl LaunchPlanner {
             .iter()
             .filter(|t| {
                 !self.considered.contains(&t.id)
+                    && self.queues.permits(t)
                     && rules.contains_key(&t.execution_project)
                     && self.failures.permits(&t.execution_project, now)
             })
@@ -164,6 +182,7 @@ impl LaunchPlanner {
     pub fn started(&mut self, budget: &BudgetConfig, candidate: &Candidate) {
         let Some(model) = &candidate.decision.model else { return };
         self.slots = self.slots.saturating_sub(1);
+        self.queues.started(&candidate.task);
         reserve(&mut self.ledgers, model, candidate.weighted_cost(budget));
     }
 
@@ -276,6 +295,10 @@ pub fn on_starting(
     if !task.execution_approved() {
         return None;
     }
+    if !cfg.queues.is_empty() {
+        let execution = cfg.execution_for(task).ok()?;
+        task.execution = Some(execution);
+    }
     let attempt = task.attempts + 1;
     if resuming_with_prompt && let Some(watch) = task.review.as_mut() {
         watch.parked = false;
@@ -295,7 +318,7 @@ pub fn on_starting(
         EventLevel::Info,
         "task.starting",
         format!("starting attempt {attempt} with {model}"),
-        serde_json::json!({ "model": model, "attempt": attempt, "reasons": decision.reasons, "prediction": decision.prediction }),
+        serde_json::json!({ "model": model, "attempt": attempt, "reasons": decision.reasons, "prediction": decision.prediction, "execution": task.execution }),
     )];
     Some(Start { branch, worktree, attempt, effects })
 }
@@ -529,6 +552,7 @@ pub fn on_launch_superseded(fresh: &mut Task, claimed: &Task, session: &Session)
     fresh.branch = claimed.branch.clone();
     fresh.worktree_path = claimed.worktree_path.clone();
     fresh.model = claimed.model.clone();
+    fresh.execution = claimed.execution.clone();
     vec![Effect::log(
         EventLevel::Warn,
         "launch.superseded",
@@ -550,6 +574,24 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-10-01T12:00:00Z").unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn busy_coding_pool_does_not_block_triage_or_reserve_its_budget() {
+        let f = Fixed::new();
+        let cfg = crate::execution::tests::config();
+        let mut coding = Task::new("C-1", "coding", TaskSource::Manual);
+        coding.score = 1000.0;
+        let mut triage = crate::execution::tests::it_task();
+        triage.score = 1.0;
+        let mut p = planner(vec![coding.clone(), triage.clone()], 1).with_queues(&cfg, &[coding.clone(), coding]);
+        let next = p.next(f.ctx(), now()).unwrap();
+        assert_eq!(next.task.id, triage.id);
+        // A failed launch consumes nothing; a later pass can try it again.
+        assert!(p.queues.permits(&triage));
+        p.started(&f.cfg.budget, &next);
+        assert!(!p.queues.permits(&triage));
+        assert!(p.next(f.ctx(), now()).is_none());
     }
 
     #[test]

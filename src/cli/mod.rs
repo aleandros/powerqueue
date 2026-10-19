@@ -275,6 +275,12 @@ pub enum TaskCommand {
         task: TaskRef,
         #[arg(short, long)]
         summary: Option<String>,
+        /// Read the full summary from a UTF-8 Markdown file.
+        #[arg(long, conflicts_with = "summary")]
+        summary_file: Option<PathBuf>,
+        /// Recommended next action for a leave-ticket-open workflow; also publishes a Linear label.
+        #[arg(long, value_enum, conflicts_with = "pr")]
+        outcome: Option<crate::execution::TriageOutcome>,
         /// GitHub pull request whose merge is armed (`https://github.com/OWNER/REPO/pull/N`)
         #[arg(long, value_name = "URL")]
         pr: Option<String>,

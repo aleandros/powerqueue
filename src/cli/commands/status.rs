@@ -199,6 +199,7 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
                 "failed": counts.failed, "cancelled": counts.cancelled,
             },
             "project_filter": args.project,
+            "queues": cfg.queues,
             "tasks": rows,
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
@@ -255,7 +256,8 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
     if !color {
         table.force_no_tty();
     }
-    let mut header = vec!["KEY", "PROJECT", "STATE", "CRIT", "MODEL", "ATTEMPT", "WEIGHTED TOKENS", "CPU/RSS", "AGE/RUNTIME"];
+    let mut header =
+        vec!["KEY", "PROJECT", "QUEUE", "STATE", "CRIT", "MODEL", "ATTEMPT", "WEIGHTED TOKENS", "CPU/RSS", "AGE/RUNTIME"];
     if waiting {
         header.push("WAITING ON");
     }
@@ -280,6 +282,7 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
         let mut cells = vec![
             Cell::new(&t.key),
             Cell::new(&t.execution_project),
+            Cell::new(cfg.execution_for(t).map(|e| e.queue).unwrap_or_else(|_| "invalid".into())),
             Cell::new(state),
             Cell::new(crit),
             Cell::new(model_text),

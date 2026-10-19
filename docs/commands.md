@@ -159,3 +159,14 @@ source fallback are held with reasons. `task show`/`task explain --json` expose
 saved and current routing; see [routing configuration](configuration.md#routing).
 `task project` reassigns only unstarted work, and routing must agree with the new
 assignment before it can launch.
+
+## Triage completion
+
+`task complete <task> --summary-file PATH --outcome OUTCOME` records a full UTF-8
+Markdown analysis and recommended next action for a `leave-ticket-open` workflow.
+`--summary-file` conflicts with `--summary`; `--outcome` conflicts with `--pr`.
+Outcomes: `needs-information`, `needs-decision`, `ready-for-agent`, `manual-action`,
+`no-action-recommended`. Linear report/label delivery is retried by the daemon
+without holding a session slot or closing the source issue. Use `task retry`
+for an explicit retriage; recommendation labels do not admit coding work.
+See [triage workflows](triage.md) for configuration and application rollout.

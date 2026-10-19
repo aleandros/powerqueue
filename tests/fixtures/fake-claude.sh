@@ -211,6 +211,14 @@ case "$mode" in
     sleep "${FAKE_CLAUDE_IDLE_SECS:-120}"
     exit 0
     ;;
+  triage)
+    printf 'Investigate only.\n\nDraft questions for the customer.\n' > "$POWERQUEUE_TASK_DIR/report.md"
+    "${POWERQUEUE_BIN:-powerqueue}" task complete "$task_id" --summary-file "$POWERQUEUE_TASK_DIR/report.md" --outcome needs-information || exit 2
+    usage_line "msg_${session:0:8}_triage" 100 "Analysis recorded"
+    fire Stop "\"last_assistant_message\":\"[[POWERQUEUE:DONE]] Short final message\",\"stop_hook_active\":false"
+    fire SessionEnd "\"reason\":\"prompt_input_exit\""
+    exit 0
+    ;;
   ratelimit)
     fire StopFailure "\"error_type\":\"rate_limit\",\"error_message\":\"Rate limit exceeded\""
     sleep 1

@@ -37,3 +37,5 @@ pub use lifecycle::{CleanupPlan, cleanup_plan, cleanup_task, pick_next, worktree
 pub use transitions::{
     CRASH_TAIL_LINES, Effect, LinearTarget, NUDGE_TEXT, ProbeContext, SKIP_REASON, on_crash, on_hook_outcome, on_probe,
 };
+
+pub mod triage;

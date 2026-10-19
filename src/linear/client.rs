@@ -729,6 +729,32 @@ impl LinearClient {
         }
     }
 
+    /// Fetch the base intake plus independent team filters, without relaxing the coding intake.
+    /// A named override owns its team's admission even if the base query also returns that team.
+    pub async fn fetch_configured_issues(&self, cfg: &crate::config::LinearConfig) -> Result<Vec<LinearIssue>> {
+        let mut base = IssueFilter::from_config(cfg);
+        base.team_keys.retain(|t| !cfg.team_filters.contains_key(t));
+        let mut issues =
+            if !cfg.team_keys.is_empty() && base.team_keys.is_empty() { Vec::new() } else { self.fetch_issues(&base).await? };
+        issues.retain(|i| !cfg.team_filters.contains_key(&i.team_key));
+        for (team, filter) in &cfg.team_filters {
+            let filter = IssueFilter {
+                team_keys: vec![team.clone()],
+                assignee: filter.assignee.clone(),
+                state_names: filter.queued_states.clone(),
+                required_labels: filter.required_labels.clone(),
+                excluded_labels: filter.excluded_labels.clone(),
+                cycle: crate::config::CycleScope::parse(&filter.cycle).context("invalid team cycle scope")?,
+                projects: filter.projects.clone(),
+                max: filter.max_issues,
+            };
+            issues.extend(self.fetch_issues(&filter).await?);
+        }
+        let mut seen = std::collections::HashSet::new();
+        issues.retain(|i| seen.insert(i.id.clone()));
+        Ok(issues)
+    }
+
     /// Move an issue to the workflow state called `state_name` in its team
     /// (case-insensitive). Errors list the valid state names if none matches.
     pub async fn set_state(&self, issue_id: &str, state_name: &str) -> Result<()> {
@@ -880,6 +906,94 @@ impl LinearClient {
         }
         debug!(target: "powerqueue::linear", issue = %issue_id, bytes = body.len(), "comment posted");
         Ok(data.pointer("/commentCreate/comment").and_then(parse_comment))
+    }
+
+    /// Deliver a report using a persisted client-generated UUID. Retries verify the same comment
+    /// before creating it, including after a lost response; mismatching content is an error.
+    pub async fn ensure_report_comment(&self, issue_id: &str, comment_id: &str, body: &str) -> Result<()> {
+        let existing = self
+            .graphql("query($id: String!) { comment(id: $id) { id body issue { id } } }", serde_json::json!({"id": comment_id}))
+            .await;
+        match existing {
+            Ok(data) if data.get("comment").is_some_and(|c| !c.is_null()) => {
+                if data.pointer("/comment/body").and_then(|v| v.as_str()) != Some(body)
+                    || data.pointer("/comment/issue/id").and_then(|v| v.as_str()) != Some(issue_id)
+                {
+                    bail!("report comment {comment_id} already exists with different content or issue");
+                }
+                return Ok(());
+            }
+            Err(e) if !is_not_found(&e) => return Err(e),
+            _ => {}
+        }
+        let data = self
+            .graphql(
+                "mutation($input: CommentCreateInput!) { commentCreate(input: $input) { success } }",
+                serde_json::json!({"input": {"id": comment_id, "issueId": issue_id, "body": body}}),
+            )
+            .await?;
+        if data.pointer("/commentCreate/success").and_then(|v| v.as_bool()) != Some(true) {
+            bail!("Linear did not confirm report comment {comment_id}");
+        }
+        Ok(())
+    }
+
+    /// Replace only Powerqueue's triage recommendation labels, preserving other labels atomically.
+    /// Labels must already exist for this team or workspace. Missing/ambiguous labels fail explicitly.
+    pub async fn set_triage_label(&self, issue_id: &str, team: &str, outcome: crate::execution::TriageOutcome) -> Result<()> {
+        let mut cursor: Option<String> = None;
+        let mut labels: Vec<(String, String)> = Vec::new();
+        loop {
+            let data = self.graphql(
+                "query($team: String!, $after: String) { issueLabels(first: 100, after: $after, filter: { or: [{ team: { key: { eq: $team } } }, { team: { null: true } }] }) { nodes { id name parent { name } } pageInfo { hasNextPage endCursor } } }",
+                serde_json::json!({"team": team, "after": cursor}),
+            ).await?;
+            let nodes = data.pointer("/issueLabels/nodes").and_then(|v| v.as_array()).context("Linear label catalog missing")?;
+            for node in nodes {
+                let id = node["id"].as_str().context("label ID missing")?;
+                let name = node["name"].as_str().context("label name missing")?;
+                let qualified = crate::domain::qualified_label(name, node.pointer("/parent/name").and_then(|v| v.as_str()));
+                labels.push((id.to_owned(), qualified));
+            }
+            if data.pointer("/issueLabels/pageInfo/hasNextPage").and_then(|v| v.as_bool()) != Some(true) {
+                break;
+            }
+            let next = data
+                .pointer("/issueLabels/pageInfo/endCursor")
+                .and_then(|v| v.as_str())
+                .context("label page cursor missing")?
+                .to_owned();
+            if cursor.as_ref() == Some(&next) {
+                bail!("Linear label pagination did not advance");
+            }
+            cursor = Some(next);
+        }
+        let matches: Vec<_> = labels.iter().filter(|(_, n)| n.eq_ignore_ascii_case(outcome.label())).collect();
+        if matches.len() != 1 {
+            bail!(
+                "team {team}: expected one label named {}, found {}; create the triage label group or remove duplicate names",
+                outcome.label(),
+                matches.len()
+            );
+        }
+        let wanted = &matches[0].0;
+        let removed: Vec<_> = labels
+            .iter()
+            .filter(|(id, name)| {
+                id != wanted && crate::execution::TriageOutcome::ALL.iter().any(|o| o.label().eq_ignore_ascii_case(name))
+            })
+            .map(|(id, _)| id)
+            .collect();
+        let data = self
+            .graphql(
+                "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
+                serde_json::json!({"id": issue_id, "input": {"addedLabelIds": [wanted], "removedLabelIds": removed}}),
+            )
+            .await?;
+        if data.pointer("/issueUpdate/success").and_then(|v| v.as_bool()) != Some(true) {
+            bail!("Linear did not confirm triage label for {issue_id}");
+        }
+        Ok(())
     }
 
     /// Comments on an issue created after `since`, oldest first (at most

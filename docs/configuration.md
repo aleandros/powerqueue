@@ -104,6 +104,35 @@ policy file and stored task binding. `task show` and its JSON expose both the
 execution project and pinned checkout. A broken project does not stop other
 projects from using the shared queue.
 
+## Queues and workflows
+
+See [triage queues and rollout](triage.md) for a complete same-repository example.
+All new settings are opt-in; empty queue/workflow tables preserve existing behavior.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `queues.<id>.max_concurrent` | `1` | Dedicated slots; sum must fit `scheduler.max_concurrent`. `default` is required when queues are configured. |
+| `queues.<id>.all` | `[]` | Priority-style selection predicates. Required for named queues; forbidden for `default`, which receives unmatched work. Conflicting matches hold the task. |
+| `queues.<id>.workflow` | unset | Selected workflow; unset retains existing coding prompts and lifecycle. |
+| `workflows.<id>.instructions` | `""` (required) | Markdown path relative to the task worktree. Missing/empty files or paths leaving the checkout fail the launch. |
+| `workflows.<id>.completion` | `"standard"` | `leave-ticket-open` completes analysis without source state changes, PR adoption, or automatic commit/push. |
+| `workflows.<id>.comment_prefix` | `""` | First text of workflow comments; e.g. `[interno]` for an integration's internal notes. |
+| `linear.team_filters.<TEAM>.assignee` | unset | Independent team intake: any assignee unless supplied. |
+| `linear.team_filters.<TEAM>.queued_states` | `["Todo"]` | State names admitted for this team. |
+| `linear.team_filters.<TEAM>.required_labels` | `[]` | At least one required label, or no requirement. |
+| `linear.team_filters.<TEAM>.excluded_labels` | `["no-agent"]` | Labels that exclude this team's issues. |
+| `linear.team_filters.<TEAM>.cycle` | `"any"` | Same cycle scopes as `[linear]`. |
+| `linear.team_filters.<TEAM>.projects` | `[]` | Any Linear project unless listed. |
+| `linear.team_filters.<TEAM>.max_issues` | `100` | Per-filter issue cap; `0` means unlimited. |
+
+Queue/workflow tables live in host configuration. Team intake filters may also
+live in the legacy repository's `[linear]` override. Team filters replace the
+base intake for their team, even when it was absent from `linear.team_keys`.
+Queue selection is independent of execution-project routing, uses the existing
+priority predicate grammar, and is pinned before the first launch. Existing
+started tasks retain the default pool. Retries preserve the binding. Slots are
+not borrowed; shared provider budget limits still apply.
+
 ## Providers
 
 powerqueue can run tasks on three locally installed coding-agent CLIs, each

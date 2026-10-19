@@ -441,3 +441,31 @@ checkout ownership. SQLite schema v9 adds `tasks.routing`; source sync and launc
 claims compare the observed assignment, routing evidence and metadata so stale
 snapshots cannot overwrite a newer claim or routing hold. See
 [routing configuration](configuration.md#routing) for precedence and recovery.
+
+## Execution queues and workflows
+
+Repository routing (`execution_project`) and execution queues are independent.
+`execution::QueueSlots` computes per-queue capacity from live sessions; the launch
+planner filters exhausted pools before priority selection and reserves slots only
+after successful launches. The global session cap and provider budgets still
+apply. `default` contains unmatched and previously started legacy tasks.
+
+SQLite schema v10 adds nullable `tasks.execution` JSON. The pure
+`on_execution_selected` transition pins the queue, workflow name, and lifecycle
+policy before dependency evaluation; starts also carry that binding through the
+atomic claim. Old rows remain unbound until scheduling. Retries preserve the
+policy and clear the previous analysis outcome.
+
+Workflow instructions come from the task worktree revision. A workflow prompt
+error is task-scoped, so a missing triage file does not suspend coding in the
+same repository. Analysis bypasses implementation dependency waits, suppresses
+tracker state updates, parent auto-close, PR adoption, and automatic commit/push.
+It completes through `on_triage_complete`, storing the full summary and outcome.
+
+The daemon delivers one due Linear analysis report per tick, after releasing
+finished sessions and allocating launches. Delivery receipts in
+`triage.delivery.<task-id>` persist the completion timestamp, client-generated
+comment UUID, independent comment/label acknowledgements, and retry time. A lost
+comment response is reconciled by UUID. Label mutations change only the managed
+recommendation labels. Completed tasks are not implicitly re-imported or turned
+into coding tasks; explicit retry requests another analysis pass.

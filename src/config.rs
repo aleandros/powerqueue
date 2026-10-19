@@ -56,6 +56,10 @@ pub struct Config {
     pub repo: RepoConfig,
     /// Execution projects keyed by stable ID; `repo` is the legacy default.
     pub projects: BTreeMap<String, crate::projects::ProjectConfig>,
+    /// Dedicated execution pools, independent of repository routing.
+    pub queues: BTreeMap<String, crate::execution::QueueConfig>,
+    /// Repository-backed task instructions and completion policies.
+    pub workflows: BTreeMap<String, crate::execution::WorkflowConfig>,
     pub linear: LinearConfig,
     pub github: GitHubConfig,
     /// Additional independent GitHub intake sources; the legacy `github` is retained.
@@ -201,6 +205,8 @@ pub struct LinearConfig {
     pub execution_project: String,
     /// Team keys to pull issues from (e.g. `["ENG"]`). Empty = all teams visible to the key.
     pub team_keys: Vec<String>,
+    /// Additional team-specific intake filters. These replace the base filter for the named teams.
+    pub team_filters: BTreeMap<String, LinearTeamFilter>,
     /// Only issues assigned to this user id, or `"me"`. `None` = any assignee.
     pub assignee: Option<String>,
     /// Workflow state *names* considered queued for the agent.
@@ -246,6 +252,7 @@ impl Default for LinearConfig {
             enabled: true,
             execution_project: "default".into(),
             team_keys: Vec::new(),
+            team_filters: BTreeMap::new(),
             assignee: None,
             queued_states: vec!["Todo".to_string()],
             required_labels: Vec::new(),
@@ -261,6 +268,34 @@ impl Default for LinearConfig {
             poll_interval_secs: 60,
             max_issues: 100,
             endpoint: "https://api.linear.app/graphql".to_string(),
+        }
+    }
+}
+
+/// Independent intake for a Linear team (lifecycle settings and credentials remain shared).
+/// Unspecified fields use these defaults, not the coding team's filters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LinearTeamFilter {
+    pub assignee: Option<String>,
+    pub queued_states: Vec<String>,
+    pub required_labels: Vec<String>,
+    pub excluded_labels: Vec<String>,
+    pub cycle: String,
+    pub projects: Vec<String>,
+    pub max_issues: u32,
+}
+
+impl Default for LinearTeamFilter {
+    fn default() -> Self {
+        Self {
+            assignee: None,
+            queued_states: vec!["Todo".into()],
+            required_labels: Vec::new(),
+            excluded_labels: vec!["no-agent".into()],
+            cycle: "any".into(),
+            projects: Vec::new(),
+            max_issues: 100,
         }
     }
 }
@@ -1413,6 +1448,7 @@ pub struct RepoOverrides {
 pub struct LinearOverrides {
     pub enabled: Option<bool>,
     pub team_keys: Option<Vec<String>>,
+    pub team_filters: Option<BTreeMap<String, LinearTeamFilter>>,
     pub assignee: Option<String>,
     pub queued_states: Option<Vec<String>>,
     pub required_labels: Option<Vec<String>>,
@@ -1881,6 +1917,7 @@ impl Config {
         if let Some(l) = ov.linear {
             take!(self.linear.enabled, l.enabled, "linear.enabled");
             take!(self.linear.team_keys, l.team_keys, "linear.team_keys");
+            take!(self.linear.team_filters, l.team_filters, "linear.team_filters");
             take!(self.linear.assignee, l.assignee.map(Some), "linear.assignee");
             take!(self.linear.queued_states, l.queued_states, "linear.queued_states");
             take!(self.linear.required_labels, l.required_labels, "linear.required_labels");
@@ -2068,6 +2105,7 @@ impl Config {
                 "repo.fetch_interval_secs must be at most {MAX_FETCH_INTERVAL_SECS} seconds (a week); 0 disables the periodic fetch"
             ));
         }
+        problems.extend(self.execution_problems());
         if self.scheduler.max_concurrent == 0 {
             problems.push("scheduler.max_concurrent must be >= 1".to_string());
         }
@@ -2187,6 +2225,13 @@ impl Config {
         problems.extend(self.github_routing_problems());
         if self.linear.enabled && self.linear.queued_states.is_empty() {
             problems.push("linear.queued_states is empty; no issues would ever be picked up".to_string());
+        }
+        for (team, filter) in &self.linear.team_filters {
+            if team.trim().is_empty() || filter.queued_states.is_empty() || CycleScope::parse(&filter.cycle).is_none() {
+                problems.push(format!(
+                    "linear.team_filters.{team}: team and queued_states must be nonempty and cycle must be a valid scope"
+                ));
+            }
         }
         if CycleScope::parse(&self.linear.cycle).is_none() {
             problems.push(format!(

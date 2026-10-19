@@ -115,7 +115,7 @@ fn sync(ctx: &mut Context, apply: bool) -> Result<i32> {
     let client = LinearClient::new(&cfg.linear.endpoint, key)?;
     let rt = super::runtime()?;
     let filter = IssueFilter::from_config(&cfg.linear);
-    let mut issues = rt.block_on(client.fetch_issues(&filter)).context("fetch issues from Linear")?;
+    let mut issues = rt.block_on(client.fetch_configured_issues(&cfg.linear)).context("fetch issues from Linear")?;
     let store = ctx.store()?.clone();
     rt.block_on(add_dependencies(&client, &store, &mut issues))?;
 
@@ -177,6 +177,12 @@ fn sync(ctx: &mut Context, apply: bool) -> Result<i32> {
         return Ok(0);
     }
     println!("Dry run: fetched {} queued issue(s) from Linear (filters: {}).", issues.len(), describe_filter(&filter));
+    if !cfg.linear.team_filters.is_empty() {
+        println!(
+            "Additional independent team filters: {}",
+            cfg.linear.team_filters.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
     if planned.is_empty() {
         println!("Nothing would change. Re-run with --apply to sync anyway.");
         return Ok(0);
