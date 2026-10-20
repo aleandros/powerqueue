@@ -1698,6 +1698,7 @@ proptest! {
     }
 }
 
+mod analysis;
 mod deferral;
 mod policy_reload;
 mod triage;

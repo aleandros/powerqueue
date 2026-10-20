@@ -2400,6 +2400,23 @@ pub async fn run_all(
     results.push(check_scheduling_pause(store));
     results.push(check_starting_tasks(store));
     results.push(check_launch_failures(store));
+    let analysis_cfg = Config::load_or_default(paths).unwrap_or_else(|_| cfg.clone());
+    let mut analysis_problems = analysis_cfg.analysis_problems();
+    for task in store.list_open_tasks()? {
+        match store.kv_get::<crate::analysis::AnalysisRecord>(&crate::analysis::record_key(task.id)) {
+            Ok(Some(record))
+                if record.stale(&analysis_cfg, &task) || record.proposal.as_ref().and_then(|p| p.project.as_ref()).is_none() =>
+            {
+                analysis_problems.push(format!("{}: {}", task.key, record.status(&analysis_cfg, &task)));
+            }
+            Err(error) => analysis_problems.push(format!("{}: cannot read analysis: {error}", task.key)),
+            _ => {}
+        }
+    }
+    if !analysis_problems.is_empty() {
+        results.push(CheckResult::warn(STATE, "Issue analysis", analysis_problems.join("; "),
+            "inspect task analyze <task> --show and analysis.recorded events; fix model credentials/configuration or clarify the issue/project descriptions, then explicitly rerun analysis. Resolve ambiguous work and destinations with a human; doctor --fix does not approve or route work"));
+    }
     results.push(check_stuck_tasks(cfg, store, fix));
     results.push(check_dependencies(cfg, store));
     results.push(check_reviews(cfg, store));

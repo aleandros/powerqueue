@@ -942,3 +942,55 @@ mod tests {
         }
     }
 }
+
+/// Arbitrary advisory proposals, including unsupported destinations and hostile prose.
+pub fn analysis_proposal() -> impl Strategy<Value = crate::analysis::Proposal> {
+    use crate::analysis::{Classification, Proposal};
+    (
+        prop::option::of(prop::sample::select(vec!["default", "web", "/tmp/evil", "agent:ready"])),
+        prop::sample::select(vec![0.0, 0.5, 0.79, 0.8, 1.0, f64::NAN, f64::INFINITY]),
+        ".{0,100}",
+        prop::collection::vec(".{0,100}", 0..12),
+    )
+        .prop_map(|(project, confidence, reasoning, plan)| Proposal {
+            project: project.map(str::to_owned),
+            classification: Classification::Unknown,
+            confidence,
+            reasoning,
+            plan,
+        })
+}
+
+/// Analysis snapshots/results interleaved with real scheduler lifecycle operations.
+#[derive(Debug, Clone)]
+pub enum AnalysisModelOp {
+    Observe,
+    Finish,
+    Edit,
+    Describe,
+    Approve(bool),
+    Launch,
+    Complete,
+    Retry,
+    Reassign,
+    Restart,
+}
+
+pub fn analysis_model_ops() -> impl Strategy<Value = Vec<AnalysisModelOp>> {
+    use AnalysisModelOp::*;
+    prop::collection::vec(
+        prop_oneof![
+            Just(Observe),
+            Just(Finish),
+            Just(Edit),
+            Just(Describe),
+            any::<bool>().prop_map(Approve),
+            Just(Launch),
+            Just(Complete),
+            Just(Retry),
+            Just(Reassign),
+            Just(Restart)
+        ],
+        1..50,
+    )
+}

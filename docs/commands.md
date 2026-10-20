@@ -48,6 +48,7 @@ Project filters on `status`, `task list` and `dashboard` affect only the task li
 | `add "title" [-d DESC\|-] [-c CRIT] [-m MODEL] [-k KEY] [-l LABEL]... [--paused] [--project ID]` | enqueue a manual task in a registered execution project; omitted `--project` always selects `default`, unknown IDs fail; `-d -` reads stdin |
 | `task defer <task> <until> [--reason TEXT]` | set or replace a local launch hold; `<until>` is an RFC 3339 timestamp with explicit offset or a positive duration such as `2h` |
 | `task defer <task> --clear` | clear only the local hold; source deferrals and other scheduling restrictions still apply |
+| `task analyze <task> [--show]` | explicitly request advisory classification, registered-project recommendation and preliminary plan; `--show` reads saved advice without a model call. Requires opt-in `[analysis]`; never approves or assigns work. Exit 3 means unresolved/stale. See [issue analysis](issue-analysis.md) |
 | `task project <task> <id>` | reassign an unstarted task to a registered execution project; refuses tasks with previous execution history; validates again when the daemon applies the command |
 | `task show <task>` | details, execution project/configured checkout, saved/current routing decisions and timeline |
 | `task list [-a] [--project ID]` | same as `status` |
@@ -208,7 +209,7 @@ intent is allowed; executable legacy Markdown directives still require migration
 | `config unset <key>` | remove a key so its default applies again |
 | `config edit` | open `config.toml` in `$EDITOR` |
 | `config validate [--file PATH]` | validate `config.toml` (or a draft) with the repo's `.powerqueue.toml` applied, so a bad value the repo sets is reported too; says which keys the repo sets and from which branch |
-| `secrets set <linear\|github\|jev> [value]` | store a key (prompts if omitted) |
+| `secrets set <linear\|github\|jev\|analysis> [value]` | store a key (prompts if omitted) |
 | `secrets unset <name>` | remove a key |
 | `secrets list` | which keys are configured and where they come from |
 | `hook --task ID [--session SID] --event EVENT [--provider P] [PAYLOAD]` | internal; called by agent CLI hooks (hidden); `--event StatusLine` is the Claude status line (stores rate limits, prints a short status); `PAYLOAD` replaces stdin (Codex `notify`) |

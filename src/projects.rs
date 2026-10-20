@@ -45,6 +45,9 @@ impl Config {
         }
         let mut cfg = self.clone();
         cfg.projects.clear();
+        // Advisory analysis is machine-level. A narrowed execution config no
+        // longer has the registry needed to validate its candidate descriptions.
+        cfg.analysis = Default::default();
         cfg.overrides = AppliedOverrides::default();
         if let Some(project) = self.projects.get(id) {
             cfg.repo = project.repo.clone();

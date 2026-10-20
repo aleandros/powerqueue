@@ -1488,6 +1488,36 @@ impl Store {
 
     // --------------------------------------------------------------------- kv
 
+    /// Save advisory analysis and its audit event atomically without updating task rows.
+    /// Returns false if a newer analysis already finished; fails for missing tasks or storage errors.
+    pub fn save_analysis(&self, id: TaskId, record: &crate::analysis::AnalysisRecord) -> Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("begin analysis result transaction")?;
+        let exists: bool =
+            tx.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)", params![id.to_string()], |r| r.get(0))?;
+        if !exists {
+            anyhow::bail!("cannot save analysis for a missing task");
+        }
+        let key = crate::analysis::record_key(id);
+        let previous: Option<String> =
+            tx.query_row("SELECT value FROM kv WHERE key = ?1", params![key], |r| r.get(0)).optional()?;
+        if let Some(previous) = previous {
+            let previous: crate::analysis::AnalysisRecord = serde_json::from_str(&previous).context("read prior analysis")?;
+            if previous.created_at > record.created_at {
+                return Ok(false);
+            }
+        }
+        let now = ts(&Utc::now());
+        tx.execute("INSERT INTO kv (key, value, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![key, serde_json::to_string(record)?, now])?;
+        tx.execute("INSERT INTO events (task_id, timestamp, level, kind, message, data) VALUES (?1, ?2, 'info', 'analysis.recorded', ?3, ?4)",
+            params![id.to_string(), now, "Advisory analysis recorded; human approval required", serde_json::to_string(record)?])?;
+        tx.commit().context("commit analysis result and event")?;
+        Ok(true)
+    }
+
     pub fn kv_set<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
         let conn = self.lock();
         conn.execute(

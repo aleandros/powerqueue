@@ -136,6 +136,17 @@ external report/label delivery and source issue lifecycle suppression remain
 in the mocked Linear and real-daemon integration tests. It does not model
 concurrent Linear writers, report network requests, or filesystem cleanup.
 
+### Advisory analysis validation
+
+`cargo test --test analysis_client --test analysis_cli` uses synthetic issues,
+mock Jev/Messages endpoints and real CLI/SQLite persistence. It checks fallback,
+resource bounds, untrusted-output rejection, stale snapshots and concurrent task
+updates. `cargo test --lib analysis` includes proposal properties and a focused
+stateful daemon model with forced denied/admitted launches and late results.
+The model checks that advice never grants source approval, retargets started work
+or reserves resources. These tests measure contracts and authority boundaries,
+not live model accuracy; see [issue analysis](docs/issue-analysis.md).
+
 ### End-to-end tests
 
 `tests/fixtures/fake-claude.sh` stands in for Claude Code. It accepts the

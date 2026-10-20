@@ -22,6 +22,7 @@
 //! | [`tune`] | `powerqueue tune`: plain-language config changes drafted by a headless Claude Code session |
 //! | [`cli`] | clap definitions and command handlers |
 
+pub mod analysis;
 pub mod budget;
 pub mod cli;
 pub mod config;

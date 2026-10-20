@@ -19,6 +19,46 @@ pub fn color_enabled() -> bool {
     COLOR.load(Ordering::Relaxed)
 }
 
+/// Display advisory analysis as inert text; proposed work always needs human approval.
+pub fn print_analysis(key: &str, status: &str, record: &crate::analysis::AnalysisRecord) {
+    println!("{}: {}", analysis_text(key), analysis_text(status));
+    if let Some(proposal) = &record.proposal {
+        println!("  project: {}", analysis_text(proposal.project.as_deref().unwrap_or("unresolved")));
+        println!("  classification: {:?}; confidence: {:.2}", proposal.classification, proposal.confidence);
+        println!("  {}", analysis_text(&proposal.reasoning));
+        for (i, step) in proposal.plan.iter().enumerate() {
+            println!("  {}. {}", i + 1, analysis_text(step));
+        }
+    }
+    for attempt in &record.attempts {
+        println!(
+            "  {} / {}: input tokens {:?}, output tokens {:?}{}",
+            analysis_text(&attempt.backend),
+            analysis_text(&attempt.model),
+            attempt.input_tokens,
+            attempt.output_tokens,
+            attempt.error.as_ref().map(|e| format!("; {}", analysis_text(e))).unwrap_or_default()
+        );
+    }
+    println!(
+        "Review work and destination, then use task project for unstarted work and the source's approval workflow. Analysis never grants approval or changes priority."
+    );
+}
+
+// Escape controls at display time, including old records. JSON output already
+// escapes C0 controls; this protects human-readable output even with NO_COLOR.
+fn analysis_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 /// Apply `style` only when colours are enabled.
 pub fn paint(text: &str, style: impl Fn(&str) -> String) -> String {
     if color_enabled() { style(text) } else { text.to_string() }

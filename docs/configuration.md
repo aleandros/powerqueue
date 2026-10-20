@@ -495,6 +495,40 @@ uses the most recent successful source sync. A routing hold created during setup
 logs `routing.launch_held` and preserves the worktree. Reload machine configuration
 with `reload` (or restart) after changing rules.
 
+## `[analysis]`
+
+Optional explicit issue analysis, separate from routing, approval and priority.
+Machine-level settings only; `.powerqueue.toml` cannot enable analysis. See the
+[prototype workflow and tradeoffs](issue-analysis.md).
+
+```toml
+[analysis]
+enabled = false                 # opt in before task analyze can contact models
+jev_first = true                # uses priority.jev.endpoint/model and the Jev key
+min_confidence = 0.8             # 0.5–1; Jev also requires probability and margin
+timeout_secs = 20              # per request, 1–60; no retries
+
+[analysis.projects]             # 1–32 registered IDs when enabled
+# default = "API service: authentication, billing and database; excludes browser UI"
+# web = "Browser UI: components and styling; excludes backend authentication"
+
+# Optional fallback; absent by default. No default text model is assumed.
+# [analysis.llm]
+# endpoint = "https://api.anthropic.com/v1/messages"
+# model = "YOUR_MESSAGES_API_MODEL_ID"
+# max_tokens = 1024             # 128–4096 output tokens
+```
+
+Project descriptions must be nonempty and at most 2,000 bytes each; only described
+registered projects can be recommended. `jev_first` is independent of priority
+scoring's `enabled` flag. With `jev_first = false`, configure a text model.
+Endpoints require HTTPS, except loopback HTTP for local services/tests; embedded
+credentials, query strings and fragments are rejected. Redirects are disabled.
+The fallback uses `secrets set analysis` or `POWERQUEUE_ANALYSIS_API_KEY`; Jev uses
+`secrets set jev` or `JEV_API_KEY`. This is API billing, separate from coding
+subscriptions. Input/response limits and recorded token usage are described in
+[issue analysis](issue-analysis.md#authority-resources-and-cost).
+
 ## `[priority]` and `[priority.jev]`
 
 | Key | Default | Meaning |

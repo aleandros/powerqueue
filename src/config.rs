@@ -66,6 +66,7 @@ pub struct Config {
     pub github_sources: Vec<GitHubConfig>,
     /// Deterministic routing, separate from admission and priority policy.
     pub routing: crate::routing::RoutingConfig,
+    pub analysis: crate::analysis::AnalysisConfig,
     pub priority: PriorityConfig,
     pub prompt: PromptConfig,
     pub scheduler: SchedulerConfig,
@@ -2097,6 +2098,7 @@ impl Config {
             problems.push("repo.path is empty".to_string());
         }
         problems.extend(self.routing_problems());
+        problems.extend(self.analysis_problems());
         if !self.repo.branch_template.contains("{key}") && !self.repo.branch_template.contains("{id}") {
             problems.push("repo.branch_template must contain {key} or {id}".to_string());
         }
