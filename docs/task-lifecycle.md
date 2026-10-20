@@ -224,3 +224,26 @@ when it enters `in_review` (`cleanup.run` commands, push, worktree removal),
 except that the local branch is always kept for later review rounds, the tmux
 window is always closed, and Linear is not moved. When the PR is merged the
 local branch is deleted (and a worktree that had been kept is removed).
+
+## Explicit deferral
+
+A local deferral or a `Powerqueue-Defer-Until` source-description directive adds
+an earliest launch time without introducing a new task state. See
+[deferral commands and source examples](commands.md#deferring-a-task).
+
+`Task.not_before` remains exclusively automatic backoff/throttling. Its writers
+were audited for this feature: `launch::on_throttled`, crash and provider-wait
+transitions set it; launch/claim recovery, pause/resume/retry/cancel/complete/block,
+dependency reconciliation, rate-limit wake, finalization and review
+handoff/requeue/parking clear or replace it. None may erase explicit deferral.
+Local holds live in the separate nullable JSON `tasks.deferral` column (schema
+v11); source holds are read from the persisted source description. Lifecycle
+writes preserve the local column and source directives even when their snapshot
+predates a concurrent source sync. A launch claim compares the selected deferral
+and source description, rejecting candidates superseded by a local edit or sync.
+
+Tests extend the one-task and whole-daemon operation models with local and source
+edits. A separate SQLite model interleaves edits, clears, restarts, stale claims,
+stale lifecycle writes and injected audit failures. Boundary and metamorphic
+properties compare expired holds with the original scheduler decisions, including
+budget/cooldowns, slot limits, priority, dependency and admission gates.

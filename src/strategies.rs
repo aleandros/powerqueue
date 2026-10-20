@@ -850,6 +850,30 @@ pub fn triage_task() -> impl Strategy<Value = Task> {
     })
 }
 
+/// Local user holds on either side of the model clock, with optional reasons.
+pub fn deferral() -> impl Strategy<Value = crate::deferral::Deferral> {
+    (instant(), prop::option::of(line())).prop_map(|(until, reason)| crate::deferral::Deferral { until, reason })
+}
+
+/// Source edits include removal, valid holds and malformed directives.
+pub fn deferral_description() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just(String::new()),
+        Just("Powerqueue-Defer-Until: tomorrow".into()),
+        deferral().prop_map(|d| format!(
+            "Powerqueue-Defer-Until: {}\nPowerqueue-Defer-Reason: {}",
+            d.until.to_rfc3339(),
+            d.reason.unwrap_or_default()
+        )),
+    ]
+}
+
+/// Persistence interleavings: edits, stale claims/writes, restart, rollback,
+/// and clock movement immediately before, at and after either hold expires.
+pub fn deferral_store_ops() -> impl Strategy<Value = Vec<u8>> {
+    vec(0u8..17, 1..80)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

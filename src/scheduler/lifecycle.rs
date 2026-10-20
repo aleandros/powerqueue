@@ -67,7 +67,11 @@ pub fn pick_next(tasks: &[Task], now: DateTime<Utc>) -> Option<&Task> {
     tasks
         .iter()
         .filter(|t| {
-            t.state.is_schedulable() && t.execution_approved() && !t.is_waiting() && t.not_before.is_none_or(|nb| nb <= now)
+            t.state.is_schedulable()
+                && t.execution_approved()
+                && !t.is_waiting()
+                && t.not_before.is_none_or(|nb| nb <= now)
+                && t.deferral_allows(now)
         })
         .min_by(|a, b| {
             b.score

@@ -1713,3 +1713,26 @@ completion = "leave-ticket-open"
         assert!(prompt.contains("--outcome"));
     }
 }
+
+#[test]
+fn deferred_task_keeps_queue_visibility_and_launches_only_after_expiry() {
+    let Some(mut env) = Env::new("complete", "") else { return };
+    env.run_ok(&["add", "Deferred", "--key", "D-1"]);
+    env.run_ok(&["task", "defer", "D-1", "1d", "--reason", "maintenance"]);
+    env.run_ok(&["add", "Ready", "--key", "D-2"]);
+    env.start_daemon();
+    assert_eq!(env.wait_for_state("D-2", "completed", Duration::from_secs(60)), "completed", "{}", env.daemon_log());
+    let before = env.wait_for_show("D-1", |_| true);
+    assert_eq!(before["task"]["state"], "queued");
+    assert_eq!(before["task"]["attempts"], 0);
+    assert!(!has_event(&before, "task.starting"));
+    assert!(env.run_ok(&["status"]).contains("maintenance"));
+    let until = chrono::Utc::now() + chrono::Duration::seconds(2);
+    env.run_ok(&["task", "defer", "D-1", &until.to_rfc3339()]);
+    assert_eq!(env.wait_for_state("D-1", "completed", Duration::from_secs(60)), "completed", "{}", env.daemon_log());
+    let after = env.wait_for_show("D-1", |v| has_event(v, "task.starting"));
+    let event = after["events"].as_array().unwrap().iter().find(|e| e["kind"] == "task.starting").unwrap();
+    let started = chrono::DateTime::parse_from_rfc3339(event["timestamp"].as_str().unwrap()).unwrap();
+    assert!(started >= until, "started {started} before {until}");
+    assert_eq!(after["task"]["deferral"]["until"], until.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true));
+}

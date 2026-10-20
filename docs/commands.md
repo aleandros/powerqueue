@@ -46,6 +46,8 @@ Project filters on `status`, `task list` and `dashboard` affect only the task li
 | Command | What it does |
 |---------|--------------|
 | `add "title" [-d DESC\|-] [-c CRIT] [-m MODEL] [-k KEY] [-l LABEL]... [--paused] [--project ID]` | enqueue a manual task in a registered execution project; omitted `--project` always selects `default`, unknown IDs fail; `-d -` reads stdin |
+| `task defer <task> <until> [--reason TEXT]` | set or replace a local launch hold; `<until>` is an RFC 3339 timestamp with explicit offset or a positive duration such as `2h` |
+| `task defer <task> --clear` | clear only the local hold; source deferrals and other scheduling restrictions still apply |
 | `task project <task> <id>` | reassign an unstarted task to a registered execution project; refuses tasks with previous execution history; validates again when the daemon applies the command |
 | `task show <task>` | details, execution project/configured checkout, saved/current routing decisions and timeline |
 | `task list [-a] [--project ID]` | same as `status` |
@@ -70,6 +72,64 @@ state machine allows it. Agent sessions can survive the daemon: offline
 `cancel`/`retry` remain queued until the daemon can stop that session. Restart
 `powerqueue run` to process those queued controls. `complete` and `block` always
 write directly.
+
+## Deferring a task
+
+```sh
+powerqueue task defer ENG-123 2h --reason "Wait for deployment"
+powerqueue task defer 'owner/repo#43' 2026-10-20T09:00:00-06:00 --reason "Maintenance window"
+powerqueue task show ENG-123
+powerqueue task explain ENG-123
+powerqueue task defer ENG-123 --clear
+```
+
+Running `defer` again replaces the local time and reason. Without `--reason`, the
+previous reason is cleared. Durations are measured once, when the command runs;
+`2h` means two elapsed hours. Absolute timestamps require `Z` (UTC) or a numeric
+UTC offset; there is no machine-local timezone default or daylight-saving guess.
+Past absolute timestamps are allowed and immediately eligible under this gate.
+
+To set a time in **either Linear or GitHub**, put these standalone lines in the
+issue description/body (not a comment or label):
+
+```text
+Powerqueue-Defer-Until: 2026-10-20T09:00:00-06:00
+Powerqueue-Defer-Reason: Wait for the maintenance window
+```
+
+The reason is optional. This example means October 20 at 09:00 at UTC−06:00,
+equivalently 15:00 UTC. Use the offset for the intended date. Source descriptions
+accept absolute timestamps only: a relative `2h` would otherwise slide on every
+poll. Change the line to reschedule; remove **both** lines to clear the source
+hold. Duplicate directives, invalid timestamps, or a reason without a time hold
+the task until corrected. `doctor` explains the error. Directives are reserved
+standalone lines, even inside a code fence; keep examples quoted or indented with
+non-whitespace text if they should not act as metadata.
+
+Changes take effect after the normal source sync (or `linear sync --apply` / `github sync --apply`);
+normal source intake, routing and approval requirements still apply. GitHub body
+edits may require renewed approval under the configured admission policy. Local
+CLI holds and source holds are independent; **both must expire**. CLI `--clear`
+does not edit or override the issue. Manual-task descriptions do not interpret
+these directives.
+
+A deferred task keeps its workflow state and remains visible in `status`, the
+dashboard, and status JSON output. Dashboard rows show `[deferred]`; select a row for
+the underlying state, source association, eligibility time and reason. `task show`,
+`task explain`, and `doctor` show local and source holds separately, including
+expired ones. Expiry is an earliest eligibility time, **not a guaranteed start**:
+priority, dependencies, user/rule pauses, queue capacity, budget, routing,
+admission and provider cooldowns still apply.
+
+`defer` writes immediately and works without a daemon. It never stops a running
+session. It holds future retries and review-round launches; `resume`, `retry`,
+crash recovery and budget resets preserve it. It can also be set on a finished
+task in preparation for a later retry. A launch already claimed as `starting`
+refuses local deferral edits; retry after it becomes running. Source edits received
+after a launch claim apply to subsequent launches. Unobserved remote edits cannot
+retroactively undo a launch. Restart preserves the absolute times and reasons.
+Local edits and their audit events commit together. `task.deferral_changed` and
+`task.source_deferral_changed` record changes; expiry needs no reset or state change.
 
 ## Priority rules
 

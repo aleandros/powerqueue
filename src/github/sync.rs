@@ -251,7 +251,7 @@ pub fn apply_plan(store: &Store, plan: &SyncPlan) -> Result<()> {
             EventLevel::Info,
             kind,
             &format!("GitHub sync: {} {}", change.action, task.key),
-            serde_json::json!({"source": "github", "key": task.key, "execution_project": task.execution_project}),
+            serde_json::json!({"source": "github", "key": task.key, "execution_project": task.execution_project, "source_deferral": task.source_deferral().map_err(|e| e.to_string())}),
         )?;
         for effect in effects {
             if let Effect::Log { level, kind, message, data } = effect {

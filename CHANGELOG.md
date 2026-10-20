@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-19
+
 ### Added
+
+- Explicit task deferral via `task defer`, with timezone-qualified timestamps,
+  relative durations and optional reasons. Linear and GitHub descriptions can
+  set independent source holds. Holds remain visible, survive restart and retry,
+  and never interrupt active sessions or bypass other scheduling restrictions.
+  Transactional audit events, doctor diagnostics, property tests and stateful
+  models cover expiry, source sync, stale writes and launch-claim races.
 
 - Dedicated execution queues and repository-backed workflows. Analysis workflows
   leave Linear tickets open, publish internal-prefix reports and recommendation
@@ -1073,7 +1082,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.18.1...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/aleandros/powerqueue/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/aleandros/powerqueue/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/aleandros/powerqueue/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/aleandros/powerqueue/compare/v0.16.0...v0.17.0

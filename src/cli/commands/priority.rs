@@ -561,7 +561,7 @@ pub(crate) fn simulate_target(
     let mut rows = Vec::with_capacity(order.len());
     for (rank, idx) in order.iter().enumerate() {
         let (task, eval, stored) = (&simulated_tasks[*idx], &evaluated[*idx], &tasks[*idx]);
-        let schedulable = task.state.is_schedulable() && task.not_before.is_none_or(|nb| nb <= now);
+        let schedulable = task.state.is_schedulable() && task.not_before.is_none_or(|nb| nb <= now) && task.deferral_allows(now);
         // `evaluate` already falls back to the criticality row.
         let preferred = eval.models.clone();
         let model_source = eval.model_source.clone();

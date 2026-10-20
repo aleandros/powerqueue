@@ -416,6 +416,23 @@ fn check_execution(cfg: &Config, paths: &Paths, store: &Store) -> Result<Vec<Che
     let mut checks = Vec::new();
     for task in store.list_tasks()? {
         if !task.state.is_terminal() {
+            if let Some(summary) = task.deferral_summary(Utc::now()) {
+                let label = format!("{} deferral", task.key);
+                if task.source_deferral().is_err() {
+                    checks.push(CheckResult::fail(
+                        CONF,
+                        &label,
+                        summary,
+                        "fix or remove the Powerqueue-Defer-Until/Reason lines in the source issue, then sync",
+                    ));
+                } else {
+                    checks.push(CheckResult::ok(
+                        CONF,
+                        &label,
+                        format!("{summary}; expiry only permits normal scheduling; task resume/retry preserves deferral"),
+                    ));
+                }
+            }
             match cfg.execution_for(&task) {
                 Err(error) => checks.push(CheckResult::fail(
                     CONF,

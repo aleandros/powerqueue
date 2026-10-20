@@ -218,6 +218,8 @@ enum Op {
     Retry,
     SetModel(Option<ModelTier>),
     SetProject(String),
+    Defer(Option<crate::deferral::Deferral>),
+    SourceDeferral(String),
     CheckBinding {
         changed: bool,
     },
@@ -289,6 +291,8 @@ fn task_op() -> impl Strategy<Value = Op> {
         5 => source_routing_decision().prop_map(|(project, admission)| Op::SourceAdmission(project, admission)),
         2 => Just(Op::HoldApproval),
         1 => Just(Op::Restart),
+        5 => prop::option::of(deferral()).prop_map(Op::Defer),
+        4 => deferral_description().prop_map(Op::SourceDeferral),
         2 => Just(Op::Pause),
         3 => Just(Op::Resume),
         1 => Just(Op::Cancel),
@@ -347,6 +351,8 @@ impl TaskWorld {
             && self.task.execution_approved()
             && !self.task.is_waiting()
             && self.task.not_before.is_none_or(|t| t <= now)
+            && self.task.deferral.as_ref().is_none_or(|d| d.until <= now)
+            && self.task.source_deferral().is_ok_and(|d| d.is_none_or(|d| d.until <= now))
             && !self.session_live()
             && self.start.is_none()
     }
@@ -359,7 +365,10 @@ impl TaskWorld {
         // no other daemon call sees the task between `on_starting` and the
         // launch or the crash that prevents it. The CLI's direct writes run
         // in another process and do see it; they must refuse (checked).
-        let direct = matches!(op, Op::Complete(_) | Op::HandOff(_) | Op::Block(_) | Op::SetProject(_) | Op::CheckBinding { .. });
+        let direct = matches!(
+            op,
+            Op::Complete(_) | Op::HandOff(_) | Op::Block(_) | Op::Defer(_) | Op::SetProject(_) | Op::CheckBinding { .. }
+        );
         if self.start.is_some()
             && !direct
             && !matches!(
@@ -392,6 +401,12 @@ impl TaskWorld {
                 self.task = serde_json::from_value(serde_json::to_value(&self.task).unwrap()).unwrap();
                 self.session = serde_json::from_value(serde_json::to_value(&self.session).unwrap()).unwrap();
                 Some(Vec::new())
+            }
+            Op::Defer(deferral) => Some(commands::on_defer(&mut self.task, deferral.clone()).unwrap_or_default()),
+            Op::SourceDeferral(description) => {
+                let before = self.task.clone();
+                self.task.description = description.clone();
+                Some(commands::source_deferral_events(&before, &self.task))
             }
             Op::Pause => Some(commands::on_pause(&mut self.task, live)),
             Op::Resume => Some(commands::on_resume(&mut self.task, live, now)),
@@ -667,6 +682,18 @@ fn check(
         )
     };
 
+    if let Op::Defer(value) = op {
+        let mut expected = b.clone();
+        if b.state != TaskState::Starting {
+            expected.deferral = value.clone();
+        }
+        prop_assert_eq!(a, &expected, "deferral altered execution state or bypassed a launch claim");
+        prop_assert_eq!(&before.session, &after.session, "deferral terminated active work");
+        prop_assert!(effects.iter().all(|e| matches!(e, Effect::Log { .. })), "deferral only logs");
+    } else {
+        prop_assert_eq!(&a.deferral, &b.deferral, "automatic lifecycle operation erased a user hold");
+    }
+
     // Legal moves. Closing a container (a parent issue whose sub-issues are
     // done) is the one move the table does not list: it happens from any
     // open state and must not open `task complete` to queued tasks.
@@ -686,6 +713,7 @@ fn check(
                     | Op::LaunchFailed(_)
                     | Op::Launched { .. }
                     | Op::SetProject(_)
+                    | Op::Defer(_)
                     | Op::CheckBinding { .. }
                     | Op::Admission(_)
                     | Op::SourceAdmission(..)
@@ -822,7 +850,7 @@ proptest! {
     /// Any sequence of daemon calls keeps the task, its session and the
     /// effect trace consistent (see the module doc for the invariants).
     #[test]
-    fn a_task_survives_any_sequence_of_daemon_calls(task in fresh_task(), cfg in scheduler_config(), ops in vec(op(), 1..40)) {
+    fn a_task_survives_any_sequence_of_daemon_calls(task in fresh_task(), cfg in scheduler_config(), ops in vec(op(), 1..model_steps())) {
         let cfg = Config { scheduler: cfg, ..Config::default() };
         let mut now = origin();
         let mut world = TaskWorld::new(task);
@@ -1127,6 +1155,7 @@ impl DaemonWorld {
                 candidate.task.key, candidate.task.state, candidate.task.score, candidate.decision.model
             );
             prop_assert!(!pass.handed.iter().any(|(id, ..)| *id == candidate.task.id), "{what}: handed out twice");
+            prop_assert!(candidate.task.deferral_allows(now), "launch before user eligibility");
             prop_assert!(ready.contains(&candidate.task.id), "{what}: not ready when the pass began");
             prop_assert!(self.queue_room(&candidate.task), "{what}: missing or saturated queue was considered");
             prop_assert!(pass.starts < slots, "{what}: handed out after the slots were used");
@@ -1669,5 +1698,6 @@ proptest! {
     }
 }
 
+mod deferral;
 mod policy_reload;
 mod triage;
