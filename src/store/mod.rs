@@ -32,7 +32,8 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// * v7: tasks.execution_project and execution_repo (stable execution binding).
 /// * v8: persisted GitHub execution admission (legacy rows start unverified).
 /// * v9: tasks.routing (persisted deterministic routing evidence).
-pub const SCHEMA_VERSION: i64 = 9;
+/// * v10: pinned execution queue and workflow policy.
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// kv key of the Claude calibration before schema v2.
 const LEGACY_CALIBRATION_KEY: &str = "budget.calibration";
@@ -238,6 +239,7 @@ impl Store {
                 ("execution_repo", "ALTER TABLE tasks ADD COLUMN execution_repo TEXT"),
                 ("github_admission", "ALTER TABLE tasks ADD COLUMN github_admission TEXT"),
                 ("routing", "ALTER TABLE tasks ADD COLUMN routing TEXT"),
+                ("execution", "ALTER TABLE tasks ADD COLUMN execution TEXT"),
             ] {
                 if !cols.iter().any(|c| c == name) {
                     conn.execute(sql, []).with_context(|| format!("add tasks.{name}"))?;
@@ -273,9 +275,9 @@ impl Store {
             "INSERT INTO tasks (id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score,
                 labels, linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts,
                 not_before, last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number,
-                blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing)
+                blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing, execution)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-                ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)",
+                ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)",
             params![
                 task.id.to_string(),
                 task.key,
@@ -316,6 +318,7 @@ impl Store {
                 task.execution_repo,
                 task.github_admission.as_ref().map(json),
                 task.routing.as_ref().map(json),
+                task.execution.as_ref().map(json),
             ],
         )
         .with_context(|| format!("insert task {}", task.key))?;
@@ -330,7 +333,7 @@ impl Store {
                 criticality=?9, score=?10, labels=?11, linear_priority=?12, estimate=?13, project=?14, model_override=?15,
                 model=?16, worktree_path=?17, branch=?18, attempts=?19, max_attempts=?20, not_before=?21, last_error=?22,
                 summary=?23, score_reasons=?24, updated_at=?25, started_at=?26, completed_at=?27, cycle=?28, cycle_number=?29,
-                blocked_by=?30, children=?31, parent=?32, pr_url=?33, review=?34, execution_project=?35, execution_repo=?36, github_admission=?37, routing=?38
+                blocked_by=?30, children=?31, parent=?32, pr_url=?33, review=?34, execution_project=?35, execution_repo=?36, github_admission=?37, routing=?38, execution=?39
              WHERE id=?1",
             params![
                 task.id.to_string(),
@@ -371,6 +374,7 @@ impl Store {
                 task.execution_repo,
                 task.github_admission.as_ref().map(json),
                 task.routing.as_ref().map(json),
+                task.execution.as_ref().map(json),
             ],
         )?;
         if n == 0 {
@@ -524,7 +528,7 @@ impl Store {
         let changed = tx
             .execute(
                 "UPDATE tasks SET state=?5, model=?6, not_before=?7, review=?8, updated_at=?9,
-             attempts=?13, branch=?14, worktree_path=?15
+             attempts=?13, branch=?14, worktree_path=?15, execution=?20
              WHERE id=?1 AND execution_project=?2 AND state=?3 AND attempts=?4
              AND github_admission IS ?10 AND title=?11 AND description=?12
              AND routing IS ?16 AND labels=?17 AND project IS ?18 AND source=?19",
@@ -547,7 +551,8 @@ impl Store {
                     before.routing.as_ref().map(json),
                     json(&before.labels),
                     before.project,
-                    json(&before.source)
+                    json(&before.source),
+                    starting.execution.as_ref().map(json)
                 ],
             )
             .context("claim task start in its execution project")?;
@@ -636,6 +641,7 @@ impl Store {
             routing: row.get::<_, Option<String>>("routing")?.as_deref().map(from_json).transpose().map_err(conv)?,
             execution_project: row.get("execution_project")?,
             execution_repo: row.get("execution_repo")?,
+            execution: row.get::<_, Option<String>>("execution")?.as_deref().map(from_json).transpose().map_err(conv)?,
             state: TaskState::from_str(&state).map_err(|e| conv(anyhow!(e)))?,
             criticality: Criticality::from_str(&criticality).map_err(|e| conv(anyhow!(e)))?,
             score: row.get("score")?,
@@ -671,7 +677,7 @@ impl Store {
         "id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score, labels,
         linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts, not_before,
         last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number,
-        blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing";
+        blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing, execution";
 
     pub fn get_task(&self, id: TaskId) -> Result<Option<Task>> {
         let conn = self.lock();
@@ -1806,6 +1812,29 @@ mod tests {
         assert!(store.kv_get::<serde_json::Value>("budget.calibration.claude").unwrap().is_none());
         assert_eq!(store.reset_counts().unwrap().total(), 0);
         assert_eq!(store.integrity_check().unwrap(), "ok");
+    }
+
+    #[test]
+    fn migrates_v9_execution_binding_without_reclassifying_existing_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pq.sqlite");
+        let task = linear_task("ENG-legacy");
+        {
+            let store = Store::open(&path).unwrap();
+            store.insert_task(&task).unwrap();
+        }
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("ALTER TABLE tasks DROP COLUMN execution; PRAGMA user_version = 9;").unwrap();
+        }
+        for _ in 0..2 {
+            let store = Store::open(&path).unwrap();
+            let restored = store.get_task(task.id).unwrap().unwrap();
+            assert!(restored.execution.is_none());
+            assert_eq!(restored.state, task.state);
+            assert_eq!(restored.execution_project, task.execution_project);
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        }
     }
 
     /// The v1 schema as `powerqueue` 0.1.0 created it (no `agent_session_id`,

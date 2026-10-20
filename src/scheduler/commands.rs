@@ -84,6 +84,9 @@ pub fn bind_project(task: &mut Task, checkout: &str) -> Result<Vec<Effect>, Refu
 /// is launching it and persists `running` when the launch ends, which would
 /// lose the completion.
 pub fn on_complete(task: &mut Task, summary: Option<&str>, now: DateTime<Utc>) -> Result<Vec<Effect>, Refused> {
+    if task.leaves_ticket_open() && task.execution.as_ref().is_none_or(|e| e.outcome.is_none()) {
+        return Err(Refused("analysis completion requires --outcome and --summary or --summary-file".into()));
+    }
     if task.state == TaskState::Completed {
         return Err(Refused(format!("{} is already completed", task.key)));
     }
@@ -106,6 +109,32 @@ pub fn on_complete(task: &mut Task, summary: Option<&str>, now: DateTime<Utc>) -
     )])
 }
 
+/// Complete an analysis pass with a durable recommendation. No external effects run here.
+/// Refuses missing summaries, ordinary coding tasks, or invalid completion states without mutation.
+pub fn on_triage_complete(
+    task: &mut Task,
+    summary: &str,
+    outcome: crate::execution::TriageOutcome,
+    now: DateTime<Utc>,
+) -> Result<Vec<Effect>, Refused> {
+    if !task.leaves_ticket_open() || summary.trim().is_empty() {
+        return Err(Refused("--outcome requires a leave-ticket-open workflow and a nonempty summary".into()));
+    }
+    let mut updated = task.clone();
+    if let Some(execution) = &mut updated.execution {
+        execution.outcome = Some(outcome);
+    }
+    let mut effects = on_complete(&mut updated, Some(summary), now)?;
+    effects.push(Effect::log(
+        EventLevel::Info,
+        "triage.completed",
+        "analysis finished; source issue remains open",
+        serde_json::json!({"outcome": outcome, "queue": updated.execution.as_ref().map(|e| &e.queue)}),
+    ));
+    *task = updated;
+    Ok(effects)
+}
+
 /// `task complete --pr <url>`: the task moves to `in_review` with the PR
 /// recorded ([`Task::hand_off_for_review`]), so the daemon releases its
 /// session, slot and worktree (keeping the branch) and watches the PR.
@@ -114,6 +143,9 @@ pub fn on_complete(task: &mut Task, summary: Option<&str>, now: DateTime<Utc>) -
 /// is not running (queued, finished, ...) and a `starting` one (see
 /// [`on_complete`]).
 pub fn on_hand_off(task: &mut Task, pr_url: &str, summary: Option<&str>, now: DateTime<Utc>) -> Result<Vec<Effect>, Refused> {
+    if task.leaves_ticket_open() {
+        return Err(Refused("analysis workflows cannot hand off a PR; create a separate coding task".into()));
+    }
     let pr: PrRef = pr_url.parse().map_err(Refused)?;
     refuse_while_starting(task, "hand off for review")?;
     if task.state != TaskState::InReview && !task.state.can_transition_to(TaskState::InReview) {
@@ -254,6 +286,9 @@ pub fn on_retry(task: &mut Task, session: Option<&mut Session>, now: DateTime<Ut
         task.attempts = 0;
         task.last_error = None;
         task.summary = None;
+        if let Some(execution) = &mut task.execution {
+            execution.outcome = None;
+        }
         task.completed_at = None;
         task.started_at = None;
     } else if !matches!(task.state, TaskState::Crashed | TaskState::Throttled | TaskState::Paused | TaskState::NeedsAttention) {
@@ -504,6 +539,23 @@ mod properties {
 
     fn has_kill(effects: &[Effect]) -> bool {
         effects.iter().any(|e| matches!(e, Effect::KillWindow))
+    }
+
+    proptest! {
+        #[test]
+        fn triage_completion_is_local_and_retry_keeps_workflow(mut task in crate::strategies::triage_task(), summary in "[a-zA-Z0-9 ]{1,100}") {
+            let before = task.clone();
+            let effects = on_triage_complete(&mut task, &format!("Findings: {summary}"), crate::execution::TriageOutcome::NeedsInformation, origin()).unwrap();
+            prop_assert_eq!(task.state, TaskState::Completed);
+            prop_assert!(task.leaves_ticket_open());
+            prop_assert_eq!(&task.source, &before.source);
+            prop_assert!(effects.iter().all(|e| matches!(e, Effect::Log { .. })), "completion only logs local state");
+            prop_assert_eq!(task.execution.as_ref().unwrap().outcome, Some(crate::execution::TriageOutcome::NeedsInformation));
+            on_retry(&mut task, None, origin());
+            prop_assert_eq!(task.state, TaskState::Queued);
+            prop_assert!(task.leaves_ticket_open());
+            prop_assert_eq!(task.execution.as_ref().unwrap().outcome, None);
+        }
     }
 
     proptest! {

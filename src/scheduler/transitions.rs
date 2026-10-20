@@ -72,6 +72,23 @@ pub enum Effect {
     ForgetAnswer,
 }
 
+/// Pin the selected queue and workflow before dependency evaluation. Existing bindings never change.
+/// Returns an error without mutation for ambiguous selection.
+pub fn on_execution_selected(task: &mut Task, cfg: &Config) -> anyhow::Result<Vec<Effect>> {
+    if task.execution.is_some() || cfg.queues.is_empty() {
+        return Ok(Vec::new());
+    }
+    let execution = cfg.execution_for(task)?;
+    let effect = Effect::log(
+        EventLevel::Info,
+        "task.workflow_selected",
+        format!("selected queue {}", execution.queue),
+        serde_json::json!({"execution": execution}),
+    );
+    task.execution = Some(execution);
+    Ok(vec![effect])
+}
+
 /// Record routing evidence without changing an existing project or execution state.
 /// A fresh intake may set its initial assignment; subsequent conflicts hold future starts.
 pub fn on_routing(task: &mut Task, mut decision: crate::routing::RoutingDecision, fresh: bool) -> Vec<Effect> {
@@ -280,6 +297,16 @@ pub fn on_hook_outcome(
             ));
         }
         HookOutcome::Completed { summary } => {
+            if task.leaves_ticket_open() && task.execution.as_ref().is_none_or(|e| e.outcome.is_none()) {
+                effects.push(Effect::Nudge { text: "Analysis is not recorded yet. Run powerqueue task complete with --summary-file and --outcome before printing the done marker.".into() });
+                effects.push(Effect::log(
+                    EventLevel::Warn,
+                    "triage.report_missing",
+                    "ignored done marker without a recorded analysis outcome",
+                    serde_json::json!({}),
+                ));
+                return effects;
+            }
             if task.state == TaskState::InReview {
                 // `task complete --pr` already handed the task to the PR
                 // watcher; the done marker only ends the session.
@@ -287,11 +314,15 @@ pub fn on_hook_outcome(
                 return effects;
             }
             let summary = summary.trim();
-            if !summary.is_empty() {
+            if !summary.is_empty() && !task.leaves_ticket_open() {
                 task.summary = Some(summary.to_string());
             }
             task.state = TaskState::Completed;
-            task.completed_at = Some(now);
+            // The report receipt is keyed by this completion timestamp. A
+            // trailing done marker must not turn the same report into a new pass.
+            if !task.leaves_ticket_open() || task.completed_at.is_none() {
+                task.completed_at = Some(now);
+            }
             task.last_error = None;
             session.state = SessionState::Exited;
             session.ended_at = Some(now);
@@ -2099,6 +2130,21 @@ mod properties {
     use crate::domain::ReviewWatch;
     use crate::priority::Evaluation;
     use crate::strategies::*;
+
+    proptest! {
+        #[test]
+        fn triage_done_marker_preserves_the_recorded_report(mut task in triage_task(), later in future_instant()) {
+            let mut session = session_stub(&task);
+            crate::scheduler::commands::on_triage_complete(
+                &mut task, "Full investigation", crate::execution::TriageOutcome::NeedsInformation, origin()
+            ).unwrap();
+            let outcome = HookOutcome::Completed { summary: "Short marker".into() };
+            on_hook_outcome(&mut task, &mut session, &outcome, &Config::default(), later, later);
+            prop_assert_eq!(task.completed_at, Some(origin()));
+            prop_assert_eq!(task.summary.as_deref(), Some("Full investigation"));
+            prop_assert_eq!(session.state, SessionState::Exited);
+        }
+    }
 
     /// A live session row of `task`'s current attempt, started at the origin.
     fn session_stub(task: &Task) -> Session {

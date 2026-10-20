@@ -1664,3 +1664,52 @@ run = ['test "$POWERQUEUE_PROJECT" = "{id}" && echo {id} > cleanup-{id}']
     assert_eq!(live, 0);
     drop(env);
 }
+
+#[test]
+fn triage_workflow_runs_in_a_worktree_and_releases_it_without_coding() {
+    for shim in [false, true] {
+        let opts = Opts {
+            mode: "triage",
+            extra_claude: if shim { "shim = true" } else { "" },
+            launcher_sets_powerqueue_bin: shim,
+            ..Opts::default()
+        };
+        let Some(mut env) = Env::with_opts(opts, |_| {
+            r#"
+[queues.default]
+max_concurrent = 1
+[queues.triage]
+max_concurrent = 1
+workflow = "triage"
+all = [{ field = "label", op = "eq", value = "triage/requested" }]
+[workflows.triage]
+instructions = "triage.md"
+completion = "leave-ticket-open"
+"#
+            .into()
+        }) else {
+            return;
+        };
+        let repo = env.root.path().join("repo");
+        std::fs::write(repo.join("triage.md"), "Inspect {{key}}. Produce analysis only.").unwrap();
+        git(&repo, &["add", "triage.md"]);
+        git(&repo, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "triage workflow"]);
+        let key = add_task(&env, "Investigate a support request", &["--label", "triage/requested"]);
+        env.start_daemon();
+        assert_eq!(env.wait_for_state(&key, "completed", Duration::from_secs(60)), "completed", "{}", env.daemon_log());
+        let show = env.wait_for_show(&key, |v| has_event(v, "cleanup.done"));
+        assert!(has_event(&show, "triage.completed"), "{show}");
+        assert!(has_event(&show, "cleanup.done"), "{show}");
+        assert_eq!(show["task"]["execution"]["queue"], "triage");
+        assert_eq!(show["task"]["execution"]["outcome"], "needs-information");
+        assert!(show["task"]["summary"].as_str().unwrap().contains("Draft questions for the customer"));
+        assert!(show["task"]["worktree_path"].is_null());
+        assert!(show["task"]["pr_url"].is_null());
+        assert!(!has_event(&show, "cleanup.autocommit"));
+        assert!(!has_event(&show, "cleanup.pushed"));
+        let id = show["task"]["id"].as_str().unwrap();
+        let prompt = std::fs::read_to_string(env.home().join("state/tasks").join(id).join("prompt.md")).unwrap();
+        assert!(prompt.contains("Produce analysis only"));
+        assert!(prompt.contains("--outcome"));
+    }
+}

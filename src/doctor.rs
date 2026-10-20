@@ -412,6 +412,54 @@ fn check_config(cfg: &Config, paths: &Paths) -> CheckResult {
     }
 }
 
+fn check_execution(cfg: &Config, paths: &Paths, store: &Store) -> Result<Vec<CheckResult>> {
+    let mut checks = Vec::new();
+    for task in store.list_tasks()? {
+        if !task.state.is_terminal() {
+            match cfg.execution_for(&task) {
+                Err(error) => checks.push(CheckResult::fail(
+                    CONF,
+                    &format!("{} queue", task.key),
+                    error.to_string(),
+                    "make queue predicates unambiguous",
+                )),
+                Ok(execution) => {
+                    if (!cfg.queues.is_empty() || execution.queue != "default") && !cfg.queues.contains_key(&execution.queue) {
+                        checks.push(CheckResult::fail(
+                            CONF,
+                            &format!("{} queue", task.key),
+                            format!("bound queue {} is missing", execution.queue),
+                            "restore the queue; existing tasks keep their binding",
+                        ));
+                    }
+                    if let Some(workflow) = execution.policy
+                        && let Ok(project) = cfg.for_task(&task, paths)
+                    {
+                        let root = task
+                            .worktree_path
+                            .as_ref()
+                            .map(std::path::PathBuf::from)
+                            .filter(|p| p.exists())
+                            .unwrap_or_else(|| project.repo_path());
+                        if let Err(error) = crate::execution::read_instructions(&root, &workflow) {
+                            checks.push(CheckResult::fail(CONF, &format!("{} workflow", task.key), format!("{error:#}"), "commit the workflow file at the selected revision; launches never fall back to coding instructions"));
+                        }
+                    }
+                }
+            }
+        }
+        if task.leaves_ticket_open() && task.state == crate::domain::TaskState::Completed && task.linear_issue_id().is_some() {
+            let receipt = store.kv_get::<crate::scheduler::triage::Delivery>(&crate::scheduler::triage::delivery_key(task.id))?;
+            if !receipt.as_ref().is_some_and(|r| Some(r.completed_at) == task.completed_at && r.done()) {
+                checks.push(CheckResult::warn(STATE, &format!("{} triage report", task.key),
+                    receipt.and_then(|r| r.error).unwrap_or_else(|| "report delivery pending or outcome missing".into()),
+                    "enable Linear comments, check credentials and the triage label group; delivery retries every minute; inspect task show"));
+            }
+        }
+    }
+    Ok(checks)
+}
+
 fn check_repo(cfg: &Config) -> CheckResult {
     let path = cfg.repo_path();
     if cfg.repo.path.trim().is_empty() {
@@ -2221,6 +2269,7 @@ pub async fn run_all(
     results.push(check_terminal());
 
     results.push(check_config(cfg, paths));
+    results.extend(check_execution(cfg, paths, store)?);
     if !cfg.projects.is_empty()
         && !cfg.repo.path.trim().is_empty()
         && let Some(error) = &cfg.overrides.error

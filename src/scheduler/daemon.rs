@@ -16,6 +16,9 @@ use anyhow::{Context as _, Result, bail};
 #[cfg(all(test, unix))]
 #[path = "start_recovery_tests.rs"]
 mod start_recovery_tests;
+#[cfg(test)]
+#[path = "triage_tests.rs"]
+mod triage_tests;
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::Notify;
 
@@ -30,8 +33,8 @@ use crate::domain::{
 use crate::github::{Gh, GitHubClient, PrRef, apply_plan, plan_sync_routed};
 use crate::jev::{JevClient, JevQuestion, content_hash};
 use crate::linear::{
-    IssueFilter, LinearClient, LinearIssue, WATCHED_PARENTS_KEY, WatchedParents, container_comment, container_finished,
-    parents_to_watch, sync_issues_routed,
+    LinearClient, LinearIssue, WATCHED_PARENTS_KEY, WatchedParents, container_comment, container_finished, parents_to_watch,
+    sync_issues_routed,
 };
 use crate::paths::Paths;
 use crate::priority::{PriorityRules, RulesWatcher};
@@ -248,7 +251,9 @@ fn failure_scope(error: &anyhow::Error, fallback: FailureScope) -> FailureScope 
         || ["no space left on device", "disk quota exceeded", "too many open files"].iter().any(|s| message.contains(s))
     {
         FailureScope::Global
-    } else if error.downcast_ref::<SetupCommandFailure>().is_some() {
+    } else if error.downcast_ref::<SetupCommandFailure>().is_some()
+        || error.downcast_ref::<crate::session::launcher::WorkflowPromptFailure>().is_some()
+    {
         FailureScope::Task
     } else {
         fallback
@@ -454,6 +459,9 @@ impl Daemon {
         self.run_usage_probes(now);
         let r = self.launch_tasks(now).await;
         self.report_phase("launch", r);
+        // Reports are delivered after session release and launch allocation.
+        let r = self.publish_triage(now).await;
+        self.report_phase("triage reports", r);
         Ok(())
     }
 
@@ -596,6 +604,9 @@ impl Daemon {
                 let mut session = self.store.latest_session(task.id)?.filter(|s| s.state.is_live());
                 let before = (task.clone(), session.clone());
                 let effects = commands::on_retry(&mut task, session.as_mut(), now);
+                if task.leaves_ticket_open() {
+                    self.rt.force_sync = true;
+                }
                 // The events name the session only when the retry ended it.
                 let ended = session.as_ref().filter(|s| Some(*s) != before.1.as_ref());
                 if let Some(session) = ended {
@@ -772,7 +783,14 @@ impl Daemon {
             let eval =
                 self.rt.rules.evaluate(&task, now, jev_norm, self.cfg.priority.jev.weight, self.cfg.priority.age_boost_per_hour);
             let before = task.clone();
-            let effects = transitions::on_evaluation(&mut task, &eval);
+            let mut effects = match transitions::on_execution_selected(&mut task, &self.cfg) {
+                Ok(effects) => effects,
+                Err(error) => {
+                    self.project_error(&task.execution_project, &format!("{}: {error:#}", task.key));
+                    continue;
+                }
+            };
+            effects.extend(transitions::on_evaluation(&mut task, &eval));
             self.log_only(&task, None, effects);
             if task != before {
                 self.store.update_task(&task)?;
@@ -912,7 +930,14 @@ impl Daemon {
                 let jev = self.jev_norm_with(&task, now, &cfg, &rules).await;
                 let eval = rules.evaluate(&task, now, jev, cfg.priority.jev.weight, cfg.priority.age_boost_per_hour);
                 let before = task.clone();
-                let effects = transitions::on_evaluation(&mut task, &eval);
+                let mut effects = match transitions::on_execution_selected(&mut task, &self.cfg) {
+                    Ok(effects) => effects,
+                    Err(error) => {
+                        self.project_error(&task.execution_project, &format!("{}: {error:#}", task.key));
+                        continue;
+                    }
+                };
+                effects.extend(transitions::on_evaluation(&mut task, &eval));
                 self.commit(&before, &mut task, None, effects).await?;
             }
             if previous_rules.get(&id) != Some(&rules) {
@@ -1298,8 +1323,7 @@ impl Daemon {
         self.rt.force_sync = false;
         self.rt.last_linear_poll = Some(now);
 
-        let filter = IssueFilter::from_config(&self.cfg.linear);
-        let mut issues = match client.fetch_issues(&filter).await {
+        let mut issues = match client.fetch_configured_issues(&self.cfg.linear).await {
             Ok(issues) => issues,
             Err(e) => {
                 self.linear_failure(now, &format!("fetching issues failed: {e:#}"));
@@ -1469,6 +1493,23 @@ impl Daemon {
                 continue;
             }
             let task = self.store.get_task_by_linear_issue(&parent.id)?;
+            let parent_task = task.clone().unwrap_or_else(|| {
+                Task::new(
+                    parent.identifier.clone(),
+                    String::new(),
+                    TaskSource::Linear {
+                        issue_id: parent.id.clone(),
+                        identifier: parent.identifier.clone(),
+                        url: String::new(),
+                        team_key: parent.team_key.clone(),
+                    },
+                )
+            });
+            // Queue policy also protects IT parents that were never admitted as tasks.
+            if self.cfg.execution_for(&parent_task).map_or(true, |e| e.leaves_ticket_open()) {
+                continue;
+            }
+
             if task.as_ref().is_some_and(|t| t.state.has_live_session()) {
                 tracing::debug!(parent = %key, "parent issue has a live session; not closing it");
                 continue;
@@ -1673,6 +1714,9 @@ impl Daemon {
             return None;
         }
         let client = self.linear_client()?;
+        let body = task.execution.as_ref().and_then(|e| e.policy.as_ref()).map_or(body.clone(), |p| {
+            if p.comment_prefix.is_empty() { body.clone() } else { format!("{}\n\n{body}", p.comment_prefix) }
+        });
         let body = relay::tag_own(&body);
         match client.post_comment(&issue_id, &body).await {
             Ok(posted) => {
@@ -2187,7 +2231,68 @@ impl Daemon {
         );
     }
 
+    async fn publish_triage(&mut self, now: DateTime<Utc>) -> Result<()> {
+        use super::triage::{Delivery, delivery_key, report_body};
+        if !self.cfg.linear.post_comments.questions() {
+            return Ok(());
+        }
+        let tasks = self.store.list_tasks_in_states(&[TaskState::Completed])?;
+        for task in tasks.into_iter().filter(Task::leaves_ticket_open) {
+            let TaskSource::Linear { issue_id, team_key, .. } = &task.source else { continue };
+            let Some(completed_at) = task.completed_at else { continue };
+            let Some(outcome) = task.execution.as_ref().and_then(|e| e.outcome) else { continue };
+            let key = delivery_key(task.id);
+            let mut receipt = self
+                .store
+                .kv_get::<Delivery>(&key)?
+                .filter(|r| r.completed_at == completed_at)
+                .unwrap_or_else(|| Delivery::new(completed_at));
+            if receipt.done() || receipt.next_attempt > now {
+                continue;
+            }
+            let Some(client) = self.linear_client() else { break };
+            self.store.kv_set(&key, &receipt)?;
+            let result: Result<()> = async {
+                if !receipt.comment_posted {
+                    let base = self
+                        .store
+                        .last_task_event(task.id, crate::domain::BRANCH_CREATED_EVENT)?
+                        .and_then(|e| e.branch_base())
+                        .map(|(_, sha)| sha);
+                    client.ensure_report_comment(issue_id, &receipt.comment_id, &report_body(&task, base.as_deref())).await?;
+                    receipt.comment_posted = true;
+                    self.store.kv_set(&key, &receipt)?;
+                    self.update_relay(&task, |s| s.record_posted(&receipt.comment_id));
+                }
+                if !receipt.label_set {
+                    client.set_triage_label(issue_id, team_key, outcome).await?;
+                    receipt.label_set = true;
+                }
+                Ok(())
+            }
+            .await;
+            receipt.error = result.err().map(|e| format!("{e:#}"));
+            receipt.next_attempt = now + Duration::seconds(60);
+            self.store.kv_set(&key, &receipt)?;
+            self.log(
+                Some(task.id),
+                None,
+                if receipt.done() { EventLevel::Info } else { EventLevel::Warn },
+                if receipt.done() { "triage.published" } else { "triage.delivery_failed" },
+                receipt.error.as_deref().unwrap_or("triage report and recommendation published; ticket left open"),
+                serde_json::json!({"comment_id": receipt.comment_id, "outcome": outcome}),
+            );
+            // Bound per-tick network work even if many completed reports are pending.
+            break;
+        }
+        Ok(())
+    }
+
     async fn update_issue(&mut self, task: &Task, target: LinearTarget, comment: Option<String>) {
+        // The workflow binding survives config changes and suppresses every lifecycle target.
+        if task.leaves_ticket_open() {
+            return;
+        }
         if matches!(&task.source, TaskSource::GitHub { .. }) {
             self.update_github(task, Some(target), comment).await;
         } else {
@@ -2327,11 +2432,20 @@ impl Daemon {
                 }
                 crate::hook::handle_provider(&self.store, *provider, target.id, session, event, &msg.body)?;
             }
-            InboxHeader::Complete { pr, .. } => {
+            InboxHeader::Complete { pr, outcome, .. } => {
                 let summary = (!body.is_empty()).then_some(body);
-                match pr.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
-                    Some(url) => hand_off_for_review(&self.store, &mut target, summary, url)?,
-                    None => complete_task(&self.store, &mut target, summary)?,
+                if let Some(outcome) = outcome {
+                    if pr.is_some() {
+                        bail!("--outcome conflicts with --pr");
+                    }
+                    let effects = commands::on_triage_complete(&mut target, body, *outcome, now)?;
+                    self.store.update_task(&target)?;
+                    self.log_only(&target, None, effects);
+                } else {
+                    match pr.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+                        Some(url) => hand_off_for_review(&self.store, &mut target, summary, url)?,
+                        None => complete_task(&self.store, &mut target, summary)?,
+                    }
                 }
                 self.log(
                     Some(target.id),
@@ -2981,6 +3095,9 @@ impl Daemon {
     /// (not installed, not a GitHub repo) is logged at debug level and
     /// leaves the task completed.
     fn adopt_open_pr(&mut self, task: &mut Task, now: DateTime<Utc>) -> bool {
+        if task.leaves_ticket_open() {
+            return false;
+        }
         let cfg = match self.cfg.for_task(task, &self.paths) {
             Ok(cfg) => cfg,
             Err(_) => return false,
@@ -3202,7 +3319,8 @@ impl Daemon {
         let estimator = Estimator::from_summaries(&self.store.task_usage_summaries()?);
         let ledgers = Ledgers::load(&self.store, &self.cfg.budget, now)?;
         self.rt.rate_limits.clear_expired(now);
-        let mut planner = LaunchPlanner::new(estimator, ledgers, tasks, slots);
+        let live_tasks: Vec<_> = live.iter().filter_map(|s| self.store.get_task(s.task_id).transpose()).collect::<Result<_>>()?;
+        let mut planner = LaunchPlanner::new(estimator, ledgers, tasks, slots).with_queues(&self.cfg, &live_tasks);
         loop {
             planner.set_failures(self.rt.launch_failures.clone());
             let candidate = if self.cfg.projects.is_empty() {
@@ -3361,6 +3479,9 @@ impl Daemon {
     async fn start_task(&mut self, mut task: Task, model: ModelTier, decision: &Decision, now: DateTime<Utc>) -> Result<Started> {
         if !self.refresh_launch_permissions(&mut task).await? {
             return Ok(Started::Skipped);
+        }
+        if let Err(e) = self.cfg.execution_for(&task) {
+            return Ok(Started::Failed(FailureScope::Project, format!("{e:#}")));
         }
         let cfg = match self.cfg.for_task(&task, &self.paths) {
             Ok(cfg) => cfg,
@@ -4411,6 +4532,8 @@ mod tests {
         }
         let setup = anyhow::anyhow!("command exited 1").context(SetupCommandFailure);
         assert_eq!(failure_scope(&setup, FailureScope::Project), FailureScope::Task);
+        let workflow = anyhow::anyhow!("missing triage instructions").context(crate::session::launcher::WorkflowPromptFailure);
+        assert_eq!(failure_scope(&workflow, FailureScope::Project), FailureScope::Task);
         let disk = anyhow::anyhow!("git: No space left on device");
         assert_eq!(failure_scope(&disk, FailureScope::Project), FailureScope::Global);
         let config = anyhow::anyhow!("unknown configuration field");

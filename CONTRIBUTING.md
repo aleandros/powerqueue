@@ -93,6 +93,14 @@ It now includes:
 - Offline CLI controls through `apply_offline`, including a surviving agent,
   and terminal retries followed by a new launch with historical session rows.
   The latter catches attempt counters resetting below an older session's count.
+- Dedicated coding/triage queues through `LaunchPlanner::with_queues`, checked
+  against an independent count of live sessions. The focused triage model runs
+  128 generated walks with a forced completion/retry/restart/removal prefix,
+  then interleaves launch failures, reports, done markers, release, crash,
+  relabeling and configuration changes. It checks binding and report retention,
+  rejected PR handoff, SQLite task reloads, queue isolation and limits reached
+  by attrition. A second generated scenario guarantees capacity returns after
+  surviving coding sessions release their slots.
 
 For a larger search, separate from the default gate:
 
@@ -115,6 +123,10 @@ arbitrary delayed hooks from every historical session, transcript identity
 changes, relay/container behavior, CPU/RSS pressure and crash-time persistence
 of every effect are outside this model. Project, routing, admission and starting
 recovery invariants remain covered by their existing feature models.
+Triage's Rust model covers persisted task rows and serialized session state;
+external report/label delivery and source issue lifecycle suppression remain
+in the mocked Linear and real-daemon integration tests. It does not model
+concurrent Linear writers, report network requests, or filesystem cleanup.
 
 ### End-to-end tests
 

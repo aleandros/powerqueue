@@ -229,6 +229,7 @@ fn execution_location(ctx: &mut Context, task: &Task) -> Result<serde_json::Valu
             "checkout": project.repo_path(),
             "worktree_root": project.worktree_root(&ctx.paths),
             "rules": project.rules_source(&ctx.paths).describe(),
+            "execution": cfg.execution_for(task).map_err(|e| e.to_string()),
         }),
         Err(error) => serde_json::json!({"error": format!("{error:#}")}),
     })
@@ -302,6 +303,10 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     println!("{} {}", task.key.if_supports_color(Stream::Stdout, |t| t.bold()), task.title);
     kv("id", task.id.to_string());
     kv("state", paint(color, output::state_colored(task.state), task.state.as_str()));
+    if let Ok(execution) = ctx.config_or_default()?.execution_for(&task) {
+        kv("queue", execution.queue);
+        kv("workflow", execution.workflow.unwrap_or_else(|| "standard".into()));
+    }
     kv("criticality", paint(color, output::criticality_colored(task.criticality), task.criticality.as_str()));
     kv("score", format!("{:.1}", task.score));
     for r in &task.score_reasons {
@@ -729,7 +734,7 @@ pub fn parse_model_arg(s: &str) -> Result<Option<ModelTier>> {
 /// (global or repo override) with attempt `attempts + 1`, the task's last
 /// error, its forced/last model (else `budget.default_model`), and the
 /// branch and worktree it would get. Nothing is written or launched.
-pub fn preview_prompt(cfg: &Config, paths: &crate::paths::Paths, task: &Task) -> crate::session::RenderedPrompt {
+pub fn preview_prompt(cfg: &Config, paths: &crate::paths::Paths, task: &Task) -> Result<crate::session::RenderedPrompt> {
     let model = effective_model(task).cloned().unwrap_or_else(|| cfg.budget.default_model.clone());
     let mut preview = task.clone();
     if preview.branch.is_none() {
@@ -750,7 +755,9 @@ pub fn preview_prompt(cfg: &Config, paths: &crate::paths::Paths, task: &Task) ->
         previous_error: task.last_error.as_deref(),
         powerqueue: shim.as_deref(),
     };
-    crate::session::render_prompt(&preview, cfg, &ctx)
+    let root =
+        task.worktree_path.as_ref().map(std::path::PathBuf::from).filter(|p| p.exists()).unwrap_or_else(|| cfg.repo_path());
+    crate::session::render_execution_prompt(&preview, cfg, &ctx, &root)
 }
 
 fn prompt(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
@@ -758,7 +765,7 @@ fn prompt(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let store = ctx.store()?.clone();
     let task = find_task(&store, &task_ref.task)?;
     let cfg = cfg.for_task(&task, &ctx.paths)?;
-    let rendered = preview_prompt(&cfg, &ctx.paths, &task);
+    let rendered = preview_prompt(&cfg, &ctx.paths, &task)?;
     if ctx.json {
         let out = serde_json::json!({
             "task": task.key,
@@ -816,10 +823,17 @@ pub fn run(ctx: &mut Context, cmd: TaskCommand) -> Result<i32> {
         TaskCommand::Show(t) => show(ctx, &t),
         TaskCommand::Explain(t) => explain(ctx, &t),
         TaskCommand::Prompt(t) => prompt(ctx, &t),
-        TaskCommand::Complete { task, summary, pr } => {
+        TaskCommand::Complete { task, summary, summary_file, outcome, pr } => {
+            let summary = match summary_file {
+                Some(path) => Some(std::fs::read_to_string(&path).with_context(|| format!("read summary {}", path.display()))?),
+                None => summary,
+            };
             let store = ctx.store()?.clone();
             let mut t = find_task(&store, &task.task)?;
-            if let Some(url) = pr.as_deref() {
+            if let Some(outcome) = outcome {
+                let effects = commands::on_triage_complete(&mut t, summary.as_deref().unwrap_or_default(), outcome, Utc::now())?;
+                persist(&store, &t, effects)?;
+            } else if let Some(url) = pr.as_deref() {
                 hand_off_for_review(&store, &mut t, summary.as_deref(), url)?;
             } else {
                 complete_task(&store, &mut t, summary.as_deref())?;
@@ -832,6 +846,8 @@ pub fn run(ctx: &mut Context, cmd: TaskCommand) -> Result<i32> {
                     "in review".if_supports_color(Stream::Stdout, |t| t.style(Style::new().blue().bold())),
                     t.key.if_supports_color(Stream::Stdout, |t| t.bold())
                 );
+            } else if t.leaves_ticket_open() {
+                println!("{} analysis complete; ticket remains open, report delivery is pending", t.key);
             } else {
                 println!(
                     "{} {} marked completed; the daemon will clean up its worktree and update Linear",

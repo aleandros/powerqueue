@@ -183,6 +183,34 @@ pub fn render_prompt(task: &Task, cfg: &Config, ctx: &PromptContext<'_>) -> Rend
     }
 }
 
+/// A workflow-specific launch failure; other tasks in the same repository may still run.
+#[derive(Debug, thiserror::Error)]
+#[error("workflow prompt could not be prepared")]
+pub struct WorkflowPromptFailure;
+
+/// Render a selected workflow instead of the coding template. Missing workflow files fail the launch.
+/// Preview may read the main checkout; actual launches always pass the task worktree.
+pub fn render_execution_prompt(task: &Task, cfg: &Config, ctx: &PromptContext<'_>, root: &Path) -> Result<RenderedPrompt> {
+    let execution = cfg.execution_for(task)?;
+    let Some(policy) = &execution.policy else {
+        return Ok(render_prompt(task, cfg, ctx));
+    };
+    let instructions = crate::execution::read_instructions(root, policy).context(WorkflowPromptFailure)?;
+    let mut task = task.clone();
+    task.execution = Some(execution.clone());
+    let mut plain = cfg.clone();
+    plain.prompt.template = None;
+    // Workflow instructions replace coding-specific project instructions too.
+    let vars = prompt_variables(&task, &plain, ctx);
+    let (instructions, unknown) = render_template(&instructions, &vars);
+    if !unknown.is_empty() {
+        return Err(anyhow::anyhow!("unknown workflow placeholders: {}", unknown.join(", ")).context(WorkflowPromptFailure));
+    }
+    plain.prompt.instructions = Some(instructions);
+    let text = prompt_variables(&task, &plain, ctx)["default_prompt"].clone();
+    Ok(RenderedPrompt { text, template: Some(root.join(&policy.instructions)), warnings: Vec::new() })
+}
+
 /// Every placeholder value for `task` (see [`PROMPT_PLACEHOLDERS`]), including
 /// `default_prompt`, the complete built-in prompt. Block values
 /// (`working_rules`, `completion_protocol`, `attempt_notes`) carry their
@@ -197,27 +225,37 @@ pub fn prompt_variables(task: &Task, cfg: &Config, ctx: &PromptContext<'_>) -> B
     };
     let description = task.description.trim().to_string();
 
-    let commit_rule = if agent_for(ctx.provider).commits_in_session(cfg) {
+    let commit_rule = if task.leaves_ticket_open() {
+        "- This is an analysis workflow. Do not implement fixes, create commits or PRs, push, or change the issue state.\n"
+    } else if agent_for(ctx.provider).commits_in_session(cfg) {
         "- Commit as you go with clear messages.\n"
     } else {
         "- Do not run `git commit` or other git write commands: this session's sandbox keeps git metadata read-only. \
          Leave your changes in the working tree; powerqueue commits and pushes them when you complete the task.\n"
     };
+    let push_rule = if task.leaves_ticket_open() { "" } else { "- Do not push unless asked; powerqueue pushes on completion.\n" };
     let working_rules = format!(
         "## Working rules\n\n\
          - You are working in a dedicated git worktree on branch `{branch}`: never switch branches and never touch other worktrees.\n\
          {commit_rule}\
-         - Do not push unless asked; powerqueue pushes on completion.\n"
+         {push_rule}"
     );
     // Shell-quoted: the prompt's commands are typed into a shell, and the
     // state directory may contain spaces.
     let powerqueue = ctx.powerqueue.map(|p| shell_quote(&p.to_string_lossy())).unwrap_or_else(|| "powerqueue".to_string());
-    let completion_protocol = format!(
-        "## Completion protocol\n\n\
+    let completion_protocol = if task.leaves_ticket_open() {
+        format!(
+            "## Completion protocol\n\nWrite the complete analysis to a Markdown file in POWERQUEUE_TASK_DIR outside the worktree, then run `{powerqueue} task complete {id} --summary-file <path> --outcome <needs-information|needs-decision|ready-for-agent|manual-action|no-action-recommended>`. This completes this analysis pass, leaves the ticket open, and publishes the report and recommendation label. Do not post the report yourself. Customer questions are drafts in the report; do not send them or use task block for missing customer information. Then print `{DONE_MARKER}`.\n",
+            id = task.id
+        )
+    } else {
+        format!(
+            "## Completion protocol\n\n\
          When the task is fully done, run `{powerqueue} task complete {id} --summary \"...\"` and then print `{DONE_MARKER}` as the last line of your final message.\n\
          If you are blocked and need a human, run `{powerqueue} task block {id} --reason \"...\"` and print `{BLOCKED_MARKER}`.\n",
-        id = task.id,
-    );
+            id = task.id,
+        )
+    };
     let previous_error = ctx.previous_error.map(str::trim).filter(|e| !e.is_empty()).unwrap_or_default().to_string();
     let attempt_notes = if ctx.attempt > 1 {
         let attempt = ctx.attempt;
@@ -439,7 +477,7 @@ impl Launcher {
 
         let prompt = match prompt_override {
             Some(text) => RenderedPrompt { text: format!("{}\n", text.trim_end()), template: None, warnings: Vec::new() },
-            None => render_prompt(
+            None => render_execution_prompt(
                 task,
                 cfg,
                 &PromptContext {
@@ -449,7 +487,8 @@ impl Launcher {
                     previous_error,
                     powerqueue: shim.as_ref().map(|(s, _)| s.as_path()),
                 },
-            ),
+                worktree,
+            )?,
         };
         for w in &prompt.warnings {
             tracing::warn!(task = %task.key, session = %session_id, "{w}");
@@ -487,7 +526,12 @@ impl Launcher {
             let _ = mode;
         }
 
-        let env = launch.env;
+        let mut env = launch.env;
+        // Reports belong outside the checkout and must be reachable through
+        // the same state-directory mount used by container launchers.
+        if !env.iter().any(|(key, _)| key == "POWERQUEUE_TASK_DIR") {
+            env.push(("POWERQUEUE_TASK_DIR".into(), task_dir.to_string_lossy().into_owned()));
+        }
         let env_text = env.iter().fold(String::new(), |mut acc, (k, v)| {
             let _ = writeln!(acc, "{k}={v}");
             acc

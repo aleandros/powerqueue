@@ -30,7 +30,7 @@
 //! that a throttled candidate gets the policy's retry time and no slot,
 //! that a failed start frees its slot, that every ledger the pass reserved
 //! on stays within the safety margin, that no ready task is left
-//! unconsidered while a slot is free (bounded progress), and that the
+//! unconsidered while global and selected-queue slots are free (bounded progress), and that the
 //! order the store lists the tasks in does not change the pass.
 //!
 //! Projects have independent model preferences, availability and checkout revisions.
@@ -1014,6 +1014,21 @@ impl DaemonWorld {
         self.tasks.iter().filter(|t| t.session_live()).count() as u32
     }
 
+    // Independent capacity oracle: count actual live session rows rather than
+    // consulting QueueSlots or the planner's remaining-slot bookkeeping.
+    fn queue_room(&self, task: &Task) -> bool {
+        let queue = task.execution.as_ref().map_or("default", |e| e.queue.as_str());
+        if self.cfg.queues.is_empty() {
+            return queue == "default";
+        }
+        let live = self
+            .tasks
+            .iter()
+            .filter(|t| t.session_live() && t.task.execution.as_ref().map_or("default", |e| e.queue.as_str()) == queue)
+            .count() as u32;
+        self.cfg.queues.get(queue).is_some_and(|q| live < q.max_concurrent)
+    }
+
     fn ready(&self) -> Vec<TaskId> {
         self.tasks
             .iter()
@@ -1093,7 +1108,9 @@ impl DaemonWorld {
         let ready = self.ready();
         let at_start = self.ledgers.clone();
         let margin = (1.0 - self.cfg.budget.safety_margin).max(0.0);
-        let mut planner = LaunchPlanner::new(self.estimator.clone(), self.ledgers.clone(), candidates, slots);
+        let live: Vec<_> = self.tasks.iter().filter(|t| t.session_live()).map(|t| t.task.clone()).collect();
+        let mut planner =
+            LaunchPlanner::new(self.estimator.clone(), self.ledgers.clone(), candidates, slots).with_queues(&self.cfg, &live);
         let mut outcomes = outcomes.iter();
         loop {
             planner.set_failures(self.launch_failures.clone());
@@ -1111,6 +1128,7 @@ impl DaemonWorld {
             );
             prop_assert!(!pass.handed.iter().any(|(id, ..)| *id == candidate.task.id), "{what}: handed out twice");
             prop_assert!(ready.contains(&candidate.task.id), "{what}: not ready when the pass began");
+            prop_assert!(self.queue_room(&candidate.task), "{what}: missing or saturated queue was considered");
             prop_assert!(pass.starts < slots, "{what}: handed out after the slots were used");
             pass.handed.push((candidate.task.id, candidate.decision.model.clone(), candidate.decision.retry_at));
             match candidate.decision.model.clone() {
@@ -1232,12 +1250,12 @@ impl DaemonWorld {
                 );
             }
         }
-        // Progress: with a slot to spare, every task that was ready was
+        // Progress: with global and queue slots to spare, every ready task was
         // handed out (started, failed to start, or throttled).
         if pass.starts < slots {
             for id in &ready {
                 let task = &self.tasks.iter().find(|t| t.task.id == *id).unwrap().task;
-                if !self.launch_failures.permits(&task.execution_project, now) {
+                if !self.launch_failures.permits(&task.execution_project, now) || !self.queue_room(task) {
                     continue;
                 }
                 prop_assert!(
@@ -1652,3 +1670,4 @@ proptest! {
 }
 
 mod policy_reload;
+mod triage;

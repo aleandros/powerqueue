@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Dedicated execution queues and repository-backed workflows. Analysis workflows
+  leave Linear tickets open, publish internal-prefix reports and recommendation
+  labels with durable delivery retries, and share a repository with coding tasks.
+  Independent per-team Linear intake keeps help-desk filters separate from coding.
+  `task complete` accepts `--summary-file` and `--outcome`; status and dashboard
+  show queue membership, and doctor diagnoses workflow and publication failures.
+
 - Advisory Quint coverage for closed/stale PR review parking and recovery,
   including shared simulation/replay guards and negative schedules. Real-daemon
   conflict/relaunch/merge and closed-PR resume traces are now required replay

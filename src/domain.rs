@@ -647,6 +647,9 @@ pub struct Task {
     /// Canonical checkout pinned before the first repository operation.
     #[serde(default)]
     pub execution_repo: Option<String>,
+    /// Queue and workflow policy pinned at first launch.
+    #[serde(default)]
+    pub execution: Option<crate::execution::Execution>,
     pub state: TaskState,
     pub criticality: Criticality,
     /// Scheduling score; higher first. Derived from criticality, rules, Jev and age.
@@ -724,6 +727,7 @@ impl Task {
             routing: None,
             execution_project: default_execution_project(),
             execution_repo: None,
+            execution: None,
             state: TaskState::Queued,
             criticality: Criticality::Normal,
             score: Criticality::Normal.base_score(),
@@ -806,7 +810,7 @@ impl Task {
     /// True if dependencies keep this task from being scheduled: it is a
     /// container, or a blocker is still pending.
     pub fn is_waiting(&self) -> bool {
-        self.is_container() || self.blocked_by.iter().any(|b| !b.is_satisfied())
+        !self.leaves_ticket_open() && (self.is_container() || self.blocked_by.iter().any(|b| !b.is_satisfied()))
     }
 
     /// True for a container whose sub-issues are all closed but none was

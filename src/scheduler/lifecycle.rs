@@ -183,7 +183,7 @@ pub fn cleanup_task(
             }
         }
 
-        if cfg.cleanup.commit_uncommitted {
+        if cfg.cleanup.commit_uncommitted && !task.leaves_ticket_open() {
             match repo.is_dirty(wt) {
                 Ok(true) => {
                     let message = format!("powerqueue: uncommitted changes from {}", task.key);
@@ -220,7 +220,7 @@ pub fn cleanup_task(
                 false
             }
         };
-        let push_wanted = cfg.cleanup.push_branch && has_remote;
+        let push_wanted = cfg.cleanup.push_branch && has_remote && !task.leaves_ticket_open();
         if push_wanted && let Some(branch) = branch.as_deref() {
             match repo.push_branch(wt, branch) {
                 Ok(()) => {
@@ -257,7 +257,16 @@ pub fn cleanup_task(
             }
         };
 
-        let mut plan = cleanup_plan(&cfg.cleanup, succeeded, has_remote, unpushed, pushed_ok);
+        let mut cleanup = cfg.cleanup.clone();
+        if task.leaves_ticket_open() {
+            cleanup.push_branch = false;
+        }
+        let mut plan = cleanup_plan(&cleanup, succeeded, has_remote, unpushed, pushed_ok);
+        if task.leaves_ticket_open() && repo.is_dirty(wt).unwrap_or(true) {
+            plan.remove_worktree = false;
+            plan.delete_branch = false;
+            plan.keep_reason = Some("analysis left uncommitted files; preserving worktree without publishing code".into());
+        }
         if for_review {
             plan.delete_branch = false;
             plan.close_window = true;

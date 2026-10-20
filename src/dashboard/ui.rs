@@ -293,17 +293,18 @@ fn draw_header(frame: &mut Frame, app: &DashboardApp, area: Rect) {
 fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) {
     let rows = app.rows();
     let compact = area.width < 145;
-    let title_width = area.width.saturating_sub(if compact { 56 } else { 125 }).max(10);
+    let title_width = area.width.saturating_sub(if compact { 67 } else { 136 }).max(10);
     let headings = if compact {
-        vec!["KEY", "PROJECT", "STATE", "MODEL", "TITLE"]
+        vec!["KEY", "PROJECT", "QUEUE", "STATE", "MODEL", "TITLE"]
     } else {
-        vec!["KEY", "PROJECT", "STATE", "CRIT", "MODEL", "WTOK", "CPU", "RSS", "AGE", "WAITING ON", "TITLE"]
+        vec!["KEY", "PROJECT", "QUEUE", "STATE", "CRIT", "MODEL", "WTOK", "CPU", "RSS", "AGE", "WAITING ON", "TITLE"]
     };
     let header = Row::new(headings.into_iter().map(|h| Cell::from(h).bold())).style(Style::default().fg(Color::DarkGray));
     let body = rows.iter().map(|r| {
         let mut cells = vec![
             Cell::from(r.key.clone()),
             Cell::from(r.execution_project.clone()),
+            Cell::from(r.queue.clone()),
             Cell::from(r.state.as_str()).style(state_style(r.state)),
         ];
         if !compact {
@@ -333,10 +334,18 @@ fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) 
         None => title,
     };
     let widths = if compact {
-        vec![Constraint::Length(16), Constraint::Length(10), Constraint::Length(11), Constraint::Length(12), Constraint::Min(10)]
+        vec![
+            Constraint::Length(16),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(11),
+            Constraint::Length(12),
+            Constraint::Min(10),
+        ]
     } else {
         vec![
             Constraint::Length(16),
+            Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(11),
             Constraint::Length(8),

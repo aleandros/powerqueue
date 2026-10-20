@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     linear_priority INTEGER,
     estimate        REAL,
     project         TEXT,
+    execution TEXT, -- pinned queue/workflow (v10)
     routing TEXT, -- persisted deterministic routing decision (v9)
     execution_project TEXT NOT NULL DEFAULT 'default', -- execution registry ID (v7)
     execution_repo TEXT, -- pinned canonical checkout (v7)

@@ -2,9 +2,9 @@
   "name": "powerqueue-spec",
   "private": true,
   "scripts": {
-    "typecheck": "quint typecheck powerqueue.qnt",
-    "test": "quint test powerqueue.qnt && quint test powerqueue.qnt --main=assignment_race",
-    "check": "quint run powerqueue.qnt --invariant=safety --max-samples=1000 --max-steps=100 --seed=42 --verbosity=1 && quint run powerqueue.qnt --main=assignment_race --invariant=safety --max-samples=1000 --max-steps=100 --seed=42 --verbosity=1",
+    "typecheck": "quint typecheck powerqueue.qnt && quint typecheck triage.qnt",
+    "test": "quint test powerqueue.qnt && quint test powerqueue.qnt --main=assignment_race && quint test triage.qnt",
+    "check": "quint run powerqueue.qnt --invariant=safety --max-samples=1000 --max-steps=100 --seed=42 --verbosity=1 && quint run powerqueue.qnt --main=assignment_race --invariant=safety --max-samples=1000 --max-steps=100 --seed=42 --verbosity=1 && quint run triage.qnt --invariant=safety --max-samples=1000 --max-steps=100 --seed=42 --verbosity=1",
     "verify:assignment": "quint verify powerqueue.qnt --main=assignment_race --backend=tlc --invariant=safety"
   },
   "devDependencies": {
