@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Update certificate-validation dependencies to address RUSTSEC-2026-0382 and
+  RUSTSEC-2026-0383 (distrusted emSign intermediates).
+
 - Run `repo.setup` outside the daemon tick so heartbeats, commands and other
   queues continue during long bootstraps. Pending setups reserve capacity and
   predicted budget across ticks, show elapsed setup time in status, and defer
