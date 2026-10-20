@@ -110,6 +110,17 @@ impl LaunchPlanner {
         self
     }
 
+    /// Reserve slots, queue capacity and predicted cost for setup attempts
+    /// carried over from earlier ticks. Their tasks cannot be selected again.
+    /// Call after `with_queues` when dedicated queues are enabled.
+    pub fn with_pending(mut self, budget: &BudgetConfig, pending: &[Candidate]) -> Self {
+        for candidate in pending {
+            self.considered.insert(candidate.task.id);
+            self.started(budget, candidate);
+        }
+        self
+    }
+
     /// The next task to consider and the policy's decision for it: the best
     /// schedulable task not handed out yet. `None` when no slot is left or
     /// nothing else can start now. A task is handed out once per pass
@@ -321,6 +332,19 @@ pub fn on_starting(
         serde_json::json!({ "model": model, "attempt": attempt, "reasons": decision.reasons, "prediction": decision.prediction, "execution": task.execution }),
     )];
     Some(Start { branch, worktree, attempt, effects })
+}
+
+/// Whether a setup result still belongs to the current claimed attempt.
+/// Commands may pause, cancel or retry a task while its setup is running;
+/// stale results must neither launch an agent nor crash the replacement task.
+pub fn setup_is_current(claimed: &Task, current: &Task) -> bool {
+    current.state == TaskState::Starting
+        && current.id == claimed.id
+        && current.attempts == claimed.attempts
+        && current.execution_project == claimed.execution_project
+        && current.execution_repo == claimed.execution_repo
+        && current.branch == claimed.branch
+        && current.worktree_path == claimed.worktree_path
 }
 
 /// The attempt is under way: its branch, worktree path and number go on
@@ -1013,6 +1037,42 @@ mod properties {
     }
 
     proptest! {
+        #[test]
+        fn setup_result_requires_the_same_claim(mut claimed in task_in(TaskState::Starting), state in task_state(), changed in 0u8..6) {
+            claimed.execution_repo = Some("/repo".into());
+            claimed.branch = Some("pq/test".into());
+            claimed.worktree_path = Some("/wt/test".into());
+            prop_assert!(setup_is_current(&claimed, &claimed));
+            let mut current = claimed.clone();
+            current.state = state;
+            prop_assert_eq!(setup_is_current(&claimed, &current), state == TaskState::Starting);
+            current.state = TaskState::Starting;
+            match changed {
+                0 => current.attempts += 1,
+                1 => current.execution_project.push_str("-moved"),
+                2 => current.execution_repo = None,
+                3 => current.branch = None,
+                4 => current.worktree_path = None,
+                _ => current.id = TaskId(uuid::Uuid::from_u128(claimed.id.0.as_u128().wrapping_add(1))),
+            }
+            prop_assert!(!setup_is_current(&claimed, &current));
+        }
+
+        #[test]
+        fn carrying_setup_across_ticks_preserves_budget_and_capacity(tasks in candidates(), slots in 1u32..=5, ledgers in ledgers()) {
+            let f = Fixed::new();
+            let mut first = LaunchPlanner::new(Estimator::from_summaries(&[]), ledgers.clone(), tasks.clone(), slots);
+            let Some(candidate) = first.next(f.ctx(), origin()) else { return Ok(()) };
+            prop_assume!(candidate.decision.model.is_some());
+            first.started(&f.cfg.budget, &candidate);
+            // Rebuild from persisted usage, as the next tick does; the pending
+            // setup must retain both its cost and slot even without a session.
+            let mut next = LaunchPlanner::new(Estimator::from_summaries(&[]), ledgers, tasks, slots)
+                .with_pending(&f.cfg.budget, &[candidate]);
+            prop_assert_eq!(next.ledgers(), first.ledgers());
+            prop_assert_eq!(run_pass(&mut next, &f, origin()), run_pass(&mut first, &f, origin()));
+        }
+
         #[test]
         fn start_recovery_requires_quiescence_and_is_idempotent(
             (mut task, session) in task_with_session(),

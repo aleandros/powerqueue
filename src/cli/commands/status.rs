@@ -37,6 +37,8 @@ pub struct StatusRow {
     pub deferral_error: Option<String>,
     pub deferral_allows: bool,
     pub session: Option<Session>,
+    /// Current background setup start, when no agent has launched yet.
+    pub setup_started_at: Option<DateTime<Utc>>,
     pub usage: TokenUsage,
     pub weighted_tokens: f64,
     pub resource: Option<ResourceSample>,
@@ -94,7 +96,16 @@ pub fn load_rows(store: &Store, all: bool) -> Result<Vec<StatusRow>> {
         let source_deferral = task.source_deferral();
         let deferral_allows = task.deferral_allows(Utc::now());
         let deferral_error = source_deferral.as_ref().err().map(ToString::to_string);
+        let setup_started_at = if task.state == TaskState::Starting {
+            store
+                .last_task_event(task.id, "worktree.setup_started")?
+                .filter(|e| e.data["attempt"].as_u64() == Some(u64::from(task.attempts)))
+                .map(|e| e.timestamp)
+        } else {
+            None
+        };
         rows.push(StatusRow {
+            setup_started_at,
             source_deferral: source_deferral.ok().flatten(),
             deferral_error,
             deferral_allows,
@@ -293,7 +304,13 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
     table.set_header(header);
     for row in &rows {
         let t = &row.task;
-        let state = if color { output::state_colored(t.state) } else { t.state.to_string() };
+        let state = if let Some(at) = row.setup_started_at {
+            format!("starting (setup, {})", human_duration((now - at).num_seconds()))
+        } else if color {
+            output::state_colored(t.state)
+        } else {
+            t.state.to_string()
+        };
         let crit = if color { output::criticality_colored(t.criticality) } else { t.criticality.to_string() };
         let model = super::task::effective_model(t);
         let model_text = if color {

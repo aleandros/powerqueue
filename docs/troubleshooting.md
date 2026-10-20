@@ -191,7 +191,12 @@ powerqueue task show 'owner/repo#123'
 A database write can fail after an attempt was claimed but before its session
 was saved. `powerqueue doctor` reports these attempts with their execution
 project, attempt number and saved tmux destination. A slow `repo.setup` also
-has no session yet; age or a stale heartbeat alone does not prove a failed launch.
+has no session yet. Setup runs in the background: heartbeats and other tasks
+continue, while `status` shows `starting (setup, …)`. Inspect
+`worktree.setup_started` and `worktree.setup` events for its progress. A task
+cancel prevents launch and waits for setup before removing its worktree. There
+is no built-in timeout; inspect a stuck setup process before stopping it.
+Age alone does not prove a failed launch.
 
 The daemon checks these tasks between launches while holding its exclusive lock,
 including on its first tick after restart. It waits if a live session, a tmux pane,

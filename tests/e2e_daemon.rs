@@ -1736,3 +1736,136 @@ fn deferred_task_keeps_queue_visibility_and_launches_only_after_expiry() {
     assert!(started >= until, "started {started} before {until}");
     assert_eq!(after["task"]["deferral"]["until"], until.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true));
 }
+
+/// Hold one setup until the test releases it. A removed temp root also releases
+/// the shell, so failed assertions cannot leave a long-lived fixture process.
+fn gate_setup(env: &Env, key: &str, failure: bool) -> PathBuf {
+    let release = env.root.path().join("release-setup");
+    let entered = env.root.path().join("entered-setup");
+    let root = env.root.path().display();
+    std::fs::write(env.root.path().join("repo/.powerqueue.toml"), format!(
+        "setup = ['''if test \"$POWERQUEUE_TASK_KEY\" = \"{key}\"; then touch {entered}; while test -d {root} && ! test -f {release}; do sleep 0.1; done; {end}; fi''']\n",
+        entered = entered.display(), release = release.display(), end = if failure { "exit 1" } else { "true" },
+    )).unwrap();
+    release
+}
+
+#[test]
+fn background_setup_keeps_heartbeat_and_other_queue_flowing() {
+    let Some(mut env) = Env::with_provider("complete", "max_concurrent = 3\npr_poll_secs = 0", |_| {
+        "[queues.default]\nmax_concurrent = 1\n[queues.fast]\nmax_concurrent = 1\nall = [{field = \"label\", op = \"eq\", value = \"fast\"}]\n".into()
+    }) else {
+        return;
+    };
+    let slow = add_task(&env, "Slow bootstrap", &[]);
+    let waiting = add_task(&env, "Same queue waits for setup slot", &[]);
+    let fast = add_task(&env, "Other queue completes during setup", &["--label", "fast"]);
+    let release = gate_setup(&env, &slow, false);
+    env.start_daemon();
+    let show = env.wait_for_show(&slow, |v| has_event(v, "worktree.setup_started"));
+    assert!(has_event(&show, "worktree.setup_started"), "{}", env.daemon_log());
+    let before: serde_json::Value = serde_json::from_str(&env.run_ok(&["status", "--json"])).unwrap();
+    assert_eq!(env.wait_for_state(&fast, "completed", Duration::from_secs(30)), "completed", "{}", env.daemon_log());
+    let after: serde_json::Value = serde_json::from_str(&env.run_ok(&["status", "--json"])).unwrap();
+    assert_eq!(after["daemon"]["alive"], true);
+    assert!(after["daemon"]["heartbeat_at"].as_str().unwrap() > before["daemon"]["heartbeat_at"].as_str().unwrap());
+    assert_eq!(env.task_state(&slow), "starting");
+    assert_eq!(env.task_state(&waiting), "queued", "setup must retain its dedicated slot across ticks");
+    assert!(env.run_ok(&["status"]).contains("starting (setup,"));
+    let row = after["tasks"].as_array().unwrap().iter().find(|t| t["key"] == slow).unwrap();
+    assert!(row["setup_started_at"].is_string());
+    std::fs::write(release, "go").unwrap();
+    assert_eq!(env.wait_for_state(&slow, "completed", Duration::from_secs(30)), "completed", "{}", env.daemon_log());
+    assert_eq!(env.wait_for_state(&waiting, "completed", Duration::from_secs(30)), "completed", "{}", env.daemon_log());
+}
+
+#[test]
+fn background_setup_cancel_defers_cleanup_and_discards_failure() {
+    let Some(mut env) = Env::with_opts(
+        Opts {
+            mode: "complete",
+            extra_scheduler: "max_concurrent = 1\npr_poll_secs = 0",
+            extra_cleanup: "keep_failed = false".into(),
+            ..Opts::default()
+        },
+        |_| String::new(),
+    ) else {
+        return;
+    };
+    let slow = add_task(&env, "Cancel during bootstrap", &[]);
+    let waiting = add_task(&env, "Next task waits for worker exit", &[]);
+    let release = gate_setup(&env, &slow, true);
+    env.start_daemon();
+    let show = env.wait_for_show(&slow, |v| has_event(v, "worktree.setup_started"));
+    assert!(has_event(&show, "worktree.setup_started"), "{}", env.daemon_log());
+    let worktree = PathBuf::from(show["task"]["worktree_path"].as_str().unwrap());
+    env.run_ok(&["task", "cancel", &slow]);
+    assert_eq!(env.wait_for_state(&slow, "cancelled", Duration::from_secs(10)), "cancelled");
+    assert!(worktree.exists(), "cannot clean up beneath the running shell");
+    assert_eq!(env.task_state(&waiting), "queued");
+    std::fs::write(release, "go").unwrap();
+    let show = env.wait_for_show(&slow, |v| has_event(v, "cleanup.done"));
+    assert!(has_event(&show, "cleanup.done"), "{}", env.daemon_log());
+    assert!(has_event(&show, "worktree.setup_superseded"));
+    assert!(!has_event(&show, "session.launched"));
+    assert!(!has_event(&show, "task.crashed"), "late failure cannot replace cancellation");
+    assert_eq!(show["task"]["state"], "cancelled");
+    assert!(!worktree.exists());
+    assert_eq!(env.wait_for_state(&waiting, "completed", Duration::from_secs(30)), "completed", "{}", env.daemon_log());
+}
+
+#[test]
+fn background_setup_once_drains_admitted_work_without_admitting_another_task() {
+    let Some(mut env) = Env::new("idle", "max_concurrent = 1\npr_poll_secs = 0") else { return };
+    let slow = add_task(&env, "One-shot setup", &[]);
+    let waiting = add_task(&env, "Outside the one-shot admission pass", &[]);
+    let release = gate_setup(&env, &slow, false);
+    let log = std::fs::File::create(env.root.path().join("daemon.log")).unwrap();
+    env.daemon = Some(
+        env.cmd().args(["run", "--once"]).stdout(Stdio::from(log.try_clone().unwrap())).stderr(Stdio::from(log)).spawn().unwrap(),
+    );
+    let show = env.wait_for_show(&slow, |v| has_event(v, "worktree.setup_started"));
+    assert!(has_event(&show, "worktree.setup_started"), "{}", env.daemon_log());
+    assert!(env.daemon.as_mut().unwrap().try_wait().unwrap().is_none(), "--once must own setup until launch");
+    std::fs::write(release, "go").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = env.daemon.as_mut().unwrap().try_wait().unwrap() {
+            assert!(status.success(), "{}", env.daemon_log());
+            break;
+        }
+        assert!(Instant::now() < deadline, "--once never drained: {}", env.daemon_log());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let show = env.wait_for_show(&slow, |v| has_event(v, "session.launched"));
+    assert!(has_event(&show, "session.launched"), "{}", env.daemon_log());
+    assert_eq!(show["task"]["attempts"], 1);
+    assert_eq!(env.task_state(&waiting), "queued");
+}
+
+#[test]
+fn background_setup_scheduling_pause_holds_completed_setup() {
+    let Some(mut env) = Env::new("complete", "max_concurrent = 1\npr_poll_secs = 0") else { return };
+    let slow = add_task(&env, "Pause scheduling during setup", &[]);
+    let release = gate_setup(&env, &slow, false);
+    env.start_daemon();
+    let show = env.wait_for_show(&slow, |v| has_event(v, "worktree.setup_started"));
+    assert!(has_event(&show, "worktree.setup_started"), "{}", env.daemon_log());
+    env.run_ok(&["pause"]);
+    std::fs::write(release, "go").unwrap();
+    // Wait for the shell's inherited lease to be released, then allow another
+    // full tick. This checks the completed worker, not just a still-busy shell.
+    let paths = powerqueue::paths::Paths::rooted(&env.home());
+    let lease = paths.task_dir(show["task"]["id"].as_str().unwrap()).join("setup.lock");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while powerqueue::worktree::setup_in_progress(&lease).unwrap() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(env.task_state(&slow), "starting");
+    let show: serde_json::Value = serde_json::from_str(&env.run_ok(&["task", "show", &slow, "--json"])).unwrap();
+    assert!(!has_event(&show, "session.launched"));
+    env.run_ok(&["resume"]);
+    assert_eq!(env.wait_for_state(&slow, "completed", Duration::from_secs(30)), "completed", "{}", env.daemon_log());
+}

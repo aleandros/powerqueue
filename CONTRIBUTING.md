@@ -112,6 +112,14 @@ PROPTEST_CASES=512 POWERQUEUE_MODEL_STEPS=160 cargo test --lib scheduler::model
 `POWERQUEUE_MODEL_STEPS` sets the exclusive operation-count bound for the
 whole-daemon walk. Keep minimized regression seeds with any bug fixes.
 
+The focused background-setup model runs 128 generated walks with a forced
+launch/cancel/retry/success/failure/restart prefix. It counts pending workers
+alongside live sessions to check global and dedicated queue capacity, attrition
+after config changes, stale-result rejection and surviving setup recovery. A
+planner property checks reservation continuity across tick boundaries. Real-daemon
+file-gate tests check advancing heartbeats, progress in another queue, setup status
+and cancellation cleanup while a shell is still running.
+
 Limits: this is a sequential model of daemon phase boundaries, not a simulation
 of OS processes or simultaneous writers. Reload operations model successfully
 loaded settings/policies; file watching, invalid-file fallback, network probes,

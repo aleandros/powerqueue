@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Run `repo.setup` outside the daemon tick so heartbeats, commands and other
+  queues continue during long bootstraps. Pending setups reserve capacity and
+  predicted budget across ticks, show elapsed setup time in status, and defer
+  cancellation cleanup until the worker exits. Stale results cannot launch an
+  agent or overwrite a newer task state (#72).
+
 ## [0.19.0] - 2026-10-19
 
 ### Added

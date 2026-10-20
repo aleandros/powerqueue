@@ -229,11 +229,16 @@ impl QueueSlots {
         self.assignments.get(&task.id).and_then(|q| self.remaining.get(q)).is_some_and(|n| *n > 0)
     }
 
-    /// Reserve a slot only after an actual successful launch.
+    /// Reserve a slot for a launch or an already claimed background setup.
+    /// Pending setup need not appear among this pass's candidates.
     pub fn started(&mut self, task: &Task) {
-        if let Some(queue) = self.assignments.get(&task.id)
-            && let Some(n) = self.remaining.get_mut(queue)
-        {
+        let queue = self
+            .assignments
+            .get(&task.id)
+            .map(String::as_str)
+            .or_else(|| task.execution.as_ref().map(|e| e.queue.as_str()))
+            .unwrap_or("default");
+        if let Some(n) = self.remaining.get_mut(queue) {
             *n = n.saturating_sub(1);
         }
     }

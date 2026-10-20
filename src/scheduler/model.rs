@@ -361,10 +361,10 @@ impl TaskWorld {
     /// `Tick` is the world's business and is never applied here.
     fn apply(&mut self, cfg: &Config, now: DateTime<Utc>, op: &Op) -> Option<Vec<Effect>> {
         let live = self.session_live();
-        // A start runs to its end inside one daemon tick (`start_task`):
-        // no other daemon call sees the task between `on_starting` and the
-        // launch or the crash that prevents it. The CLI's direct writes run
-        // in another process and do see it; they must refuse (checked).
+        // This general-purpose world treats preparation as one atomic launch.
+        // The focused background_setup world below explicitly interleaves
+        // commands and passes with pending workers across tick boundaries.
+        // Direct CLI writes must still refuse while starting (checked here).
         let direct = matches!(
             op,
             Op::Complete(_) | Op::HandOff(_) | Op::Block(_) | Op::Defer(_) | Op::SetProject(_) | Op::CheckBinding { .. }
@@ -1701,3 +1701,5 @@ proptest! {
 mod deferral;
 mod policy_reload;
 mod triage;
+
+mod background_setup;

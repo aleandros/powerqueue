@@ -1595,7 +1595,7 @@ fn check_worktree_base(store: &Store) -> CheckResult {
 
 /// Launches whose task row was written by the CLI while they ran
 /// (`launch.superseded`): a command applied offline because the daemon's
-/// heartbeat went stale during a long `repo.setup`. The launched session
+/// heartbeat went stale during a blocking launch operation. The launched session
 /// is released, but the attempt was wasted.
 pub fn superseded_launch_status(superseded: u64) -> CheckResult {
     const NAME: &str = "launches";
@@ -1604,7 +1604,7 @@ pub fn superseded_launch_status(superseded: u64) -> CheckResult {
             STATE,
             NAME,
             format!("{superseded} launch(es) in the last 24h were superseded by a command the CLI applied offline"),
-            "the daemon looked dead while `repo.setup` ran; shorten the setup, or wait for `powerqueue status` to show the daemon alive before `task cancel` / `task pause`",
+            "inspect daemon logs for a blocking git, provider pre_launch or tmux operation; repo.setup runs in the background and should not stop heartbeats",
         );
     }
     CheckResult::ok(STATE, NAME, "no launch was superseded by an offline command in the last 24h")
@@ -1672,7 +1672,7 @@ fn pane_ids(tmux: &Tmux, session: &str) -> Option<Vec<crate::tmux::PaneInfo>> {
     tmux.list_panes(session).ok()
 }
 
-/// Starting is owned by the daemon's serial launch loop. Doctor must not
+/// Starting is owned by the daemon's launch loop and setup workers. Doctor must not
 /// rewrite it while setup is in progress, even with a stale heartbeat.
 fn check_launch_failures(store: &Store) -> CheckResult {
     use crate::scheduler::launch_failures::{KEY, LaunchFailures};
@@ -1740,11 +1740,11 @@ fn check_starting_tasks(store: &Store) -> CheckResult {
             STATE,
             "starting attempts",
             format!(
-                "{} starting attempt(s) without a live session: {}. Setup may still be running, or persistence failed after the start was claimed.",
+                "{} starting attempt(s) without a live session: {}. Background setup may still be running (other tasks and heartbeats continue), or persistence failed after the start was claimed.",
                 pending.len(),
                 pending.join(", ")
             ),
-            "let setup finish; run/restart `powerqueue run` if the daemon stopped. At its next phase boundary it retries abandoned starts with normal backoff and attempt limits. A surviving setup process or live unrecorded tmux pane holds recovery: inspect it and let it finish or stop it. Check `powerqueue task show <task>` for task.start_recovery_* events and database/tmux errors. Doctor --fix leaves starting attempts untouched",
+            "inspect worktree.setup_started/worktree.setup events and let setup finish; run/restart `powerqueue run` if the daemon stopped. At its next phase boundary it retries abandoned starts with normal backoff and attempt limits. A surviving setup process or live unrecorded tmux pane holds recovery: inspect it and let it finish or stop it. Check `powerqueue task show <task>` for task.start_recovery_* events and database/tmux errors. Doctor --fix leaves starting attempts untouched",
         ),
     }
 }

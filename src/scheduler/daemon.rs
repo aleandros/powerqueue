@@ -161,6 +161,9 @@ struct RuntimeState {
     project_rules: HashMap<String, PriorityRules>,
     project_rule_errors: HashMap<String, String>,
     project_fetches: HashMap<String, ProjectFetch>,
+    setups: HashMap<TaskId, PendingSetup>,
+    setup_launches: Vec<Candidate>,
+    draining_setups: bool,
     rules: PriorityRules,
     rules_loaded: bool,
     rules_ready: bool,
@@ -231,10 +234,29 @@ pub struct Daemon {
 enum Started {
     /// The session launched: its slot is used and its cost reserved.
     Launched,
+    /// Setup is pending and holds its slot and predicted budget across ticks.
+    Preparing,
     /// Admission or a concurrent task update superseded this candidate.
     Skipped,
     /// A failed operation; no slot or predicted budget was reserved.
     Failed(FailureScope, String),
+}
+
+/// A claimed launch whose setup is running outside the tick. Only the daemon
+/// reads or writes task/session state; the worker owns just shell inputs.
+struct PendingSetup {
+    launch: PreparedLaunch,
+    candidate: Candidate,
+    worker: std::thread::JoinHandle<Result<String>>,
+}
+
+struct PreparedLaunch {
+    task: Task,
+    cfg: Config,
+    start: launch::Start,
+    relaunch: Option<crate::domain::ReviewRelaunch>,
+    answer: Option<String>,
+    ready: Effect,
 }
 
 /// Typed stage evidence; a command's nonzero exit alone does not prove a shared outage.
@@ -276,6 +298,9 @@ impl Daemon {
             project_rules: HashMap::new(),
             project_rule_errors: HashMap::new(),
             project_fetches: HashMap::new(),
+            setups: HashMap::new(),
+            setup_launches: Vec::new(),
+            draining_setups: false,
             rules: PriorityRules::default(),
             rules_loaded: false,
             rules_ready: false,
@@ -329,7 +354,8 @@ impl Daemon {
     }
 
     /// Run until `handle.stop()` or SIGINT/SIGTERM. `once` performs a single
-    /// tick (used by tests and `run --once`).
+    /// admission tick, then supervises any setup it started through completion
+    /// (used by tests and `run --once`).
     ///
     /// Takes an exclusive lock on `daemon.lock`; fails with "another daemon is
     /// running (pid …)" when it is held. Writes `daemon.pid` for the duration.
@@ -391,8 +417,16 @@ impl Daemon {
                 tracing::error!(error = %format!("{e:#}"), "tick failed");
                 self.log(None, None, EventLevel::Error, "daemon.error", &format!("tick failed: {e:#}"), serde_json::json!({}));
             }
-            if once || self.rt.shutdown || self.handle.should_stop() {
+            if self.rt.shutdown || self.handle.should_stop() {
                 return Ok(());
+            }
+            if once {
+                if self.rt.setups.is_empty() {
+                    return Ok(());
+                }
+                // Complete the admission pass without abandoning background
+                // setup. Keep supervising/heartbeating, but admit no new tasks.
+                self.rt.draining_setups = true;
             }
             let period = std::time::Duration::from_secs(self.cfg.scheduler.tick_secs.max(1));
             let sleep = period.saturating_sub(started.elapsed());
@@ -410,6 +444,7 @@ impl Daemon {
     /// `daemon.error` event and the next phase still runs.
     pub async fn tick(&mut self) -> Result<()> {
         let now = Utc::now();
+        self.rt.setup_launches.clear();
         self.store.heartbeat(std::process::id()).context("write heartbeat")?;
         let r = self.bind_existing_projects().await;
         self.report_phase("projects", r);
@@ -446,6 +481,8 @@ impl Daemon {
         self.report_phase("transcripts", r);
         let r = self.probe_sessions(now).await;
         self.report_phase("probes", r);
+        let r = self.poll_setups(now).await;
+        self.report_phase("setup", r);
         let r = self.recover_starting(now);
         self.report_phase("starting recovery", r);
         let r = self.retry_cleanups();
@@ -2560,6 +2597,13 @@ impl Daemon {
     }
 
     fn attempt_cleanup(&self, task: &mut Task, pending: &mut std::collections::BTreeMap<TaskId, PendingCleanup>) -> Result<()> {
+        // Cancellation records cleanup immediately, but must not remove a
+        // checkout underneath a running setup (including a surviving child).
+        if self.rt.setups.contains_key(&task.id)
+            || crate::worktree::setup_in_progress(&self.paths.task_dir(&task.id.to_string()).join("setup.lock"))?
+        {
+            return Ok(());
+        }
         let request = pending.get(&task.id).expect("cleanup intent was recorded").clone();
         let result = (|| {
             let cfg = self.cfg.for_task(task, &self.paths)?;
@@ -3289,6 +3333,9 @@ impl Daemon {
     }
 
     async fn launch_tasks(&mut self, now: DateTime<Utc>) -> Result<()> {
+        if self.rt.draining_setups {
+            return Ok(());
+        }
         if self.cfg.projects.is_empty() && !self.rt.rules_ready {
             bail!("no valid priority policy; run `powerqueue priority check` and repair or migrate it");
         }
@@ -3301,7 +3348,31 @@ impl Daemon {
         if slots == 0 {
             return Ok(());
         }
-        let busy: HashSet<TaskId> = live.iter().map(|s| s.task_id).collect();
+        let mut busy: HashSet<TaskId> = live.iter().map(|s| s.task_id).collect();
+        let estimator = Estimator::from_summaries(&self.store.task_usage_summaries()?);
+        let mut pending: Vec<_> = self.rt.setups.values().map(|s| s.candidate.clone()).collect();
+        // A child can survive a daemon restart. Keep its capacity reserved
+        // until recovery can safely classify the abandoned attempt.
+        for task in self.store.list_tasks()? {
+            if !busy.contains(&task.id)
+                && !self.rt.setups.contains_key(&task.id)
+                && (task.state == TaskState::Starting
+                    || crate::worktree::setup_in_progress(&self.paths.task_dir(&task.id.to_string()).join("setup.lock"))?)
+            {
+                pending.push(Candidate {
+                    decision: Decision {
+                        model: task.model.clone(),
+                        retry_at: None,
+                        prediction: estimator.predict(&task),
+                        reasons: Vec::new(),
+                    },
+                    task,
+                    preferred: Vec::new(),
+                });
+            }
+        }
+        // Paused/cancelled/retried tasks still own their worker until it exits.
+        busy.extend(pending.iter().map(|p| p.task.id));
         let mut tasks = Vec::new();
         for mut task in self.store.list_open_tasks()?.into_iter().filter(|t| !busy.contains(&t.id)) {
             let before = task.clone();
@@ -3316,11 +3387,17 @@ impl Daemon {
         if !tasks.iter().any(|t| t.state.is_schedulable()) {
             return Ok(());
         }
-        let estimator = Estimator::from_summaries(&self.store.task_usage_summaries()?);
-        let ledgers = Ledgers::load(&self.store, &self.cfg.budget, now)?;
+        let mut ledgers = Ledgers::load(&self.store, &self.cfg.budget, now)?;
+        for candidate in &self.rt.setup_launches {
+            if let Some(model) = &candidate.decision.model {
+                launch::reserve(&mut ledgers, model, candidate.weighted_cost(&self.cfg.budget));
+            }
+        }
         self.rt.rate_limits.clear_expired(now);
         let live_tasks: Vec<_> = live.iter().filter_map(|s| self.store.get_task(s.task_id).transpose()).collect::<Result<_>>()?;
-        let mut planner = LaunchPlanner::new(estimator, ledgers, tasks, slots).with_queues(&self.cfg, &live_tasks);
+        let mut planner = LaunchPlanner::new(estimator, ledgers, tasks, slots)
+            .with_queues(&self.cfg, &live_tasks)
+            .with_pending(&self.cfg.budget, &pending);
         loop {
             planner.set_failures(self.rt.launch_failures.clone());
             let candidate = if self.cfg.projects.is_empty() {
@@ -3335,6 +3412,9 @@ impl Daemon {
                 Some(model) => {
                     let (key, id) = (task.key.clone(), task.id);
                     match self.start_task(task, model, &decision, now).await {
+                        Ok(Started::Preparing) => {
+                            planner.started(&self.cfg.budget, &candidate);
+                        }
                         Ok(Started::Launched) => {
                             planner.started(&self.cfg.budget, &candidate);
                             let effects = self.rt.launch_failures.succeeded(&candidate.task);
@@ -3390,12 +3470,15 @@ impl Daemon {
         Ok(())
     }
 
-    /// Called only between launches under the exclusive daemon lock. Unlike a
+    /// Called under the exclusive daemon lock, ignoring owned setup workers. Unlike a
     /// heartbeat/age timeout this cannot mistake a long setup for abandonment;
     /// after restart, acquiring that same lock proves the previous owner exited.
     /// Its setup children may survive, so their inherited lease is checked too.
     fn recover_starting(&self, now: DateTime<Utc>) -> Result<()> {
         for mut task in self.store.list_tasks_in_states(&[TaskState::Starting])? {
+            if self.rt.setups.contains_key(&task.id) {
+                continue;
+            }
             let sessions = self.store.list_sessions_for_task(task.id)?;
             if sessions.iter().any(|s| s.state.is_live()) {
                 continue;
@@ -3470,7 +3553,7 @@ impl Daemon {
         }
     }
 
-    /// Create the worktree, run setup, launch the agent and record the
+    /// Create the worktree, start background setup (if configured), or launch the
     /// session. A worktree, setup or launcher failure is not an error: the
     /// task is crashed with a backoff and [`Started::Failed`]
     /// reports the scope without reserving a slot or budget. `Err` is a store failure; one after the
@@ -3513,7 +3596,7 @@ impl Daemon {
         self.log_only(&task, None, start.effects.clone());
         // The claim is durable before setup and the second approval read,
         // including review/retry launches whose checkout binding is unchanged.
-        let launch::Start { branch, worktree, attempt, .. } = start;
+        let launch::Start { ref branch, ref worktree, .. } = start;
 
         let prepared = match cfg
             .repo_path()
@@ -3524,27 +3607,133 @@ impl Daemon {
                 let before = task.clone();
                 let effects = commands::bind_project(&mut task, &checkout.to_string_lossy())?;
                 self.commit(&before, &mut task, None, effects).await?;
-                self.prepare_worktree(&task, &root, &worktree, &branch)
+                self.prepare_worktree(&task, &root, worktree, branch)
             }
             Err(e) => Err(e),
         };
-        if let Ok(true) = prepared {
-            // The periodic fetch has nothing to add right after this one.
+        let (fetched, ready) = match prepared {
+            Ok(ready) => ready,
+            Err(e) => return self.fail_preparation(task, &cfg, e, now).await,
+        };
+        if fetched {
             self.rt.last_fetch = Some(now);
         }
-        if let Err(e) = prepared {
-            let before = task.clone();
-            let effects =
-                transitions::on_crash(&mut task, None, &format!("worktree setup failed: {e:#}"), None, &cfg.scheduler, now, None);
-            self.commit(&before, &mut task, None, effects).await?;
-            return Ok(Started::Failed(failure_scope(&e, FailureScope::Project), format!("{e:#}")));
+        let launch = PreparedLaunch { task, cfg, start, relaunch, answer, ready };
+        if launch.cfg.repo.setup.is_empty() {
+            return self.finish_start(launch, now).await;
         }
+        let candidate = Candidate { task: launch.task.clone(), preferred: Vec::new(), decision: decision.clone() };
+        let worker = crate::worktree::spawn_setup(
+            &launch.start.worktree,
+            &launch.cfg.repo.setup,
+            &self.setup_env(&launch.task, &launch.start),
+            &self.paths.task_dir(&launch.task.id.to_string()).join("setup.lock"),
+        );
+        match worker {
+            Ok(worker) => {
+                self.log(
+                    Some(launch.task.id),
+                    None,
+                    EventLevel::Info,
+                    "worktree.setup_started",
+                    "setup commands running in background",
+                    serde_json::json!({ "attempt": launch.start.attempt }),
+                );
+                self.rt.setups.insert(launch.task.id, PendingSetup { launch, candidate, worker });
+                Ok(Started::Preparing)
+            }
+            Err(e) => self.fail_preparation(launch.task, &launch.cfg, e, now).await,
+        }
+    }
+
+    fn setup_env(&self, task: &Task, start: &launch::Start) -> Vec<(String, String)> {
+        vec![
+            ("POWERQUEUE_TASK_ID".into(), task.id.to_string()),
+            ("POWERQUEUE_TASK_KEY".into(), task.key.clone()),
+            ("POWERQUEUE_PROJECT".into(), task.execution_project.clone()),
+            ("POWERQUEUE_TASK_SLUG".into(), task.slug()),
+            ("POWERQUEUE_TASK_DIR".into(), self.paths.task_dir(&task.id.to_string()).display().to_string()),
+            ("POWERQUEUE_BRANCH".into(), start.branch.clone()),
+            ("POWERQUEUE_WORKTREE".into(), start.worktree.display().to_string()),
+            ("POWERQUEUE_DATA_DIR".into(), self.paths.data_dir.display().to_string()),
+            ("POWERQUEUE_STATE_DIR".into(), self.paths.state_dir.display().to_string()),
+        ]
+    }
+
+    async fn fail_preparation(
+        &mut self,
+        mut task: Task,
+        cfg: &Config,
+        error: anyhow::Error,
+        now: DateTime<Utc>,
+    ) -> Result<Started> {
+        let before = task.clone();
+        let effects =
+            transitions::on_crash(&mut task, None, &format!("worktree setup failed: {error:#}"), None, &cfg.scheduler, now, None);
+        self.commit(&before, &mut task, None, effects).await?;
+        Ok(Started::Failed(failure_scope(&error, FailureScope::Project), format!("{error:#}")))
+    }
+
+    async fn poll_setups(&mut self, now: DateTime<Utc>) -> Result<()> {
+        let finished: Vec<_> = self.rt.setups.iter().filter(|(_, p)| p.worker.is_finished()).map(|(id, _)| *id).collect();
+        for id in finished {
+            // Scheduling pause also holds agents whose setup has just finished.
+            if self.store.scheduling_pause()?.is_some()
+                && let Some(current) = self.store.get_task(id)?
+                && launch::setup_is_current(&self.rt.setups[&id].launch.task, &current)
+            {
+                continue;
+            }
+            let pending = self.rt.setups.remove(&id).expect("finished setup exists");
+            let result = pending.worker.join().unwrap_or_else(|_| Err(anyhow::anyhow!("setup worker panicked")));
+            let Some(fresh) = self.store.get_task(id)? else { continue };
+            if !launch::setup_is_current(&pending.launch.task, &fresh) {
+                self.log(
+                    Some(id),
+                    None,
+                    EventLevel::Info,
+                    "worktree.setup_superseded",
+                    "setup finished after the task changed; no agent launched",
+                    serde_json::json!({}),
+                );
+                continue;
+            }
+            let mut launch = pending.launch;
+            launch.task = fresh;
+            let outcome = match result {
+                Ok(output) => {
+                    self.log(Some(id), None, EventLevel::Debug, "worktree.setup", "setup commands finished",
+                        serde_json::json!({ "output": output.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect::<String>() }));
+                    self.finish_start(launch, now).await
+                }
+                Err(e) => self.fail_preparation(launch.task, &launch.cfg, e.context(SetupCommandFailure), now).await,
+            };
+            match outcome {
+                Ok(Started::Launched) => {
+                    self.rt.setup_launches.push(pending.candidate.clone());
+                    let effects = self.rt.launch_failures.succeeded(&pending.candidate.task);
+                    self.log_only(&pending.candidate.task, None, effects);
+                    self.store.kv_set(super::launch_failures::KEY, &self.rt.launch_failures)?;
+                }
+                Ok(Started::Failed(scope, reason)) => self.record_launch_failure(&pending.candidate.task, scope, reason, now)?,
+                Err(e) => self.record_launch_failure(&pending.candidate.task, FailureScope::Global, format!("{e:#}"), now)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish_start(&mut self, launch: PreparedLaunch, now: DateTime<Utc>) -> Result<Started> {
+        let PreparedLaunch { mut task, cfg, start, relaunch, answer, ready } = launch;
+        let launch::Start { branch, worktree, attempt, .. } = start;
+        let model = task.model.clone().context("claimed launch has no model")?;
+        self.log_only(&task, None, vec![ready]);
 
         // Setup may take minutes. Recheck immediately before preparing the agent,
         // preserving any work already created if routing or approval changed meanwhile.
         {
             let Some(mut fresh) = self.store.get_task(task.id)? else { return Ok(Started::Skipped) };
-            if fresh.state != TaskState::Starting {
+            if !launch::setup_is_current(&task, &fresh) {
                 return Ok(Started::Skipped);
             }
             if !self.refresh_launch_permissions(&mut fresh).await? {
@@ -3575,6 +3764,17 @@ impl Daemon {
             task = fresh;
         }
 
+        // Reloads can change the tmux socket, project availability or provider
+        // settings while setup runs. Revalidate the pinned checkout and save
+        // the destination actually used below before creating any agent pane.
+        let cfg = match self.cfg.for_task(&task, &self.paths) {
+            Ok(cfg) => cfg,
+            Err(e) => return self.fail_preparation(task, &cfg, e, now).await,
+        };
+        self.store.kv_set(&crate::tmux::LaunchTarget::key(task.id), &self.launch_target(&cfg, &task))?;
+        let mut launcher = self.rt.launcher.clone();
+        launcher.tmux = Tmux::new(&cfg.tmux.binary, cfg.tmux.socket_name.clone());
+
         let mut previous = self.store.latest_session(task.id)?;
         if let Some(p) = previous.take() {
             // Last chance to learn the id of a crashed session before resuming it.
@@ -3604,7 +3804,7 @@ impl Daemon {
             task.pr_url.as_deref(),
             task.last_error.as_deref(),
         );
-        let prepared = self.rt.launcher.prepare_with_prompt(
+        let prepared = launcher.prepare_with_prompt(
             &cfg,
             &task,
             session_id,
@@ -3627,7 +3827,7 @@ impl Daemon {
                         serde_json::json!({ "template": plan.prompt_template, "configured": cfg.prompt.template_path() }),
                     );
                 }
-                self.rt.launcher.launch(&cfg, &task, &plan, session_id, &model, attempt)
+                launcher.launch(&cfg, &task, &plan, session_id, &model, attempt)
             }
             Err(e) => Err(e),
         };
@@ -3716,7 +3916,8 @@ impl Daemon {
         self.log(Some(task.id), None, level, kind, &message, data);
     }
 
-    /// Fetch, create (or reuse) the worktree and run `repo.setup`.
+    /// Fetch and create (or reuse) the worktree. Return its ready event for
+    /// publication only after background setup succeeds.
     ///
     /// A new branch starts from `origin/<base>` after a successful fetch, so
     /// work merged on the remote (a finished blocker's PR) is in it even when
@@ -3729,7 +3930,7 @@ impl Daemon {
     /// to `origin/<branch>` after a successful fetch (commits pushed to the
     /// PR on GitHub since the hand-off); a branch with local commits the
     /// remote lacks is left as is.
-    fn prepare_worktree(&self, task: &Task, root: &Path, worktree: &Path, branch: &str) -> Result<bool> {
+    fn prepare_worktree(&self, task: &Task, root: &Path, worktree: &Path, branch: &str) -> Result<(bool, Effect)> {
         let cfg = self.cfg.for_task(task, &self.paths)?;
         let repo = Repo::new(cfg.repo_path());
         repo.ensure_worktree_owner(worktree)?;
@@ -3798,34 +3999,15 @@ impl Daemon {
                 );
             }
         }
-        if !cfg.repo.setup.is_empty() {
-            let env = vec![
-                ("POWERQUEUE_TASK_ID".to_string(), task.id.to_string()),
-                ("POWERQUEUE_TASK_KEY".to_string(), task.key.clone()),
-                ("POWERQUEUE_PROJECT".to_string(), task.execution_project.clone()),
-                ("POWERQUEUE_TASK_SLUG".to_string(), task.slug()),
-                ("POWERQUEUE_TASK_DIR".to_string(), self.paths.task_dir(&task.id.to_string()).display().to_string()),
-                ("POWERQUEUE_BRANCH".to_string(), branch.to_string()),
-                ("POWERQUEUE_WORKTREE".to_string(), worktree.display().to_string()),
-                ("POWERQUEUE_DATA_DIR".to_string(), self.paths.data_dir.display().to_string()),
-                ("POWERQUEUE_STATE_DIR".to_string(), self.paths.state_dir.display().to_string()),
-            ];
-            let lease = self.paths.task_dir(&task.id.to_string()).join("setup.lock");
-            let output =
-                crate::worktree::run_commands_with_lease(worktree, &cfg.repo.setup, &env, &lease).context(SetupCommandFailure)?;
-            self.log(Some(task.id), None, EventLevel::Debug, "worktree.setup", "setup commands finished", serde_json::json!({ "output": output.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect::<String>() }));
-        }
         // A reused branch keeps the base recorded when it was created.
         let base = match &start {
             Some(s) => Some((s.reference.clone(), s.sha.clone())),
             None => self.store.last_task_event(task.id, BRANCH_CREATED_EVENT)?.and_then(|e| e.branch_base()),
         };
-        self.log(
-            Some(task.id),
-            None,
+        let ready = Effect::log(
             EventLevel::Info,
             "worktree.ready",
-            &format!(
+            format!(
                 "worktree {} on {} branch {branch}{}",
                 worktree.display(),
                 if new_branch { "new" } else { "existing" },
@@ -3840,7 +4022,7 @@ impl Daemon {
                 "stale_base": new_branch && fetch_error.is_some(),
             }),
         );
-        Ok(fetched)
+        Ok((fetched, ready))
     }
 }
 
