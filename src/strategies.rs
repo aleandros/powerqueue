@@ -74,6 +74,36 @@ pub fn start_activity() -> impl Strategy<Value = crate::scheduler::launch::Start
     prop::sample::select(vec![InProgress, LivePane, LiveSetup, Abandoned])
 }
 
+/// Tick-boundary operations while setup workers and agent sessions coexist.
+#[derive(Debug, Clone)]
+pub enum SetupModelOp {
+    Pass,
+    Finish(usize, bool),
+    Pause(usize),
+    Resume(usize),
+    Cancel(usize),
+    Retry(usize),
+    Restart,
+    Capacity(u32, u32),
+}
+
+pub fn setup_model_ops() -> impl Strategy<Value = Vec<SetupModelOp>> {
+    use SetupModelOp::*;
+    vec(
+        prop_oneof![
+            4 => Just(Pass),
+            4 => (0usize..6, any::<bool>()).prop_map(|(i, ok)| Finish(i, ok)),
+            1 => (0usize..6).prop_map(Pause),
+            1 => (0usize..6).prop_map(Resume),
+            2 => (0usize..6).prop_map(Cancel),
+            2 => (0usize..6).prop_map(Retry),
+            1 => Just(Restart),
+            1 => (1u32..=3, 1u32..=3).prop_map(|(a, b)| Capacity(a, b)),
+        ],
+        1..80,
+    )
+}
+
 /// Persistence and concurrent writes interleaved with abandoned-start recovery.
 #[derive(Debug, Clone, Copy)]
 pub enum StartRecoveryOp {

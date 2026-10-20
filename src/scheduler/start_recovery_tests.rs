@@ -123,7 +123,10 @@ async fn starting_subprocess_worker() {
         prediction: crate::budget::Prediction::default_guess(),
         reasons: vec!["test".into()],
     };
-    daemon.start_task(task, ModelTier::sonnet(), &decision, Utc::now()).await.unwrap();
+    assert_eq!(daemon.start_task(task, ModelTier::sonnet(), &decision, Utc::now()).await.unwrap(), Started::Preparing);
+    // Background setup no longer holds this call. Keep the owning daemon and
+    // its exclusive lock alive until the parent kills this process.
+    std::future::pending::<()>().await;
 }
 
 #[tokio::test]
@@ -211,7 +214,17 @@ async fn starting_recovers_binding_and_crash_persistence_failures_after_restart(
             h.daemon.cfg.repo.setup = vec!["exit 1".into()];
             h.writer.execute_batch("CREATE TRIGGER inject BEFORE UPDATE ON tasks WHEN NEW.state='crashed' BEGIN SELECT RAISE(ABORT, 'crash write failed'); END;").unwrap();
         }
-        assert!(h.start(task.clone()).await.is_err(), "{boundary}");
+        if boundary == "binding" {
+            assert!(h.start(task.clone()).await.is_err(), "{boundary}");
+        } else {
+            assert_eq!(h.start(task.clone()).await.unwrap(), Started::Preparing);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !h.daemon.rt.setups[&task.id].worker.is_finished() {
+                assert!(std::time::Instant::now() < deadline, "setup failed to exit");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            h.daemon.poll_setups(Utc::now()).await.unwrap();
+        }
         let stranded = h.saved(&task);
         assert_eq!(stranded.state, TaskState::Starting, "{boundary}");
         assert_eq!(stranded.attempts, 1);
@@ -310,4 +323,38 @@ async fn starting_resumed_session_update_failure_waits_for_unrecorded_agent() {
     h.daemon.recover_starting(Utc::now()).unwrap();
     assert_eq!(h.saved(&task).state, TaskState::Crashed);
     assert_eq!(h.saved(&task).attempts, 2);
+}
+
+#[tokio::test]
+async fn background_setup_reload_persists_the_actual_target_before_session_write() {
+    let Some(mut h) = Harness::new() else { return };
+    let task = h.task();
+    h.daemon.cfg.repo.setup = vec!["true".into()];
+    assert_eq!(h.start(task.clone()).await.unwrap(), Started::Preparing);
+    let old = h.target(&task);
+    h.daemon.cfg.tmux.socket_name = Some(format!("powerqueue-test-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
+    h.daemon.cfg.tmux.session_name = "reloaded".into();
+    h.daemon.cfg.save(&h.daemon.paths).unwrap();
+    h.daemon.reload_config().unwrap();
+    h.tmux = h.daemon.rt.tmux.clone();
+    // Lose the session row after creating its pane: restart recovery must
+    // find that pane using the refreshed target, not the original claim.
+    h.writer
+        .execute_batch("CREATE TRIGGER inject BEFORE INSERT ON sessions BEGIN SELECT RAISE(ABORT, 'session insert failed'); END;")
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !h.daemon.rt.setups[&task.id].worker.is_finished() {
+        assert!(std::time::Instant::now() < deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    h.daemon.poll_setups(Utc::now()).await.unwrap();
+    let target = h.target(&task);
+    assert_ne!(target.socket_name, old.socket_name);
+    assert_eq!(target.session_name, "reloaded");
+    assert!(target.has_live_pane().unwrap());
+    assert!(h.daemon.store.list_sessions_for_task(task.id).unwrap().is_empty());
+    h.writer.execute_batch("DROP TRIGGER inject;").unwrap();
+    h.restart();
+    h.daemon.recover_starting(Utc::now()).unwrap();
+    assert_eq!(h.saved(&task).state, TaskState::Starting, "live agent must prevent another launch");
 }

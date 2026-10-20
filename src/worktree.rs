@@ -554,6 +554,23 @@ pub fn run_commands(cwd: &Path, commands: &[String], env: &[(String, String)]) -
     run_commands_inner(cwd, commands, env, None)
 }
 
+/// Start setup on a dedicated thread; callers poll `is_finished` before joining.
+/// The worker never accesses scheduler state. Dropping its handle does not wait:
+/// surviving shell children retain the setup lease for restart recovery.
+/// Returns an error if the OS cannot create the worker thread.
+pub fn spawn_setup(
+    cwd: &Path,
+    commands: &[String],
+    env: &[(String, String)],
+    lease: &Path,
+) -> Result<std::thread::JoinHandle<Result<String>>> {
+    let (cwd, commands, env, lease) = (cwd.to_owned(), commands.to_vec(), env.to_vec(), lease.to_owned());
+    std::thread::Builder::new()
+        .name("powerqueue-setup".into())
+        .spawn(move || run_commands_with_lease(&cwd, &commands, &env, &lease))
+        .context("spawn repo.setup worker")
+}
+
 /// Run setup while holding a task-specific lease. On Unix the shell inherits
 /// the locked file description, so setup children keep the lease if the daemon
 /// dies, even before exec or when their environment cannot be inspected.

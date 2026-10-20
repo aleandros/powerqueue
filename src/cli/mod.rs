@@ -209,7 +209,7 @@ pub struct InitArgs {
 
 #[derive(Debug, Args, Default)]
 pub struct RunArgs {
-    /// Perform one scheduling pass and exit.
+    /// Admit one scheduling pass; finish its background setups before exiting.
     #[arg(long)]
     pub once: bool,
     /// Do not talk to Linear or GitHub (local tasks only).

@@ -175,9 +175,23 @@ anything else uses the explicit `codex:<name>` form.
 | `branch_template` | `"pq/{key}"` | `{key}` = task key slug, `{id}` = short task id |
 | `fetch_before_start` | `true` | `git fetch` before creating a worktree; new branches then start from `origin/<default_branch>` |
 | `fast_forward_base` | `true` | after that fetch, before creating a branch, fast-forward the local default branch to `origin/<default_branch>` when it is safe (no local commits, no rebase/bisect, clean checkout; hooks off) |
-| `setup` | `[]` | commands run (`sh -c`) in a fresh worktree before Claude starts, with `POWERQUEUE_TASK_ID`, `POWERQUEUE_TASK_KEY`, `POWERQUEUE_TASK_SLUG`, `POWERQUEUE_TASK_DIR`, `POWERQUEUE_BRANCH`, `POWERQUEUE_WORKTREE`, `POWERQUEUE_DATA_DIR` and `POWERQUEUE_STATE_DIR` in the environment |
+| `setup` | `[]` | background commands run sequentially (`sh -c`) in a fresh worktree before Claude starts, with `POWERQUEUE_TASK_ID`, `POWERQUEUE_TASK_KEY`, `POWERQUEUE_TASK_SLUG`, `POWERQUEUE_TASK_DIR`, `POWERQUEUE_BRANCH`, `POWERQUEUE_WORKTREE`, `POWERQUEUE_DATA_DIR` and `POWERQUEUE_STATE_DIR` in the environment |
 | `overrides_from` | `"working-tree"` | where the repository's [`.powerqueue.toml`](#per-repository-overrides-powerqueuetoml) (and a relative `priority_file` named in it) is read from: the main checkout's working tree, or `"default-branch"` for the file as committed on `origin/<default_branch>` (the local branch when there is no remote), so a `git checkout` in the main checkout cannot change what the daemon runs |
 | `fetch_interval_secs` | `300` | with `overrides_from = "default-branch"`, how often the daemon runs `git fetch` so a change merged upstream reaches it while the queue is idle; `0` = only the fetch before a task starts; at most a week (604800) |
+
+`repo.setup` runs outside the daemon tick. The task remains `starting` and
+reserves a global slot, its queue slot and predicted model budget until setup
+finishes. Heartbeats, source sync, commands and other available slots continue.
+`status` shows setup elapsed time; `status --json` includes `setup_started_at`.
+Setup errors use normal crash backoff and attempt limits. Commands run in order
+and stop at the first failure. No setup timeout is imposed; bound long commands
+in your script when needed. Pausing or cancelling the task prevents its agent
+from launching; cancellation cleanup waits for setup to exit. Scheduling pause
+holds completed setups until scheduling resumes. Stopping the daemon does not
+wait for setup: surviving shell children retain their lease, and the next daemon
+waits for them before recovering the abandoned attempt. `run --once` performs
+one admission pass, then keeps heartbeating and supervising its pending setups
+through launch or failure before exiting. It admits no new tasks during that drain.
 
 ## `[github]`
 

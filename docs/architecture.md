@@ -360,9 +360,12 @@ still runs):
    days once an hour;
 9. while live sessions `< max_concurrent`: `launch::LaunchPlanner::next`
    (`pick_next`, `Estimator::predict`, `Policy::decide`: throttle or start),
-   `git fetch`, create the worktree, run `repo.setup`, `Launcher::prepare` +
-   `launch`, then `LaunchPlanner::started` reserves the predicted cost for
-   the rest of the pass; `on_launched` moves the Linear issue to
+   `git fetch`, create the worktree, and start `repo.setup` on a worker.
+   Pending workers reserve global/queue capacity and predicted cost across
+   ticks (`LaunchPlanner::with_pending`). A later tick polls finished workers,
+   rejects superseded attempts, rechecks source approval and calls
+   `Launcher::prepare` + `launch`. Tasks without setup launch immediately;
+   `LaunchPlanner::started` reserves their predicted cost for the pass; `on_launched` moves the Linear issue to
    `in_progress_state` or applies the configured GitHub in-progress label.
 
 Every transition goes through `store.log_event` so `task show` replays the
