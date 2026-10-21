@@ -229,9 +229,9 @@ pub struct StatusArgs {
 
 #[derive(Debug, Args)]
 pub struct AddArgs {
-    /// Execution project ID (independent of a Linear project).
-    #[arg(long, default_value = "default")]
-    pub project: String,
+    /// Explicit execution project; otherwise follow routing.mode (default: default project).
+    #[arg(long)]
+    pub project: Option<String>,
     /// Task title.
     pub title: String,
     /// Longer description (markdown). `-` reads stdin.
@@ -257,6 +257,14 @@ pub struct AddArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum TaskCommand {
+    /// Analyze repository ownership; automatic mode may assign unstarted work.
+    Analyze {
+        #[command(flatten)]
+        task: TaskRef,
+        /// Read the saved recommendation without contacting a model.
+        #[arg(long)]
+        show: bool,
+    },
     /// Set a local launch hold (RFC 3339 with offset, or relative duration); --clear removes it.
     Defer {
         #[command(flatten)]
@@ -690,7 +698,7 @@ pub struct TuneArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SecretsCommand {
-    /// Store a key (prompts if value omitted). NAME: linear | github | jev
+    /// Store a key (prompts if value omitted). NAME: linear | github | jev | analysis
     Set { name: String, value: Option<String> },
     /// Remove a key.
     Unset { name: String },

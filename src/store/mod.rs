@@ -34,7 +34,8 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// * v9: tasks.routing (persisted deterministic routing evidence).
 /// * v10: pinned execution queue and workflow policy.
 /// * v11: explicit local deferral, independent of automatic not_before.
-pub const SCHEMA_VERSION: i64 = 11;
+/// * v12: explicit and automatic repository assignment provenance.
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// kv key of the Claude calibration before schema v2.
 const LEGACY_CALIBRATION_KEY: &str = "budget.calibration";
@@ -240,6 +241,7 @@ impl Store {
                 ("execution_repo", "ALTER TABLE tasks ADD COLUMN execution_repo TEXT"),
                 ("github_admission", "ALTER TABLE tasks ADD COLUMN github_admission TEXT"),
                 ("routing", "ALTER TABLE tasks ADD COLUMN routing TEXT"),
+                ("project_assignment", "ALTER TABLE tasks ADD COLUMN project_assignment TEXT"),
                 ("execution", "ALTER TABLE tasks ADD COLUMN execution TEXT"),
                 ("deferral", "ALTER TABLE tasks ADD COLUMN deferral TEXT"),
             ] {
@@ -277,9 +279,9 @@ impl Store {
             "INSERT INTO tasks (id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score,
                 labels, linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts,
                 not_before, last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number,
-                blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing, execution, deferral)
+                blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing, execution, deferral, project_assignment)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-                ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)",
+                ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42)",
             params![
                 task.id.to_string(),
                 task.key,
@@ -322,6 +324,7 @@ impl Store {
                 task.routing.as_ref().map(json),
                 task.execution.as_ref().map(json),
                 task.deferral.as_ref().map(json),
+                task.project_assignment.as_ref().map(json),
             ],
         )
         .with_context(|| format!("insert task {}", task.key))?;
@@ -350,12 +353,15 @@ impl Store {
             } else {
                 &task.description
             };
+        // Assignment changes have their own transactional writers. Preserve newer
+        // human/model choices when a lifecycle writer holds an older snapshot.
+        let assignment = if current.project_assignment != task.project_assignment { &current } else { task };
         let n = tx.execute(
             "UPDATE tasks SET key=?2, title=?3, description=?4, source=?5, source_kind=?6, linear_issue_id=?7, state=?8,
                 criticality=?9, score=?10, labels=?11, linear_priority=?12, estimate=?13, project=?14, model_override=?15,
                 model=?16, worktree_path=?17, branch=?18, attempts=?19, max_attempts=?20, not_before=?21, last_error=?22,
                 summary=?23, score_reasons=?24, updated_at=?25, started_at=?26, completed_at=?27, cycle=?28, cycle_number=?29,
-                blocked_by=?30, children=?31, parent=?32, pr_url=?33, review=?34, execution_project=?35, execution_repo=?36, github_admission=?37, routing=?38, execution=?39
+                blocked_by=?30, children=?31, parent=?32, pr_url=?33, review=?34, execution_project=?35, execution_repo=?36, github_admission=?37, routing=?38, execution=?39, project_assignment=?40
              WHERE id=?1",
             params![
                 task.id.to_string(),
@@ -392,11 +398,12 @@ impl Store {
                 task.parent,
                 task.pr_url,
                 task.review.as_ref().map(json),
-                task.execution_project,
+                assignment.execution_project,
                 task.execution_repo,
                 task.github_admission.as_ref().map(json),
-                task.routing.as_ref().map(json),
+                assignment.routing.as_ref().map(json),
                 task.execution.as_ref().map(json),
+                current.project_assignment.as_ref().map(json),
             ],
         )?;
         if n == 0 {
@@ -437,23 +444,74 @@ impl Store {
 
     /// Atomically change an unstarted task's execution project. Refuses if a
     /// daemon started it or another command changed its assignment meanwhile.
-    /// Only the project column changes; task state and source data are preserved.
+    /// The explicit assignment and routing cache change; task state and source data are preserved.
     pub fn set_execution_project(&self, id: TaskId, from: &str, to: &str) -> Result<()> {
         let changed = self
             .lock()
             .execute(
-                "UPDATE tasks SET execution_project=?3, updated_at=?4 WHERE id=?1 AND execution_project=?2
+                "UPDATE tasks SET execution_project=?3, updated_at=?4, project_assignment=?5, routing=NULL WHERE id=?1 AND execution_project=?2
              AND execution_repo IS NULL AND attempts=0 AND started_at IS NULL
              AND branch IS NULL AND worktree_path IS NULL AND review IS NULL AND pr_url IS NULL
              AND state IN ('queued','paused','blocked','throttled','needs_attention')
              AND NOT EXISTS (SELECT 1 FROM sessions WHERE task_id=?1)",
-                params![id.to_string(), from, to, ts(&Utc::now())],
+                params![id.to_string(), from, to, ts(&Utc::now()), json(&crate::routing::ProjectAssignment::Explicit { project: to.into() })],
             )
             .context("change execution project of unstarted task")?;
         if changed == 0 {
             return Err(anyhow!("task {id} changed or has execution history; project was not changed"));
         }
         Ok(())
+    }
+
+    /// Apply saved analysis against the latest task inside a write transaction.
+    /// Refuses stale results, human overrides, existing sessions and execution history.
+    /// Only repository assignment/evidence and their audit events are changed.
+    pub fn apply_analysis_project(&self, id: TaskId, cfg: &crate::config::Config) -> Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let applied = Self::apply_analysis_project_in(&tx, id, cfg)?;
+        tx.commit().context("commit automatic repository selection")?;
+        Ok(applied)
+    }
+
+    fn apply_analysis_project_in(tx: &rusqlite::Transaction<'_>, id: TaskId, cfg: &crate::config::Config) -> Result<bool> {
+        let Some(mut task) = tx
+            .query_row(&format!("SELECT {} FROM tasks WHERE id=?1", Self::TASK_COLS), params![id.to_string()], Self::row_to_task)
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        let record: Option<String> = tx
+            .query_row("SELECT value FROM kv WHERE key=?1", params![crate::analysis::record_key(id)], |row| row.get(0))
+            .optional()?;
+        let Some(record) = record else { return Ok(false) };
+        let record = serde_json::from_str(&record).context("decode saved repository analysis")?;
+        let has_session =
+            tx.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE task_id=?1)", params![id.to_string()], |row| row.get(0))?;
+        let effects = crate::scheduler::commands::on_analysis_project(&mut task, cfg, &record, has_session);
+        if effects.is_empty() {
+            return Ok(false);
+        }
+        let now = ts(&Utc::now());
+        tx.execute(
+            "UPDATE tasks SET execution_project=?2, project_assignment=?3, routing=?4, updated_at=?5 WHERE id=?1",
+            params![
+                id.to_string(),
+                task.execution_project,
+                task.project_assignment.as_ref().map(json),
+                task.routing.as_ref().map(json),
+                now
+            ],
+        )?;
+        for effect in effects {
+            if let crate::scheduler::transitions::Effect::Log { level, kind, message, data } = effect {
+                tx.execute(
+                    "INSERT INTO events (task_id,timestamp,level,kind,message,data) VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![id.to_string(), now, level.as_str(), kind, message, json(&data)],
+                )?;
+            }
+        }
+        Ok(true)
     }
 
     /// Save routing evidence only while its metadata and assignment remain current.
@@ -463,7 +521,7 @@ impl Store {
             .lock()
             .execute(
                 "UPDATE tasks SET routing=?2 WHERE id=?1 AND execution_project=?3 AND state=?4
-             AND attempts=?5 AND routing IS ?6 AND labels=?7 AND project IS ?8 AND source=?9",
+             AND attempts=?5 AND routing IS ?6 AND labels=?7 AND project IS ?8 AND source=?9 AND project_assignment IS ?10",
                 params![
                     task.id.to_string(),
                     task.routing.as_ref().map(json),
@@ -473,7 +531,8 @@ impl Store {
                     before.routing.as_ref().map(json),
                     json(&before.labels),
                     before.project,
-                    json(&before.source)
+                    json(&before.source),
+                    before.project_assignment.as_ref().map(json)
                 ],
             )
             .context("record deterministic routing decision")?;
@@ -546,7 +605,7 @@ impl Store {
             .execute(
                 "UPDATE tasks SET github_admission=?2, routing=?9 WHERE id=?1 AND title=?3 AND description=?4
              AND state=?5 AND attempts=?6 AND github_admission IS ?7 AND execution_project=?8
-             AND routing IS ?10 AND labels=?11 AND project IS ?12 AND source=?13",
+             AND routing IS ?10 AND labels=?11 AND project IS ?12 AND source=?13 AND project_assignment IS ?14",
                 params![
                     task.id.to_string(),
                     task.github_admission.as_ref().map(json),
@@ -560,7 +619,8 @@ impl Store {
                     before.routing.as_ref().map(json),
                     json(&before.labels),
                     before.project,
-                    json(&before.source)
+                    json(&before.source),
+                    before.project_assignment.as_ref().map(json)
                 ],
             )
             .context("record verified GitHub admission")?;
@@ -608,7 +668,7 @@ impl Store {
              attempts=?13, branch=?14, worktree_path=?15, execution=?20
              WHERE id=?1 AND execution_project=?2 AND state=?3 AND attempts=?4
              AND github_admission IS ?10 AND title=?11 AND description=?12
-             AND routing IS ?16 AND labels=?17 AND project IS ?18 AND source=?19 AND deferral IS ?21",
+             AND routing IS ?16 AND labels=?17 AND project IS ?18 AND source=?19 AND deferral IS ?21 AND project_assignment IS ?22",
                 params![
                     before.id.to_string(),
                     before.execution_project,
@@ -630,7 +690,8 @@ impl Store {
                     before.project,
                     json(&before.source),
                     starting.execution.as_ref().map(json),
-                    before.deferral.as_ref().map(json)
+                    before.deferral.as_ref().map(json),
+                    before.project_assignment.as_ref().map(json)
                 ],
             )
             .context("claim task start in its execution project")?;
@@ -718,6 +779,12 @@ impl Store {
                 .map_err(conv)?,
             routing: row.get::<_, Option<String>>("routing")?.as_deref().map(from_json).transpose().map_err(conv)?,
             execution_project: row.get("execution_project")?,
+            project_assignment: row
+                .get::<_, Option<String>>("project_assignment")?
+                .as_deref()
+                .map(from_json)
+                .transpose()
+                .map_err(conv)?,
             execution_repo: row.get("execution_repo")?,
             execution: row.get::<_, Option<String>>("execution")?.as_deref().map(from_json).transpose().map_err(conv)?,
             state: TaskState::from_str(&state).map_err(|e| conv(anyhow!(e)))?,
@@ -756,7 +823,7 @@ impl Store {
         "id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score, labels,
         linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts, not_before,
         last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number,
-        blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing, execution, deferral";
+        blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing, execution, deferral, project_assignment";
 
     pub fn get_task(&self, id: TaskId) -> Result<Option<Task>> {
         let conn = self.lock();
@@ -1487,6 +1554,57 @@ impl Store {
     }
 
     // --------------------------------------------------------------------- kv
+
+    /// Save advisory analysis and its audit event atomically without updating task rows.
+    /// Returns false if a newer analysis already finished; fails for missing tasks or storage errors.
+    pub fn save_analysis(&self, id: TaskId, record: &crate::analysis::AnalysisRecord) -> Result<bool> {
+        self.save_analysis_inner(id, record, None).map(|(saved, _)| saved)
+    }
+
+    /// Save a result and reconcile automatic assignment atomically against the latest task.
+    /// Returns (saved, assignment_changed); older results are ignored. Storage errors roll back both.
+    pub fn save_and_apply_analysis(
+        &self,
+        id: TaskId,
+        record: &crate::analysis::AnalysisRecord,
+        cfg: &crate::config::Config,
+    ) -> Result<(bool, bool)> {
+        self.save_analysis_inner(id, record, Some(cfg))
+    }
+
+    fn save_analysis_inner(
+        &self,
+        id: TaskId,
+        record: &crate::analysis::AnalysisRecord,
+        cfg: Option<&crate::config::Config>,
+    ) -> Result<(bool, bool)> {
+        let mut conn = self.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("begin analysis result transaction")?;
+        let exists: bool =
+            tx.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)", params![id.to_string()], |r| r.get(0))?;
+        if !exists {
+            anyhow::bail!("cannot save analysis for a missing task");
+        }
+        let key = crate::analysis::record_key(id);
+        let previous: Option<String> =
+            tx.query_row("SELECT value FROM kv WHERE key = ?1", params![key], |r| r.get(0)).optional()?;
+        if let Some(previous) = previous {
+            let previous: crate::analysis::AnalysisRecord = serde_json::from_str(&previous).context("read prior analysis")?;
+            if previous.created_at > record.created_at {
+                return Ok((false, false));
+            }
+        }
+        let now = ts(&Utc::now());
+        tx.execute("INSERT INTO kv (key, value, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![key, serde_json::to_string(record)?, now])?;
+        tx.execute("INSERT INTO events (task_id, timestamp, level, kind, message, data) VALUES (?1, ?2, 'info', 'analysis.recorded', ?3, ?4)",
+            params![id.to_string(), now, "Advisory analysis recorded; human approval required", serde_json::to_string(record)?])?;
+        let applied = if let Some(cfg) = cfg { Self::apply_analysis_project_in(&tx, id, cfg)? } else { false };
+        tx.commit().context("commit analysis result and event")?;
+        Ok((true, applied))
+    }
 
     pub fn kv_set<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
         let conn = self.lock();

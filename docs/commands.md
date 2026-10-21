@@ -45,10 +45,11 @@ Project filters on `status`, `task list` and `dashboard` affect only the task li
 
 | Command | What it does |
 |---------|--------------|
-| `add "title" [-d DESC\|-] [-c CRIT] [-m MODEL] [-k KEY] [-l LABEL]... [--paused] [--project ID]` | enqueue a manual task in a registered execution project; omitted `--project` always selects `default`, unknown IDs fail; `-d -` reads stdin |
+| `add "title" [-d DESC\|-] [-c CRIT] [-m MODEL] [-k KEY] [-l LABEL]... [--paused] [--project ID]` | enqueue a manual task in a registered execution project; omitted `--project` selects `default` in deterministic mode, uses analysis in automatic mode, and fails in explicit mode; unknown IDs fail; `-d -` reads stdin |
 | `task defer <task> <until> [--reason TEXT]` | set or replace a local launch hold; `<until>` is an RFC 3339 timestamp with explicit offset or a positive duration such as `2h` |
 | `task defer <task> --clear` | clear only the local hold; source deferrals and other scheduling restrictions still apply |
-| `task project <task> <id>` | reassign an unstarted task to a registered execution project; refuses tasks with previous execution history; validates again when the daemon applies the command |
+| `task analyze <task> [--show]` | request/retry classification and repository selection; automatic mode applies a confident choice to unstarted tasks. `--show` only reads evidence. Requires opt-in `[analysis]`; source approval stays separate. Exit 3 means unresolved/stale. See [issue analysis](issue-analysis.md) |
+| `task project <task> <id>` | explicitly assign an unstarted task to a registered execution project; overrides AI and rules; refuses tasks with previous execution history; validates again when the daemon applies the command |
 | `task show <task>` | details, execution project/configured checkout, saved/current routing decisions and timeline |
 | `task list [-a] [--project ID]` | same as `status` |
 | `task complete <task> [-s SUMMARY] [--pr URL]` | mark completed (Claude calls this from inside the session); with `--pr` hand it off for review instead: `in_review`, slot and worktree released, the daemon watches the PR (see [Review](task-lifecycle.md#review-pull-requests)). Refused while the task is `starting` (the daemon is launching it; try again once it is running) |
@@ -63,6 +64,10 @@ Project filters on `status`, `task list` and `dashboard` affect only the task li
 | `task output <task> [-n LINES]` | last screen of the task's tmux pane (default 60 lines) |
 | `task send <task> "message"` | type a message into the running session |
 | `attach [<task>] [--print]` | open the task's tmux window; no task = the powerqueue session |
+
+In the dashboard, **P** opens the repository picker for unstarted work; arrows or
+`j`/`k` navigate, Enter selects, Escape cancels. Explicit routing mode opens the
+picker after adding an unassigned task.
 
 `<task>` is a key (`ENG-123`, `manual-1a2b3c4d`), a full id, or an id prefix.
 `pause`, `resume`, `cancel` and `retry` are queued for the daemon; with no
@@ -208,7 +213,7 @@ intent is allowed; executable legacy Markdown directives still require migration
 | `config unset <key>` | remove a key so its default applies again |
 | `config edit` | open `config.toml` in `$EDITOR` |
 | `config validate [--file PATH]` | validate `config.toml` (or a draft) with the repo's `.powerqueue.toml` applied, so a bad value the repo sets is reported too; says which keys the repo sets and from which branch |
-| `secrets set <linear\|github\|jev> [value]` | store a key (prompts if omitted) |
+| `secrets set <linear\|github\|jev\|analysis> [value]` | store a key (prompts if omitted) |
 | `secrets unset <name>` | remove a key |
 | `secrets list` | which keys are configured and where they come from |
 | `hook --task ID [--session SID] --event EVENT [--provider P] [PAYLOAD]` | internal; called by agent CLI hooks (hidden); `--event StatusLine` is the Claude status line (stores rate limits, prints a short status); `PAYLOAD` replaces stdin (Codex `notify`) |

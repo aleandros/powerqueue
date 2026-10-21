@@ -14,6 +14,7 @@
 
 ## Scheduling and task behavior
 
+- [Advisory issue analysis](issue-analysis.md): optional Jev/text-model recommendations with human approval and routing.
 - [Priority rules](priority.md): grammar, model preferences, simulation and tuning.
 - [Budget pacing](budget.md): usage readings, cost estimates, provider limits and worked examples.
 - [Task lifecycle](task-lifecycle.md): worktrees, completion, PR review, human replies and cleanup.

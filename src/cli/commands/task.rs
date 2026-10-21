@@ -239,6 +239,9 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let store = ctx.store()?.clone();
     let task = find_task(&store, &task_ref.task)?;
     let location = execution_location(ctx, &task)?;
+    let analysis = store.kv_get::<crate::analysis::AnalysisRecord>(&crate::analysis::record_key(task.id))?;
+    let analysis_cfg = Config::load(&ctx.paths)?;
+    let analysis_status = analysis.as_ref().map(|r| r.status(&analysis_cfg, &task));
     let sessions = store.list_sessions_for_task(task.id)?;
     let events = store.events_for_task(task.id, 50)?;
     let pr_events = if task.pr_url.is_some() { pr_timeline(&store.events_for_task(task.id, 2000)?) } else { Vec::new() };
@@ -270,6 +273,8 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     if ctx.json {
         let out = serde_json::json!({
             "task": task,
+            "analysis": analysis,
+            "analysis_status": analysis_status,
             "source_route": source_route,
             "current_routing": current_routing,
             "execution_location": location,
@@ -302,6 +307,9 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     };
     println!("{} {}", task.key.if_supports_color(Stream::Stdout, |t| t.bold()), task.title);
     kv("id", task.id.to_string());
+    if let Some(status) = analysis_status {
+        kv("analysis", format!("{status}; task analyze {} --show", task.key));
+    }
     kv("state", paint(color, output::state_colored(task.state), task.state.as_str()));
     if let Ok(execution) = ctx.config_or_default()?.execution_for(&task) {
         kv("queue", execution.queue);
@@ -801,6 +809,7 @@ fn prompt(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
 pub fn run(ctx: &mut Context, cmd: TaskCommand) -> Result<i32> {
     ensure_initialised(ctx)?;
     match cmd {
+        TaskCommand::Analyze { task, show } => super::analyze::run(ctx, &task, show),
         TaskCommand::Defer { task, until, reason, clear: _ } => {
             let store = ctx.store()?.clone();
             let current = find_task(&store, &task.task)?;

@@ -22,17 +22,20 @@ use crate::paths::Paths;
 pub enum SecretKind {
     LinearApiKey,
     JevApiKey,
+    AnalysisApiKey,
     GitHubToken,
 }
 
 impl SecretKind {
-    pub const ALL: [SecretKind; 3] = [SecretKind::LinearApiKey, SecretKind::JevApiKey, SecretKind::GitHubToken];
+    pub const ALL: [SecretKind; 4] =
+        [SecretKind::LinearApiKey, SecretKind::JevApiKey, SecretKind::GitHubToken, SecretKind::AnalysisApiKey];
 
     /// Keychain account name / TOML key.
     pub fn name(&self) -> &'static str {
         match self {
             SecretKind::LinearApiKey => "linear_api_key",
             SecretKind::JevApiKey => "jev_api_key",
+            SecretKind::AnalysisApiKey => "analysis_api_key",
             SecretKind::GitHubToken => "github_token",
         }
     }
@@ -42,6 +45,7 @@ impl SecretKind {
         match self {
             SecretKind::LinearApiKey => "LINEAR_API_KEY",
             SecretKind::JevApiKey => "JEV_API_KEY",
+            SecretKind::AnalysisApiKey => "POWERQUEUE_ANALYSIS_API_KEY",
             SecretKind::GitHubToken => "GITHUB_TOKEN",
         }
     }
@@ -50,6 +54,7 @@ impl SecretKind {
         match self {
             SecretKind::LinearApiKey => "Linear API key",
             SecretKind::JevApiKey => "Jev (TypeSafe) API key",
+            SecretKind::AnalysisApiKey => "Analysis text model API key",
             SecretKind::GitHubToken => "GitHub token",
         }
     }

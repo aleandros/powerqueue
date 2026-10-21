@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     estimate        REAL,
     project         TEXT,
     execution TEXT, -- pinned queue/workflow (v10)
-    routing TEXT, -- persisted deterministic routing decision (v9)
+    routing TEXT, -- persisted routing decision (v9)
+    project_assignment TEXT, -- explicit/automatic selection (v12)
     execution_project TEXT NOT NULL DEFAULT 'default', -- execution registry ID (v7)
     execution_repo TEXT, -- pinned canonical checkout (v7)
     cycle           TEXT,                      -- active | next | past | future (v3)

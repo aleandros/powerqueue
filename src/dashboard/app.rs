@@ -269,8 +269,18 @@ pub enum Action {
     ToggleTerminal,
     Help,
     OpenAdd,
+    OpenProject(TaskId),
+    SetProject(TaskId, String),
     /// The add-task modal was submitted with this title.
     AddTask(String),
+}
+
+/// A repository picker remains attached to one task across dashboard refreshes.
+#[derive(Debug, Clone)]
+pub struct ProjectPicker {
+    pub task_id: TaskId,
+    pub projects: Vec<String>,
+    pub selected: usize,
 }
 
 /// Selection, scroll and mode state.
@@ -286,6 +296,7 @@ pub struct DashboardApp {
     pub filter_terminal: bool,
     /// Text of the add-task modal while it is open.
     pub add_input: Option<String>,
+    pub project_picker: Option<ProjectPicker>,
     pub now: Option<DateTime<Utc>>,
     /// Draw with ASCII symbols and borders (see [`crate::dashboard::Options`]).
     pub ascii: bool,
@@ -342,6 +353,22 @@ impl DashboardApp {
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d')) {
             return Some(Action::Quit);
+        }
+        if let Some(picker) = self.project_picker.as_mut() {
+            match key.code {
+                KeyCode::Esc => self.project_picker = None,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    picker.selected = (picker.selected + 1).min(picker.projects.len().saturating_sub(1))
+                }
+                KeyCode::Up | KeyCode::Char('k') => picker.selected = picker.selected.saturating_sub(1),
+                KeyCode::Enter => {
+                    let action = picker.projects.get(picker.selected).map(|p| Action::SetProject(picker.task_id, p.clone()));
+                    self.project_picker = None;
+                    return action;
+                }
+                _ => {}
+            }
+            return None;
         }
         if let Some(input) = self.add_input.as_mut() {
             match key.code {
@@ -402,6 +429,7 @@ impl DashboardApp {
             }
             KeyCode::Char('a') | KeyCode::Enter => selected_id.map(Action::Attach),
             KeyCode::Char('p') => selected_id.map(Action::Pause),
+            KeyCode::Char('P') => selected_id.map(Action::OpenProject),
             KeyCode::Char('r') => selected_id.map(Action::Resume),
             KeyCode::Char('c') => selected_id.map(Action::Cancel),
             KeyCode::Char('R') => selected_id.map(Action::Retry),
@@ -453,6 +481,25 @@ mod tests {
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn project_picker_keeps_task_identity_across_refresh_and_cancels_cleanly() {
+        let mut app = DashboardApp::new(snapshot());
+        let id = app.selected_task().unwrap().id;
+        assert_eq!(app.handle_key(key('P')), Some(Action::OpenProject(id)));
+        app.project_picker = Some(ProjectPicker { task_id: id, projects: vec!["app".into(), "infra".into()], selected: 0 });
+        app.handle_key(key('j'));
+        app.set_snapshot(Snapshot::default());
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::SetProject(id, "infra".into()))
+        );
+        assert!(app.project_picker.is_none());
+        app.project_picker = Some(ProjectPicker { task_id: id, projects: vec![], selected: 0 });
+        app.handle_key(key('j'));
+        assert_eq!(app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), None);
+        assert!(app.project_picker.is_none());
     }
 
     #[test]

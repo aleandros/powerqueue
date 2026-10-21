@@ -426,7 +426,12 @@ tasks (which would wait forever) and failed attempts to close a parent.
 
 ## `[routing]`
 
-Routing is machine configuration in `config.toml`. Its default is `rules = []`.
+Routing is machine configuration in `config.toml`. Defaults are `mode = "deterministic"`
+and `rules = []`. `mode = "automatic"` requires `analysis.enabled = true`: explicit
+choices win, then deterministic rules; unmatched tasks use Jev/Claude descriptions.
+`mode = "explicit"` holds new tasks until `--project`, `task project` or dashboard
+**P** selects a repository. Existing execution bindings are retained. See
+[automatic repository selection](issue-analysis.md).
 It selects only registered execution-project IDs; source admission still decides
 whether an issue is approved, `priority.toml` decides ordering/models, and the
 selected project's settings decide checkout, setup and cleanup.
@@ -462,9 +467,11 @@ matching as [priority policy](priority.md): `eq`, `ne`, or `matches`
 `project` (Linear project name), or `label`. Equality and regexes ignore case;
 qualified labels and child labels follow policy matching. A missing field does
 not match `eq`/`matches`, but does match `ne`. Use `source` to scope negative rules.
-Routing never evaluates title/body text or treats issue content as a checkout path.
+Deterministic rules never evaluate title/body text. Automatic analysis uses that text
+but can select only described registry IDs, never issue-provided checkout paths.
 
-Selection is independent of rule order:
+Explicit human selections override rules. Otherwise, in deterministic mode,
+selection is independent of rule order:
 
 1. Evaluate every rule; every condition in a rule must match.
 2. If all matching rules name the same project, select it. These rules override
@@ -476,7 +483,7 @@ Selection is independent of rule order:
    errors; previews and doctor explain them. No arbitrary repository is selected.
 
 The initial decision and subsequent evaluations are stored with the task and logged
-as `routing.selected` or `routing.blocked`. A saved assignment never changes during
+as `routing.selected` or `routing.blocked`. A deterministic assignment never changes during
 sync, retry, restart or PR review, even while queued. Changed metadata/configuration
 that selects another destination holds future starts; active sessions continue in
 their original checkout. Restore the original route or deliberately run
@@ -494,6 +501,45 @@ also verifies current remote labels and approval before launching. Linear routin
 uses the most recent successful source sync. A routing hold created during setup
 logs `routing.launch_held` and preserves the worktree. Reload machine configuration
 with `reload` (or restart) after changing rules.
+
+## `[analysis]`
+
+Optional model analysis; automatic routing can apply accepted repository choices.
+Source approval and priority remain independent.
+Machine-level settings only; `.powerqueue.toml` cannot enable analysis. See the
+[workflow and tradeoffs](issue-analysis.md).
+
+```toml
+[analysis]
+enabled = false                 # opt in before task analyze can contact models
+jev_first = true                # uses priority.jev.endpoint/model and the Jev key
+min_confidence = 0.8             # 0.5–1; Jev also requires probability and margin
+timeout_secs = 20              # per request, 1–60; no retries
+
+[analysis.projects]             # 1–32 registered IDs when enabled
+# default = "API service: authentication, billing and database; excludes browser UI"
+# web = "Browser UI: components and styling; excludes backend authentication"
+
+# Optional server Claude Code fallback (existing login); absent by default.
+# [analysis.claude_code]
+# binary = "claude"              # no per-task placeholders
+# model = "sonnet"
+
+# Alternative API fallback; configure only one fallback.
+# [analysis.llm]
+# endpoint = "https://api.anthropic.com/v1/messages"
+# model = "YOUR_MESSAGES_API_MODEL_ID"
+# max_tokens = 1024             # 128–4096 output tokens
+```
+
+Project descriptions must be nonempty and at most 2,000 bytes each; only described
+registered projects can be recommended. `jev_first` is independent of priority
+scoring's `enabled` flag. With `jev_first = false`, configure a text model.
+Endpoints require HTTPS, except loopback HTTP for local services/tests; embedded
+credentials, query strings and fragments are rejected. Redirects are disabled.
+The API fallback uses `secrets set analysis` or `POWERQUEUE_ANALYSIS_API_KEY`; Jev uses
+`secrets set jev` or `JEV_API_KEY`. The API fallback has separate API billing. Claude Code uses its server login. Input/response limits and recorded token usage are described in
+[issue analysis](issue-analysis.md#scheduling-staleness-and-cost).
 
 ## `[priority]` and `[priority.jev]`
 

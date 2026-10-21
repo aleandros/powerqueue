@@ -85,16 +85,80 @@ pub fn on_set_project(task: &mut Task, project: &str, has_session: bool) -> Resu
             task.key
         )));
     }
-    if task.execution_project == project {
+    let assignment = crate::routing::ProjectAssignment::Explicit { project: project.into() };
+    if task.execution_project == project && task.project_assignment.as_ref() == Some(&assignment) {
         return Ok(Vec::new());
     }
     let old = std::mem::replace(&mut task.execution_project, project.to_string());
+    task.project_assignment = Some(assignment);
+    task.routing = None;
     Ok(vec![Effect::log(
         EventLevel::Info,
         "task.project_set",
         format!("execution project changed from {old} to {project}"),
         serde_json::json!({"from": old, "project": project}),
     )])
+}
+
+/// Reconcile current automatic routing advice for unstarted work, withholding unresolved replacements.
+/// Explicit human selections, stale input and any session/history refuse the change.
+pub fn on_analysis_project(
+    task: &mut Task,
+    cfg: &crate::config::Config,
+    record: &crate::analysis::AnalysisRecord,
+    has_session: bool,
+) -> Vec<Effect> {
+    // Evaluate eligibility without the previous automatic decision: a new result
+    // supersedes that evidence even when its input fingerprint is unchanged.
+    let mut candidate = task.clone();
+    let replacing = matches!(candidate.project_assignment, Some(crate::routing::ProjectAssignment::Automatic { .. }));
+    if replacing {
+        candidate.project_assignment = None;
+    }
+    if !cfg.needs_project_analysis(&candidate) || record.stale(cfg, task) || has_session {
+        return Vec::new();
+    }
+    let Ok(input) = crate::analysis::AnalysisInput::new(cfg, task) else { return Vec::new() };
+    let project = record
+        .proposal
+        .clone()
+        .and_then(|proposal| proposal.validate(&input, cfg.analysis.min_confidence).ok())
+        .and_then(|proposal| proposal.project);
+    let Some(project) = project else {
+        if !replacing || on_set_project(&mut candidate, "", false).is_err() {
+            return Vec::new();
+        }
+        let from = task.execution_project.clone();
+        candidate.project_assignment = None;
+        *task = candidate;
+        let mut effects = vec![Effect::log(
+            EventLevel::Info,
+            "routing.automatic_withheld",
+            "Replacement analysis is unresolved; repository selection required",
+            serde_json::json!({"from": from, "fingerprint": record.fingerprint}),
+        )];
+        effects.extend(super::transitions::on_routing(task, cfg.route(task), false));
+        return effects;
+    };
+    let assignment =
+        crate::routing::ProjectAssignment::Automatic { project: project.clone(), fingerprint: record.fingerprint.clone() };
+    if task.execution_project == project && task.project_assignment.as_ref() == Some(&assignment) {
+        return Vec::new();
+    }
+    let from = task.execution_project.clone();
+    if on_set_project(task, &project, false).is_err() {
+        return Vec::new();
+    }
+    task.project_assignment = Some(assignment);
+    let mut effects = vec![Effect::log(
+        EventLevel::Info,
+        "routing.automatic_assigned",
+        format!("automatically selected repository {project}"),
+        serde_json::json!({"from": from, "project": project, "confidence": record.proposal.as_ref().map(|p| p.confidence), "fingerprint": record.fingerprint}),
+    )];
+    let decision = cfg.route(task);
+    effects.extend(super::transitions::on_routing(task, decision, false));
+    effects
 }
 
 /// Pin the checkout before the first repository operation. Refuses a changed
@@ -616,14 +680,50 @@ mod properties {
         }
 
         #[test]
+        fn automatic_selection_cannot_change_approval_or_retarget_history(
+            mut task in crate::strategies::task(), proposal in crate::strategies::analysis_proposal(),
+            session in any::<bool>(), explicit in any::<bool>(), stale in any::<bool>(), replacing in any::<bool>()
+        ) {
+            let mut cfg = crate::config::Config::default();
+            cfg.repo.path = "/repos/default".into();
+            cfg.routing.mode = crate::routing::RoutingMode::Automatic;
+            cfg.analysis.enabled = true;
+            cfg.analysis.projects.insert("default".into(), "Application".into());
+            task.source = crate::domain::TaskSource::Manual;
+            if explicit { task.project_assignment = Some(crate::routing::ProjectAssignment::Explicit { project: "default".into() }); }
+            let input = crate::analysis::AnalysisInput::new(&cfg, &task).unwrap();
+            let record = crate::analysis::AnalysisRecord { created_at: Utc::now(), fingerprint: input.fingerprint(&cfg), proposal: Some(proposal), attempts: vec![] };
+            if stale { task.description.push_str(" changed"); }
+            if replacing && !explicit {
+                task.project_assignment = Some(crate::routing::ProjectAssignment::Automatic { project: "default".into(), fingerprint: record.fingerprint.clone() });
+            }
+            let before = task.clone();
+            let effects = on_analysis_project(&mut task, &cfg, &record, session);
+            if session || explicit || stale || crate::routing::has_execution_history(&before) {
+                prop_assert_eq!(&task, &before);
+                prop_assert!(effects.is_empty());
+            }
+            if !effects.is_empty() {
+                let accepted = record.proposal.clone().unwrap().validate(&input, cfg.analysis.min_confidence).ok().and_then(|p| p.project);
+                prop_assert_eq!(accepted.as_deref().unwrap_or(""), task.execution_project.as_str());
+                prop_assert_eq!(cfg.route(&task).permitted, accepted.is_some());
+                let mut expected = before;
+                expected.execution_project = task.execution_project.clone();
+                expected.project_assignment = task.project_assignment.clone();
+                expected.routing = task.routing.clone();
+                prop_assert_eq!(task, expected, "automatic routing changed unrelated task authority");
+            }
+        }
+
+        #[test]
         fn fresh_project_reassignment_preserves_source(project in crate::strategies::execution_project()) {
             let mut task = Task::new("T", "t", crate::domain::TaskSource::Manual);
             task.project = Some("source project".into());
             let before = task.clone();
             let effects = on_set_project(&mut task, &project, false).unwrap();
             prop_assert_eq!(&task.execution_project, &project);
-            prop_assert_eq!(&task, &Task { execution_project: project.clone(), ..before.clone() });
-            prop_assert_eq!(effects.is_empty(), before.execution_project == project);
+            prop_assert_eq!(&task, &Task { execution_project: project.clone(), project_assignment: Some(crate::routing::ProjectAssignment::Explicit {project: project.clone()}), routing: None, ..before.clone() });
+            prop_assert!(!effects.is_empty());
             prop_assert!(on_set_project(&mut task, "other", true).is_err());
         }
     }

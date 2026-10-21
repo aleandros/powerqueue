@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-10-20
+
+### Added
+
+- Optional automatic repository selection from trusted project descriptions:
+  Jev first (80% confidence by default), then a bounded Claude Code or API fallback.
+  Explicit mode requires a human choice; CLI assignment and dashboard **P** override
+  AI and rules for unstarted tasks. Source approval and execution history stay
+  independent. Durable evidence, stale-result guards, doctor diagnostics, properties
+  and stateful model coverage accompany the workflow (#44).
+
 ## [0.19.1] - 2026-10-20
 
 ### Fixed
@@ -1095,7 +1106,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.19.1...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/aleandros/powerqueue/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/aleandros/powerqueue/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/aleandros/powerqueue/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/aleandros/powerqueue/compare/v0.18.0...v0.18.1

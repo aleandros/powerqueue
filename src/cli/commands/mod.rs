@@ -2,6 +2,7 @@
 //! only place that knows about all of them.
 
 pub mod add;
+pub mod analyze;
 pub mod attach;
 pub mod budget;
 pub mod config;

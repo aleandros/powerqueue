@@ -5,6 +5,7 @@
 //! tailing for token usage, liveness probing and resource sampling.
 
 pub mod agent;
+pub mod analysis;
 pub mod binary;
 pub mod claude;
 pub mod codex;

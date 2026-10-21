@@ -1,6 +1,6 @@
 [package]
 name = "powerqueue"
-version = "0.19.1"
+version = "0.20.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Get the most out of your Claude subscription: an autonomous work queue that turns Linear tickets and GitHub Issues into Claude Code sessions on a cheap VPS or your laptop, with budget pacing, crash recovery and usage learning"
@@ -58,6 +58,7 @@ similar = "2"
 sysinfo = "0.39.6"
 tar = "0.4.44"
 thiserror = "2.0.21"
+tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["full"] }
 toml = "1.1.6"
 toml_edit = "0.25.15"
@@ -69,14 +70,13 @@ uuid = { version = "1.26.1", features = ["v4", "v7", "serde"] }
 which = "8.0.6"
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1.5", features = ["fs"] }
+rustix = { version = "1.1.5", features = ["fs", "process"] }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
 pretty_assertions = "1.4.1"
 proptest = "1.11"
-tempfile = "3.27.0"
 wiremock = "0.6.5"
 
 [lints.rust]
