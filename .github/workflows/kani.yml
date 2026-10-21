@@ -8,6 +8,7 @@ on:
       - 'src/scheduler/launch.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'spec/KANI.md'
       - '.github/workflows/kani.yml'
   workflow_dispatch:
 permissions:
@@ -20,9 +21,18 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: target-kani
     steps:
       - uses: actions/checkout@v7
       - uses: model-checking/kani-github-action@v1.1
         with:
           kani-version: '0.68.0'
-          args: --lib -Z unstable-options --harness-timeout 300s --output-format terse --jobs 2
+          args: --lib -Z unstable-options --harness-timeout 300s --output-format terse --jobs 2 --export-json kani-results.json
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: kani-results
+          path: kani-results.json
+          if-no-files-found: warn

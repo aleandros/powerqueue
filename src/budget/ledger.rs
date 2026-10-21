@@ -1091,6 +1091,60 @@ mod properties {
 mod verification {
     use super::*;
 
+    /// Two configured tiers start with existing spend. Three reservations,
+    /// the last to either tier, conserve totals and charge only their target.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn kani_add_spend_isolates_two_tiers() {
+        let first = if kani::any::<bool>() {
+            0.0
+        } else if kani::any::<bool>() {
+            0.25
+        } else {
+            4.0
+        };
+        let second = if kani::any::<bool>() { 0.25 } else { 4.0 };
+        let third = if kani::any::<bool>() { 0.0 } else { 1.0 };
+        let third_to_sonnet: bool = kani::any();
+        let sonnet = ModelTier::sonnet();
+        let haiku = ModelTier::haiku();
+        let now = DateTime::<Utc>::UNIX_EPOCH;
+        let period = Period { start: now, end: now + Duration::seconds(60) };
+        let mut ledger = Ledger::blank(Provider::Claude, now, period, period);
+        for (tier, spent) in [(sonnet.clone(), 1.0), (haiku.clone(), 2.0)] {
+            ledger.tiers.push(TierLedger {
+                tier,
+                period_usage: TokenUsage::default(),
+                window_usage: TokenUsage::default(),
+                period_weighted: spent,
+                window_weighted: spent,
+                period_budget: 0.0,
+                messages: 0,
+            });
+        }
+        ledger.total_period_weighted = 3.0;
+        ledger.total_window_weighted = 3.0;
+        ledger.spent_since_observation = 0.5;
+        ledger.add_spend(&sonnet, first);
+        ledger.add_spend(&haiku, second);
+        ledger.add_spend(if third_to_sonnet { &sonnet } else { &haiku }, third);
+        let added = first + second + third;
+        let sonnet_spend = 1.0 + first + if third_to_sonnet { third } else { 0.0 };
+        let haiku_spend = 2.0 + second + if third_to_sonnet { 0.0 } else { third };
+        assert!(ledger.total_period_weighted == 3.0 + added);
+        assert!(ledger.total_window_weighted == 3.0 + added);
+        assert!(ledger.spent_since_observation == 0.5 + added);
+        assert!(ledger.tiers.len() == 2);
+        assert!(ledger.tiers[0].period_weighted == sonnet_spend);
+        assert!(ledger.tiers[0].window_weighted == sonnet_spend);
+        assert!(ledger.tiers[1].period_weighted == haiku_spend);
+        assert!(ledger.tiers[1].window_weighted == haiku_spend);
+        assert!(ledger.total_period_weighted == sonnet_spend + haiku_spend);
+        std::mem::forget(ledger);
+        std::mem::forget(sonnet);
+        std::mem::forget(haiku);
+    }
+
     /// Three task reservations at independently selected exact finite costs
     /// conserve shared tier/provider totals. Projects share this same ledger;
     /// routing and provider selection are checked by the scheduler properties.

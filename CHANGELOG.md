@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Advisory Kani proof of reservation arithmetic across two model tiers, with
+  measured proof costs, explicit cooldown timeout limits, and per-harness CI
+  result artifacts (#50, #51). Runtime behavior is unchanged.
+
 ## [0.20.0] - 2026-10-20
 
 ### Added
