@@ -12,7 +12,38 @@ use crate::priority::{Predicate, policy::predicates, rules::condition_matches};
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RoutingConfig {
+    pub mode: RoutingMode,
     pub rules: Vec<RoutingRule>,
+}
+
+/// How unmatched, unstarted tasks obtain an execution repository.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingMode {
+    #[default]
+    Deterministic,
+    Automatic,
+    Explicit,
+}
+
+/// Persisted selection, distinct from the latest routing evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectAssignment {
+    Explicit { project: String },
+    Automatic { project: String, fingerprint: String },
+}
+
+/// Whether a task has any execution binding/history that prevents reassignment.
+pub fn has_execution_history(task: &Task) -> bool {
+    task.execution_repo.is_some()
+        || task.attempts > 0
+        || task.started_at.is_some()
+        || task.branch.is_some()
+        || task.worktree_path.is_some()
+        || task.review.is_some()
+        || task.pr_url.is_some()
+        || task.state == crate::domain::TaskState::Starting
 }
 
 /// All predicates must match. Matching rules must agree on a single destination.
@@ -62,6 +93,9 @@ impl Config {
     pub fn routing_problems(&self) -> Vec<String> {
         let projects = self.project_ids();
         let mut errors = Vec::new();
+        if self.routing.mode == RoutingMode::Automatic && !self.analysis.enabled {
+            errors.push("routing.mode = automatic requires analysis.enabled = true".into());
+        }
         let mut names = BTreeSet::new();
         for rule in &self.routing.rules {
             let path = format!("routing rule `{}`", rule.name);
@@ -94,7 +128,10 @@ impl Config {
     /// Evaluate rules before the source fallback. Conflicts and unknown IDs fail closed.
     /// Manual tasks retain their explicitly assigned project. Rule order has no precedence.
     pub fn route(&self, task: &Task) -> RoutingDecision {
-        if matches!(task.source, TaskSource::Manual) {
+        if matches!(task.source, TaskSource::Manual)
+            && self.routing.mode == RoutingMode::Deterministic
+            && task.project_assignment.is_none()
+        {
             return self.route_destination(&task.execution_project, Vec::new(), "manual assignment");
         }
         if let Some(error) = self.routing_problems().first() {
@@ -107,8 +144,18 @@ impl Config {
                 Err(e) => return RoutingDecision::blocked(format!("{e:#}")),
             },
             TaskSource::Linear { .. } => self.linear.execution_project.as_str(),
-            TaskSource::Manual => unreachable!("manual tasks handled above"),
+            TaskSource::Manual => task.execution_project.as_str(),
         };
+        if let Some(ProjectAssignment::Explicit { project }) = &task.project_assignment {
+            return self.route_destination(project, Vec::new(), "explicit repository selection");
+        }
+        if self.routing.mode == RoutingMode::Explicit {
+            return if has_execution_history(task) {
+                self.route_destination(&task.execution_project, Vec::new(), "existing execution binding")
+            } else {
+                RoutingDecision::blocked("explicit repository selection required; use task project or dashboard P")
+            };
+        }
         let mut destinations = BTreeSet::new();
         let mut matched = Vec::new();
         for rule in &self.routing.rules {
@@ -136,9 +183,29 @@ impl Config {
         }
         if let Some(project) = destinations.first() {
             self.route_destination(project, matched, "matching routing rules override source fallback")
+        } else if self.routing.mode == RoutingMode::Automatic {
+            if has_execution_history(task) {
+                return self.route_destination(&task.execution_project, matched, "existing execution binding");
+            }
+            if let Some(ProjectAssignment::Automatic { project, fingerprint }) = &task.project_assignment
+                && crate::analysis::AnalysisInput::new(self, task).is_ok_and(|input| input.fingerprint(self) == *fingerprint)
+            {
+                return self.route_destination(project, matched, "automatic repository selection");
+            }
+            RoutingDecision::blocked(
+                "repository analysis pending or unresolved; use task analyze to retry, task project or dashboard P to choose",
+            )
         } else {
             self.route_destination(fallback, matched, "no routing rules matched; source fallback")
         }
+    }
+
+    /// True only for unmatched automatic routing; conflicts and explicit choices never call a model.
+    pub fn needs_project_analysis(&self, task: &Task) -> bool {
+        self.routing.mode == RoutingMode::Automatic
+            && !has_execution_history(task)
+            && !matches!(task.project_assignment, Some(ProjectAssignment::Explicit { .. }))
+            && self.route(task).reason.starts_with("repository analysis pending")
     }
 
     fn route_destination(&self, project: &str, matched_rules: Vec<String>, origin: &str) -> RoutingDecision {

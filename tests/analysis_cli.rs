@@ -83,7 +83,7 @@ async fn explicit_analysis_is_advisory_persisted_visible_and_detects_stale_conte
         .stdout
         .clone();
     let result: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(result["requires_human_approval"], true);
+    assert_eq!(result["repository_assigned"], false);
     assert_eq!(result["analysis"]["proposal"]["project"], "default");
     assert_eq!(store.get_task(task.id).unwrap().unwrap(), task);
     assert!(store.list_sessions_for_task(task.id).unwrap().is_empty());
@@ -209,6 +209,85 @@ fn saved_model_controls_are_escaped_even_without_color() {
     assert!(!output.contains('\u{7}'));
     assert!(!output.contains('\r'));
     assert!(!output.contains('\u{202e}'));
-    assert!(output.contains("human approval required"));
-    assert!(output.contains("Analysis never grants approval"));
+    assert!(output.contains("source approval still applies"));
+    assert!(output.contains("Source approval and priority still apply"));
+}
+
+#[test]
+fn automatic_assignment_is_atomic_sticky_and_guarded_against_stale_writers() {
+    let (_home, paths, mut cfg, store, mut task) = setup("https://example.test/messages");
+    cfg.routing.mode = powerqueue::routing::RoutingMode::Automatic;
+    cfg.github.enabled = true;
+    cfg.github.repository = "example/issues".into();
+    cfg.projects.insert("infra".into(), Default::default());
+    cfg.projects.get_mut("infra").unwrap().repo.path = "/infra".into();
+    cfg.analysis.projects.insert("infra".into(), "Infrastructure".into());
+    task = store.get_task(task.id).unwrap().unwrap();
+    let mut record = AnalysisRecord {
+        created_at: chrono::Utc::now(),
+        fingerprint: AnalysisInput::new(&cfg, &task).unwrap().fingerprint(&cfg),
+        proposal: Some(Proposal { project: Some("infra".into()), ..proposal() }),
+        attempts: vec![],
+    };
+    store.save_analysis(task.id, &record).unwrap();
+    let writer = rusqlite::Connection::open(paths.database()).unwrap();
+    writer.execute_batch("CREATE TRIGGER reject_assignment BEFORE INSERT ON events WHEN NEW.kind = 'routing.automatic_assigned' BEGIN SELECT RAISE(ABORT, 'test failure'); END;").unwrap();
+    assert!(store.apply_analysis_project(task.id, &cfg).is_err());
+    assert_eq!(store.get_task(task.id).unwrap().unwrap(), task);
+    writer.execute_batch("DROP TRIGGER reject_assignment").unwrap();
+    assert!(store.apply_analysis_project(task.id, &cfg).unwrap());
+    let assigned = store.get_task(task.id).unwrap().unwrap();
+    assert_eq!(assigned.execution_project, "infra");
+    assert_eq!(assigned.github_admission, task.github_admission);
+    assert_eq!(assigned.state, task.state);
+    assert!(!assigned.execution_approved());
+    assert!(cfg.route(&assigned).permitted);
+    store.update_task(&task).unwrap(); // stale rescore cannot undo assignment
+    assert_eq!(store.get_task(task.id).unwrap().unwrap().execution_project, "infra");
+    assert!(!store.record_routing(&task, &task).unwrap());
+    store.set_execution_project(task.id, "infra", "default").unwrap();
+    let explicit = store.get_task(task.id).unwrap().unwrap();
+    assert_eq!(cfg.route(&explicit).project.as_deref(), Some("default"));
+    record.created_at += chrono::Duration::seconds(1);
+    store.save_analysis(task.id, &record).unwrap();
+    assert!(!store.apply_analysis_project(task.id, &cfg).unwrap());
+    store.update_task(&assigned).unwrap();
+    assert_eq!(store.get_task(task.id).unwrap().unwrap().project_assignment, explicit.project_assignment);
+    assert!(store.list_sessions_for_task(task.id).unwrap().is_empty());
+}
+
+#[test]
+fn manual_add_obeys_routing_mode_and_explicit_cli_selection() {
+    let (home, paths, mut cfg, store, _) = setup("https://example.test/messages");
+    cfg.routing.mode = powerqueue::routing::RoutingMode::Automatic;
+    cfg.save(&paths).unwrap();
+    pq(home.path()).args(["add", "Auto", "--key", "AUTO"]).assert().success();
+    let auto = store.get_task_by_key("AUTO").unwrap().unwrap();
+    assert!(auto.execution_project.is_empty());
+    assert!(!auto.execution_approved());
+    pq(home.path()).args(["add", "Manual", "--key", "MANUAL", "--project", "default"]).assert().success();
+    let manual = store.get_task_by_key("MANUAL").unwrap().unwrap();
+    assert!(matches!(manual.project_assignment, Some(powerqueue::routing::ProjectAssignment::Explicit { .. })));
+    cfg.routing.mode = powerqueue::routing::RoutingMode::Explicit;
+    cfg.save(&paths).unwrap();
+    pq(home.path()).args(["add", "Needs a repo"]).assert().failure();
+    pq(home.path()).args(["task", "project", "AUTO", "default"]).assert().success();
+    assert!(cfg.route(&store.get_task(auto.id).unwrap().unwrap()).permitted);
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_routing_fallback_can_run_from_inside_claude_code() {
+    use std::os::unix::fs::PermissionsExt;
+    let (home, paths, mut cfg, _store, task) = setup("https://example.test/messages");
+    let script = home.path().join("fake-claude.sh");
+    let raw = serde_json::json!({"result": serde_json::to_string(&proposal()).unwrap()}).to_string();
+    std::fs::write(&script, format!("#!/bin/sh\ntest -z \"$CLAUDECODE\" || exit 1\ncat >/dev/null\nprintf '%s\\n' '{}'\n", raw))
+        .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    cfg.analysis.llm = None;
+    cfg.analysis.claude_code =
+        Some(powerqueue::analysis::ClaudeCodeConfig { binary: script.display().to_string(), ..Default::default() });
+    cfg.save(&paths).unwrap();
+    pq(home.path()).env("CLAUDECODE", "1").args(["task", "analyze", &task.key]).assert().success();
 }

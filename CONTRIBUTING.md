@@ -141,7 +141,8 @@ concurrent Linear writers, report network requests, or filesystem cleanup.
 `cargo test --test analysis_client --test analysis_cli` uses synthetic issues,
 mock Jev/Messages endpoints and real CLI/SQLite persistence. It checks fallback,
 resource bounds, untrusted-output rejection, stale snapshots and concurrent task
-updates. `cargo test --lib analysis` includes proposal properties and a focused
+updates, automatic assignment and a fake tool-free Claude Code fallback.
+`cargo test --lib analysis` includes proposal properties and a focused
 stateful daemon model with forced denied/admitted launches and late results.
 The model checks that advice never grants source approval, retargets started work
 or reserves resources. These tests measure contracts and authority boundaries,

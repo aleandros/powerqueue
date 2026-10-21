@@ -193,3 +193,96 @@ async fn missing_key_and_timed_out_jev_fall_back_without_retries() {
         assert_eq!(record.attempts.len(), 2);
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_code_fallback_receives_only_data_with_no_tools_and_has_a_deadline() {
+    use std::os::unix::fs::PermissionsExt;
+    if which::which("python3").is_err() {
+        return;
+    }
+    let server = MockServer::start().await;
+    let (mut cfg, task) = fixture(&server);
+    cfg.analysis.llm = None;
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("claude.py");
+    std::fs::write(&script, r#"#!/usr/bin/env python3
+import sys,json,os
+args=sys.argv[1:]
+assert args[args.index('--tools')+1] == ''
+assert args[args.index('--setting-sources')+1] == ''
+assert json.loads(args[args.index('--mcp-config')+1]) == {'mcpServers':{}}
+assert json.loads(args[args.index('--settings')+1])['disableAllHooks']
+assert '--safe-mode' in args
+assert '--no-session-persistence' in args and '--disable-slash-commands' in args
+assert '--max-turns' in args and args[args.index('--max-turns')+1] == '1'
+data=json.load(sys.stdin)
+assert set(data)=={'issue','projects'} and '/private/' not in json.dumps(data)
+print(json.dumps({'result':json.dumps({'project':'default','classification':'bug','confidence':0.92,'reasoning':'Authentication API','plan':['Test API login']}),'usage':{'input_tokens':42}}))
+"#).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    cfg.analysis.claude_code =
+        Some(powerqueue::analysis::ClaudeCodeConfig { binary: script.display().to_string(), ..Default::default() });
+    let input = AnalysisInput::new(&cfg, &task).unwrap();
+    let record = analyze(&cfg, &input, None, None).await.unwrap();
+    assert_eq!(record.attempts.len(), 2); // missing Jev key falls back
+    assert_eq!(record.attempts[1].backend, "claude_code");
+    assert_eq!(record.attempts[1].input_tokens, Some(42));
+    assert_eq!(record.proposal.unwrap().project.as_deref(), Some("default"));
+    std::fs::write(&script, "#!/usr/bin/env python3\nimport time\ntime.sleep(10)\n").unwrap();
+    cfg.analysis.timeout_secs = 1;
+    let record = analyze(&cfg, &input, None, None).await.unwrap();
+    assert!(record.proposal.is_none());
+    assert!(record.attempts[1].error.as_ref().unwrap().contains("timed out"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_wrapper_descendants_end_on_timeout_overflow_and_cancellation() {
+    use std::os::unix::fs::PermissionsExt;
+    if which::which("python3").is_err() {
+        return;
+    }
+    let server = MockServer::start().await;
+    let (mut cfg, task) = fixture(&server);
+    cfg.analysis.llm = None;
+    cfg.analysis.jev_first = false;
+    cfg.analysis.timeout_secs = 1;
+    for mode in ["timeout", "overflow", "cancel"] {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("wrapper.py");
+        let pidfile = dir.path().join("child.pid");
+        let ending =
+            if mode == "overflow" { "sys.stdout.write('x'*131073);sys.stdout.flush();time.sleep(10)" } else { "time.sleep(10)" };
+        std::fs::write(&script, format!("#!/usr/bin/env python3\nimport subprocess,sys,time\nchild=subprocess.Popen([sys.executable,'-c','import time;time.sleep(10)'])\nopen({},'w').write(str(child.pid))\n{}\n", serde_json::to_string(&pidfile).unwrap(), ending)).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        cfg.analysis.claude_code =
+            Some(powerqueue::analysis::ClaudeCodeConfig { binary: script.display().to_string(), ..Default::default() });
+        let input = AnalysisInput::new(&cfg, &task).unwrap();
+        let current = cfg.clone();
+        let handle = tokio::spawn(async move { analyze(&current, &input, None, None).await });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !pidfile.exists() {
+            assert!(std::time::Instant::now() < deadline, "wrapper did not start");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        if mode == "cancel" {
+            handle.abort();
+            assert!(handle.await.unwrap_err().is_cancelled());
+        } else {
+            let record = handle.await.unwrap().unwrap();
+            assert!(record.proposal.is_none());
+            assert!(record.attempts[0].error.as_ref().unwrap().contains(if mode == "timeout" { "timed out" } else { "128 KiB" }));
+        }
+        let pid = std::fs::read_to_string(&pidfile).unwrap();
+        loop {
+            let output = std::process::Command::new("ps").args(["-o", "stat=", "-p", pid.trim()]).output().unwrap();
+            let state = String::from_utf8_lossy(&output.stdout);
+            if state.trim().is_empty() || state.trim().starts_with('Z') {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{mode} left child {pid} running: {state}");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+}

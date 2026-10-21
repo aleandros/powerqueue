@@ -654,10 +654,14 @@ fn check(
         let mut expected = b.clone();
         if eligible {
             expected.execution_project = project.clone();
+            expected.project_assignment = Some(crate::routing::ProjectAssignment::Explicit { project: project.clone() });
+            if b.project_assignment != expected.project_assignment || b.execution_project != *project {
+                expected.routing = None;
+            }
         }
         prop_assert_eq!(a, &expected, "reassignment changed history or bypassed its guard");
         prop_assert_eq!(&before.session, &after.session);
-        prop_assert_eq!(effects.is_empty(), !eligible || &b.execution_project == project);
+        prop_assert_eq!(effects.is_empty(), !eligible || a == b);
     } else {
         prop_assert_eq!(&a.execution_project, &b.execution_project, "execution project changed in a lifecycle transition");
     }
@@ -1580,7 +1584,7 @@ proptest! {
                 1 => {
                     let accepted = rows[idx].state == TaskState::Queued;
                     prop_assert_eq!(store.set_execution_project(rows[idx].id, &rows[idx].execution_project, &target).is_ok(), accepted);
-                    if accepted { expected[idx].execution_project = target; }
+                    if accepted { expected[idx].project_assignment = Some(crate::routing::ProjectAssignment::Explicit { project: target.clone() }); expected[idx].execution_project = target; expected[idx].routing = None; }
                 }
                 _ => {
                     let saved = &snapshots[idx];
@@ -1588,7 +1592,7 @@ proptest! {
                     let mut starting = saved.clone();
                     starting.state = TaskState::Starting;
                     starting.model = Some(ModelTier::sonnet());
-                    let accepted = rows[idx].state == saved.state && rows[idx].execution_project == saved.execution_project;
+                    let accepted = rows[idx].state == saved.state && rows[idx].execution_project == saved.execution_project && rows[idx].project_assignment == saved.project_assignment && rows[idx].routing == saved.routing;
                     prop_assert_eq!(store.claim_task_start(saved, &starting).unwrap(), accepted);
                     if accepted {
                         expected[idx].state = TaskState::Starting;

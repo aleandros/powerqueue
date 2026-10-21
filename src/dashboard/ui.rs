@@ -17,10 +17,11 @@ use crate::domain::{Criticality, ModelTier, Provider, TaskState};
 use super::app::DashboardApp;
 
 /// Footer key legend (Unicode variant; see [`Symbols::keys`]).
-pub const KEYS: &str = "↑↓ select  a attach  p pause  r resume  c cancel  R retry  n new task  t terminal  ? help  q quit";
+pub const KEYS: &str =
+    "↑↓ select  a attach  p pause  P project  r resume  c cancel  R retry  n new task  t terminal  ? help  q quit";
 /// Footer key legend in plain ASCII.
 pub const KEYS_ASCII: &str =
-    "up/down select  a attach  p pause  r resume  c cancel  R retry  n new task  t terminal  ? help  q quit";
+    "up/down select  a attach  p pause  P project  r resume  c cancel  R retry  n new task  t terminal  ? help  q quit";
 
 /// `+-|` borders for terminals without box-drawing glyphs.
 pub const ASCII_BORDER: border::Set = border::Set {
@@ -232,6 +233,9 @@ pub fn draw(frame: &mut Frame, app: &DashboardApp) {
     draw_footer(frame, app, chunks[2], &sym);
     if let Some(input) = &app.add_input {
         draw_add_modal(frame, input, area, &sym);
+    }
+    if let Some(picker) = &app.project_picker {
+        draw_project_picker(frame, picker, area, &sym);
     }
     if app.show_help {
         draw_help(frame, area, &sym);
@@ -555,12 +559,38 @@ fn draw_add_modal(frame: &mut Frame, input: &str, area: Rect, sym: &Symbols) {
     frame.render_widget(text, inner);
 }
 
+fn draw_project_picker(frame: &mut Frame, picker: &super::app::ProjectPicker, area: Rect, sym: &Symbols) {
+    let rect = centered(area, 64, (picker.projects.len() as u16 + 4).min(20));
+    frame.render_widget(Clear, rect);
+    let block = sym.panel(" repository (enter to select, esc to cancel) ".into());
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let height = inner.height.saturating_sub(1) as usize;
+    let start = picker.selected.saturating_sub(height.saturating_sub(1));
+    let lines: Vec<Line> = picker
+        .projects
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(height)
+        .map(|(i, project)| {
+            if i == picker.selected {
+                Line::styled(format!("> {project}"), Style::default().fg(Color::Yellow))
+            } else {
+                Line::raw(format!("  {project}"))
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_help(frame: &mut Frame, area: Rect, sym: &Symbols) {
     let lines = [
         "WTOK: cumulative weighted tokens, not context or quota %".to_string(),
         format!("{} k/j  move selection      g/G  first/last", sym.arrows),
         "a/enter    attach to the task's tmux window".to_string(),
         "p / r      pause / resume      c    cancel".to_string(),
+        "P          choose repository for an unstarted task".to_string(),
         "R          retry (re-queue)    n    new manual task".to_string(),
         "t          show/hide finished  u    refresh now".to_string(),
         "?          this help           q    quit".to_string(),

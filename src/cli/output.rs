@@ -19,7 +19,7 @@ pub fn color_enabled() -> bool {
     COLOR.load(Ordering::Relaxed)
 }
 
-/// Display advisory analysis as inert text; proposed work always needs human approval.
+/// Display analysis as inert text; source approval remains independent.
 pub fn print_analysis(key: &str, status: &str, record: &crate::analysis::AnalysisRecord) {
     println!("{}: {}", analysis_text(key), analysis_text(status));
     if let Some(proposal) = &record.proposal {
@@ -41,7 +41,7 @@ pub fn print_analysis(key: &str, status: &str, record: &crate::analysis::Analysi
         );
     }
     println!(
-        "Review work and destination, then use task project for unstarted work and the source's approval workflow. Analysis never grants approval or changes priority."
+        "Choose or override an unstarted task's repository with task project or dashboard P. Source approval and priority still apply."
     );
 }
 

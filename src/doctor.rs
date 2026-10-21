@@ -2402,7 +2402,15 @@ pub async fn run_all(
     results.push(check_launch_failures(store));
     let analysis_cfg = Config::load_or_default(paths).unwrap_or_else(|_| cfg.clone());
     let mut analysis_problems = analysis_cfg.analysis_problems();
+    if let Some(claude) = &analysis_cfg.analysis.claude_code
+        && crate::session::which_program(&claude.binary).is_none()
+    {
+        analysis_problems.push("Claude Code analysis binary not found; install it and sign in, or configure analysis.llm".into());
+    }
     for task in store.list_open_tasks()? {
+        if analysis_cfg.needs_project_analysis(&task) {
+            analysis_problems.push(format!("{}: repository unresolved; choose with task project or dashboard P", task.key));
+        }
         match store.kv_get::<crate::analysis::AnalysisRecord>(&crate::analysis::record_key(task.id)) {
             Ok(Some(record))
                 if record.stale(&analysis_cfg, &task) || record.proposal.as_ref().and_then(|p| p.project.as_ref()).is_none() =>

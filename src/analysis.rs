@@ -1,4 +1,4 @@
-//! Optional, advisory issue analysis. Recommendations never mutate task authority.
+//! Optional issue analysis and input-bound repository selection; source approval stays separate.
 
 pub mod client;
 
@@ -22,11 +22,33 @@ pub struct AnalysisConfig {
     pub timeout_secs: u64,
     pub projects: BTreeMap<String, String>,
     pub llm: Option<TextModelConfig>,
+    pub claude_code: Option<ClaudeCodeConfig>,
 }
 
 impl Default for AnalysisConfig {
     fn default() -> Self {
-        Self { enabled: false, jev_first: true, min_confidence: 0.8, timeout_secs: 20, projects: BTreeMap::new(), llm: None }
+        Self {
+            enabled: false,
+            jev_first: true,
+            min_confidence: 0.8,
+            timeout_secs: 20,
+            projects: BTreeMap::new(),
+            llm: None,
+            claude_code: None,
+        }
+    }
+}
+
+/// Bounded, tool-free Claude Code fallback using the server's existing login.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClaudeCodeConfig {
+    pub binary: String,
+    pub model: String,
+}
+impl Default for ClaudeCodeConfig {
+    fn default() -> Self {
+        Self { binary: "claude".into(), model: "sonnet".into() }
     }
 }
 
@@ -67,14 +89,24 @@ impl Config {
                 problems.push(format!("analysis.projects.{id} needs a description of 1–2000 bytes"));
             }
         }
-        if cfg.enabled && !cfg.jev_first && cfg.llm.is_none() {
-            problems.push("analysis needs jev_first or an analysis.llm endpoint".into());
+        if cfg.enabled && !cfg.jev_first && cfg.llm.is_none() && cfg.claude_code.is_none() {
+            problems.push("analysis needs jev_first, analysis.claude_code or an analysis.llm endpoint".into());
         }
         if cfg.enabled
             && cfg.jev_first
             && (!valid_endpoint(&self.priority.jev.endpoint) || self.priority.jev.model.trim().is_empty())
         {
             problems.push("analysis requires a valid priority.jev endpoint and nonempty model".into());
+        }
+        if let Some(claude) = &cfg.claude_code {
+            if cfg.llm.is_some() {
+                problems.push("choose only one fallback: analysis.claude_code or analysis.llm".into());
+            }
+            if claude.model.trim().is_empty()
+                || crate::session::BinaryTemplate::parse(&claude.binary).map_or(true, |command| command.is_per_task())
+            {
+                problems.push("analysis.claude_code needs a nonempty model and host binary without task placeholders".into());
+            }
         }
         if let Some(llm) = &cfg.llm {
             if !valid_endpoint(&llm.endpoint) {
@@ -134,7 +166,7 @@ impl AnalysisInput {
     pub fn fingerprint(&self, cfg: &Config) -> String {
         let value = serde_json::json!({
             "input": self, "analysis": cfg.analysis, "jev": cfg.priority.jev,
-            "registry": cfg.projects, "default_repo": cfg.repo,
+            "registry": cfg.projects, "default_repo": cfg.repo.path, "routing": cfg.routing,
         });
         format!("{:x}", Sha256::digest(value.to_string().as_bytes()))
     }
@@ -226,12 +258,17 @@ impl AnalysisRecord {
         } else if self.proposal.as_ref().and_then(|p| p.project.as_ref()).is_none() {
             "unresolved — human resolution required"
         } else {
-            "recommendation — human approval required"
+            if matches!(&task.project_assignment, Some(crate::routing::ProjectAssignment::Automatic { fingerprint, .. }) if *fingerprint == self.fingerprint)
+            {
+                "repository assigned — source approval still applies"
+            } else {
+                "recommendation — source approval still applies"
+            }
         }
     }
 }
 
-/// Per-task advisory metadata key; never consulted by launch admission.
+/// Per-task analysis metadata key; assignment validates this record transactionally.
 pub fn record_key(id: TaskId) -> String {
     format!("analysis.{id}")
 }
@@ -270,6 +307,21 @@ mod properties {
             task.description.push_str(&edit);
             prop_assert!(record.stale(&cfg, &task));
         }
+    }
+
+    #[test]
+    fn legacy_repo_overrides_do_not_invalidate_machine_analysis() {
+        let mut cfg = Config::default();
+        cfg.repo.path = "/repo".into();
+        cfg.analysis.projects.insert("default".into(), "Application".into());
+        let task = Task::new("A", "title", crate::domain::TaskSource::Manual);
+        let input = AnalysisInput::new(&cfg, &task).unwrap();
+        let fingerprint = input.fingerprint(&cfg);
+        cfg.repo.setup.push("npm ci".into());
+        cfg.repo.default_branch = Some("main".into());
+        assert_eq!(input.fingerprint(&cfg), fingerprint, "CLI and daemon must agree despite repo-local setup overrides");
+        cfg.repo.path = "/other/repo".into();
+        assert_ne!(input.fingerprint(&cfg), fingerprint);
     }
 
     #[test]

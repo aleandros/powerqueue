@@ -28,7 +28,7 @@ use anyhow::{Context as _, Result};
 use chrono::Utc;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
-use crate::cli::commands::add::{NewTask, create_task};
+use crate::cli::commands::add::{NewTask, create_task_in_config};
 use crate::cli::commands::task::apply_offline;
 use crate::config::Config;
 use crate::domain::DaemonCommand;
@@ -139,7 +139,6 @@ enum Flow {
 /// Run the dashboard until the user quits. Fails when the terminal cannot be
 /// put into raw mode; call [`TerminalEnv::check`] first for a friendlier message.
 pub fn run(cfg: &Config, paths: &Paths, store: &Store, options: Options) -> Result<()> {
-    let _ = paths;
     let mut app = DashboardApp::new(Snapshot::load(store, cfg, Utc::now())?);
     app.ascii = options.ascii;
     app.project_filter = options.project;
@@ -155,7 +154,7 @@ pub fn run(cfg: &Config, paths: &Paths, store: &Store, options: Options) -> Resu
     // whatever the terminal showed before (shell history, a tmux pane that
     // ignores the alternate screen) would stay visible behind the dashboard.
     // Clearing forces a full redraw of the very first frame.
-    let result = terminal.clear().context("clear terminal").and_then(|()| event_loop(&mut terminal, &mut app, cfg, store));
+    let result = terminal.clear().context("clear terminal").and_then(|()| event_loop(&mut terminal, &mut app, cfg, paths, store));
     restore_and_clear_terminal();
     let _ = std::panic::take_hook();
     result
@@ -211,7 +210,13 @@ pub fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
     out
 }
 
-fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut DashboardApp, cfg: &Config, store: &Store) -> Result<()> {
+fn event_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut DashboardApp,
+    cfg: &Config,
+    paths: &Paths,
+    store: &Store,
+) -> Result<()> {
     let mut last_refresh = Instant::now();
     loop {
         terminal.draw(|f| ui::draw(f, app))?;
@@ -219,7 +224,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut DashboardApp, c
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if let Some(action) = app.handle_key(key) {
-                        match apply(action, app, cfg, store, terminal)? {
+                        match apply(action, app, cfg, paths, store, terminal)? {
                             Flow::Quit => return Ok(()),
                             Flow::Continue => last_refresh = Instant::now() - REFRESH_EVERY,
                         }
@@ -308,6 +313,7 @@ fn apply(
     action: Action,
     app: &mut DashboardApp,
     cfg: &Config,
+    paths: &Paths,
     store: &Store,
     terminal: &mut ratatui::DefaultTerminal,
 ) -> Result<Flow> {
@@ -325,15 +331,60 @@ fn apply(
             Some(s) => attach(app, cfg, terminal, &s),
         },
         Action::Refresh | Action::ToggleTerminal | Action::Help | Action::OpenAdd => {}
-        Action::AddTask(title) => {
-            let project = app.project_filter.as_deref().unwrap_or("default");
-            if !cfg.project_ids().contains(project) {
-                app.status_line = Some("select a registered project with dashboard --project ID before adding tasks".into());
-            } else {
-                match create_task(store, &NewTask { title, execution_project: Some(project.into()), ..Default::default() }) {
-                    Ok(t) => app.status_line = Some(format!("added {} ({}) to {}", t.key, t.id.short(), project)),
-                    Err(e) => app.status_line = Some(format!("add failed: {e:#}")),
+        Action::OpenProject(id) => {
+            if let Some(mut task) = store.get_task(id)? {
+                let project = task.execution_project.clone();
+                match crate::scheduler::commands::on_set_project(&mut task, &project, store.latest_session(id)?.is_some()) {
+                    Ok(_) => {
+                        let projects: Vec<_> = cfg.project_ids().into_iter().collect();
+                        let selected = projects.iter().position(|p| *p == project).unwrap_or(0);
+                        app.project_picker = Some(app::ProjectPicker { task_id: id, projects, selected });
+                    }
+                    Err(e) => app.status_line = Some(e.to_string()),
                 }
+            }
+        }
+        Action::SetProject(id, project) => {
+            let result = (|| -> Result<()> {
+                Config::load(paths)?.for_project(&project, paths)?;
+                let mut task = store.get_task(id)?.ok_or_else(|| anyhow::anyhow!("task no longer exists"))?;
+                let from = task.execution_project.clone();
+                let effects =
+                    crate::scheduler::commands::on_set_project(&mut task, &project, store.latest_session(id)?.is_some())?;
+                if app.snapshot.daemon_alive {
+                    store.enqueue_command(&DaemonCommand::SetProject { task_id: id, project: project.clone() })?;
+                    app.status_line = Some(format!("repository change to {project} queued for {}", task.key));
+                } else {
+                    store.set_execution_project(id, &from, &project)?;
+                    for effect in effects {
+                        if let crate::scheduler::transitions::Effect::Log { level, kind, message, data } = effect {
+                            store.log_event(Some(id), None, level, &kind, &message, data)?;
+                        }
+                    }
+                    app.status_line = Some(format!("{} repository: {project}", task.key));
+                }
+                Ok(())
+            })();
+            if let Err(e) = result {
+                app.status_line = Some(format!("repository change failed: {e:#}"));
+            }
+        }
+        Action::AddTask(title) => {
+            let project = app.project_filter.clone().unwrap_or_else(|| {
+                if cfg.routing.mode == crate::routing::RoutingMode::Deterministic { "default".into() } else { String::new() }
+            });
+            match create_task_in_config(store, &NewTask { title, execution_project: Some(project), ..Default::default() }, cfg) {
+                Ok(t) => {
+                    app.status_line = Some(format!("added {} ({})", t.key, t.id.short()));
+                    if cfg.routing.mode == crate::routing::RoutingMode::Explicit && t.execution_project.is_empty() {
+                        app.project_picker = Some(app::ProjectPicker {
+                            task_id: t.id,
+                            projects: cfg.project_ids().into_iter().collect(),
+                            selected: 0,
+                        });
+                    }
+                }
+                Err(e) => app.status_line = Some(format!("add failed: {e:#}")),
             }
         }
     }

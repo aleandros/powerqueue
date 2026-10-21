@@ -164,6 +164,7 @@ struct RuntimeState {
     setups: HashMap<TaskId, PendingSetup>,
     setup_launches: Vec<Candidate>,
     draining_setups: bool,
+    analysis: Option<(TaskId, tokio::task::JoinHandle<Result<crate::analysis::AnalysisRecord>>)>,
     rules: PriorityRules,
     rules_loaded: bool,
     rules_ready: bool,
@@ -301,6 +302,7 @@ impl Daemon {
             setups: HashMap::new(),
             setup_launches: Vec::new(),
             draining_setups: false,
+            analysis: None,
             rules: PriorityRules::default(),
             rules_loaded: false,
             rules_ready: false,
@@ -404,6 +406,9 @@ impl Daemon {
         }
 
         let result = self.main_loop(once, &notify).await;
+        if let Some((_, handle)) = self.rt.analysis.take() {
+            handle.abort();
+        }
         self.log(None, None, EventLevel::Info, "daemon.stopped", "daemon stopped", serde_json::json!({ "pid": pid }));
         let _ = std::fs::remove_file(self.paths.daemon_pid());
         tracing::info!("daemon stopped");
@@ -421,7 +426,7 @@ impl Daemon {
                 return Ok(());
             }
             if once {
-                if self.rt.setups.is_empty() {
+                if self.rt.setups.is_empty() && self.rt.analysis.is_none() {
                     return Ok(());
                 }
                 // Complete the admission pass without abandoning background
@@ -438,6 +443,72 @@ impl Daemon {
                 return Ok(());
             }
         }
+    }
+
+    /// Reap at most one bounded model request without blocking scheduling ticks.
+    async fn poll_project_analysis(&mut self) -> Result<()> {
+        use crate::analysis::{AnalysisInput, AnalysisRecord, record_key};
+        if self.rt.analysis.as_ref().is_some_and(|(_, handle)| handle.is_finished()) {
+            let (id, handle) = self.rt.analysis.take().expect("finished analysis exists");
+            let record = handle.await.context("join repository analysis worker")??;
+            if self.store.save_analysis(id, &record)? {
+                self.store.apply_analysis_project(id, &self.cfg)?;
+            }
+        }
+        if self.offline || self.rt.analysis.is_some() || self.rt.draining_setups {
+            return Ok(());
+        }
+        for task in self.store.list_open_tasks()? {
+            if !self.cfg.needs_project_analysis(&task) || self.store.latest_session(task.id)?.is_some() {
+                continue;
+            }
+            if let Some(record) = self.store.kv_get::<AnalysisRecord>(&record_key(task.id))?
+                && !record.stale(&self.cfg, &task)
+            {
+                self.store.apply_analysis_project(task.id, &self.cfg)?;
+                continue;
+            }
+            let input = match AnalysisInput::new(&self.cfg, &task) {
+                Ok(input) => input,
+                Err(error) => {
+                    let key = format!("analysis.rejected.{}", task.id);
+                    let message = error.to_string();
+                    if self.store.kv_get::<String>(&key)?.as_ref() != Some(&message) {
+                        self.store.kv_set(&key, &message)?;
+                        self.log(Some(task.id), None, EventLevel::Warn, "analysis.rejected", &message, serde_json::json!({}));
+                    }
+                    continue;
+                }
+            };
+            let cfg = self.cfg.clone();
+            let jev_key = if cfg.analysis.jev_first { self.secrets.get(SecretKind::JevApiKey)? } else { None };
+            let llm_key = if cfg.analysis.llm.is_some() { self.secrets.get(SecretKind::AnalysisApiKey)? } else { None };
+            // Persist before dispatch: a restart cannot repeatedly spend on the same input.
+            // An interrupted attempt is retried explicitly with `task analyze`.
+            self.store.save_analysis(
+                task.id,
+                &AnalysisRecord {
+                    created_at: Utc::now(),
+                    fingerprint: input.fingerprint(&cfg),
+                    proposal: None,
+                    attempts: vec![crate::analysis::AnalysisAttempt {
+                        backend: "pending".into(),
+                        model: String::new(),
+                        input_tokens: None,
+                        output_tokens: None,
+                        error: Some("analysis pending; if interrupted, retry with task analyze".into()),
+                    }],
+                },
+            )?;
+            self.rt.analysis = Some((
+                task.id,
+                tokio::spawn(async move {
+                    crate::analysis::client::analyze(&cfg, &input, jev_key.as_deref(), llm_key.as_deref()).await
+                }),
+            ));
+            break;
+        }
+        Ok(())
     }
 
     /// One scheduling pass. Each phase is isolated: its error is logged as a
@@ -467,6 +538,8 @@ impl Daemon {
         let r = self.poll_github(now).await;
         self.report_phase("github", r);
         self.rt.force_sync = false;
+        let r = self.poll_project_analysis().await;
+        self.report_phase("repository analysis", r);
         let r = self.refresh_rules(now).await;
         self.report_phase("rules", r);
         // Inbox before hooks: a shim-delivered hook becomes a hook row that
@@ -4072,6 +4145,67 @@ mod tests {
         cfg.github.repository = "acme/app".into();
         cfg.github.endpoint = endpoint.into();
         Daemon::new(cfg, paths, Store::open_in_memory().unwrap(), secrets).unwrap()
+    }
+
+    #[tokio::test]
+    async fn automatic_analysis_is_nonblocking_cached_and_manual_selection_wins() {
+        use crate::analysis::{AnalysisInput, AnalysisRecord, Classification, Proposal};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        let store = Store::open_in_memory().unwrap();
+        let secrets = Secrets::with_backend(Box::new(crate::secrets::FileBackend::new(paths.secrets_file())));
+        let mut cfg = Config::default();
+        cfg.repo.path = dir.path().display().to_string();
+        cfg.analysis.enabled = true;
+        cfg.analysis.projects.insert("default".into(), "Application".into());
+        cfg.routing.mode = crate::routing::RoutingMode::Automatic;
+        let mut task = Task::new("AUTO", "Choose repository", TaskSource::Manual);
+        task.execution_project.clear();
+        store.insert_task(&task).unwrap();
+        let mut daemon = Daemon::new(cfg.clone(), paths, store.clone(), secrets).unwrap();
+        let input = AnalysisInput::new(&cfg, &task).unwrap();
+        let record = AnalysisRecord {
+            created_at: Utc::now(),
+            fingerprint: input.fingerprint(&cfg),
+            proposal: Some(Proposal {
+                project: Some("default".into()),
+                classification: Classification::Feature,
+                confidence: 0.9,
+                reasoning: "Application".into(),
+                plan: vec!["Test it".into()],
+            }),
+            attempts: vec![],
+        };
+        let (send, receive) = tokio::sync::oneshot::channel();
+        daemon.rt.analysis = Some((task.id, tokio::spawn(async move { receive.await.context("test channel") })));
+        tokio::time::timeout(std::time::Duration::from_millis(100), daemon.poll_project_analysis()).await.unwrap().unwrap();
+        assert!(daemon.rt.analysis.is_some());
+        store.set_execution_project(task.id, "", "default").unwrap();
+        send.send(record).unwrap();
+        while !daemon.rt.analysis.as_ref().unwrap().1.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        daemon.poll_project_analysis().await.unwrap();
+        let task = store.get_task(task.id).unwrap().unwrap();
+        assert!(matches!(task.project_assignment, Some(crate::routing::ProjectAssignment::Explicit { .. })));
+        assert!(daemon.rt.analysis.is_none());
+        // A current unresolved record survives restart without another call.
+        let mut unresolved = Task::new("WAIT", "Unknown ownership", TaskSource::Manual);
+        unresolved.execution_project.clear();
+        store.insert_task(&unresolved).unwrap();
+        store
+            .save_analysis(
+                unresolved.id,
+                &AnalysisRecord {
+                    created_at: Utc::now(),
+                    fingerprint: AnalysisInput::new(&cfg, &unresolved).unwrap().fingerprint(&cfg),
+                    proposal: None,
+                    attempts: vec![],
+                },
+            )
+            .unwrap();
+        daemon.poll_project_analysis().await.unwrap();
+        assert!(daemon.rt.analysis.is_none());
     }
 
     #[tokio::test]

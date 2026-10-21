@@ -1,4 +1,4 @@
-//! Explicit, optional analysis. Human routing and source approval remain separate commands.
+//! Explicit analysis and retry; automatic mode may assign a repository, never source approval.
 
 use anyhow::{Result, bail};
 
@@ -7,7 +7,7 @@ use crate::cli::{Context, TaskRef, output};
 use crate::secrets::SecretKind;
 
 /// Analyze one existing task or display saved advice. Fails on invalid config or persistence.
-/// Returns 3 for unresolved/stale results; no task row or source system is mutated.
+/// Returns 3 for unresolved/stale results. Automatic mode may update unstarted repository assignment.
 pub fn run(ctx: &mut Context, task_ref: &TaskRef, show: bool) -> Result<i32> {
     let cfg = crate::config::Config::load(&ctx.paths)?;
     let store = ctx.store()?.clone();
@@ -31,8 +31,9 @@ pub fn run(ctx: &mut Context, task_ref: &TaskRef, show: bool) -> Result<i32> {
         record
     };
     // Reload after network I/O: source sync or a concurrent command may have changed the task.
-    let current = super::task::find_task(&store, &task.id.to_string())?;
     let current_cfg = crate::config::Config::load(&ctx.paths)?;
+    let assigned = !show && store.apply_analysis_project(task.id, &current_cfg)?;
+    let current = super::task::find_task(&store, &task.id.to_string())?;
     let stale = record.stale(&current_cfg, &current);
     let status = record.status(&current_cfg, &current);
     let resolved = !stale && record.proposal.as_ref().and_then(|p| p.project.as_ref()).is_some();
@@ -41,7 +42,7 @@ pub fn run(ctx: &mut Context, task_ref: &TaskRef, show: bool) -> Result<i32> {
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "task": current.key, "status": status, "stale": stale,
-                "requires_human_approval": true, "analysis": record,
+                "repository_assigned": assigned, "execution_project": current.execution_project, "analysis": record,
             }))?
         );
     } else {

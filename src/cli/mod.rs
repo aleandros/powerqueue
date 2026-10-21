@@ -229,9 +229,9 @@ pub struct StatusArgs {
 
 #[derive(Debug, Args)]
 pub struct AddArgs {
-    /// Execution project ID (independent of a Linear project).
-    #[arg(long, default_value = "default")]
-    pub project: String,
+    /// Explicit execution project; otherwise follow routing.mode (default: default project).
+    #[arg(long)]
+    pub project: Option<String>,
     /// Task title.
     pub title: String,
     /// Longer description (markdown). `-` reads stdin.
@@ -257,7 +257,7 @@ pub struct AddArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum TaskCommand {
-    /// Request advisory issue analysis; never approves, routes or starts work.
+    /// Analyze repository ownership; automatic mode may assign unstarted work.
     Analyze {
         #[command(flatten)]
         task: TaskRef,

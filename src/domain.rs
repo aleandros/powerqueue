@@ -644,6 +644,9 @@ pub struct Task {
     /// Stable execution project ID, independent of source/Linear project metadata.
     #[serde(default = "default_execution_project")]
     pub execution_project: String,
+    /// Human override or input-bound automatic repository selection.
+    #[serde(default)]
+    pub project_assignment: Option<crate::routing::ProjectAssignment>,
     /// Canonical checkout pinned before the first repository operation.
     #[serde(default)]
     pub execution_repo: Option<String>,
@@ -728,6 +731,7 @@ impl Task {
             source,
             github_admission: None,
             routing: None,
+            project_assignment: None,
             execution_project: default_execution_project(),
             execution_repo: None,
             execution: None,

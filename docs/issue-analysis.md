@@ -1,129 +1,140 @@
-# Advisory issue analysis (prototype)
+# Repository selection with Jev and Claude
 
-`powerqueue task analyze <task>` optionally classifies an existing issue, recommends
-one described execution project and proposes preliminary next steps. It is an
-explicit CLI operation, disabled by default. It does not run inside the daemon's
-launch pass and does not invoke a coding session.
+Describe each registered execution project once. With `routing.mode = "automatic"`,
+powerqueue chooses a repository for new, unmatched tasks using Jev. A confident
+choice is applied automatically; uncertain results fall back once to Claude Code
+or a configured text API. If that result is also uncertain, the task stays held
+until you choose. Source approval, pause/deferral settings and budget policy still
+control whether and when implementation starts.
 
-## Four separate decisions
+## Application and infrastructure example
 
-1. **Analysis:** a model suggests a category, destination and plan. The saved
-   result is advice, even when confidence is high.
-2. **Approval:** a human decides whether the proposed work should happen. GitHub
-   still requires its configured labels and trusted approvers. Analysis never
-   adds `agent:ready`, posts source comments, or changes admission.
-3. **Routing:** a human checks the destination against the registry, then uses
-   `task project <task> <id>` for unstarted work and updates deterministic source
-   routing if needed. Existing routing must agree. Started work cannot move.
-4. **Prioritization:** priority rules and budget policy still determine when and
-   with which model approved work runs. Analysis categories/confidence do not
-   change scores, model preferences or resource reservations.
+```toml
+[projects.app.repo]
+path = "/srv/application"
+[projects.infra.repo]
+path = "/srv/infrastructure"
 
-Keep work paused or unapproved while reviewing it. Analysis does not pause an
-already runnable task; a concurrent daemon can still start previously approved
-work. For issues not admitted into the queue, an initial prototype workflow is
-`powerqueue add 'Issue title' --description - --paused`, then analyze that manual
-task. It does not import arbitrary remote issues or bypass intake filters. Existing
-Linear/GitHub tasks retain their original source association throughout analysis.
+[routing]
+mode = "automatic"              # default: deterministic; alternative: explicit
 
-## Configuration and review
+[analysis]
+enabled = true
+min_confidence = 0.8
+jev_first = true
+timeout_secs = 20
 
-Configure registered project IDs and trusted descriptions in the machine
-`config.toml`; see [configuration](configuration.md#analysis). Descriptions should
-explain ownership and exclusions, not contain secrets. Only described projects
-are candidates; registration alone does not make a project eligible for advice.
+[analysis.projects]
+app = "Product application: screens, API behavior, authentication and business logic. Excludes provisioning and deployment infrastructure."
+infra = "Infrastructure: Terraform, networks, servers, Kubernetes and deployment pipelines. Excludes application features and business logic."
 
-```sh
-powerqueue secrets set jev
-# Optional text fallback: a separate Anthropic Messages-compatible API key.
-powerqueue secrets set analysis
-powerqueue task analyze GH-123
-powerqueue task analyze GH-123 --show
-powerqueue --json task show GH-123
+[analysis.claude_code]
+binary = "claude"
+model = "sonnet"
 ```
 
-There are no default text-model credentials or model selection. Supply
-`analysis.llm.model` and its API key explicitly. The text fallback uses the
-[Anthropic Messages request format](https://platform.claude.com/docs/en/api/messages/create).
-The key is stored through the existing keychain/0600-file mechanism, with
-`POWERQUEUE_ANALYSIS_API_KEY` taking precedence. This is separate from Claude Code
-subscription authentication and implementation-provider settings.
+Set the Jev key with `powerqueue secrets set jev`, sign in to Claude Code on the
+server, and reload/restart powerqueue. Keep the normal Linear/GitHub intake and
+approval configuration. Descriptions reference registered IDs, never paths supplied
+by an issue. Only described projects are eligible for model selection.
 
-The command returns 0 for a current destination recommendation, 3 for unresolved
-or stale advice, and the ordinary error exit for configuration/storage failures.
-Exit 0 **does not approve execution**. `--show` performs no model requests and can
-inspect results after analysis is disabled. `task show` includes the saved result
-and its current status; `analysis.recorded` is an atomic audit event. `doctor`
-reports invalid configuration and unresolved/stale advice on open tasks; `--fix`
-does not approve, reroute, or call models.
+“Fix the login form” can go to `app`, while “Change the Terraform network” can go
+to `infra`. “Improve login reliability” may need the Claude fallback or your choice.
+The threshold is a model-confidence gate, not a measured guarantee of 80% accuracy.
 
-## Jev first, text fallback
+## Choose or correct a repository
 
-Jev's [Choice primitive](https://docs.typesafe.ai/primitives/choice) selects named
-options, unlike the ordered Score primitive used for priority. One request asks
-for destination and classification. Destinations have an explicit unresolved
-option. We require a complete probability distribution, confidence and selected
-probability at least `min_confidence`, plus a 0.15 lead over the next option.
-Unknown or malformed destinations are rejected.
+```sh
+powerqueue add 'Fix the login form'               # automatic selection
+powerqueue add 'Update the network' --project infra # explicit selection
+powerqueue task project TASK-123 app              # override before execution
+powerqueue task analyze TASK-123                  # retry now
+powerqueue task analyze TASK-123 --show            # inspect saved evidence
+```
 
-A confident Jev answer skips the text model. Jev does not generate a prose
-explanation or implementation plan: the saved reasoning describes its statistical
-evidence and the plan is explicitly a generic template requiring code inspection.
-It is not presented as a code-specific investigation.
+In the dashboard, select an unstarted task and press **P** (uppercase). Choose a
+repository with arrows or `j`/`k`, then Enter; Escape cancels. Lowercase `p` still
+pauses. The picker stays attached to the selected task during refreshes and checks
+eligibility again when applied. Active or previously executed tasks cannot move;
+create a new task for another repository.
 
-Missing keys, transport/API errors, malformed answers and ambiguous choices fall
-back once to `analysis.llm`, if configured. That model receives issue text and
-project descriptions and returns strict JSON with category, confidence, reasoning,
-plan and a registered project or null. Unsupported destinations, extra fields,
-low confidence, truncated output and tool-call responses remain unresolved.
-If no fallback is configured/available, a human resolves the task. There is no
-retry loop or daemon-side automatic rerun. Failed fallback attempts do not turn
-uncertain Jev advice into a destination.
+An explicit selection is sticky and wins over model results and routing rules,
+including a model request already in progress. It does not grant source approval.
+To require human selection for every new task, set `routing.mode = "explicit"`.
+CLI `add` then requires `--project`; dashboard creation opens the picker. Cancelling
+leaves the task held. Source intake also stays held until explicitly assigned.
 
-## Authority, resources and cost
+The default `deterministic` mode preserves source fallback/rule routing and keeps
+`task analyze` advisory. In `automatic` mode explicit selections win first, then
+matching deterministic rules. Conflicting rules hold work rather than call a model.
+Only unmatched work uses descriptions instead of the source fallback. Existing
+execution bindings stay fixed across retries and reviews.
 
-The analysis service sees the issue title, description, labels, source identity
-and source-project metadata, plus trusted descriptions. It gets no checkout
-contents/paths, implementation prompt, process environment, shell, MCP tools or
-source credentials. Issue text is JSON-encoded as data separate from instructions.
-No output is executed or applied to source labels/configuration. Prompt injection
-can still degrade advice; a human must verify the proposed work and destination.
+## Evidence and fallback
 
-Each invocation makes at most two HTTP requests, sequentially: one Jev request
-and one fallback. Each has a 20-second default deadline (1–60 configurable), no
-redirects or retries, a 64 KiB total input cap and a 128 KiB response cap. Oversized
-input is rejected rather than silently truncating ownership clues. The fallback
-has a 1,024-token output limit by default (128–4,096 configurable). These bounds
-limit per-invocation spend, not an account-wide monetary budget or concurrent CLI
-process count. No repository CPU/worktree/tmux slots are reserved.
+Jev's [Choice primitive](https://docs.typesafe.ai/primitives/choice) selects a
+project and category, with an explicit unresolved option. A choice needs confidence
+and selected probability at least `min_confidence`, plus a 0.15 lead over the next
+option. It provides statistical evidence and a generic inspection plan, not a
+code-specific explanation.
 
-Analysis API billing is independent of subscription pacing. Available input/output
-token usage is saved for every response, including rejected proposals; failed or
-timed-out calls may incur provider charges with unknown usage. No dollar estimate
-is inferred from changing provider prices. Operators control frequency and API
-spend limits at their provider. Do not invoke analysis repeatedly as a polling loop.
+An uncertain choice, unavailable key or malformed response falls back once. Claude
+receives task text, labels, source metadata and trusted project descriptions. It
+returns strict JSON with destination, category, confidence, reasoning and a
+preliminary plan. Unsupported destinations, unknown fields, low confidence,
+malformed responses and timeouts remain unresolved. No code is inspected.
 
-Saved results include an input/configuration fingerprint. Source edits, changed
-project descriptions, model settings and registry changes make old advice stale;
-rerun explicitly. Concurrent task updates are never overwritten. A later-started
-analysis result cannot be replaced by an older request finishing late. Advice
-records survive restarts, independently of task/session state.
+`analysis.claude_code` uses the server's Claude Code login and its configured model.
+The request runs in a temporary directory with tools, MCP servers, hooks, slash
+commands, user/project settings and session persistence disabled. The CLI flags
+are documented in the [Claude Code reference](https://code.claude.com/docs/en/cli-reference).
+A missing or incompatible installation leaves diagnostic evidence and holds work.
+The binary accepts a command template without per-task placeholders.
 
-## Validation and limits
+Alternatively, omit `analysis.claude_code` and configure `analysis.llm` with an
+Anthropic Messages-compatible endpoint/model and `powerqueue secrets set analysis`
+(or `POWERQUEUE_ANALYSIS_API_KEY`). Configure only one fallback. API authentication
+and billing are separate from Claude Code's login. Neither fallback is enabled
+unless configured.
 
-Synthetic fixtures cover an API defect, API/UI ambiguity, insufficient detail,
-misleading instructions, unsupported destinations, malformed probabilities and
-JSON, unknown fields, tool attempts, missing credentials, HTTP failures, redirects,
-response limits and timeouts. CLI tests exercise real SQLite, atomic event/result
-persistence, stale input, concurrent task changes and offline diagnostics. Rust
-properties validate destination/confidence gates; the stateful daemon model
-interleaves advisory results with real admission, launch and lifecycle transitions.
+## Scheduling, staleness and cost
 
-These are deterministic contract and authority tests using mock model responses.
-They do not measure live Jev/LLM routing accuracy or claim prompt-injection
-resistance of the model itself. Before expanding automation, evaluate a labeled
-corpus of your projects, measure ambiguity/false-routing rates and token costs,
-and review generated plans. Automatic intake analysis, source publication,
-automated approval, code inspection and automatic assignment are outside this
-initial prototype. The existing repository triage workflows remain a separate
-feature with their own execution permissions.
+The daemon runs at most one routing request chain at a time, outside its scheduling
+tick. It reserves no worktree, tmux window or implementation slot. A chain has at
+most one Jev call and one fallback, each with a configurable 1–60 second deadline
+(default 20), 64 KiB input and 128 KiB response limits. HTTP requests have no redirects
+or retries. Claude Code is limited to one turn; the API fallback defaults to 1,024
+output tokens. Available token usage and failures are saved in analysis records.
+These bounds do not impose an account-wide spend limit or limit concurrent manual
+CLI calls. Claude Code routing uses the server account but is not charged to the
+scheduler's implementation ledger.
+
+Current unresolved results are cached across restarts. `task analyze` explicitly
+retries them. Changed task text, descriptions, routing policy, models or registry
+bindings invalidate an automatic selection and trigger new analysis before an
+unstarted task can launch. A saved in-flight marker prevents automatic repeated
+spend after a crash; retry interrupted analysis with `task analyze`. `run --offline`
+makes no automatic model calls. `run --once` waits for its one pending analysis
+and any setup, but newly routed work may need the next admission pass.
+
+Results are applied transactionally to the latest task. Stale results, explicit
+choices, sessions and execution history prohibit reassignment. Model output never
+changes source approval, labels, state, priority, deferrals or budget. Source sync
+continues to use the original issue association. `analysis.recorded`,
+`routing.automatic_assigned` and routing events explain decisions; `task show`,
+`task explain` and `doctor` expose pending, unresolved and stale work.
+
+`task analyze` exits 0 for a current destination proposal, 3 for unresolved/stale
+results. Exit 0 does not mean the task was approved or started; JSON includes
+`repository_assigned`. `--show` never assigns or calls a model. `doctor --fix`
+does not choose repositories or invoke models.
+
+## Validation
+
+Mock Jev/API responses and a fake Claude Code executable test thresholds, ambiguity,
+unsupported destinations, misleading issue instructions, response bounds and
+fallbacks. SQLite tests cover atomic assignment, stale writers and manual overrides.
+Properties and stateful models interleave analysis, source/config edits, approval,
+assignment, launch and restart. Dashboard tests cover selection across refreshes.
+These are contract tests, not measurements of live routing accuracy. Use your own
+labeled tasks to tune descriptions and confidence thresholds.

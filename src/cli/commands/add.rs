@@ -38,6 +38,9 @@ pub fn build_task(req: &NewTask) -> Result<Task> {
     };
     if let Some(project) = &req.execution_project {
         task.execution_project = project.clone();
+        if !project.is_empty() {
+            task.project_assignment = Some(crate::routing::ProjectAssignment::Explicit { project: project.clone() });
+        }
     }
     task.description = req.description.trim().to_string();
     task.criticality = req.criticality.unwrap_or(Criticality::Normal);
@@ -71,12 +74,29 @@ pub fn unique_manual_key(store: &Store, id: crate::domain::TaskId) -> Result<Str
 ///
 /// Fails with a clear message when the key is already taken.
 pub fn create_task(store: &Store, req: &NewTask) -> Result<Task> {
+    insert_task(store, req, None)
+}
+
+/// Create a manual task with the machine routing policy evaluated before insertion.
+/// Fails on invalid input or persistence; pending automatic choices remain unassigned.
+pub fn create_task_in_config(store: &Store, req: &NewTask, cfg: &crate::config::Config) -> Result<Task> {
+    insert_task(store, req, Some(cfg))
+}
+
+fn insert_task(store: &Store, req: &NewTask, cfg: Option<&crate::config::Config>) -> Result<Task> {
     let mut task = build_task(req)?;
     if store.get_task_by_key(&task.key)?.is_some() {
         if req.key.is_some() {
             bail!("a task with key `{}` already exists", task.key);
         }
         task.key = unique_manual_key(store, task.id)?;
+    }
+    if let Some(cfg) = cfg {
+        if !task.execution_project.is_empty() && !cfg.project_ids().contains(&task.execution_project) {
+            bail!("unknown execution project `{}`", task.execution_project);
+        }
+        let decision = cfg.route(&task);
+        crate::scheduler::transitions::on_routing(&mut task, decision, true);
     }
     store.insert_task(&task).with_context(|| format!("insert task {}", task.key))?;
     store.log_event(
@@ -111,12 +131,22 @@ pub fn run(ctx: &mut Context, args: AddArgs) -> Result<i32> {
         None => String::new(),
     };
     let cfg = ctx.config_cloned()?;
-    if !cfg.project_ids().contains(&args.project) {
-        bail!("unknown execution project `{}`; register it or select a registered project with --project", args.project);
+    let project = match args.project {
+        Some(project) => {
+            cfg.for_project(&project, &ctx.paths)?;
+            project
+        }
+        None => match cfg.routing.mode {
+            crate::routing::RoutingMode::Deterministic => "default".into(),
+            crate::routing::RoutingMode::Automatic => String::new(),
+            crate::routing::RoutingMode::Explicit => bail!("routing.mode = explicit requires --project ID"),
+        },
+    };
+    if !project.is_empty() {
+        cfg.for_project(&project, &ctx.paths)?;
     }
-    cfg.for_project(&args.project, &ctx.paths)?;
     let req = NewTask {
-        execution_project: Some(args.project),
+        execution_project: Some(project),
         title: args.title,
         description,
         key: args.key,
@@ -130,7 +160,7 @@ pub fn run(ctx: &mut Context, args: AddArgs) -> Result<i32> {
         super::task::warn_if_provider_disabled(&cfg, m);
     }
     let store = ctx.store()?.clone();
-    let task = create_task(&store, &req)?;
+    let task = create_task_in_config(&store, &req, &cfg)?;
 
     if ctx.json {
         println!("{}", serde_json::to_string_pretty(&task)?);

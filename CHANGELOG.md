@@ -11,11 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Optional advisory issue analysis with Jev project/classification choices and a
-  bounded, tool-free text-model fallback. Trusted project descriptions constrain
-  destinations; humans retain approval and routing. Saved reasoning, plans, token
-  usage, stale-result detection and doctor diagnostics accompany CLI, property
-  and stateful model coverage (#44).
+- Optional automatic repository selection from trusted project descriptions:
+  Jev first (80% confidence by default), then a bounded Claude Code or API fallback.
+  Explicit mode requires a human choice; CLI assignment and dashboard **P** override
+  AI and rules for unstarted tasks. Source approval and execution history stay
+  independent. Durable evidence, stale-result guards, doctor diagnostics, properties
+  and stateful model coverage accompany the workflow (#44).
 
 ## [0.19.1] - 2026-10-20
 
