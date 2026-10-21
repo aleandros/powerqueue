@@ -1103,7 +1103,13 @@ impl DaemonWorld {
         let now = self.now;
         let before = self.tasks[idx].clone();
         let mut cfg = self.cfg.clone();
-        cfg.repo.path = self.checkouts[&before.task.execution_project].clone();
+        // Unresolved automatic routing has no checkout, but command/admission
+        // transitions must still work before a repository is selected.
+        cfg.repo.path = if before.task.execution_project.is_empty() {
+            String::new()
+        } else {
+            self.checkouts[&before.task.execution_project].clone()
+        };
         let Some(effects) = self.tasks[idx].apply(&cfg, now, op) else { return Ok(None) };
         check(step, op, &self.cfg, &before, &self.tasks[idx], &effects)?;
         self.carry_out(&effects);

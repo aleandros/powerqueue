@@ -451,9 +451,7 @@ impl Daemon {
         if self.rt.analysis.as_ref().is_some_and(|(_, handle)| handle.is_finished()) {
             let (id, handle) = self.rt.analysis.take().expect("finished analysis exists");
             let record = handle.await.context("join repository analysis worker")??;
-            if self.store.save_analysis(id, &record)? {
-                self.store.apply_analysis_project(id, &self.cfg)?;
-            }
+            self.store.save_and_apply_analysis(id, &record, &self.cfg)?;
         }
         if self.offline || self.rt.analysis.is_some() || self.rt.draining_setups {
             return Ok(());

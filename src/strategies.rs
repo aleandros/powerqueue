@@ -964,7 +964,7 @@ pub fn analysis_proposal() -> impl Strategy<Value = crate::analysis::Proposal> {
 /// Analysis snapshots/results interleaved with real scheduler lifecycle operations.
 #[derive(Debug, Clone)]
 pub enum AnalysisModelOp {
-    Observe,
+    Observe(Option<bool>),
     Finish,
     Edit,
     Describe,
@@ -980,7 +980,7 @@ pub fn analysis_model_ops() -> impl Strategy<Value = Vec<AnalysisModelOp>> {
     use AnalysisModelOp::*;
     prop::collection::vec(
         prop_oneof![
-            Just(Observe),
+            prop::option::of(any::<bool>()).prop_map(Observe),
             Just(Finish),
             Just(Edit),
             Just(Describe),

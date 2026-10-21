@@ -110,24 +110,30 @@ CLI calls. Claude Code routing uses the server account but is not charged to the
 scheduler's implementation ledger.
 
 Current unresolved results are cached across restarts. `task analyze` explicitly
-retries them. Changed task text, descriptions, routing policy, models or registry
+retries them, and can also replace a previous automatic decision before execution.
+A new confident result may select another repository; an unresolved replacement
+clears the automatic selection and holds the task. Explicit human choices remain
+unchanged. Changed task text, descriptions, routing policy, models or registry
 bindings invalidate an automatic selection and trigger new analysis before an
 unstarted task can launch. A saved in-flight marker prevents automatic repeated
 spend after a crash; retry interrupted analysis with `task analyze`. `run --offline`
 makes no automatic model calls. `run --once` waits for its one pending analysis
 and any setup, but newly routed work may need the next admission pass.
 
-Results are applied transactionally to the latest task. Stale results, explicit
-choices, sessions and execution history prohibit reassignment. Model output never
+Results and assignment changes are saved together transactionally against the latest
+task. Stale results, explicit choices, sessions and execution history prohibit
+reassignment. Model output never
 changes source approval, labels, state, priority, deferrals or budget. Source sync
 continues to use the original issue association. `analysis.recorded`,
-`routing.automatic_assigned` and routing events explain decisions; `task show`,
-`task explain` and `doctor` expose pending, unresolved and stale work.
+`routing.automatic_assigned`, `routing.automatic_withheld` and routing events explain
+decisions; `task show`, `task explain` and `doctor` expose pending, unresolved and
+stale work.
 
 `task analyze` exits 0 for a current destination proposal, 3 for unresolved/stale
 results. Exit 0 does not mean the task was approved or started; JSON includes
-`repository_assigned`. `--show` never assigns or calls a model. `doctor --fix`
-does not choose repositories or invoke models.
+`repository_assigned` (false when a selection was withheld). CLI analysis applies
+the same repository source overrides as the daemon. `--show` never assigns or calls
+a model. `doctor --fix` does not choose repositories or invoke models.
 
 ## Validation
 

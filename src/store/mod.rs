@@ -469,6 +469,12 @@ impl Store {
     pub fn apply_analysis_project(&self, id: TaskId, cfg: &crate::config::Config) -> Result<bool> {
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let applied = Self::apply_analysis_project_in(&tx, id, cfg)?;
+        tx.commit().context("commit automatic repository selection")?;
+        Ok(applied)
+    }
+
+    fn apply_analysis_project_in(tx: &rusqlite::Transaction<'_>, id: TaskId, cfg: &crate::config::Config) -> Result<bool> {
         let Some(mut task) = tx
             .query_row(&format!("SELECT {} FROM tasks WHERE id=?1", Self::TASK_COLS), params![id.to_string()], Self::row_to_task)
             .optional()?
@@ -505,7 +511,6 @@ impl Store {
                 )?;
             }
         }
-        tx.commit().context("commit automatic repository selection")?;
         Ok(true)
     }
 
@@ -1553,6 +1558,26 @@ impl Store {
     /// Save advisory analysis and its audit event atomically without updating task rows.
     /// Returns false if a newer analysis already finished; fails for missing tasks or storage errors.
     pub fn save_analysis(&self, id: TaskId, record: &crate::analysis::AnalysisRecord) -> Result<bool> {
+        self.save_analysis_inner(id, record, None).map(|(saved, _)| saved)
+    }
+
+    /// Save a result and reconcile automatic assignment atomically against the latest task.
+    /// Returns (saved, assignment_changed); older results are ignored. Storage errors roll back both.
+    pub fn save_and_apply_analysis(
+        &self,
+        id: TaskId,
+        record: &crate::analysis::AnalysisRecord,
+        cfg: &crate::config::Config,
+    ) -> Result<(bool, bool)> {
+        self.save_analysis_inner(id, record, Some(cfg))
+    }
+
+    fn save_analysis_inner(
+        &self,
+        id: TaskId,
+        record: &crate::analysis::AnalysisRecord,
+        cfg: Option<&crate::config::Config>,
+    ) -> Result<(bool, bool)> {
         let mut conn = self.lock();
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -1568,7 +1593,7 @@ impl Store {
         if let Some(previous) = previous {
             let previous: crate::analysis::AnalysisRecord = serde_json::from_str(&previous).context("read prior analysis")?;
             if previous.created_at > record.created_at {
-                return Ok(false);
+                return Ok((false, false));
             }
         }
         let now = ts(&Utc::now());
@@ -1576,8 +1601,9 @@ impl Store {
             params![key, serde_json::to_string(record)?, now])?;
         tx.execute("INSERT INTO events (task_id, timestamp, level, kind, message, data) VALUES (?1, ?2, 'info', 'analysis.recorded', ?3, ?4)",
             params![id.to_string(), now, "Advisory analysis recorded; human approval required", serde_json::to_string(record)?])?;
+        let applied = if let Some(cfg) = cfg { Self::apply_analysis_project_in(&tx, id, cfg)? } else { false };
         tx.commit().context("commit analysis result and event")?;
-        Ok(true)
+        Ok((true, applied))
     }
 
     pub fn kv_set<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {

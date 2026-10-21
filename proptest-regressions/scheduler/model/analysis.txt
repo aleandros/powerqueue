@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc af3423add3f8fdc6ead875c4a402057e886d842cfc6470d0f21bdde040598398 # shrinks to ops = [Observe]
+cc 6c20abdbffaa4a7467cf886422cf02ff751d427cb1200dd4f3a8a8c4b329d0b3 # shrinks to ops = [Observe(None), Finish, Complete]

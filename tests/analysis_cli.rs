@@ -291,3 +291,118 @@ fn claude_routing_fallback_can_run_from_inside_claude_code() {
     cfg.save(&paths).unwrap();
     pq(home.path()).env("CLAUDECODE", "1").args(["task", "analyze", &task.key]).assert().success();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reanalysis_replaces_or_withholds_an_unstarted_automatic_assignment() {
+    let server = MockServer::start().await;
+    let (home, paths, mut cfg, store, task) = setup(&format!("{}/messages", server.uri()));
+    cfg.routing.mode = powerqueue::routing::RoutingMode::Automatic;
+    cfg.github.enabled = true;
+    cfg.github.repository = "example/issues".into();
+    cfg.projects.insert("infra".into(), Default::default());
+    cfg.projects.get_mut("infra").unwrap().repo.path = "/infra".into();
+    cfg.analysis.projects.insert("infra".into(), "Infrastructure".into());
+    cfg.save(&paths).unwrap();
+    for (destination, confidence, expected, exit) in [
+        (Some("default"), 0.95, Some("default"), 0),
+        (Some("infra"), 0.95, Some("infra"), 0),
+        (Some("infra"), 0.2, None, 3),
+        (Some("default"), 0.95, Some("default"), 0),
+        (None, 0.95, None, 3),
+    ] {
+        server.reset().await;
+        let proposal = Proposal { project: destination.map(str::to_owned), confidence, ..proposal() };
+        Mock::given(path("/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "stop_reason":"end_turn", "content":[{"type":"text", "text":serde_json::to_string(&proposal).unwrap()}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let output = pq(home.path())
+            .env("POWERQUEUE_ANALYSIS_API_KEY", "test-only")
+            .args(["--json", "task", "analyze", &task.key])
+            .assert()
+            .code(exit)
+            .get_output()
+            .stdout
+            .clone();
+        let result: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(result["repository_assigned"], expected.is_some());
+        let current = store.get_task(task.id).unwrap().unwrap();
+        assert_eq!(current.execution_project, expected.unwrap_or(""));
+        assert_eq!(cfg.route(&current).permitted, expected.is_some());
+        assert_eq!(current.github_admission, task.github_admission);
+        assert_eq!(current.state, task.state);
+        assert!(!current.execution_approved());
+    }
+    assert!(store.events_for_task(task.id, 50).unwrap().iter().any(|e| e.kind == "routing.automatic_withheld"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn analysis_uses_effective_repository_source_overrides() {
+    let server = MockServer::start().await;
+    Mock::given(path("/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "stop_reason":"end_turn", "content":[{"type":"text", "text":serde_json::to_string(&proposal()).unwrap()}]
+        })))
+        .mount(&server)
+        .await;
+    for enabled in [true, false] {
+        let (home, paths, mut cfg, store, task) = setup(&format!("{}/messages", server.uri()));
+        cfg.routing.mode = powerqueue::routing::RoutingMode::Automatic;
+        // Exercise both a source supplied only by the override and an override
+        // disabling a globally configured source. Include the multi-project path.
+        cfg.github.enabled = !enabled;
+        cfg.github.repository = if enabled { String::new() } else { "example/issues".into() };
+        cfg.projects.insert("infra".into(), Default::default());
+        cfg.projects.get_mut("infra").unwrap().repo.path = "/infra".into();
+        cfg.save(&paths).unwrap();
+        std::fs::write(
+            std::path::Path::new(&cfg.repo.path).join(".powerqueue.toml"),
+            format!("[github]\nenabled = {enabled}\nrepository = \"example/issues\"\n"),
+        )
+        .unwrap();
+        let output = pq(home.path())
+            .env("POWERQUEUE_ANALYSIS_API_KEY", "test-only")
+            .args(["--json", "task", "analyze", &task.key])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let result: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(result["repository_assigned"], enabled);
+        let current = store.get_task(task.id).unwrap().unwrap();
+        assert_eq!(current.project_assignment.is_some(), enabled);
+        assert_eq!(current.github_admission, task.github_admission);
+    }
+}
+
+#[test]
+fn replacement_analysis_and_assignment_roll_back_together() {
+    let (_home, paths, mut cfg, store, task) = setup("https://example.test/messages");
+    cfg.routing.mode = powerqueue::routing::RoutingMode::Automatic;
+    cfg.github.enabled = true;
+    cfg.github.repository = "example/issues".into();
+    let record = AnalysisRecord {
+        created_at: chrono::Utc::now(),
+        fingerprint: AnalysisInput::new(&cfg, &task).unwrap().fingerprint(&cfg),
+        proposal: Some(proposal()),
+        attempts: vec![],
+    };
+    assert_eq!(store.save_and_apply_analysis(task.id, &record, &cfg).unwrap(), (true, true));
+    let before = store.get_task(task.id).unwrap().unwrap();
+    let replacement =
+        AnalysisRecord { created_at: record.created_at + chrono::Duration::seconds(1), proposal: None, ..record.clone() };
+    let writer = rusqlite::Connection::open(paths.database()).unwrap();
+    writer.execute_batch("CREATE TRIGGER reject_withholding BEFORE INSERT ON events WHEN NEW.kind = 'routing.automatic_withheld' BEGIN SELECT RAISE(ABORT, 'test failure'); END;").unwrap();
+    assert!(store.save_and_apply_analysis(task.id, &replacement, &cfg).is_err());
+    assert_eq!(store.get_task(task.id).unwrap().unwrap(), before);
+    assert_eq!(store.kv_get::<AnalysisRecord>(&record_key(task.id)).unwrap().unwrap(), record);
+    writer.execute_batch("DROP TRIGGER reject_withholding").unwrap();
+    assert_eq!(store.save_and_apply_analysis(task.id, &replacement, &cfg).unwrap(), (true, true));
+    assert!(!cfg.route(&store.get_task(task.id).unwrap().unwrap()).permitted);
+    assert_eq!(store.save_and_apply_analysis(task.id, &record, &cfg).unwrap(), (false, false));
+    assert!(!cfg.route(&store.get_task(task.id).unwrap().unwrap()).permitted);
+}
