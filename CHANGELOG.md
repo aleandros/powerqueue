@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-10-23
+
+### Fixed
+
+- Triage report delivery now sets the outcome label in Linear: it removes only
+  labels the issue actually carries (other recommendation labels and siblings in
+  the recommendation's single-select group, such as `triage/requested`) instead of
+  every catalog outcome label, which Linear rejected with `Label not on issue` /
+  `labelIds not exclusive child labels` (#77).
+- Failing triage deliveries no longer starve newly completed reports: never-attempted
+  reports go first, retries go oldest first, and failures back off exponentially
+  from one minute to one hour. `doctor` shows the failure count and next attempt (#77).
+
 ### Added
 
 - Advisory Kani proof of reservation arithmetic across two model tiers, with
@@ -1112,7 +1125,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.20.1...HEAD
+[0.20.1]: https://github.com/aleandros/powerqueue/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/aleandros/powerqueue/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/aleandros/powerqueue/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/aleandros/powerqueue/compare/v0.18.1...v0.19.0

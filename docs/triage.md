@@ -121,10 +121,15 @@ names or children of a `triage` group, visible to the IT team):
 | `triage/manual-action` | Support or operational work is the next step |
 | `triage/no-action-recommended` | Explain the evidence for no change or a duplicate |
 
-Also create `triage/requested` if using the opt-in intake example.
+Also create `triage/requested` if using the opt-in intake example. Linear label
+groups are single-select, so when `requested` lives in the same `triage` group the
+recommendation label replaces it on the issue once the report is published (the
+completed task is not re-imported either way).
 
 Powerqueue publishes a report containing the recommendation, inspected base SHA,
-and full summary, then replaces only its five recommendation labels. Other
+and full summary, then sets the recommendation label. It removes only labels the
+issue actually carries: any other recommendation label and, when the recommendation
+is a group child, its siblings in that group (such as `triage/requested`). Other
 labels, including `agent/skip`, are preserved using additive/removal mutations.
 `comment_prefix` is the first text in the comment; use the marker your help-desk
 integration recognizes for internal notes. It also prefixes other workflow
@@ -132,7 +137,10 @@ comments. `linear.post_comments = "questions"` or `true` enables publication;
 `false` disables it. Native report/label delivery currently targets Linear.
 
 Delivery receipts and a client-generated comment UUID are saved before posting.
-Network failures and missing labels retry every minute and survive restarts.
+Network failures and missing labels are retried with exponential backoff (one
+minute, doubling, capped at one hour) and survive restarts. Each tick attempts at
+most one report: never-failed reports go first and retries take turns oldest first,
+so failing receipts do not delay newly completed analyses.
 The execution slot is already free while delivery waits. `doctor` reports
 pending publication; `task show` records `triage.completed`, `triage.published`,
 or `triage.delivery_failed` events. Powerqueue never creates labels implicitly.

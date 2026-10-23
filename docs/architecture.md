@@ -466,9 +466,12 @@ tracker state updates, parent auto-close, PR adoption, and automatic commit/push
 It completes through `on_triage_complete`, storing the full summary and outcome.
 
 The daemon delivers one due Linear analysis report per tick, after releasing
-finished sessions and allocating launches. Delivery receipts in
+finished sessions and allocating launches. Never-attempted reports go before
+retries, retries go oldest first, and failures back off exponentially (60 s
+doubling to one hour), so failing receipts cannot starve new ones. Delivery receipts in
 `triage.delivery.<task-id>` persist the completion timestamp, client-generated
-comment UUID, independent comment/label acknowledgements, and retry time. A lost
-comment response is reconciled by UUID. Label mutations change only the managed
-recommendation labels. Completed tasks are not implicitly re-imported or turned
+comment UUID, independent comment/label acknowledgements, failed attempt count and
+retry time. A lost comment response is reconciled by UUID. Label mutations remove
+only labels present on the issue: other recommendation labels and siblings in the
+recommendation's single-select group. Completed tasks are not implicitly re-imported or turned
 into coding tasks; explicit retry requests another analysis pass.

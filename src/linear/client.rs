@@ -938,22 +938,23 @@ impl LinearClient {
         Ok(())
     }
 
-    /// Replace only Powerqueue's triage recommendation labels, preserving other labels atomically.
-    /// Labels must already exist for this team or workspace. Missing/ambiguous labels fail explicitly.
+    /// Set the triage recommendation label, preserving unrelated labels atomically.
+    ///
+    /// Removes only labels the issue actually carries: other recommendation labels and,
+    /// because Linear label groups are single-select, any sibling of the wanted label in
+    /// its group (e.g. `triage/requested`). Labels must already exist for this team or
+    /// workspace; a missing/ambiguous label or an issue that cannot be read fails explicitly.
     pub async fn set_triage_label(&self, issue_id: &str, team: &str, outcome: crate::execution::TriageOutcome) -> Result<()> {
         let mut cursor: Option<String> = None;
-        let mut labels: Vec<(String, String)> = Vec::new();
+        let mut labels: Vec<LabelRef> = Vec::new();
         loop {
             let data = self.graphql(
-                "query($team: String!, $after: String) { issueLabels(first: 100, after: $after, filter: { or: [{ team: { key: { eq: $team } } }, { team: { null: true } }] }) { nodes { id name parent { name } } pageInfo { hasNextPage endCursor } } }",
+                "query($team: String!, $after: String) { issueLabels(first: 100, after: $after, filter: { or: [{ team: { key: { eq: $team } } }, { team: { null: true } }] }) { nodes { id name parent { id name } } pageInfo { hasNextPage endCursor } } }",
                 serde_json::json!({"team": team, "after": cursor}),
             ).await?;
             let nodes = data.pointer("/issueLabels/nodes").and_then(|v| v.as_array()).context("Linear label catalog missing")?;
             for node in nodes {
-                let id = node["id"].as_str().context("label ID missing")?;
-                let name = node["name"].as_str().context("label name missing")?;
-                let qualified = crate::domain::qualified_label(name, node.pointer("/parent/name").and_then(|v| v.as_str()));
-                labels.push((id.to_owned(), qualified));
+                labels.push(LabelRef::parse(node)?);
             }
             if data.pointer("/issueLabels/pageInfo/hasNextPage").and_then(|v| v.as_bool()) != Some(true) {
                 break;
@@ -968,7 +969,7 @@ impl LinearClient {
             }
             cursor = Some(next);
         }
-        let matches: Vec<_> = labels.iter().filter(|(_, n)| n.eq_ignore_ascii_case(outcome.label())).collect();
+        let matches: Vec<_> = labels.iter().filter(|l| l.name.eq_ignore_ascii_case(outcome.label())).collect();
         if matches.len() != 1 {
             bail!(
                 "team {team}: expected one label named {}, found {}; create the triage label group or remove duplicate names",
@@ -976,18 +977,32 @@ impl LinearClient {
                 matches.len()
             );
         }
-        let wanted = &matches[0].0;
-        let removed: Vec<_> = labels
+        let wanted = matches[0];
+        let data = self
+            .graphql(
+                "query($id: String!) { issue(id: $id) { labels(first: 100) { nodes { id name parent { id name } } pageInfo { hasNextPage } } } }",
+                serde_json::json!({"id": issue_id}),
+            )
+            .await
+            .with_context(|| format!("read labels of {issue_id}"))?;
+        if data.pointer("/issue/labels/pageInfo/hasNextPage").and_then(|v| v.as_bool()) == Some(true) {
+            bail!("issue {issue_id} has more than 100 labels; cannot safely replace the triage label");
+        }
+        let current = data
+            .pointer("/issue/labels/nodes")
+            .and_then(|v| v.as_array())
+            .with_context(|| format!("Linear returned no labels for {issue_id}"))?
             .iter()
-            .filter(|(id, name)| {
-                id != wanted && crate::execution::TriageOutcome::ALL.iter().any(|o| o.label().eq_ignore_ascii_case(name))
-            })
-            .map(|(id, _)| id)
-            .collect();
+            .map(LabelRef::parse)
+            .collect::<Result<Vec<_>>>()?;
+        let removed = triage_label_removals(&current, wanted);
+        if removed.is_empty() && current.iter().any(|l| l.id == wanted.id) {
+            return Ok(());
+        }
         let data = self
             .graphql(
                 "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
-                serde_json::json!({"id": issue_id, "input": {"addedLabelIds": [wanted], "removedLabelIds": removed}}),
+                serde_json::json!({"id": issue_id, "input": {"addedLabelIds": [wanted.id], "removedLabelIds": removed}}),
             )
             .await?;
         if data.pointer("/issueUpdate/success").and_then(|v| v.as_bool()) != Some(true) {
@@ -1067,6 +1082,41 @@ fn backoff_for(attempt: u32, retry_after: Option<Duration>) -> Duration {
 fn operation_name(query: &str) -> String {
     let body = query.split('{').nth(1).unwrap_or("");
     body.split(|c: char| !c.is_alphanumeric() && c != '_').find(|s| !s.is_empty()).unwrap_or("graphql").to_string()
+}
+
+/// A Linear label with its group-qualified name (`triage/ready-for-agent`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LabelRef {
+    id: String,
+    name: String,
+    parent_id: Option<String>,
+}
+
+impl LabelRef {
+    fn parse(node: &serde_json::Value) -> Result<Self> {
+        let id = node["id"].as_str().context("label ID missing")?;
+        let name = node["name"].as_str().context("label name missing")?;
+        Ok(Self {
+            id: id.to_owned(),
+            name: crate::domain::qualified_label(name, node.pointer("/parent/name").and_then(|v| v.as_str())),
+            parent_id: node.pointer("/parent/id").and_then(|v| v.as_str()).map(str::to_owned),
+        })
+    }
+}
+
+/// Labels on the issue (`current`) that must go when `wanted` is added: other triage
+/// recommendation labels, and siblings in `wanted`'s group, which Linear keeps
+/// single-select. Never names a label the issue does not carry (Linear rejects that).
+fn triage_label_removals(current: &[LabelRef], wanted: &LabelRef) -> Vec<String> {
+    current
+        .iter()
+        .filter(|l| l.id != wanted.id)
+        .filter(|l| {
+            crate::execution::TriageOutcome::ALL.iter().any(|o| o.label().eq_ignore_ascii_case(&l.name))
+                || (wanted.parent_id.is_some() && l.parent_id == wanted.parent_id)
+        })
+        .map(|l| l.id.clone())
+        .collect()
 }
 
 /// Linear reports a missing entity as a GraphQL error rather than `null`.
@@ -1308,5 +1358,79 @@ mod tests {
         assert_eq!(operation_name("query { viewer { id } }"), "viewer");
         assert_eq!(operation_name("mutation($id: String!) { issueUpdate(id: $id) { success } }"), "issueUpdate");
         assert_eq!(operation_name("nonsense"), "graphql");
+    }
+
+    fn label(id: &str, name: &str, parent: Option<&str>) -> LabelRef {
+        LabelRef { id: id.into(), name: name.into(), parent_id: parent.map(Into::into) }
+    }
+
+    #[test]
+    fn triage_removals_only_name_labels_on_the_issue_including_group_siblings() {
+        let wanted = label("ready", "triage/ready-for-agent", Some("g-triage"));
+        let current = [
+            label("requested", "triage/requested", Some("g-triage")),
+            label("skip", "agent/skip", Some("g-agent")),
+            label("bug", "bug", None),
+        ];
+        // Other outcome labels in the catalog are not on the issue, so they are not removed.
+        assert_eq!(triage_label_removals(&current, &wanted), ["requested"]);
+        // Flat (ungrouped) labels: only other outcome labels present on the issue go.
+        let flat = label("ready", "triage/ready-for-agent", None);
+        let current = [
+            label("info", "triage/needs-information", None),
+            label("req", "triage/requested", None),
+            label("ready", "triage/ready-for-agent", None),
+        ];
+        assert_eq!(triage_label_removals(&current, &flat), ["info"]);
+    }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn any_label() -> impl Strategy<Value = (&'static str, Option<&'static str>)> {
+            let names = prop::sample::select(vec![
+                "triage/requested",
+                "triage/needs-information",
+                "triage/ready-for-agent",
+                "triage/manual-action",
+                "agent/skip",
+                "bug",
+            ]);
+            (names, prop::option::of(prop::sample::select(vec!["g-triage", "g-agent"])))
+        }
+
+        /// Issue labels with unique ids (as in Linear) and a wanted label that is either
+        /// already on the issue or a fresh one.
+        fn issue_and_wanted() -> impl Strategy<Value = (Vec<LabelRef>, LabelRef)> {
+            (prop::collection::vec(any_label(), 0..8), any_label(), any::<prop::sample::Index>(), any::<bool>()).prop_map(
+                |(specs, fresh, pick, present)| {
+                    let current: Vec<_> =
+                        specs.iter().enumerate().map(|(i, (name, parent))| label(&format!("l{i}"), name, *parent)).collect();
+                    let wanted = if present && !current.is_empty() {
+                        current[pick.index(current.len())].clone()
+                    } else {
+                        label("wanted", fresh.0, fresh.1)
+                    };
+                    (current, wanted)
+                },
+            )
+        }
+
+        proptest! {
+            #[test]
+            fn removals_are_a_subset_of_the_issue_labels_and_spare_unrelated_ones((current, wanted) in issue_and_wanted()) {
+                let removed = triage_label_removals(&current, &wanted);
+                for id in &removed {
+                    prop_assert!(id != &wanted.id);
+                    prop_assert!(current.iter().any(|l| &l.id == id));
+                }
+                for l in current.iter().filter(|l| l.id != wanted.id) {
+                    let outcome = crate::execution::TriageOutcome::ALL.iter().any(|o| o.label().eq_ignore_ascii_case(&l.name));
+                    let sibling = wanted.parent_id.is_some() && l.parent_id == wanted.parent_id;
+                    prop_assert_eq!(removed.contains(&l.id), outcome || sibling);
+                }
+            }
+        }
     }
 }

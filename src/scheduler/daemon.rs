@@ -2345,54 +2345,58 @@ impl Daemon {
             return Ok(());
         }
         let tasks = self.store.list_tasks_in_states(&[TaskState::Completed])?;
+        let mut due = Vec::new();
         for task in tasks.into_iter().filter(Task::leaves_ticket_open) {
-            let TaskSource::Linear { issue_id, team_key, .. } = &task.source else { continue };
+            let TaskSource::Linear { .. } = &task.source else { continue };
             let Some(completed_at) = task.completed_at else { continue };
             let Some(outcome) = task.execution.as_ref().and_then(|e| e.outcome) else { continue };
-            let key = delivery_key(task.id);
-            let mut receipt = self
+            let receipt = self
                 .store
-                .kv_get::<Delivery>(&key)?
+                .kv_get::<Delivery>(&delivery_key(task.id))?
                 .filter(|r| r.completed_at == completed_at)
                 .unwrap_or_else(|| Delivery::new(completed_at));
-            if receipt.done() || receipt.next_attempt > now {
-                continue;
+            if !receipt.done() && receipt.next_attempt <= now {
+                due.push((task, outcome, receipt));
             }
-            let Some(client) = self.linear_client() else { break };
-            self.store.kv_set(&key, &receipt)?;
-            let result: Result<()> = async {
-                if !receipt.comment_posted {
-                    let base = self
-                        .store
-                        .last_task_event(task.id, crate::domain::BRANCH_CREATED_EVENT)?
-                        .and_then(|e| e.branch_base())
-                        .map(|(_, sha)| sha);
-                    client.ensure_report_comment(issue_id, &receipt.comment_id, &report_body(&task, base.as_deref())).await?;
-                    receipt.comment_posted = true;
-                    self.store.kv_set(&key, &receipt)?;
-                    self.update_relay(&task, |s| s.record_posted(&receipt.comment_id));
-                }
-                if !receipt.label_set {
-                    client.set_triage_label(issue_id, team_key, outcome).await?;
-                    receipt.label_set = true;
-                }
-                Ok(())
-            }
-            .await;
-            receipt.error = result.err().map(|e| format!("{e:#}"));
-            receipt.next_attempt = now + Duration::seconds(60);
-            self.store.kv_set(&key, &receipt)?;
-            self.log(
-                Some(task.id),
-                None,
-                if receipt.done() { EventLevel::Info } else { EventLevel::Warn },
-                if receipt.done() { "triage.published" } else { "triage.delivery_failed" },
-                receipt.error.as_deref().unwrap_or("triage report and recommendation published; ticket left open"),
-                serde_json::json!({"comment_id": receipt.comment_id, "outcome": outcome}),
-            );
-            // Bound per-tick network work even if many completed reports are pending.
-            break;
         }
+        // Bound per-tick network work to one report; never-failed reports go first and
+        // retries take turns oldest first, so failing receipts cannot starve new ones.
+        let Some((task, outcome, mut receipt)) = due.into_iter().min_by_key(|(_, _, r)| r.due_order()) else {
+            return Ok(());
+        };
+        let TaskSource::Linear { issue_id, team_key, .. } = &task.source else { return Ok(()) };
+        let Some(client) = self.linear_client() else { return Ok(()) };
+        let key = delivery_key(task.id);
+        self.store.kv_set(&key, &receipt)?;
+        let result: Result<()> = async {
+            if !receipt.comment_posted {
+                let base = self
+                    .store
+                    .last_task_event(task.id, crate::domain::BRANCH_CREATED_EVENT)?
+                    .and_then(|e| e.branch_base())
+                    .map(|(_, sha)| sha);
+                client.ensure_report_comment(issue_id, &receipt.comment_id, &report_body(&task, base.as_deref())).await?;
+                receipt.comment_posted = true;
+                self.store.kv_set(&key, &receipt)?;
+                self.update_relay(&task, |s| s.record_posted(&receipt.comment_id));
+            }
+            if !receipt.label_set {
+                client.set_triage_label(issue_id, team_key, outcome).await?;
+                receipt.label_set = true;
+            }
+            Ok(())
+        }
+        .await;
+        receipt.record_attempt(now, result.err().map(|e| format!("{e:#}")));
+        self.store.kv_set(&key, &receipt)?;
+        self.log(
+            Some(task.id),
+            None,
+            if receipt.done() { EventLevel::Info } else { EventLevel::Warn },
+            if receipt.done() { "triage.published" } else { "triage.delivery_failed" },
+            receipt.error.as_deref().unwrap_or("triage report and recommendation published; ticket left open"),
+            serde_json::json!({"comment_id": receipt.comment_id, "outcome": outcome, "attempts": receipt.attempts, "next_attempt": receipt.next_attempt}),
+        );
         Ok(())
     }
 
