@@ -26,15 +26,19 @@ impl Respond for Reports {
             assert!(input["body"].as_str().unwrap().starts_with("[interno]\n"));
             *comment = Some(json!({"id": input["id"], "body": input["body"], "issue": {"id": input["issueId"]}}));
             json!({"commentCreate": {"success": true}})
+        } else if query.contains("issue(id:") {
+            // The issue carries the intake label of the same single-select group, but no
+            // other recommendation label; Linear rejects removing labels that are absent.
+            json!({"issue": {"labels": {"nodes": [{"id": "requested", "name": "requested", "parent": {"id": "g-triage", "name": "triage"}}, {"id": "skip", "name": "skip", "parent": {"id": "g-agent", "name": "agent"}}], "pageInfo": {"hasNextPage": false}}}})
         } else if query.contains("issueLabels") {
             let nodes = if self.labels_available.load(Ordering::SeqCst) {
-                json!([{"id": "needs-info", "name": "needs-information", "parent": {"name": "triage"}}, {"id": "ready", "name": "ready-for-agent", "parent": {"name": "triage"}}, {"id": "skip", "name": "skip", "parent": {"name": "agent"}}])
+                json!([{"id": "needs-info", "name": "needs-information", "parent": {"id": "g-triage", "name": "triage"}}, {"id": "ready", "name": "ready-for-agent", "parent": {"id": "g-triage", "name": "triage"}}, {"id": "requested", "name": "requested", "parent": {"id": "g-triage", "name": "triage"}}, {"id": "skip", "name": "skip", "parent": {"id": "g-agent", "name": "agent"}}])
             } else {
                 json!([])
             };
             json!({"issueLabels": {"nodes": nodes, "pageInfo": {"hasNextPage": false}}})
         } else if query.contains("issueUpdate") {
-            assert_eq!(body["variables"]["input"], json!({"addedLabelIds": ["needs-info"], "removedLabelIds": ["ready"]}));
+            assert_eq!(body["variables"]["input"], json!({"addedLabelIds": ["needs-info"], "removedLabelIds": ["requested"]}));
             json!({"issueUpdate": {"success": true}})
         } else {
             panic!("unexpected query (must never move or close issue): {query}");
@@ -115,4 +119,74 @@ async fn triage_parent_is_not_closed_by_coding_child_completion() {
     let client = LinearClient::new(server.uri(), "test-key").unwrap();
     daemon.close_finished_parents(&client, &[], true, Utc::now()).await.unwrap();
     assert!(!store.kv_get::<WatchedParents>(WATCHED_PARENTS_KEY).unwrap().unwrap().closed.contains(&"IT-1".into()));
+}
+
+#[tokio::test]
+async fn failing_deliveries_do_not_starve_a_newly_completed_report() {
+    let server = MockServer::start().await;
+    let commented = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = commented.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |request: &Request| {
+            let body: Value = request.body_json().unwrap();
+            let query = body["query"].as_str().unwrap();
+            let data = if query.contains("comment(id:") {
+                json!({"comment": null})
+            } else if query.contains("commentCreate") {
+                seen.lock().unwrap().push(body["variables"]["input"]["issueId"].as_str().unwrap().to_owned());
+                json!({"commentCreate": {"success": true}})
+            } else {
+                json!({"issueLabels": {"nodes": [], "pageInfo": {"hasNextPage": false}}})
+            };
+            ResponseTemplate::new(200).set_body_json(json!({"data": data}))
+        })
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::rooted(dir.path());
+    let store = Store::open(&paths.database()).unwrap();
+    let mut cfg = config();
+    cfg.repo.path = dir.path().display().to_string();
+    cfg.linear.endpoint = server.uri();
+    cfg.linear.post_comments = crate::config::PostComments::Questions;
+    let now = Utc::now();
+    let completed = |key: &str, issue: &str, at| {
+        let mut task = Task::new(
+            key,
+            "Investigate",
+            TaskSource::Linear {
+                issue_id: issue.into(),
+                identifier: key.into(),
+                url: format!("https://linear.app/{key}"),
+                team_key: "IT".into(),
+            },
+        );
+        transitions::on_execution_selected(&mut task, &cfg).unwrap();
+        task.state = TaskState::Running;
+        commands::on_triage_complete(&mut task, "Findings", TriageOutcome::NeedsInformation, at).unwrap();
+        store.insert_task(&task).unwrap();
+        store.get_task(task.id).unwrap().unwrap()
+    };
+    // An older report whose label step keeps failing and whose retry is overdue.
+    let stuck = completed("IT-1", "stuck-issue", now - Duration::days(2));
+    let key = crate::scheduler::triage::delivery_key(stuck.id);
+    let mut receipt = crate::scheduler::triage::Delivery::new(stuck.completed_at.unwrap());
+    receipt.comment_posted = true;
+    receipt.record_attempt(now - Duration::hours(3), Some("Label not on issue".into()));
+    store.kv_set(&key, &receipt).unwrap();
+    let fresh = completed("IT-2", "fresh-issue", now);
+    let secrets = Secrets::with_backend(Box::new(FileBackend::new(paths.secrets_file())));
+    secrets.set(SecretKind::LinearApiKey, "test-key").unwrap();
+    let mut daemon = Daemon::new(cfg.clone(), paths.clone(), store.clone(), secrets).unwrap();
+    daemon.publish_triage(now).await.unwrap();
+    assert_eq!(*commented.lock().unwrap(), ["fresh-issue"]);
+    assert_eq!(store.kv_get::<crate::scheduler::triage::Delivery>(&key).unwrap().unwrap().attempts, 1);
+    let fresh_receipt =
+        store.kv_get::<crate::scheduler::triage::Delivery>(&crate::scheduler::triage::delivery_key(fresh.id)).unwrap().unwrap();
+    assert!(fresh_receipt.comment_posted && fresh_receipt.attempts == 1);
+    // Next tick: the fresh report now waits for its backoff, so the overdue retry runs.
+    daemon.publish_triage(now).await.unwrap();
+    let stuck_receipt = store.kv_get::<crate::scheduler::triage::Delivery>(&key).unwrap().unwrap();
+    assert_eq!(stuck_receipt.attempts, 2);
+    assert_eq!(stuck_receipt.next_attempt, now + Duration::seconds(120));
 }

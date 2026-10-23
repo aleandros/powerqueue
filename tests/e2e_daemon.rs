@@ -1697,7 +1697,8 @@ completion = "leave-ticket-open"
         let key = add_task(&env, "Investigate a support request", &["--label", "triage/requested"]);
         env.start_daemon();
         assert_eq!(env.wait_for_state(&key, "completed", Duration::from_secs(60)), "completed", "{}", env.daemon_log());
-        let show = env.wait_for_show(&key, |v| has_event(v, "cleanup.done"));
+        // `cleanup.done` is logged just before the task row drops its worktree path.
+        let show = env.wait_for_show(&key, |v| has_event(v, "cleanup.done") && v["task"]["worktree_path"].is_null());
         assert!(has_event(&show, "triage.completed"), "{show}");
         assert!(has_event(&show, "cleanup.done"), "{show}");
         assert_eq!(show["task"]["execution"]["queue"], "triage");

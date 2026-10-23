@@ -468,9 +468,18 @@ fn check_execution(cfg: &Config, paths: &Paths, store: &Store) -> Result<Vec<Che
         if task.leaves_ticket_open() && task.state == crate::domain::TaskState::Completed && task.linear_issue_id().is_some() {
             let receipt = store.kv_get::<crate::scheduler::triage::Delivery>(&crate::scheduler::triage::delivery_key(task.id))?;
             if !receipt.as_ref().is_some_and(|r| Some(r.completed_at) == task.completed_at && r.done()) {
-                checks.push(CheckResult::warn(STATE, &format!("{} triage report", task.key),
-                    receipt.and_then(|r| r.error).unwrap_or_else(|| "report delivery pending or outcome missing".into()),
-                    "enable Linear comments, check credentials and the triage label group; delivery retries every minute; inspect task show"));
+                let detail = match receipt {
+                    Some(r) if r.attempts > 0 => format!(
+                        "{} (failed {} time(s); next attempt {})",
+                        r.error.unwrap_or_else(|| "delivery failed".into()),
+                        r.attempts,
+                        r.next_attempt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                    ),
+                    Some(r) => r.error.unwrap_or_else(|| "report delivery pending".into()),
+                    None => "report delivery pending or outcome missing".into(),
+                };
+                checks.push(CheckResult::warn(STATE, &format!("{} triage report", task.key), detail,
+                    "enable Linear comments, check credentials and the triage label group (labels must exist; in a single-select group the recommendation replaces siblings such as triage/requested); failed deliveries retry with backoff up to hourly; inspect task show"));
             }
         }
     }
