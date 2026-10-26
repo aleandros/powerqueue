@@ -23,6 +23,10 @@ fn pq(home: &Path) -> Command {
 }
 
 /// Minimal config: the repo, an explicit worktree root and a tmux socket nobody uses.
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn write_config(home: &Path, repo: &Path, worktree_root: &Path) {
     let config_dir = home.join("config");
     std::fs::create_dir_all(&config_dir).unwrap();
@@ -49,6 +53,10 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> String {
 }
 
 /// A fresh repo on `main` with one commit, or `None` when git is missing.
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn git_repo(dir: &Path) -> Option<PathBuf> {
     if which::which("git").is_err() {
         eprintln!("skipping: git not on PATH");
@@ -63,6 +71,10 @@ fn git_repo(dir: &Path) -> Option<PathBuf> {
     Some(root)
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn task_dirs(home: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(home.join("state").join("tasks")).map(|rd| rd.map(|e| e.unwrap().path()).collect()).unwrap_or_default()
 }

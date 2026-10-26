@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 /// be inherited by a process another test thread forks at that moment, and
 /// executing the script while that child still holds it fails with
 /// `ETXTBSY` ("Text file busy").
-pub fn write_executable(path: &Path, body: &str) {
+pub(crate) fn write_executable(path: &Path, body: &str) {
     let mut child = Command::new("sh")
         .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
         .arg(path)

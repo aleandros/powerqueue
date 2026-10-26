@@ -22,26 +22,34 @@ pub struct Context {
     config: Option<Config>,
     store: Option<Store>,
     secrets: Option<Secrets>,
-    _log_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+    log_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
 
 impl Context {
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+    )]
     pub fn new(home: Option<PathBuf>, verbosity: Verbosity, json: bool, color: bool) -> Self {
         let paths = match &home {
             Some(h) => Paths::rooted(h),
             None => Paths::resolve(),
         };
-        Self { paths, home, verbosity, json, color, config: None, store: None, secrets: None, _log_guard: None }
+        Self { paths, home, verbosity, json, color, config: None, store: None, secrets: None, log_guard: None }
     }
 
     /// Initialise file + stderr logging. `stderr=false` for TUI commands.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+    )]
     pub fn init_logging(&mut self, stderr: bool) -> Result<()> {
-        if self._log_guard.is_some() {
+        if self.log_guard.is_some() {
             return Ok(());
         }
         let logging = self.config_or_default()?.logging.clone();
         let guard = crate::logging::init(&self.paths, &logging, self.verbosity, stderr)?;
-        self._log_guard = Some(guard);
+        self.log_guard = Some(guard);
         Ok(())
     }
 
@@ -52,6 +60,8 @@ impl Context {
     /// warned about once on stderr, so the commands that diagnose or stop
     /// the daemon keep working. `powerqueue run` checks the field and
     /// refuses to start.
+    /// # Panics
+    /// Panics if the lazy initialization invariant is violated: a successfully loaded value must be cached.
     pub fn config(&mut self) -> Result<&Config> {
         if self.config.is_none() {
             let cfg = Config::load(&self.paths)?;
@@ -62,6 +72,8 @@ impl Context {
 
     /// Config, or defaults when no file exists yet. Repo overrides degrade
     /// as in [`Context::config`].
+    /// # Panics
+    /// Panics if the lazy initialization invariant is violated: a successfully loaded value must be cached.
     pub fn config_or_default(&mut self) -> Result<&Config> {
         if self.config.is_none() {
             let cfg = Config::load_or_default(&self.paths)?;
@@ -70,6 +82,10 @@ impl Context {
         Ok(self.config.as_ref().expect("config just loaded"))
     }
 
+    #[expect(
+        clippy::unused_self,
+        reason = "Keep this helper on its context so callers use the same interface as adjacent context-dependent operations."
+    )]
     fn with_repo_overrides(&self, mut cfg: Config) -> Config {
         let repo = cfg.repo_path();
         if !cfg.repo.path.trim().is_empty()
@@ -94,6 +110,8 @@ impl Context {
         Ok(())
     }
 
+    /// # Panics
+    /// Panics if the lazy initialization invariant is violated: a successfully loaded value must be cached.
     pub fn store(&mut self) -> Result<&Store> {
         if self.store.is_none() {
             self.paths.ensure()?;
@@ -102,6 +120,8 @@ impl Context {
         Ok(self.store.as_ref().expect("store just opened"))
     }
 
+    /// # Panics
+    /// Panics if the lazy initialization invariant is violated: a successfully loaded value must be cached.
     pub fn secrets(&mut self) -> &Secrets {
         if self.secrets.is_none() {
             self.secrets = Some(Secrets::auto(&self.paths));
@@ -111,5 +131,17 @@ impl Context {
 
     pub fn is_initialised(&self) -> bool {
         self.paths.config_file().exists()
+    }
+}
+
+impl std::fmt::Debug for Context {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Context")
+            .field("paths", &self.paths)
+            .field("home", &self.home)
+            .field("verbosity", &self.verbosity)
+            .field("json", &self.json)
+            .field("color", &self.color)
+            .finish_non_exhaustive()
     }
 }

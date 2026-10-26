@@ -20,7 +20,7 @@ use tracing::{debug, warn};
 pub struct RulesWatcher {
     path: PathBuf,
     changed: Arc<AtomicBool>,
-    _watcher: Option<notify::RecommendedWatcher>,
+    watcher: Option<notify::RecommendedWatcher>,
     last_mtime: Option<std::time::SystemTime>,
 }
 
@@ -39,7 +39,7 @@ impl RulesWatcher {
             }
         };
         let last_mtime = mtime(&path);
-        Ok(Self { path, changed, _watcher: watcher, last_mtime })
+        Ok(Self { path, changed, watcher, last_mtime })
     }
 
     fn start_watcher(path: &Path, flag: Arc<AtomicBool>) -> Result<notify::RecommendedWatcher> {
@@ -47,8 +47,10 @@ impl RulesWatcher {
             Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
             _ => PathBuf::from("."),
         };
-        let file_name =
-            path.file_name().map(|n| n.to_os_string()).ok_or_else(|| anyhow::anyhow!("{} has no file name", path.display()))?;
+        let file_name = path
+            .file_name()
+            .map(std::ffi::OsStr::to_os_string)
+            .ok_or_else(|| anyhow::anyhow!("{} has no file name", path.display()))?;
         let target = path.to_path_buf();
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
             Ok(event) => {
@@ -84,7 +86,10 @@ impl RulesWatcher {
 
 impl std::fmt::Debug for RulesWatcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RulesWatcher").field("path", &self.path).field("os_watcher", &self._watcher.is_some()).finish()
+        f.debug_struct("RulesWatcher")
+            .field("path", &self.path)
+            .field("os_watcher", &self.watcher.is_some())
+            .finish_non_exhaustive()
     }
 }
 

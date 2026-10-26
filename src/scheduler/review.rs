@@ -86,7 +86,7 @@ pub fn fingerprint(status: &PrStatus, armed_at: DateTime<Utc>) -> String {
         status.mergeable,
         status.merge_state_status,
         status.in_merge_queue,
-        status.head_oid.as_deref().map(|h| &h[..h.len().min(7)]).unwrap_or("?"),
+        status.head_oid.as_deref().map_or("?", |h| &h[..h.len().min(7)]),
         status.checks.len(),
         failed.join(","),
         status.new_unresolved_threads(armed_at),
@@ -131,6 +131,15 @@ pub fn review_prompt(template: &str, relaunch: &ReviewRelaunch, pr_url: &str) ->
 /// Apply one poll result to an `in_review` task. Mutates `task` (state,
 /// review bookkeeping) and returns the effects for the daemon: events, a
 /// Linear comment, branch deletion. Tasks in any other state are left alone.
+#[expect(
+    clippy::as_conversions,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(clippy::too_many_lines, reason = "Keep the on_pr_status workflow and its early exits together in execution order.")]
 pub fn on_pr_status(task: &mut Task, status: &PrStatus, cfg: &SchedulerConfig, now: DateTime<Utc>) -> Vec<Effect> {
     let mut effects = Vec::new();
     if task.state != TaskState::InReview {
@@ -495,7 +504,7 @@ mod tests {
         assert_eq!(t.state, TaskState::InReview);
         assert_eq!(kinds(&fx), vec!["review.status"]);
         // Same status later: no event, still waiting.
-        assert!(on_pr_status(&mut t, &st, &cfg, now() + Duration::hours(2)).is_empty());
+        assert_eq!((on_pr_status(&mut t, &st, &cfg, now() + Duration::hours(2))).len(), 0);
         let fx = on_pr_status(&mut t, &st, &cfg, now() + Duration::hours(24));
         assert_eq!(t.state, TaskState::NeedsAttention);
         assert_eq!(kinds(&fx), vec!["review.stale", "linear_comment"]);
@@ -517,7 +526,7 @@ mod tests {
     fn other_states_are_ignored() {
         let mut t = task();
         t.state = TaskState::Running;
-        assert!(on_pr_status(&mut t, &status("MERGED", "UNKNOWN"), &SchedulerConfig::default(), now()).is_empty());
+        assert_eq!((on_pr_status(&mut t, &status("MERGED", "UNKNOWN"), &SchedulerConfig::default(), now())).len(), 0);
         assert_eq!(t.state, TaskState::Running);
     }
 
@@ -584,7 +593,7 @@ mod properties {
         #[test]
         fn review_rounds_are_capped_and_parking_is_consistent((task, statuses) in review_run(), cfg in scheduler_config(), step_secs in 0i64..7200) {
             let rounds_before = task.review.as_ref().map_or(0, |w| w.rounds);
-            let mut t = task.clone();
+            let mut t = task;
             let mut now = origin();
             let mut rounds = rounds_before;
             for status in &statuses {
@@ -643,7 +652,7 @@ mod properties {
         #[test]
         fn requested_rounds_apply_only_in_review(task in task(), url in any_pr_url()) {
             let now = origin();
-            let mut t = task.clone();
+            let mut t = task;
             t.pr_url = Some(url.clone());
             let before = t.clone();
             let effect = request_round(&mut t, now);
@@ -685,7 +694,7 @@ mod properties {
             on_watch_recovered(&mut t);
             prop_assert_eq!(t.last_error.as_deref().is_none(), error.starts_with(WATCHER_ERROR_PREFIX));
             // An unusable PR parks the task without a retry time.
-            let mut t = task.clone();
+            let mut t = task;
             on_unusable_pr(&mut t, &error, origin());
             prop_assert_eq!((t.state, t.not_before), (TaskState::NeedsAttention, None));
             prop_assert!(t.last_error.as_deref().is_some_and(|e| e.ends_with(&error)));

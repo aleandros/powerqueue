@@ -304,7 +304,7 @@ impl Draft {
 
     pub fn save_meta(&self) -> Result<()> {
         let text = serde_json::to_string_pretty(&self.meta).context("serialise meta.json")?;
-        atomic_write(&self.dir.join(META_FILE), &(text + "\n"), false)
+        atomic_write(&self.dir.join(META_FILE), &format!("{text}\n"), false)
     }
 
     pub fn priority_path(&self) -> PathBuf {
@@ -387,12 +387,16 @@ fn write(path: &Path, text: &str) -> Result<()> {
 /// Write `text` to `path` atomically (temp file in the same directory, then
 /// rename). `private` sets mode 0600 (config.toml holds nothing secret, but
 /// `init` writes it that way and we keep the habit).
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing atomic_write flag interface during lint adoption; callers already supply named state predicates."
+)]
 pub fn atomic_write(path: &Path, text: &str, private: bool) -> Result<()> {
     let parent = path.parent().ok_or_else(|| anyhow!("{} has no parent directory", path.display()))?;
     std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     let tmp = parent.join(format!(
         ".{}.tmp-{}",
-        path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into()),
+        path.file_name().map_or_else(|| "file".into(), |n| n.to_string_lossy().to_string()),
         std::process::id()
     ));
     let result = (|| -> Result<()> {
@@ -720,7 +724,7 @@ pub fn build_prompt(instruction: &str, scope: TuneScope, context_md: &str, repo_
     }
     match scope {
         TuneScope::Priority => {
-            p.push_str("`config.toml` is present for reference only; the user asked for rule changes, so leave it untouched.\n")
+            p.push_str("`config.toml` is present for reference only; the user asked for rule changes, so leave it untouched.\n");
         }
         TuneScope::Config => p.push_str(
             "`priority.toml` is present for reference only; the user asked for config changes, so leave it untouched.\n",
@@ -822,7 +826,7 @@ pub const ALLOWED_TOOLS: [&str; 8] = [
 pub fn claude_argv(binary: &str, model: &str, extra_args: &[String]) -> Vec<String> {
     let mut argv: Vec<String> = crate::session::BinaryTemplate::parse(binary)
         .ok()
-        .and_then(|t| t.host_argv().map(|w| w.to_vec()))
+        .and_then(|t| t.host_argv().map(<[std::string::String]>::to_vec))
         .unwrap_or_else(|| vec![binary.to_string()]);
     argv.extend([
         "-p".to_string(),
@@ -968,6 +972,10 @@ fn join_within(handle: std::thread::JoinHandle<Vec<u8>>, wait: Duration) -> Vec<
 /// Interpret `claude -p --output-format json` output. The result object may
 /// be the whole stdout or one line of it; anything else is treated as the
 /// agent's plain-text answer.
+#[expect(
+    clippy::as_conversions,
+    reason = "Collection and read lengths fit the platform counter type on supported 32-bit and 64-bit targets."
+)]
 pub fn parse_agent_output(stdout: &str) -> AgentOutcome {
     let candidates = std::iter::once(stdout.trim()).chain(stdout.lines().rev().map(str::trim));
     for text in candidates {
@@ -986,14 +994,14 @@ pub fn parse_agent_output(stdout: &str) -> AgentOutcome {
         };
         let report = AgentReport {
             session_id: obj.get("session_id").and_then(|v| v.as_str()).map(str::to_string),
-            num_turns: obj.get("num_turns").and_then(|v| v.as_u64()),
-            duration_ms: obj.get("duration_ms").and_then(|v| v.as_u64()),
-            total_cost_usd: obj.get("total_cost_usd").and_then(|v| v.as_f64()),
+            num_turns: obj.get("num_turns").and_then(serde_json::Value::as_u64),
+            duration_ms: obj.get("duration_ms").and_then(serde_json::Value::as_u64),
+            total_cost_usd: obj.get("total_cost_usd").and_then(serde_json::Value::as_f64),
             exit_code: None,
             timed_out: false,
-            is_error: obj.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false)
+            is_error: obj.get("is_error").and_then(serde_json::Value::as_bool).unwrap_or(false)
                 || obj.get("subtype").and_then(|s| s.as_str()).is_some_and(|s| s.starts_with("error")),
-            permission_denials: obj.get("permission_denials").and_then(|v| v.as_array()).map(|a| a.len() as u64).unwrap_or(0),
+            permission_denials: obj.get("permission_denials").and_then(|v| v.as_array()).map_or(0, |a| a.len() as u64),
         };
         return AgentOutcome { result, report, stdout: String::new(), stderr: String::new() };
     }
@@ -1048,7 +1056,7 @@ mod tests {
 
     #[test]
     fn create_load_list_and_resolve() {
-        let (_tmp, paths) = paths();
+        let (tmp, paths) = paths();
         let d1 = make_draft(
             &paths,
             "20260101T000000Z-aaaaaa",
@@ -1081,8 +1089,8 @@ mod tests {
         // Stray directories without meta.json are ignored.
         std::fs::create_dir_all(paths.tune_dir().join("junk")).unwrap();
         assert_eq!(Draft::list(&paths).unwrap().len(), 2);
-        let empty = Paths::rooted(&_tmp.path().join("other"));
-        assert!(Draft::list(&empty).unwrap().is_empty());
+        let empty = Paths::rooted(&tmp.path().join("other"));
+        assert_eq!((Draft::list(&empty).unwrap()).len(), 0);
     }
 
     #[test]

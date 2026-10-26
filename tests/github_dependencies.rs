@@ -22,6 +22,10 @@ fn dependency(server: &MockServer, repo: &str, number: u64, state: &str) -> Valu
 fn config(server: &MockServer) -> GitHubConfig {
     GitHubConfig { enabled: true, repository: "acme/app".into(), endpoint: server.uri(), ..Default::default() }
 }
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn client(server: &MockServer) -> GitHubClient {
     GitHubClient::new(&server.uri(), "token".into()).unwrap()
 }
@@ -196,7 +200,7 @@ async fn source_wide_dependency_failure_does_not_partially_apply() {
         snapshot(&server, issue(0, 0), ResponseTemplate::new(status)).await;
         let store = Store::open_in_memory().unwrap();
         assert!(plan_sync(&store, &config(&server), &client(&server)).await.is_err(), "{status}");
-        assert!(store.list_tasks().unwrap().is_empty());
+        assert_eq!((store.list_tasks().unwrap()).len(), 0);
     }
 }
 

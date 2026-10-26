@@ -24,7 +24,7 @@ pub const KEYS_ASCII: &str =
     "up/down select  a attach  p pause  P project  r resume  c cancel  R retry  n new task  t terminal  ? help  q quit";
 
 /// `+-|` borders for terminals without box-drawing glyphs.
-pub const ASCII_BORDER: border::Set = border::Set {
+pub const ASCII_BORDER: border::Set<'_> = border::Set {
     top_left: "+",
     top_right: "+",
     bottom_left: "+",
@@ -60,6 +60,10 @@ pub struct Symbols {
 
 impl Symbols {
     /// Unicode glyphs, or ASCII look-alikes when `ascii`.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Keep the existing for_mode flag interface during lint adoption; callers already supply named state predicates."
+    )]
     pub const fn for_mode(ascii: bool) -> Self {
         if ascii {
             Self {
@@ -119,6 +123,22 @@ impl Symbols {
 
 /// Textual progress bar (`[####......]`) used instead of a colour gauge in
 /// ASCII mode; `width` is the total width including the brackets.
+#[expect(
+    clippy::as_conversions,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
 pub fn text_bar(ratio: f64, width: usize) -> String {
     let inner = width.saturating_sub(2);
     let filled = ((ratio.clamp(0.0, 1.0) * inner as f64).round() as usize).min(inner);
@@ -188,12 +208,20 @@ pub fn window_color(window: f64) -> Color {
 
 /// Rows the budget panel needs: one header row plus one gauge per model for
 /// every provider (one row when there is nothing to show).
+#[expect(
+    clippy::as_conversions,
+    reason = "Terminal dimensions and rendered collection lengths use the existing bounded display representation."
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Terminal dimensions and rendered collection lengths use the existing bounded display representation."
+)]
 pub fn budget_rows(app: &DashboardApp) -> u16 {
     let ledgers = app.snapshot.ordered_ledgers();
     if ledgers.is_empty() {
         return 1;
     }
-    ledgers.iter().map(|l| 1 + l.tiers.len()).sum::<usize>().min(u16::MAX as usize) as u16
+    ledgers.iter().map(|l| 1 + l.tiers.len()).sum::<usize>().min(usize::from(u16::MAX)) as u16
 }
 
 /// Gauge colour from pacing: spent fraction vs elapsed fraction of the period.
@@ -210,7 +238,7 @@ pub fn pacing_color(spent: f64, elapsed: f64) -> Color {
 }
 
 /// Draw one frame.
-pub fn draw(frame: &mut Frame, app: &DashboardApp) {
+pub fn draw(frame: &mut Frame<'_>, app: &DashboardApp) {
     let sym = Symbols::for_mode(app.ascii);
     let area = frame.area();
     let chunks = Layout::default()
@@ -242,7 +270,7 @@ pub fn draw(frame: &mut Frame, app: &DashboardApp) {
     }
 }
 
-fn draw_header(frame: &mut Frame, app: &DashboardApp, area: Rect) {
+fn draw_header(frame: &mut Frame<'_>, app: &DashboardApp, area: Rect) {
     let sym = Symbols::for_mode(app.ascii);
     let s = &app.snapshot;
     let daemon = if s.daemon_alive {
@@ -294,7 +322,7 @@ fn draw_header(frame: &mut Frame, app: &DashboardApp, area: Rect) {
     frame.render_widget(Paragraph::new(right), area);
 }
 
-fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) {
+fn draw_table(frame: &mut Frame<'_>, app: &DashboardApp, area: Rect, sym: &Symbols) {
     let rows = app.rows();
     let compact = area.width < 145;
     let title_width = area.width.saturating_sub(if compact { 67 } else { 136 }).max(10);
@@ -314,7 +342,10 @@ fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) 
         if !compact {
             cells.push(Cell::from(r.criticality.as_str()).style(criticality_style(r.criticality)));
         }
-        cells.push(Cell::from(r.model.as_ref().map(|m| m.as_str()).unwrap_or("-")).style(model_style(r.model.as_ref())));
+        cells.push(
+            Cell::from(r.model.as_ref().map_or("-", super::super::domain::ModelTier::as_str))
+                .style(model_style(r.model.as_ref())),
+        );
         if !compact {
             cells.extend([
                 Cell::from(r.tokens.clone()),
@@ -329,7 +360,7 @@ fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) 
             ]);
         }
         let title = if r.deferred { format!("[deferred] {}", r.title) } else { r.title.clone() };
-        cells.push(Cell::from(sym.truncate(&title, title_width as usize)));
+        cells.push(Cell::from(sym.truncate(&title, usize::from(title_width))));
         Row::new(cells)
     });
     let count = rows.len();
@@ -381,7 +412,7 @@ fn draw_table(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) 
     }
 }
 
-fn draw_budget(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) {
+fn draw_budget(frame: &mut Frame<'_>, app: &DashboardApp, area: Rect, sym: &Symbols) {
     let block = sym.panel(" budget ".into());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -420,7 +451,7 @@ fn draw_budget(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols)
             let colour = pacing_color(spent, elapsed);
             if sym.ascii {
                 // A textual bar survives plain-text dumps and fonts without block glyphs.
-                let bar = text_bar(spent, (r.width as usize).saturating_sub(label.len() + 1).clamp(4, 30));
+                let bar = text_bar(spent, (usize::from(r.width)).saturating_sub(label.len() + 1).clamp(4, 30));
                 let line = Line::from(vec![Span::raw(format!("{label} ")), Span::styled(bar, Style::default().fg(colour))]);
                 frame.render_widget(Paragraph::new(line), *r);
             } else {
@@ -459,7 +490,7 @@ fn provider_header(app: &DashboardApp, ledger: &crate::budget::Ledger, sym: &Sym
     Line::from(spans)
 }
 
-fn draw_detail(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) {
+fn draw_detail(frame: &mut Frame<'_>, app: &DashboardApp, area: Rect, sym: &Symbols) {
     let block = sym.panel(" selected task ".into());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -467,7 +498,7 @@ fn draw_detail(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols)
         frame.render_widget(Paragraph::new("nothing selected").style(Style::default().fg(Color::DarkGray)), inner);
         return;
     };
-    let mut lines: Vec<Line> = vec![
+    let mut lines: Vec<Line<'_>> = vec![
         Line::from(vec![
             Span::styled(task.key.clone(), Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" "),
@@ -526,7 +557,7 @@ fn draw_detail(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols)
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn draw_footer(frame: &mut Frame, app: &DashboardApp, area: Rect, sym: &Symbols) {
+fn draw_footer(frame: &mut Frame<'_>, app: &DashboardApp, area: Rect, sym: &Symbols) {
     let keys = sym.keys;
     let attention = app.snapshot.tasks.iter().filter(|t| t.state == TaskState::NeedsAttention).count();
     let notice = (attention > 0).then(|| format!("{attention} need attention: select task + Enter to respond"));
@@ -546,7 +577,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h }
 }
 
-fn draw_add_modal(frame: &mut Frame, input: &str, area: Rect, sym: &Symbols) {
+fn draw_add_modal(frame: &mut Frame<'_>, input: &str, area: Rect, sym: &Symbols) {
     let rect = centered(area, 60, 5);
     frame.render_widget(Clear, rect);
     let block = sym.panel(format!(" new task {} title (enter to add, esc to cancel) ", sym.dash));
@@ -559,15 +590,23 @@ fn draw_add_modal(frame: &mut Frame, input: &str, area: Rect, sym: &Symbols) {
     frame.render_widget(text, inner);
 }
 
-fn draw_project_picker(frame: &mut Frame, picker: &super::app::ProjectPicker, area: Rect, sym: &Symbols) {
+#[expect(
+    clippy::as_conversions,
+    reason = "Terminal dimensions and rendered collection lengths use the existing bounded display representation."
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Terminal dimensions and rendered collection lengths use the existing bounded display representation."
+)]
+fn draw_project_picker(frame: &mut Frame<'_>, picker: &super::app::ProjectPicker, area: Rect, sym: &Symbols) {
     let rect = centered(area, 64, (picker.projects.len() as u16 + 4).min(20));
     frame.render_widget(Clear, rect);
     let block = sym.panel(" repository (enter to select, esc to cancel) ".into());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
-    let height = inner.height.saturating_sub(1) as usize;
+    let height = usize::from(inner.height.saturating_sub(1));
     let start = picker.selected.saturating_sub(height.saturating_sub(1));
-    let lines: Vec<Line> = picker
+    let lines: Vec<Line<'_>> = picker
         .projects
         .iter()
         .enumerate()
@@ -584,7 +623,15 @@ fn draw_project_picker(frame: &mut Frame, picker: &super::app::ProjectPicker, ar
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_help(frame: &mut Frame, area: Rect, sym: &Symbols) {
+#[expect(
+    clippy::as_conversions,
+    reason = "Terminal dimensions and rendered collection lengths use the existing bounded display representation."
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Terminal dimensions and rendered collection lengths use the existing bounded display representation."
+)]
+fn draw_help(frame: &mut Frame<'_>, area: Rect, sym: &Symbols) {
     let lines = [
         "WTOK: cumulative weighted tokens, not context or quota %".to_string(),
         format!("{} k/j  move selection      g/G  first/last", sym.arrows),
@@ -639,7 +686,7 @@ mod tests {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
-        let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        let text: String = terminal.backend().buffer().content().iter().map(ratatui::buffer::Cell::symbol).collect();
         assert!(text.contains("powerqueue"));
         assert!(text.contains("ENG-1"));
         assert!(text.contains("ledger unavailable"));
@@ -671,7 +718,7 @@ mod tests {
         app.add_input = Some("new".into());
         app.show_help = true;
         terminal.draw(|f| draw(f, &app)).unwrap();
-        let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        let text: String = terminal.backend().buffer().content().iter().map(ratatui::buffer::Cell::symbol).collect();
         assert!(text.contains("keys"));
         // Tiny terminal must not panic.
         let mut tiny = Terminal::new(TestBackend::new(20, 6)).unwrap();
@@ -689,7 +736,7 @@ mod tests {
         app.show_help = true;
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
-        let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        let text: String = terminal.backend().buffer().content().iter().map(ratatui::buffer::Cell::symbol).collect();
         let ours: String = text.chars().filter(|c| !c.is_ascii()).collect();
         // The only non-ASCII characters on screen come from user data (the title).
         assert_eq!(ours, "—", "{text}");
@@ -701,7 +748,7 @@ mod tests {
         app.add_input = None;
         app.ascii = false;
         terminal.draw(|f| draw(f, &app)).unwrap();
-        let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        let text: String = terminal.backend().buffer().content().iter().map(ratatui::buffer::Cell::symbol).collect();
         assert!(text.contains("● daemon not running") && text.contains("▶ ENG-2"), "{text}");
     }
 

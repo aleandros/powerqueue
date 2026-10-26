@@ -23,7 +23,7 @@ pub fn claude_json_path(cfg: &crate::config::Config) -> PathBuf {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
         return PathBuf::from(dir).join(".claude.json");
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
     home.join(".claude.json")
 }
 
@@ -37,6 +37,8 @@ pub fn is_trusted(file: &Path, path: &Path) -> bool {
 /// Mark every path in `paths` as trusted in `file`, creating the file if
 /// needed. Everything else in the file is preserved byte-for-byte in meaning
 /// (it is re-serialised). Returns the paths that were newly marked.
+/// # Panics
+/// Panics if an object normalized or checked above is no longer a JSON object.
 pub fn ensure_trusted(file: &Path, paths: &[&Path]) -> Result<Vec<PathBuf>> {
     let mut json: serde_json::Value = match std::fs::read_to_string(file) {
         Ok(text) if !text.trim().is_empty() => {
@@ -111,7 +113,7 @@ mod tests {
         assert!(is_trusted(&file, Path::new("/b")));
         assert!(!is_trusted(&file, Path::new("/c")));
         // Idempotent.
-        assert!(ensure_trusted(&file, &[Path::new("/a")]).unwrap().is_empty());
+        assert_eq!((ensure_trusted(&file, &[Path::new("/a")]).unwrap()).len(), 0);
     }
 
     #[test]

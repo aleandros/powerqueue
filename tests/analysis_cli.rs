@@ -9,6 +9,10 @@ use serde_json::{Value, json};
 use wiremock::matchers::path;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn pq(home: &std::path::Path) -> Command {
     let mut cmd = Command::cargo_bin("powerqueue").unwrap();
     cmd.env("POWERQUEUE_HOME", home)
@@ -21,6 +25,10 @@ fn pq(home: &std::path::Path) -> Command {
     cmd
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn setup(endpoint: &str) -> (tempfile::TempDir, Paths, Config, Store, Task) {
     let home = tempfile::tempdir().unwrap();
     let paths = Paths::rooted(home.path());
@@ -86,7 +94,7 @@ async fn explicit_analysis_is_advisory_persisted_visible_and_detects_stale_conte
     assert_eq!(result["repository_assigned"], false);
     assert_eq!(result["analysis"]["proposal"]["project"], "default");
     assert_eq!(store.get_task(task.id).unwrap().unwrap(), task);
-    assert!(store.list_sessions_for_task(task.id).unwrap().is_empty());
+    assert_eq!((store.list_sessions_for_task(task.id).unwrap()).len(), 0);
     let saved: AnalysisRecord = store.kv_get(&record_key(task.id)).unwrap().unwrap();
     assert!(!saved.stale(&cfg, &task));
     assert!(store.events_for_task(task.id, 20).unwrap().iter().any(|e| e.kind == "analysis.recorded"));
@@ -219,7 +227,7 @@ fn automatic_assignment_is_atomic_sticky_and_guarded_against_stale_writers() {
     cfg.routing.mode = powerqueue::routing::RoutingMode::Automatic;
     cfg.github.enabled = true;
     cfg.github.repository = "example/issues".into();
-    cfg.projects.insert("infra".into(), Default::default());
+    cfg.projects.insert("infra".into(), powerqueue::projects::ProjectConfig::default());
     cfg.projects.get_mut("infra").unwrap().repo.path = "/infra".into();
     cfg.analysis.projects.insert("infra".into(), "Infrastructure".into());
     task = store.get_task(task.id).unwrap().unwrap();
@@ -253,7 +261,7 @@ fn automatic_assignment_is_atomic_sticky_and_guarded_against_stale_writers() {
     assert!(!store.apply_analysis_project(task.id, &cfg).unwrap());
     store.update_task(&assigned).unwrap();
     assert_eq!(store.get_task(task.id).unwrap().unwrap().project_assignment, explicit.project_assignment);
-    assert!(store.list_sessions_for_task(task.id).unwrap().is_empty());
+    assert_eq!((store.list_sessions_for_task(task.id).unwrap()).len(), 0);
 }
 
 #[test]
@@ -263,7 +271,7 @@ fn manual_add_obeys_routing_mode_and_explicit_cli_selection() {
     cfg.save(&paths).unwrap();
     pq(home.path()).args(["add", "Auto", "--key", "AUTO"]).assert().success();
     let auto = store.get_task_by_key("AUTO").unwrap().unwrap();
-    assert!(auto.execution_project.is_empty());
+    assert_eq!(auto.execution_project, "");
     assert!(!auto.execution_approved());
     pq(home.path()).args(["add", "Manual", "--key", "MANUAL", "--project", "default"]).assert().success();
     let manual = store.get_task_by_key("MANUAL").unwrap().unwrap();
@@ -282,7 +290,7 @@ fn claude_routing_fallback_can_run_from_inside_claude_code() {
     let (home, paths, mut cfg, _store, task) = setup("https://example.test/messages");
     let script = home.path().join("fake-claude.sh");
     let raw = serde_json::json!({"result": serde_json::to_string(&proposal()).unwrap()}).to_string();
-    std::fs::write(&script, format!("#!/bin/sh\ntest -z \"$CLAUDECODE\" || exit 1\ncat >/dev/null\nprintf '%s\\n' '{}'\n", raw))
+    std::fs::write(&script, format!("#!/bin/sh\ntest -z \"$CLAUDECODE\" || exit 1\ncat >/dev/null\nprintf '%s\\n' '{raw}'\n"))
         .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     cfg.analysis.llm = None;
@@ -299,7 +307,7 @@ async fn reanalysis_replaces_or_withholds_an_unstarted_automatic_assignment() {
     cfg.routing.mode = powerqueue::routing::RoutingMode::Automatic;
     cfg.github.enabled = true;
     cfg.github.repository = "example/issues".into();
-    cfg.projects.insert("infra".into(), Default::default());
+    cfg.projects.insert("infra".into(), powerqueue::projects::ProjectConfig::default());
     cfg.projects.get_mut("infra").unwrap().repo.path = "/infra".into();
     cfg.analysis.projects.insert("infra".into(), "Infrastructure".into());
     cfg.save(&paths).unwrap();
@@ -355,7 +363,7 @@ async fn analysis_uses_effective_repository_source_overrides() {
         // disabling a globally configured source. Include the multi-project path.
         cfg.github.enabled = !enabled;
         cfg.github.repository = if enabled { String::new() } else { "example/issues".into() };
-        cfg.projects.insert("infra".into(), Default::default());
+        cfg.projects.insert("infra".into(), powerqueue::projects::ProjectConfig::default());
         cfg.projects.get_mut("infra").unwrap().repo.path = "/infra".into();
         cfg.save(&paths).unwrap();
         std::fs::write(

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Enforce BeautifulRust's Rust and Clippy lint policy across all targets, with
+  documented CLI-specific exclusions and local, reasoned expectations for
+  intentional exceptions. Test environment overrides now run in isolated child
+  processes rather than mutating the parallel test harness environment (#81).
+
 ## [0.21.0] - 2026-10-26
 
 ### Added

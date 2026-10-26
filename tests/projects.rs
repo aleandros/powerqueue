@@ -143,6 +143,10 @@ fn reassignment_and_launch_claim_cannot_cross_each_other() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the project_setup_reconfiguration_and_filtered_views workflow and its early exits together in execution order."
+)]
 fn project_setup_reconfiguration_and_filtered_views() {
     use assert_cmd::Command;
     use predicates::str::contains;

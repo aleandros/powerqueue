@@ -179,6 +179,18 @@ pub struct Kept {
 /// Wipe all queue state (see the module docs). Exits 1 when the daemon
 /// could not be stopped, when the user declines, or when some item could
 /// not be removed; `--dry-run` only prints the plan.
+#[expect(
+    clippy::as_conversions,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Command dispatch transfers ownership of parsed arguments to the selected handler."
+)]
 pub fn run(ctx: &mut Context, args: ResetArgs) -> Result<i32> {
     ensure_initialised(ctx)?;
     let cfg = ctx.config_cloned()?;
@@ -262,13 +274,25 @@ pub fn run(ctx: &mut Context, args: ResetArgs) -> Result<i32> {
     } else {
         print_result(&plan, &result, &args);
     }
-    Ok(if result.errors.is_empty() { 0 } else { 1 })
+    Ok(i32::from(!result.errors.is_empty()))
 }
 
 // ----------------------------------------------------------------- planning
 
 /// Compute the plan. `have_linear_key` tells whether a Linear API key is
 /// available (so `--revert-linear` can be planned without the key itself).
+#[expect(
+    clippy::as_conversions,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 fn build_plan(cfg: &Config, paths: &Paths, store: &Store, args: &ResetArgs, have_linear_key: bool) -> Result<ResetPlan> {
     let mut notes = Vec::new();
     let tasks = store.list_tasks().context("list tasks")?;
@@ -522,6 +546,10 @@ fn plan_branches(cfg: &Config, repo: Option<&Repo>, tasks: &[Task], worktrees: &
         .collect()
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 fn plan_linear(cfg: &Config, tasks: &[Task], args: &ResetArgs, have_key: bool) -> LinearPlan {
     let issues: Vec<LinearIssuePlan> = tasks
         .iter()
@@ -548,7 +576,7 @@ fn plan_linear(cfg: &Config, tasks: &[Task], args: &ResetArgs, have_key: bool) -
 /// Direct children of `dir`, sorted; empty when it does not exist.
 fn list_children(dir: &Path) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut out: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    let mut out: Vec<PathBuf> = rd.filter_map(std::result::Result::ok).map(|e| e.path()).collect();
     out.sort();
     out
 }
@@ -557,6 +585,14 @@ fn list_children(dir: &Path) -> Vec<PathBuf> {
 
 /// Ask the daemon to shut down and wait for its heartbeat to go stale.
 /// Returns whether it is gone.
+#[expect(
+    clippy::as_conversions,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
 fn stop_daemon(store: &Store, tick_secs: i64) -> Result<bool> {
     store.enqueue_command(&DaemonCommand::Shutdown).context("queue shutdown command")?;
     let max_age = chrono::Duration::seconds(3 * tick_secs);
@@ -717,7 +753,7 @@ fn print_plan(plan: &ResetPlan, args: &ResetArgs) {
         if states.is_empty() { "none".to_string() } else { states.join(", ") }
     );
     for t in &plan.tasks {
-        println!("    {:<12} {}{}", t.key, t.state, t.linear_issue.as_deref().map(|_| " (Linear)").unwrap_or(""));
+        println!("    {:<12} {}{}", t.key, t.state, t.linear_issue.as_deref().map_or("", |_| " (Linear)"));
     }
 
     let tmux = if !plan.tmux.installed {

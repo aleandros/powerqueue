@@ -19,6 +19,8 @@
 //! back. Everything here is pure; the daemon does the I/O and keeps a
 //! [`RelayState`] per task in kv ([`relay_key`]).
 
+use std::fmt::Write as _;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -173,7 +175,7 @@ pub fn question_text(message: &str, reason: Option<&str>) -> Option<String> {
 pub fn question_body(text: &str, reason: Option<&str>) -> String {
     let mut body = format!("🤖 Pregunta del agente\n\n{}", quote(text));
     if let Some(reason) = reason.map(str::trim).filter(|r| !r.is_empty() && !text.contains(r)) {
-        body.push_str(&format!("\n\nMotivo: {reason}"));
+        let _ = write!(body, "\n\nMotivo: {reason}");
     }
     body.push_str("\n\nResponde con un comentario en este ticket; powerqueue se lo pasa a la sesión del agente.\n\n");
     body.push_str(QUESTION_MARKER);
@@ -289,7 +291,7 @@ mod tests {
         assert!(hint_text(&human).starts_with("New comment from Edgar on the Linear issue"));
         // Only own comments: nothing to relay, but the cursor still moves.
         let (human, newest) = state.human_comments(&comments[..4], at(1));
-        assert!(human.is_empty());
+        assert_eq!((human).len(), 0);
         assert_eq!(newest, Some(at(4)));
     }
 
@@ -404,7 +406,7 @@ mod properties {
                 let body = question_body(text, reason.as_deref());
                 prop_assert!(body.ends_with(QUESTION_MARKER));
                 prop_assert!(body.contains(MARKER_PREFIX));
-                prop_assert_eq!(tag_own(&body), body.clone(), "a tagged body is not tagged twice");
+                prop_assert_eq!(tag_own(&body), body, "a tagged body is not tagged twice");
             }
         }
 

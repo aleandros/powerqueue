@@ -242,7 +242,7 @@ pub fn prompt_variables(task: &Task, cfg: &Config, ctx: &PromptContext<'_>) -> B
     );
     // Shell-quoted: the prompt's commands are typed into a shell, and the
     // state directory may contain spaces.
-    let powerqueue = ctx.powerqueue.map(|p| shell_quote(&p.to_string_lossy())).unwrap_or_else(|| "powerqueue".to_string());
+    let powerqueue = ctx.powerqueue.map_or_else(|| "powerqueue".to_string(), |p| shell_quote(&p.to_string_lossy()));
     let completion_protocol = if task.leaves_ticket_open() {
         format!(
             "## Completion protocol\n\nWrite the complete analysis to a Markdown file in POWERQUEUE_TASK_DIR outside the worktree, then run `{powerqueue} task complete {id} --summary-file <path> --outcome <needs-information|needs-decision|ready-for-agent|manual-action|no-action-recommended>`. This completes this analysis pass, leaves the ticket open, and publishes the report and recommendation label. Do not post the report yourself. Customer questions are drafts in the report; do not send them or use task block for missing customer information. Then print `{DONE_MARKER}`.\n",
@@ -340,13 +340,12 @@ pub fn render_template(template: &str, vars: &BTreeMap<&'static str, String>) ->
         };
         let name = after[..end].trim();
         let is_ident = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-        match (is_ident, vars.get(name)) {
-            (true, Some(value)) => out.push_str(value),
-            _ => {
-                out.push_str(&rest[start..start + 2 + end + 2]);
-                if is_ident && !unknown.iter().any(|u| u == name) {
-                    unknown.push(name.to_string());
-                }
+        if let (true, Some(value)) = (is_ident, vars.get(name)) {
+            out.push_str(value);
+        } else {
+            out.push_str(&rest[start..start + 2 + end + 2]);
+            if is_ident && !unknown.iter().any(|u| u == name) {
+                unknown.push(name.to_string());
             }
         }
         rest = &after[end + 2..];
@@ -400,7 +399,10 @@ impl Launcher {
     /// CLIs with their own ids the previous session's `agent_session_id` is
     /// passed through `resume_id`. Fails when the task has no worktree yet
     /// or the provider cannot describe the launch (e.g. an invalid mode).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Keep the existing prepare flag interface during lint adoption; callers already supply named state predicates."
+    )]
     pub fn prepare(
         &self,
         cfg: &Config,
@@ -415,7 +417,10 @@ impl Launcher {
     }
 
     /// [`Launcher::prepare`] with an explicit provider session id to resume.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Keep the existing prepare_with_resume_id flag interface during lint adoption; callers already supply named state predicates."
+    )]
     pub fn prepare_with_resume_id(
         &self,
         cfg: &Config,
@@ -433,7 +438,14 @@ impl Launcher {
     /// [`Launcher::prepare_with_resume_id`] where `prompt_override`, when
     /// set, replaces the rendered task prompt verbatim (a review round tells
     /// the resumed session only what changed on its pull request).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Keep the existing prepare_with_prompt flag interface during lint adoption; callers already supply named state predicates."
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep the prepare_with_prompt workflow and its early exits together in execution order."
+    )]
     pub fn prepare_with_prompt(
         &self,
         cfg: &Config,
@@ -473,7 +485,7 @@ impl Launcher {
                 tracing::warn!(task = %task.key, session = %session_id, stale, "discarded inbox messages left by the previous session");
             }
         }
-        let powerqueue_bin: &Path = shim.as_ref().map(|(s, _)| s.as_path()).unwrap_or(&self.self_bin);
+        let powerqueue_bin: &Path = shim.as_ref().map_or(&self.self_bin, |(s, _)| s.as_path());
 
         let prompt = match prompt_override {
             Some(text) => RenderedPrompt { text: format!("{}\n", text.trim_end()), template: None, warnings: Vec::new() },
@@ -684,7 +696,7 @@ impl Launcher {
 /// the same rule for the task's shim when the session runs through one
 /// (the prompt then names the shim by its absolute path).
 pub fn always_allowed_tools(shim: Option<&str>) -> Vec<String> {
-    let mut out: Vec<String> = ALWAYS_ALLOWED_TOOLS.iter().map(|s| s.to_string()).collect();
+    let mut out: Vec<String> = ALWAYS_ALLOWED_TOOLS.iter().map(std::string::ToString::to_string).collect();
     if let Some(shim) = shim.map(str::trim).filter(|s| !s.is_empty()) {
         out.push(format!("Bash({shim} task *)"));
     }
@@ -714,6 +726,10 @@ fn worktree_of(task: &Task) -> Result<&Path> {
 }
 
 /// Render `launch.sh`. `path_dirs` go in front of `PATH`, first entry first.
+#[expect(
+    clippy::similar_names,
+    reason = "The names distinguish related domain values and match the surrounding workflow terminology."
+)]
 fn launch_script(
     task: &Task,
     attempt: u32,
@@ -834,7 +850,7 @@ mod tests {
                 format!("'/opt/power queue/bin/powerqueue' hook --task {} --session {sid} --event {}", t.id, event.as_str()),
                 "{event:?}"
             );
-            let is_async = entry.get("async").and_then(|a| a.as_bool()).unwrap_or(false);
+            let is_async = entry.get("async").and_then(serde_json::Value::as_bool).unwrap_or(false);
             let expected = event == HookEvent::PreCompact;
             assert_eq!(is_async, expected, "{event:?}");
         }
@@ -1242,7 +1258,7 @@ mod tests {
         assert_eq!(unknown, vec!["nope".to_string()]);
         let (out, unknown) = render_template("no placeholders }} here", &vars);
         assert_eq!(out, "no placeholders }} here");
-        assert!(unknown.is_empty());
+        assert_eq!((unknown).len(), 0);
         let (out, _) = render_template("{{key}}{{key}}", &vars);
         assert_eq!(out, "ENG-1ENG-1");
     }
@@ -1284,7 +1300,7 @@ mod tests {
         plain.prompt.template = None;
         let wrapped = render_prompt(&t, &cfg, &ctx);
         assert_eq!(wrapped.text, render_prompt(&t, &plain, &ctx).text);
-        assert!(wrapped.warnings.is_empty());
+        assert_eq!((wrapped.warnings).len(), 0);
 
         // Missing file: the built-in prompt plus a warning, never an error.
         cfg.prompt.template = Some(dir.path().join("missing.md").to_string_lossy().to_string());
@@ -1319,7 +1335,7 @@ mod tests {
         cfg.prompt.template = Some(tpl.to_string_lossy().to_string());
         let plan = launcher.prepare(&cfg, &t, sid, &ModelTier::sonnet(), 1, false, None).unwrap();
         assert_eq!(plan.prompt_template.as_deref(), Some(tpl.as_path()));
-        assert!(plan.prompt_warnings.is_empty());
+        assert_eq!((plan.prompt_warnings).len(), 0);
         assert_eq!(std::fs::read_to_string(&plan.prompt_path).unwrap(), "ENG-123 via sonnet\n");
     }
 }

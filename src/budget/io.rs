@@ -67,6 +67,10 @@ pub fn load_observations(store: &Store, provider: Provider) -> Result<Vec<Observ
         .with_context(|| format!("read observation history of {provider}"))?
         .unwrap_or_default();
     #[derive(Deserialize)]
+    #[expect(
+        clippy::items_after_statements,
+        reason = "The local helper type is scoped beside the resource or compatibility operation that uses it."
+    )]
     struct Legacy {
         observed_fraction: f64,
         at: DateTime<Utc>,
@@ -130,7 +134,7 @@ mod tests {
         assert_eq!(load_observed(&store, Provider::Codex).unwrap(), Some(obs.clone()));
         assert_eq!(load_observations(&store, Provider::Codex).unwrap(), vec![ObservationSample::of(&obs)]);
         assert!(load_observed(&store, Provider::Claude).unwrap().is_none());
-        assert!(load_observations(&store, Provider::Claude).unwrap().is_empty());
+        assert_eq!((load_observations(&store, Provider::Claude).unwrap()).len(), 0);
         assert_eq!(observed_key(Provider::Gemini), "budget.observed.gemini");
         assert_eq!(observations_key(Provider::Gemini), "budget.observations.gemini");
         assert!(NoProbe(Provider::Gemini).probe().unwrap().is_none());
@@ -144,18 +148,13 @@ mod tests {
         let base = ObservedUsage { period_used: Some(0.3), window_used: Some(0.1), ..ObservedUsage::empty(t0) };
         save_observed(&store, Provider::Claude, &base).unwrap();
         // Same reading 20s later: not stored. Same reading 2 min later: stored.
-        save_observed(&store, Provider::Claude, &ObservedUsage { observed_at: t0 + Duration::seconds(20), ..base.clone() })
-            .unwrap();
+        save_observed(&store, Provider::Claude, &ObservedUsage { observed_at: t0 + Duration::seconds(20), ..base }).unwrap();
         assert_eq!(load_observations(&store, Provider::Claude).unwrap().len(), 1);
-        save_observed(&store, Provider::Claude, &ObservedUsage { observed_at: t0 + Duration::minutes(2), ..base.clone() })
-            .unwrap();
+        save_observed(&store, Provider::Claude, &ObservedUsage { observed_at: t0 + Duration::minutes(2), ..base }).unwrap();
         assert_eq!(load_observations(&store, Provider::Claude).unwrap().len(), 2);
         // A changed reading 10s later replaces the one just before it (one per minute is kept).
-        let changed = ObservedUsage {
-            period_used: Some(0.31),
-            observed_at: t0 + Duration::minutes(2) + Duration::seconds(10),
-            ..base.clone()
-        };
+        let changed =
+            ObservedUsage { period_used: Some(0.31), observed_at: t0 + Duration::minutes(2) + Duration::seconds(10), ..base };
         save_observed(&store, Provider::Claude, &changed).unwrap();
         let h = load_observations(&store, Provider::Claude).unwrap();
         assert_eq!(h.len(), 2);

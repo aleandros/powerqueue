@@ -33,7 +33,7 @@ use crate::logging::Verbosity;
 /// Route a parsed CLI to its handler. Returns the exit code.
 pub fn dispatch(cli: Cli) -> Result<i32> {
     let verbosity = Verbosity::from_flags(cli.verbose, cli.quiet);
-    let no_color_env = std::env::var_os("NO_COLOR").map(|v| !v.is_empty()).unwrap_or(false);
+    let no_color_env = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
     let color = !cli.no_color && !no_color_env && std::io::IsTerminal::is_terminal(&std::io::stdout());
     crate::cli::output::set_color(color);
     let mut ctx = Context::new(cli.home.clone(), verbosity, cli.json, color);

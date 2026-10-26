@@ -33,11 +33,7 @@ impl Paths {
             .or_else(|| directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()))
             .unwrap_or_else(|| PathBuf::from("."));
         let xdg = |var: &str, default: &str| -> PathBuf {
-            std::env::var_os(var)
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(default))
-                .join(APP_NAME)
+            std::env::var_os(var).filter(|v| !v.is_empty()).map_or_else(|| home.join(default), PathBuf::from).join(APP_NAME)
         };
         Self {
             config_dir: xdg("XDG_CONFIG_HOME", ".config"),

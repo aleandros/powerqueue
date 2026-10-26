@@ -15,6 +15,8 @@
 //! `loginctl` / `journalctl` with explicit arguments, and failures carry the
 //! tool's stderr.
 
+use std::fmt::Write as _;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -93,8 +95,7 @@ impl Manager {
         Ok(match self {
             Manager::Systemd => std::env::var_os("XDG_CONFIG_HOME")
                 .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".config"))
+                .map_or_else(|| home.join(".config"), PathBuf::from)
                 .join("systemd/user")
                 .join(SYSTEMD_UNIT),
             Manager::Launchd => home.join("Library/LaunchAgents").join(format!("{LAUNCHD_LABEL}.plist")),
@@ -102,6 +103,10 @@ impl Manager {
     }
 
     /// The command that shows the service's own output.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Keep the existing logs_command flag interface during lint adoption; callers already supply named state predicates."
+    )]
     pub fn logs_command(self, paths: &Paths, lines: usize, follow: bool) -> Command {
         match self {
             Manager::Systemd => {
@@ -202,18 +207,18 @@ impl ServiceSpec {
 
     fn render_systemd(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!("# {GENERATED_MARKER} (powerqueue {}).\n", crate::VERSION));
+        let _ = writeln!(out, "# {GENERATED_MARKER} (powerqueue {}).", crate::VERSION);
         out.push_str("# Re-run it after moving the binary or changing PATH; `powerqueue service uninstall` removes it.\n");
         out.push_str("[Unit]\n");
         out.push_str("Description=powerqueue daemon (Linear -> Claude Code work queue)\n");
         out.push_str("Documentation=https://github.com/aleandros/powerqueue\n\n");
         out.push_str("[Service]\n");
         out.push_str("Type=simple\n");
-        out.push_str(&format!("ExecStart={} run\n", systemd_quote(&self.binary.to_string_lossy())));
+        let _ = writeln!(out, "ExecStart={} run", systemd_quote(&self.binary.to_string_lossy()));
         // systemd's `~` is the user's home; this setting does not take quotes.
         out.push_str("WorkingDirectory=~\n");
         for (k, v) in &self.env {
-            out.push_str(&format!("Environment={}\n", systemd_quote(&format!("{k}={v}"))));
+            let _ = writeln!(out, "Environment={}", systemd_quote(&format!("{k}={v}")));
         }
         out.push_str("# Restart after a crash, not after `powerqueue stop` (a clean exit).\n");
         out.push_str("Restart=on-failure\n");
@@ -233,27 +238,27 @@ impl ServiceSpec {
         out.push_str(
             "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n",
         );
-        out.push_str(&format!("<!-- {GENERATED_MARKER} (powerqueue {}).\n", crate::VERSION));
+        let _ = writeln!(out, "<!-- {GENERATED_MARKER} (powerqueue {}).", crate::VERSION);
         out.push_str("     Re-run it after moving the binary or changing PATH; `powerqueue service uninstall` removes it. -->\n");
         out.push_str("<plist version=\"1.0\">\n<dict>\n");
-        out.push_str(&format!("  <key>Label</key>{}\n", s(LAUNCHD_LABEL)));
+        let _ = writeln!(out, "  <key>Label</key>{}", s(LAUNCHD_LABEL));
         out.push_str("  <key>ProgramArguments</key>\n  <array>\n");
-        out.push_str(&format!("    {}\n    {}\n", s(&self.binary.to_string_lossy()), s("run")));
+        let _ = write!(out, "    {}\n    {}\n", s(&self.binary.to_string_lossy()), s("run"));
         out.push_str("  </array>\n");
         out.push_str("  <key>EnvironmentVariables</key>\n  <dict>\n");
         for (k, v) in &self.env {
-            out.push_str(&format!("    <key>{}</key>{}\n", xml_escape(k), s(v)));
+            let _ = writeln!(out, "    <key>{}</key>{}", xml_escape(k), s(v));
         }
         out.push_str("  </dict>\n");
-        out.push_str(&format!("  <key>WorkingDirectory</key>{}\n", s(&self.working_dir.to_string_lossy())));
+        let _ = writeln!(out, "  <key>WorkingDirectory</key>{}", s(&self.working_dir.to_string_lossy()));
         out.push_str("  <key>RunAtLoad</key><true/>\n");
         out.push_str("  <!-- Restart after a crash, not after `powerqueue stop` (a clean exit). -->\n");
         out.push_str("  <key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key><false/>\n  </dict>\n");
         out.push_str("  <key>ThrottleInterval</key><integer>10</integer>\n");
         out.push_str("  <!-- Leave tmux and the Claude sessions running when the daemon exits. -->\n");
         out.push_str("  <key>AbandonProcessGroup</key><true/>\n");
-        out.push_str(&format!("  <key>StandardOutPath</key>{}\n", s(&self.stdout.to_string_lossy())));
-        out.push_str(&format!("  <key>StandardErrorPath</key>{}\n", s(&self.stderr.to_string_lossy())));
+        let _ = writeln!(out, "  <key>StandardOutPath</key>{}", s(&self.stdout.to_string_lossy()));
+        let _ = writeln!(out, "  <key>StandardErrorPath</key>{}", s(&self.stderr.to_string_lossy()));
         out.push_str("</dict>\n</plist>\n");
         out
     }
@@ -291,7 +296,7 @@ fn stable_path(path: &str) -> String {
             seen.push(entry);
         }
     }
-    std::env::join_paths(&seen).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| path.to_string())
+    std::env::join_paths(&seen).map_or_else(|_| path.to_string(), |p| p.to_string_lossy().into_owned())
 }
 
 /// `dir` with its deepest symlinked ancestor (or itself) replaced by the
@@ -478,7 +483,7 @@ impl InstalledUnit {
 
     /// Tools from `tools` that the unit's `PATH` does not resolve.
     pub fn missing_tools(&self, tools: &[String]) -> Vec<String> {
-        let path = self.env.get("PATH").map(String::as_str).unwrap_or(FALLBACK_PATH);
+        let path = self.env.get("PATH").map_or(FALLBACK_PATH, String::as_str);
         let cwd = home_dir().unwrap_or_else(|_| PathBuf::from("/"));
         tools.iter().filter(|t| which::which_in(t.as_str(), Some(path), &cwd).is_err()).cloned().collect()
     }
@@ -506,7 +511,7 @@ pub fn unit_problems(unit: &InstalledUnit, current_exe: Option<&Path>, tools: &[
     }
     match &unit.binary {
         None => {
-            out.push(UnitProblem { detail: "the unit does not say which binary it runs".to_string(), hint: regenerate.clone() })
+            out.push(UnitProblem { detail: "the unit does not say which binary it runs".to_string(), hint: regenerate });
         }
         Some(b) if !b.exists() => out.push(UnitProblem {
             detail: format!("it runs {}, which does not exist", b.display()),
@@ -563,7 +568,7 @@ fn unit_lines(text: &str) -> Vec<String> {
 fn plist_section<'a>(text: &'a str, key: &str, end: &str) -> Option<&'a str> {
     let start = text.find(&format!("<key>{key}</key>"))? + key.len() + 11;
     let rest = &text[start..];
-    let stop = rest.find(end).map(|i| i + end.len()).unwrap_or(rest.len());
+    let stop = rest.find(end).map_or(rest.len(), |i| i + end.len());
     Some(&rest[..stop])
 }
 
@@ -721,6 +726,10 @@ fn launchd_domain() -> Result<String> {
 
 /// Make the manager pick up a freshly written unit and enable it; with
 /// `start`, also start it. Does not restart a running instance.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing activate flag interface during lint adoption; callers already supply named state predicates."
+)]
 pub fn activate(manager: Manager, start: bool) -> Result<()> {
     match manager {
         Manager::Systemd => {

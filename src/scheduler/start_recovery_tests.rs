@@ -14,6 +14,10 @@ struct Harness {
 }
 
 impl Harness {
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+    )]
     fn new() -> Option<Self> {
         if which::which("git").is_err() || which::which("tmux").is_err() {
             return None;
@@ -51,6 +55,10 @@ impl Harness {
         Some(Self { daemon, writer, tmux, dir })
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+    )]
     fn task(&self) -> Task {
         let task = Task::new("START-1", "test abandoned start", TaskSource::Manual);
         self.daemon.store.insert_task(&task).unwrap();
@@ -64,13 +72,21 @@ impl Harness {
             prediction: crate::budget::Prediction::default_guess(),
             reasons: vec!["test".into()],
         };
-        self.daemon.start_task(task, ModelTier::sonnet(), &decision, Utc::now()).await
+        Box::pin(self.daemon.start_task(task, ModelTier::sonnet(), &decision, Utc::now())).await
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+    )]
     fn saved(&self, task: &Task) -> Task {
         self.daemon.store.get_task(task.id).unwrap().unwrap()
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+    )]
     fn restart(&mut self) {
         let paths = self.daemon.paths.clone();
         let cfg = self.daemon.cfg.clone();
@@ -79,10 +95,18 @@ impl Harness {
         self.daemon = Daemon::new(cfg, paths, store, secrets).unwrap();
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+    )]
     fn target(&self, task: &Task) -> LaunchTarget {
         self.daemon.store.kv_get(&LaunchTarget::key(task.id)).unwrap().unwrap()
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+    )]
     fn stop_panes(&self, task: &Task) {
         let target = self.target(task);
         for pane in self.tmux.list_panes(&target.session_name).unwrap() {
@@ -123,7 +147,7 @@ async fn starting_subprocess_worker() {
         prediction: crate::budget::Prediction::default_guess(),
         reasons: vec!["test".into()],
     };
-    assert_eq!(daemon.start_task(task, ModelTier::sonnet(), &decision, Utc::now()).await.unwrap(), Started::Preparing);
+    assert_eq!(Box::pin(daemon.start_task(task, ModelTier::sonnet(), &decision, Utc::now())).await.unwrap(), Started::Preparing);
     // Background setup no longer holds this call. Keep the owning daemon and
     // its exclusive lock alive until the parent kills this process.
     std::future::pending::<()>().await;
@@ -136,10 +160,18 @@ async fn starting_setup_survives_killed_daemon() {
     let ready = h.dir.path().join("setup.pid");
     h.daemon.cfg.repo.setup = vec![format!("echo $$ > {}; exec sleep 600", crate::tmux::shell_quote(&ready.to_string_lossy()))];
     h.daemon.cfg.save(&h.daemon.paths).unwrap();
+    #[expect(
+        clippy::items_after_statements,
+        reason = "The local helper type is scoped beside the resource or compatibility operation that uses it."
+    )]
     struct Processes {
         worker: std::process::Child,
         setup: Option<u32>,
     }
+    #[expect(
+        clippy::items_after_statements,
+        reason = "The local helper type is scoped beside the resource or compatibility operation that uses it."
+    )]
     impl Drop for Processes {
         fn drop(&mut self) {
             let _ = self.worker.kill();
@@ -197,7 +229,7 @@ async fn starting_claim_and_runtime_target_are_atomic() {
     let Some(mut h) = Harness::new() else { return };
     let task = h.task();
     h.writer.execute_batch("CREATE TRIGGER inject BEFORE INSERT ON kv WHEN NEW.key LIKE 'launch.target.%' BEGIN SELECT RAISE(ABORT, 'target write failed'); END;").unwrap();
-    assert!(h.start(task.clone()).await.is_err());
+    assert!(Box::pin(h.start(task.clone())).await.is_err());
     assert_eq!(h.saved(&task).state, TaskState::Queued);
     assert_eq!(h.saved(&task).attempts, 0);
     assert!(h.daemon.store.kv_get::<LaunchTarget>(&LaunchTarget::key(task.id)).unwrap().is_none());
@@ -215,20 +247,20 @@ async fn starting_recovers_binding_and_crash_persistence_failures_after_restart(
             h.writer.execute_batch("CREATE TRIGGER inject BEFORE UPDATE ON tasks WHEN NEW.state='crashed' BEGIN SELECT RAISE(ABORT, 'crash write failed'); END;").unwrap();
         }
         if boundary == "binding" {
-            assert!(h.start(task.clone()).await.is_err(), "{boundary}");
+            assert!(Box::pin(h.start(task.clone())).await.is_err(), "{boundary}");
         } else {
-            assert_eq!(h.start(task.clone()).await.unwrap(), Started::Preparing);
+            assert_eq!(Box::pin(h.start(task.clone())).await.unwrap(), Started::Preparing);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while !h.daemon.rt.setups[&task.id].worker.is_finished() {
                 assert!(std::time::Instant::now() < deadline, "setup failed to exit");
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            h.daemon.poll_setups(Utc::now()).await.unwrap();
+            Box::pin(h.daemon.poll_setups(Utc::now())).await.unwrap();
         }
         let stranded = h.saved(&task);
         assert_eq!(stranded.state, TaskState::Starting, "{boundary}");
         assert_eq!(stranded.attempts, 1);
-        assert!(h.daemon.store.list_sessions_for_task(task.id).unwrap().is_empty());
+        assert_eq!((h.daemon.store.list_sessions_for_task(task.id).unwrap()).len(), 0);
         h.writer.execute_batch("DROP TRIGGER inject;").unwrap();
         h.restart();
         h.writer
@@ -258,7 +290,7 @@ async fn starting_session_insert_failure_holds_renamed_live_pane_across_restart_
     h.writer
         .execute_batch("CREATE TRIGGER inject BEFORE INSERT ON sessions BEGIN SELECT RAISE(ABORT, 'session insert failed'); END;")
         .unwrap();
-    assert!(h.start(task.clone()).await.is_err());
+    assert!(Box::pin(h.start(task.clone())).await.is_err());
     assert_eq!(h.saved(&task).state, TaskState::Starting);
     assert!(h.target(&task).has_live_pane().unwrap());
     h.writer.execute_batch("DROP TRIGGER inject;").unwrap();
@@ -271,7 +303,7 @@ async fn starting_session_insert_failure_holds_renamed_live_pane_across_restart_
     h.restart();
     h.daemon.recover_starting(Utc::now()).unwrap();
     assert_eq!(h.saved(&task).state, TaskState::Starting);
-    assert!(h.daemon.store.list_sessions_for_task(task.id).unwrap().is_empty());
+    assert_eq!((h.daemon.store.list_sessions_for_task(task.id).unwrap()).len(), 0);
     h.stop_panes(&task);
     h.daemon.recover_starting(Utc::now()).unwrap();
     assert_eq!(h.saved(&task).state, TaskState::Crashed);
@@ -284,7 +316,7 @@ async fn starting_running_write_failure_keeps_registered_session() {
     let Some(mut h) = Harness::new() else { return };
     let task = h.task();
     h.writer.execute_batch("CREATE TRIGGER inject BEFORE UPDATE ON tasks WHEN NEW.state='running' BEGIN SELECT RAISE(ABORT, 'running write failed'); END;").unwrap();
-    assert!(h.start(task.clone()).await.is_err());
+    assert!(Box::pin(h.start(task.clone())).await.is_err());
     assert_eq!(h.saved(&task).state, TaskState::Starting);
     assert_eq!(h.daemon.store.list_live_sessions().unwrap().len(), 1);
     h.writer.execute_batch("DROP TRIGGER inject;").unwrap();
@@ -298,7 +330,7 @@ async fn starting_running_write_failure_keeps_registered_session() {
 async fn starting_resumed_session_update_failure_waits_for_unrecorded_agent() {
     let Some(mut h) = Harness::new() else { return };
     let task = h.task();
-    assert!(matches!(h.start(task.clone()).await.unwrap(), Started::Launched));
+    assert!(matches!(Box::pin(h.start(task.clone())).await.unwrap(), Started::Launched));
     h.stop_panes(&task);
     let mut old = h.daemon.store.latest_session(task.id).unwrap().unwrap();
     let transcript = Path::new(old.transcript_path.as_ref().unwrap());
@@ -311,10 +343,10 @@ async fn starting_resumed_session_update_failure_waits_for_unrecorded_agent() {
     h.writer
         .execute_batch("CREATE TRIGGER inject BEFORE UPDATE ON sessions BEGIN SELECT RAISE(ABORT, 'session update failed'); END;")
         .unwrap();
-    assert!(h.start(crashed).await.is_err());
+    assert!(Box::pin(h.start(crashed)).await.is_err());
     assert_eq!(h.saved(&task).state, TaskState::Starting);
     assert_eq!(h.saved(&task).attempts, 2);
-    assert!(h.daemon.store.list_live_sessions().unwrap().is_empty());
+    assert_eq!((h.daemon.store.list_live_sessions().unwrap()).len(), 0);
     h.writer.execute_batch("DROP TRIGGER inject;").unwrap();
     h.restart();
     h.daemon.recover_starting(Utc::now()).unwrap();
@@ -330,7 +362,7 @@ async fn background_setup_reload_persists_the_actual_target_before_session_write
     let Some(mut h) = Harness::new() else { return };
     let task = h.task();
     h.daemon.cfg.repo.setup = vec!["true".into()];
-    assert_eq!(h.start(task.clone()).await.unwrap(), Started::Preparing);
+    assert_eq!(Box::pin(h.start(task.clone())).await.unwrap(), Started::Preparing);
     let old = h.target(&task);
     h.daemon.cfg.tmux.socket_name = Some(format!("powerqueue-test-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
     h.daemon.cfg.tmux.session_name = "reloaded".into();
@@ -347,12 +379,12 @@ async fn background_setup_reload_persists_the_actual_target_before_session_write
         assert!(std::time::Instant::now() < deadline);
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    h.daemon.poll_setups(Utc::now()).await.unwrap();
+    Box::pin(h.daemon.poll_setups(Utc::now())).await.unwrap();
     let target = h.target(&task);
     assert_ne!(target.socket_name, old.socket_name);
     assert_eq!(target.session_name, "reloaded");
     assert!(target.has_live_pane().unwrap());
-    assert!(h.daemon.store.list_sessions_for_task(task.id).unwrap().is_empty());
+    assert_eq!((h.daemon.store.list_sessions_for_task(task.id).unwrap()).len(), 0);
     h.writer.execute_batch("DROP TRIGGER inject;").unwrap();
     h.restart();
     h.daemon.recover_starting(Utc::now()).unwrap();

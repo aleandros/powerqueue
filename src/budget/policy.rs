@@ -72,7 +72,7 @@ pub struct RateLimitState {
 
 impl RateLimitState {
     pub fn is_exhausted(&self, tier: &ModelTier, now: DateTime<Utc>) -> bool {
-        self.exhausted_until.get(tier).map(|t| *t > now).unwrap_or(false)
+        self.exhausted_until.get(tier).is_some_and(|t| *t > now)
     }
     pub fn mark(&mut self, tier: ModelTier, until: DateTime<Utc>) {
         self.exhausted_until.insert(tier, until);
@@ -171,7 +171,7 @@ impl<'a> Policy<'a> {
     pub fn decide(&self, task: &Task, prediction: Prediction, preferred: &[ModelTier]) -> Decision {
         let providers = self.providers();
         let Some(now) = providers.first().and_then(|p| self.ledgers.get(*p)).map(|l| l.now) else {
-            let now = self.ledgers.by_provider.values().next().map(|l| l.now).unwrap_or_else(Utc::now);
+            let now = self.ledgers.by_provider.values().next().map_or_else(Utc::now, |l| l.now);
             let mut reasons: Vec<String> = Provider::ALL
                 .iter()
                 .filter(|p| self.ledgers.get(**p).is_none() || !self.cfg.provider(**p).enabled)
@@ -217,7 +217,7 @@ impl<'a> Policy<'a> {
                 (vec![t.clone()], true, "preferred")
             }
             None if !preferred.is_empty() => {
-                let names: Vec<String> = preferred.iter().map(|m| m.to_string()).collect();
+                let names: Vec<String> = preferred.iter().map(std::string::ToString::to_string).collect();
                 reasons.push(format!("preferred by rules: {}", names.join(" | ")));
                 (preferred.to_vec(), false, "preferred")
             }
@@ -330,13 +330,7 @@ impl<'a> Policy<'a> {
         let s = tl.period_spent_fraction();
         let endgame = e >= self.cfg.endgame_fraction;
         let under_paced = e >= model.relax_after_fraction && s < e;
-        let levels = if endgame {
-            2
-        } else if under_paced {
-            1
-        } else {
-            0
-        };
+        let levels = if endgame { 2 } else { usize::from(under_paced) };
         let allowed = lower_by(model.min_criticality, levels);
         if task.criticality > allowed {
             let needed = level_index(task.criticality).saturating_sub(level_index(model.min_criticality));
@@ -369,7 +363,7 @@ impl<'a> Policy<'a> {
         let available = tl.period_remaining() * margin;
         if borrowed && cost > available {
             return blocked(
-                format!("{tier}'s share: needs {:.0} weighted tokens, {:.0} left after the safety margin", cost, available),
+                format!("{tier}'s share: needs {cost:.0} weighted tokens, {available:.0} left after the safety margin"),
                 Some(period.end),
             );
         }
@@ -439,7 +433,6 @@ fn observed_block(ledger: &Ledger) -> Option<(String, Option<DateTime<Utc>>)> {
             ),
             Some(until),
         )),
-        Some(_) => None,
         None if now - obs.observed_at < OBSERVED_EXHAUSTED_TTL => Some((
             format!(
                 "{} {what} (no reset time known; observed {} min ago)",
@@ -448,7 +441,7 @@ fn observed_block(ledger: &Ledger) -> Option<(String, Option<DateTime<Utc>>)> {
             ),
             Some(now + WINDOW_RECHECK),
         )),
-        None => None,
+        Some(_) | None => None,
     }
 }
 
@@ -462,6 +455,18 @@ fn lower_by(c: Criticality, levels: usize) -> Criticality {
     Criticality::ALL[idx]
 }
 
+#[expect(
+    clippy::as_conversions,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
 fn fraction_of(d: Duration, f: f64) -> Duration {
     Duration::seconds((d.num_seconds() as f64 * f.clamp(0.0, 1.0)).round() as i64)
 }
@@ -498,6 +503,11 @@ mod tests {
     }
 
     /// A Claude ledger at `elapsed` of the period with each tier at the given spent fraction.
+    #[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "Fixture counts and timestamps are bounded to small values by the test inputs."
+    )]
     fn ledger(cfg: &BudgetConfig, elapsed: f64, spent: &[(ModelTier, f64)]) -> Ledgers {
         let now = now();
         let start = now - fraction_of(Duration::hours(PERIOD_HOURS), elapsed);
@@ -508,7 +518,7 @@ mod tests {
             .into_iter()
             .map(|tier| {
                 let budget = claude.period_weighted_tokens as f64 * tier_share(cfg, &tier);
-                let frac = spent.iter().find(|(t, _)| *t == tier).map(|(_, f)| *f).unwrap_or(0.0);
+                let frac = spent.iter().find(|(t, _)| *t == tier).map_or(0.0, |(_, f)| *f);
                 TierLedger { tier, period_weighted: budget * frac, period_budget: budget, ..Default::default() }
             })
             .collect();
@@ -523,6 +533,11 @@ mod tests {
     }
 
     /// A ledger for any provider at `elapsed` of a 7-day period, nothing spent.
+    #[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "Fixture counts and timestamps are bounded to small values by the test inputs."
+    )]
     fn provider_ledger(cfg: &BudgetConfig, provider: Provider, elapsed: f64) -> Ledger {
         let now = now();
         let start = now - fraction_of(Duration::hours(PERIOD_HOURS), elapsed);
@@ -890,7 +905,7 @@ mod tests {
         let ledgers = Ledgers::default();
         let limits = RateLimitState::default();
         let policy = Policy::new(&cfg, &ledgers, &limits);
-        assert!(policy.candidates().is_empty());
+        assert_eq!((policy.candidates()).len(), 0);
         let d = policy.decide(&task(Criticality::Critical), prediction(1.0), &[]);
         assert_eq!(d.model, None);
         assert!(d.retry_at.is_some());
@@ -1045,18 +1060,17 @@ mod tests {
         assert_eq!(d.retry_at, Some(reset));
 
         // A full window without `blocked` behaves the same.
-        claude_mut(&mut only).observed = Some(ObservedUsage { blocked: false, window_used: Some(1.0), ..obs.clone() });
+        claude_mut(&mut only).observed = Some(ObservedUsage { blocked: false, window_used: Some(1.0), ..obs });
         let d = decide(&cfg_claude, &only, &limits, &task(Criticality::Critical), &[]);
         assert_eq!(d.retry_at, Some(reset));
 
         // Once the reset has passed the observation no longer blocks.
-        claude_mut(&mut only).observed =
-            Some(ObservedUsage { window_resets_at: Some(now() - Duration::minutes(1)), ..obs.clone() });
+        claude_mut(&mut only).observed = Some(ObservedUsage { window_resets_at: Some(now() - Duration::minutes(1)), ..obs });
         let d = decide(&cfg_claude, &only, &limits, &task(Criticality::Critical), &[]);
         assert_eq!(d.model, Some(fable()));
 
         // Exhausted without a reset instant: blocked for a while after the observation.
-        claude_mut(&mut only).observed = Some(ObservedUsage { window_resets_at: None, ..obs.clone() });
+        claude_mut(&mut only).observed = Some(ObservedUsage { window_resets_at: None, ..obs });
         let d = decide(&cfg_claude, &only, &limits, &task(Criticality::Critical), &[]);
         assert_eq!(d.model, None);
         assert_eq!(d.retry_at, Some(now() + WINDOW_RECHECK));
@@ -1177,28 +1191,25 @@ mod properties {
             prop_assert_eq!(&d, &policy.decide(&task, prediction.clone(), &preferred), "deterministic");
             prop_assert!(!d.reasons.is_empty());
             prop_assert_eq!(&d.prediction, &prediction);
-            match &d.model {
-                Some(m) => {
-                    prop_assert!(d.retry_at.is_none());
-                    prop_assert!(cfg.provider(m.provider()).enabled, "{} is disabled", m.provider());
-                    prop_assert!(ledgers.for_model(m).is_some());
-                    prop_assert!(!limits.is_exhausted(m, origin()), "{} is rate limited", m);
-                    prop_assert!(policy.candidates().contains(m), "{} is not a candidate", m);
-                    let (ok, why) = policy.eligibility(&task, m, prediction.weighted_tokens);
-                    prop_assert!(ok, "{}: {}", m, why);
-                    if let Some(o) = &task.model_override {
-                        prop_assert_eq!(m.provider(), o.provider(), "an override never crosses providers");
-                        prop_assert!(cfg.downgrade_chain(o).contains(m), "{} is not below the override {}", m, o);
-                    }
+            if let Some(m) = &d.model {
+                prop_assert!(d.retry_at.is_none());
+                prop_assert!(cfg.provider(m.provider()).enabled, "{} is disabled", m.provider());
+                prop_assert!(ledgers.for_model(m).is_some());
+                prop_assert!(!limits.is_exhausted(m, origin()), "{} is rate limited", m);
+                prop_assert!(policy.candidates().contains(m), "{} is not a candidate", m);
+                let (ok, why) = policy.eligibility(&task, m, prediction.weighted_tokens);
+                prop_assert!(ok, "{}: {}", m, why);
+                if let Some(o) = &task.model_override {
+                    prop_assert_eq!(m.provider(), o.provider(), "an override never crosses providers");
+                    prop_assert!(cfg.downgrade_chain(o).contains(m), "{} is not below the override {}", m, o);
                 }
-                None => {
-                    let at = d.retry_at.expect("a throttled decision says when to look again");
-                    prop_assert!(at > origin(), "retry {} is not after now", at);
-                    for m in policy.candidates() {
-                        let (ok, why) = policy.eligibility(&task, &m, prediction.weighted_tokens);
-                        let pinned = task.model_override.as_ref().is_some_and(|o| !cfg.downgrade_chain(o).contains(&m));
-                        prop_assert!(!ok || pinned, "{} was eligible ({}) but nothing was chosen: {:?}", m, why, d.reasons);
-                    }
+            } else {
+                let at = d.retry_at.expect("a throttled decision says when to look again");
+                prop_assert!(at > origin(), "retry {} is not after now", at);
+                for m in policy.candidates() {
+                    let (ok, why) = policy.eligibility(&task, &m, prediction.weighted_tokens);
+                    let pinned = task.model_override.as_ref().is_some_and(|o| !cfg.downgrade_chain(o).contains(&m));
+                    prop_assert!(!ok || pinned, "{} was eligible ({}) but nothing was chosen: {:?}", m, why, d.reasons);
                 }
             }
         }
@@ -1239,7 +1250,7 @@ mod properties {
                 state.mark(tier.clone(), *until);
             }
             // Later marks of the same model replace earlier ones.
-            let mut expected: std::collections::BTreeMap<ModelTier, DateTime<Utc>> = Default::default();
+            let mut expected: std::collections::BTreeMap<ModelTier, DateTime<Utc>> = std::collections::BTreeMap::default();
             for (tier, until) in &marks {
                 expected.insert(tier.clone(), *until);
             }

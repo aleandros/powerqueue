@@ -90,6 +90,14 @@ impl Estimator {
 
     /// Build from per-task summaries, keeping completed and failed tasks that
     /// actually consumed tokens. Running or cancelled tasks are not evidence.
+    #[expect(
+        clippy::as_conversions,
+        reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+    )]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+    )]
     pub fn from_summaries(summaries: &[TaskUsageSummary]) -> Self {
         let samples = summaries
             .iter()
@@ -121,6 +129,14 @@ impl Estimator {
     /// Mean absolute percentage error of leave-one-out predictions over
     /// completed samples, as a fraction (0.25 = predictions are off by 25% on
     /// average). `None` with fewer than four completed samples.
+    #[expect(
+        clippy::as_conversions,
+        reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+    )]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+    )]
     pub fn accuracy(&self) -> Option<f64> {
         let completed: Vec<usize> = (0..self.samples.len()).filter(|&i| self.samples[i].completed).collect();
         if completed.len() < 4 {
@@ -148,6 +164,14 @@ impl Estimator {
     }
 
     /// Core prediction. `exclude` leaves one sample out (for [`Self::accuracy`]).
+    #[expect(
+        clippy::as_conversions,
+        reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+    )]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+    )]
     fn predict_features(&self, f: Features<'_>, exclude: Option<usize>) -> Prediction {
         let all: Vec<&Sample> = self.samples.iter().enumerate().filter(|(i, _)| Some(*i) != exclude).map(|(_, s)| s).collect();
         if all.is_empty() {
@@ -198,6 +222,14 @@ impl Estimator {
 }
 
 /// `(n·bucket + k·global) / (n + k)`.
+#[expect(
+    clippy::as_conversions,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
 fn shrink(bucket_median: f64, n: usize, global_median: f64) -> f64 {
     let n = n as f64;
     (n * bucket_median + Estimator::SHRINK_K * global_median) / (n + Estimator::SHRINK_K)
@@ -211,7 +243,7 @@ fn median(values: impl Iterator<Item = f64>) -> f64 {
     }
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = v.len() / 2;
-    if v.len().is_multiple_of(2) { (v[mid - 1] + v[mid]) / 2.0 } else { v[mid] }
+    if v.len().is_multiple_of(2) { f64::midpoint(v[mid - 1], v[mid]) } else { v[mid] }
 }
 
 #[cfg(test)]
@@ -231,7 +263,7 @@ mod tests {
             task_id: TaskId::new(),
             criticality: crit,
             estimate,
-            labels: labels.iter().map(|s| s.to_string()).collect(),
+            labels: labels.iter().map(std::string::ToString::to_string).collect(),
             state,
             attempts: 1,
             usage: TokenUsage::default(),
@@ -245,7 +277,7 @@ mod tests {
         let mut t = Task::new("ENG-1", "t", TaskSource::Manual);
         t.criticality = crit;
         t.estimate = estimate;
-        t.labels = labels.iter().map(|s| s.to_string()).collect();
+        t.labels = labels.iter().map(std::string::ToString::to_string).collect();
         t
     }
 
@@ -346,7 +378,7 @@ mod tests {
     #[test]
     fn confidence_saturates_at_one() {
         let rows: Vec<_> =
-            (0..25).map(|i| summary(TaskState::Completed, Criticality::Normal, None, &[], 100.0 + i as f64, 10)).collect();
+            (0..25).map(|i| summary(TaskState::Completed, Criticality::Normal, None, &[], 100.0 + f64::from(i), 10)).collect();
         let est = Estimator::from_summaries(&rows);
         let p = est.predict(&task(Criticality::Normal, None, &[]));
         assert_eq!(p.confidence, 1.0);
@@ -467,6 +499,8 @@ mod properties {
         /// trusted as is: the prediction is that bucket's median of effective
         /// tokens, with confidence `n / 10` capped at 1.
         #[test]
+        #[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+        #[expect(clippy::cast_precision_loss, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
         fn a_full_estimate_bucket_is_its_median(
             others in vec(summary(), 0..=8),
             matching in vec(summary(), Estimator::TRUST_N..=8),

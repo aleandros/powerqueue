@@ -6,12 +6,16 @@ use serde_json::{Value, json};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn fixture(server: &MockServer) -> (Config, Task) {
     let mut cfg = Config::default();
     cfg.repo.path = "/private/checkout".into();
     cfg.analysis.enabled = true;
     cfg.analysis.projects.insert("default".into(), "API service: authentication and billing".into());
-    cfg.projects.insert("web".into(), Default::default());
+    cfg.projects.insert("web".into(), powerqueue::projects::ProjectConfig::default());
     cfg.projects.get_mut("web").unwrap().repo.path = "/private/web".into();
     cfg.analysis.projects.insert("web".into(), "Browser UI: components and styling".into());
     cfg.priority.jev.endpoint = format!("{}/jev", server.uri());
@@ -36,10 +40,18 @@ fn jev(destination: &str, p: f64) -> Value {
     }, "usage": {"input_tokens": 120, "output_tokens": 12}})
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "The test or replay driver consumes each input operation before advancing to the next one."
+)]
 fn proposal(project: Value) -> Value {
     json!({"project": project, "classification": "bug", "confidence": 0.95, "reasoning": "The failure is reported in the authentication API, which belongs to the API service.", "plan": ["Reproduce the API failure", "Inspect authentication validation and add a regression test"]})
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "The test or replay driver consumes each input operation before advancing to the next one."
+)]
 fn llm(proposal: Value) -> Value {
     json!({"content": [{"type": "text", "text": proposal.to_string()}], "stop_reason": "end_turn", "usage": {"input_tokens": 200, "output_tokens": 90}})
 }
@@ -206,7 +218,7 @@ async fn claude_code_fallback_receives_only_data_with_no_tools_and_has_a_deadlin
     cfg.analysis.llm = None;
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("claude.py");
-    std::fs::write(&script, r#"#!/usr/bin/env python3
+    std::fs::write(&script, r"#!/usr/bin/env python3
 import sys,json,os
 args=sys.argv[1:]
 assert args[args.index('--tools')+1] == ''
@@ -219,7 +231,7 @@ assert '--max-turns' in args and args[args.index('--max-turns')+1] == '1'
 data=json.load(sys.stdin)
 assert set(data)=={'issue','projects'} and '/private/' not in json.dumps(data)
 print(json.dumps({'result':json.dumps({'project':'default','classification':'bug','confidence':0.92,'reasoning':'Authentication API','plan':['Test API login']}),'usage':{'input_tokens':42}}))
-"#).unwrap();
+").unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     cfg.analysis.claude_code =
         Some(powerqueue::analysis::ClaudeCodeConfig { binary: script.display().to_string(), ..Default::default() });

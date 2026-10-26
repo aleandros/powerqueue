@@ -2,7 +2,7 @@
 //! hook receiver and `doctor` need from a coding-agent CLI.
 //!
 //! The implementations live next to this file: [`crate::session::claude`]
-//! (Claude Code), [`crate::session::codex`] (OpenAI Codex CLI) and
+//! (Claude Code), [`crate::session::codex`] (`OpenAI` Codex CLI) and
 //! [`crate::session::gemini`] (Google Antigravity CLI, experimental). This
 //! module keeps the trait, [`agent_for`] and the helpers they share (prompt
 //! argument, environment merging, rate-limit signature matching).
@@ -217,7 +217,7 @@ pub(crate) fn same_dir(a: &Path, b: &Path) -> bool {
 
 /// `$HOME` (or `.` when unset).
 pub(crate) fn home_dir() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+    std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from)
 }
 
 #[cfg(test)]
@@ -229,8 +229,8 @@ mod tests {
     fn agent_for_matches_provider() {
         for p in Provider::ALL {
             assert_eq!(agent_for(p).provider(), p);
-            assert!(!agent_for(p).allowed_modes().is_empty());
-            assert!(!agent_for(p).rate_limit_signatures().is_empty());
+            assert_ne!(agent_for(p).allowed_modes().len(), 0);
+            assert_ne!(agent_for(p).rate_limit_signatures().len(), 0);
         }
         assert_eq!(agent_for(Provider::Claude).allowed_modes(), &CLAUDE_PERMISSION_MODES);
         assert_eq!(agent_for(Provider::Codex).allowed_modes(), &CODEX_APPROVAL_MODES);

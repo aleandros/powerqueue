@@ -92,6 +92,10 @@ enum Parsed {
 /// A command whose JSON output is one document of its own (`simulate`)
 /// passes `json_missing = false` and reports a missing file in that
 /// document instead.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 fn parse_source(ctx: &mut Context, source: &RulesSource, json_missing: bool) -> Result<Parsed> {
     let path = source.path();
     let Some(text) = source.read()? else {
@@ -298,6 +302,14 @@ fn edit(ctx: &mut Context, project: Option<&str>) -> Result<i32> {
     check(ctx, &CheckArgs { project: project.map(str::to_owned), ..CheckArgs::default() })
 }
 
+#[expect(
+    clippy::as_conversions,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
 fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let store = ctx.store()?.clone();
     let task = store.find_task(&task_ref.task)?.ok_or_else(|| anyhow!("no task matches `{}`", task_ref.task))?;
@@ -306,16 +318,15 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let source = full_cfg.rules_source(&ctx.paths);
     let path = source.path();
     let cfg = full_cfg.priority.clone();
-    let rules = match PriorityRules::from_source(&source)? {
-        Some(rules) => rules,
-        None => {
-            println!(
-                "{} {}",
-                "note:".if_supports_color(Stream::Stdout, |t| t.style(owo_colors::Style::new().yellow().bold())),
-                missing_message(&path)
-            );
-            PriorityRules::default()
-        }
+    let rules = if let Some(rules) = PriorityRules::from_source(&source)? {
+        rules
+    } else {
+        println!(
+            "{} {}",
+            "note:".if_supports_color(Stream::Stdout, |t| t.style(owo_colors::Style::new().yellow().bold())),
+            missing_message(&path)
+        );
+        PriorityRules::default()
     };
     let jev_normalized = if rules.jev.enabled && cfg.jev.enabled {
         store.jev_cached(task.id)?.map(|c| {
@@ -364,6 +375,10 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
 
 /// One row of `priority simulate`.
 #[derive(Debug, Clone, serde::Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "These are independent configuration or observed-state flags, not mutually exclusive states."
+)]
 pub struct SimRow {
     pub rank: usize,
     pub key: String,
@@ -413,6 +428,10 @@ pub struct Simulation {
 /// given (or live) rules, ranked the way `pick_next` ranks, and run through
 /// the budget policy, so the effect of an edit is visible before the daemon
 /// picks it up. Nothing is written.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Command dispatch transfers ownership of parsed arguments to the selected handler."
+)]
 fn simulate(ctx: &mut Context, args: SimulateArgs) -> Result<i32> {
     let source = match &args.file {
         Some(p) => RulesSource::File(p.clone()),
@@ -482,6 +501,15 @@ pub fn simulate_with(
 
 /// Simulate a tune proposal only for tasks consuming the target policy, leaving
 /// other projects on their own policies. Reads state without changing it.
+#[expect(
+    clippy::as_conversions,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
+#[expect(clippy::too_many_lines, reason = "Keep the simulate_target workflow and its early exits together in execution order.")]
 pub(crate) fn simulate_target(
     ctx: &mut Context,
     args: &SimulateArgs,

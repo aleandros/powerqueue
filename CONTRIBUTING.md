@@ -34,6 +34,28 @@ just test
 | `just install` | `cargo install --path . --locked` |
 | `just clean-state` | removes `target/dev-home` only, never your real state |
 
+## Lint policy
+
+`Cargo.toml` and `clippy.toml` adopt the [BeautifulRust lint policy](https://github.com/morganlinton/BeautifulRust/tree/main/lints)
+(v1.4.0), including the `all` and `pedantic` groups. CI treats warnings as errors
+for all targets and features; code written by agent sessions uses the same gate.
+Keep the registered `cfg(kani)` when editing the Rust lint table.
+
+Powerqueue's library is an internal CLI implementation, so `missing_docs`,
+`print_stdout` and `print_stderr` are omitted. `missing_errors_doc` is explicitly
+allowed because it is included in `pedantic`: requiring hundreds of library-style
+error sections would duplicate the CLI's contextual errors. `missing_panics_doc`
+remains enabled. The other upstream allowances are unchanged.
+
+Fix diagnostics when possible. An intentional exception must use
+`#[expect(clippy::lint_name, reason = "specific justification")]` on the smallest
+applicable item, never `#[allow(...)]` or a crate-wide exemption. Expectations
+expire when the diagnostic disappears. Existing boolean interfaces and numeric
+conversion behavior have local exceptions to avoid changing CLI, scheduling and
+storage semantics during adoption; new code should use explicit modes and checked
+conversions. Test fixture helpers may need their own expectation because Clippy's
+`allow-unwrap-in-tests` recognizes test functions, not every helper they call.
+
 ## Tests
 
 - Unit tests sit next to the code (`#[cfg(test)] mod tests`). Keep pure

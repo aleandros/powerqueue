@@ -114,6 +114,10 @@ pub struct GitHubClient {
 
 impl GitHubClient {
     /// Build a client; fails for invalid endpoints, tokens or HTTP configuration.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "Keep the established ownership-taking boundary for callers and serialized inputs."
+    )]
     pub fn new(endpoint: &str, token: String) -> Result<Self> {
         use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
         let cfg = GitHubConfig { endpoint: endpoint.to_string(), ..Default::default() };
@@ -140,7 +144,7 @@ impl GitHubClient {
     fn url(&self, segments: &[&str]) -> Result<Url> {
         let mut url = self.endpoint.clone();
         url.path_segments_mut()
-            .map_err(|_| anyhow::anyhow!("GitHub endpoint cannot be a base URL"))?
+            .map_err(|()| anyhow::anyhow!("GitHub endpoint cannot be a base URL"))?
             .pop_if_empty()
             .extend(segments);
         Ok(url)
@@ -194,6 +198,10 @@ impl GitHubClient {
 
     // Completed local tasks can remain open for human review. Do not let them
     // permanently fill the intake cap and starve later issues.
+    #[expect(
+        clippy::as_conversions,
+        reason = "Collection and read lengths fit the platform counter type on supported 32-bit and 64-bit targets."
+    )]
     pub(super) async fn fetch_issues_ignoring(&self, cfg: &GitHubConfig, finished: &HashSet<u64>) -> Result<Vec<GitHubIssue>> {
         let mut out = Vec::new();
         let mut scanned = 0_u64;
@@ -336,6 +344,7 @@ impl GitHubClient {
 
     /// Verify approval history and material edits using GraphQL. Fails closed on
     /// missing fields, partial/error responses, inconsistent snapshots or pagination limits.
+    #[expect(clippy::too_many_lines, reason = "Keep the admission workflow and its early exits together in execution order.")]
     pub async fn admission(&self, cfg: &GitHubConfig, issue: &GitHubIssue) -> Result<GitHubAdmission> {
         // Obvious revocations need no history request.
         let preliminary = evaluate(cfg, issue, None, &[]);
@@ -357,7 +366,7 @@ impl GitHubClient {
             format!("{base}/graphql")
         };
         url.set_path(&path);
-        let query = r#"query($owner:String!, $name:String!, $number:Int!, $after:String) {
+        let query = r"query($owner:String!, $name:String!, $number:Int!, $after:String) {
           repository(owner:$owner, name:$name) { issue(number:$number) {
             title body state lastEditedAt updatedAt
             timelineItems(first:100, after:$after, itemTypes:[LABELED_EVENT, UNLABELED_EVENT, RENAMED_TITLE_EVENT]) {
@@ -369,7 +378,7 @@ impl GitHubClient {
               pageInfo { hasNextPage endCursor }
             }
           } }
-        }"#;
+        }";
         let mut cursor: Option<String> = None;
         let mut events = Vec::new();
         let mut revision = None;
@@ -431,7 +440,7 @@ impl GitHubClient {
             events.extend(page);
             let more = timeline
                 .pointer("/pageInfo/hasNextPage")
-                .and_then(|v| v.as_bool())
+                .and_then(serde_json::Value::as_bool)
                 .context("GitHub approval pagination unavailable")?;
             if !more {
                 return Ok(evaluate(cfg, issue, edited, &events));
@@ -484,5 +493,11 @@ impl GitHubClient {
         )
         .await?;
         Ok(())
+    }
+}
+
+impl std::fmt::Debug for GitHubClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitHubClient").field("endpoint", &self.endpoint).finish_non_exhaustive()
     }
 }

@@ -383,6 +383,10 @@ struct Dependencies {
 }
 
 impl Respond for Dependencies {
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+    )]
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let body: Value = request.body_json().expect("json body");
         let query = body["query"].as_str().unwrap_or("");
@@ -430,7 +434,10 @@ impl Respond for Dependencies {
 async fn dependencies_are_batched_and_fully_paginated() {
     let server = server().await;
     let batches = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    Mock::given(method("POST")).respond_with(Dependencies { batches: batches.clone() }).mount(&server).await;
+    Mock::given(method("POST"))
+        .respond_with(Dependencies { batches: std::sync::Arc::<std::sync::Mutex<std::vec::Vec<usize>>>::clone(&batches) })
+        .mount(&server)
+        .await;
     let client = client(&server);
 
     let mut ids: Vec<String> = (0..11).map(|i| format!("small-{i}")).collect();

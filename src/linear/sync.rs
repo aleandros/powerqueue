@@ -69,6 +69,7 @@ pub fn sync_issues_routed(
     sync_issues_inner(store, &cfg.linear, issues, fetch_state, Some(cfg))
 }
 
+#[expect(clippy::too_many_lines, reason = "Keep the sync_issues_inner workflow and its early exits together in execution order.")]
 fn sync_issues_inner(
     store: &Store,
     cfg: &LinearConfig,
@@ -151,8 +152,7 @@ fn sync_issues_inner(
         }
         let state_type = fetch_state(&issue_id);
         let closed = match state_type.as_deref().map(str::to_ascii_lowercase).as_deref() {
-            None => true,
-            Some("completed") | Some("canceled") | Some("cancelled") => true,
+            None | Some("completed" | "canceled" | "cancelled") => true,
             Some(_) => false,
         };
         if !closed {
@@ -195,6 +195,10 @@ fn sync_issues_inner(
     Ok(report)
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing route_issue flag interface during lint adoption; callers already supply named state predicates."
+)]
 fn route_issue(
     task: &mut Task,
     config: Option<&crate::config::Config>,
@@ -229,16 +233,16 @@ pub fn task_from_issue(issue: &LinearIssue) -> Task {
             team_key: issue.team_key.clone(),
         },
     );
-    task.description = issue.description.clone();
-    task.labels = issue.labels.clone();
+    task.description.clone_from(&issue.description);
+    task.labels.clone_from(&issue.labels);
     task.linear_priority = Some(issue.priority);
     task.estimate = issue.estimate;
-    task.project = issue.project.clone();
+    task.project.clone_from(&issue.project);
     task.cycle = issue.cycle_status().map(str::to_string);
     task.cycle_number = issue.cycle.as_ref().map(|c| c.number);
-    task.blocked_by = issue.blocked_by.clone();
-    task.children = issue.children.clone();
-    task.parent = issue.parent.clone();
+    task.blocked_by.clone_from(&issue.blocked_by);
+    task.children.clone_from(&issue.children);
+    task.parent.clone_from(&issue.parent);
     task.created_at = issue.created_at;
     task
 }
@@ -251,15 +255,15 @@ pub fn task_from_issue(issue: &LinearIssue) -> Task {
 pub fn apply_issue(task: &mut Task, issue: &LinearIssue) -> Vec<&'static str> {
     let mut changed = Vec::new();
     if task.title != issue.title {
-        task.title = issue.title.clone();
+        task.title.clone_from(&issue.title);
         changed.push("title");
     }
     if task.description != issue.description {
-        task.description = issue.description.clone();
+        task.description.clone_from(&issue.description);
         changed.push("description");
     }
     if task.labels != issue.labels {
-        task.labels = issue.labels.clone();
+        task.labels.clone_from(&issue.labels);
         changed.push("labels");
     }
     if task.linear_priority != Some(issue.priority) {
@@ -271,7 +275,7 @@ pub fn apply_issue(task: &mut Task, issue: &LinearIssue) -> Vec<&'static str> {
         changed.push("estimate");
     }
     if task.project != issue.project {
-        task.project = issue.project.clone();
+        task.project.clone_from(&issue.project);
         changed.push("project");
     }
     let cycle = issue.cycle_status().map(str::to_string);
@@ -282,15 +286,15 @@ pub fn apply_issue(task: &mut Task, issue: &LinearIssue) -> Vec<&'static str> {
         changed.push("cycle");
     }
     if task.blocked_by != issue.blocked_by {
-        task.blocked_by = issue.blocked_by.clone();
+        task.blocked_by.clone_from(&issue.blocked_by);
         changed.push("blocked_by");
     }
     if task.children != issue.children {
-        task.children = issue.children.clone();
+        task.children.clone_from(&issue.children);
         changed.push("children");
     }
     if task.parent != issue.parent {
-        task.parent = issue.parent.clone();
+        task.parent.clone_from(&issue.parent);
         changed.push("parent");
     }
     let source = TaskSource::Linear {
@@ -363,7 +367,7 @@ mod tests {
         let report = sync_issues(&store, &cfg, &issues, no_state).unwrap();
         assert_eq!(report.updated.len(), 1);
         let t = store.get_task_by_key("ENG-1").unwrap().unwrap();
-        assert!(t.pending_blockers().is_empty());
+        assert_eq!((t.pending_blockers()).len(), 0);
         assert!(t.is_container() && t.is_waiting(), "sub-issues make it a container");
         let events = store.events_for_task(t.id, 10).unwrap();
         assert!(
@@ -520,7 +524,7 @@ mod tests {
         let two = store.get_task_by_key("ENG-2").unwrap().unwrap();
         assert_eq!(report.cancelled, vec![two.id]);
         let report = sync_issues(&store, &cfg, &[], |_| None).unwrap();
-        assert!(report.cancelled.is_empty());
+        assert_eq!((report.cancelled).len(), 0);
     }
 
     #[test]

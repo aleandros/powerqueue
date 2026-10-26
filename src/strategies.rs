@@ -11,8 +11,6 @@
 //! failures shrink to readable timestamps; keep generated durations small
 //! (`chrono::Duration::seconds` panics far out of range).
 
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Duration, Utc};
@@ -29,35 +27,36 @@ use crate::github::{PrCheck, PrStatus, PrThread, QueueRemoval};
 use crate::session::{HookOutcome, SessionProbe};
 
 /// `2026-10-01T12:00:00Z`: "now" for every property unless it says otherwise.
-pub fn origin() -> DateTime<Utc> {
+pub(crate) fn origin() -> DateTime<Utc> {
     DateTime::parse_from_rfc3339("2026-10-01T12:00:00Z").expect("valid origin").with_timezone(&Utc)
 }
 
 /// An instant between `origin - before` and `origin + after` (seconds, whole).
-pub fn instant_between(before_secs: i64, after_secs: i64) -> impl Strategy<Value = DateTime<Utc>> {
+pub(crate) fn instant_between(before_secs: i64, after_secs: i64) -> impl Strategy<Value = DateTime<Utc>> {
     (-before_secs..=after_secs).prop_map(|s| origin() + Duration::seconds(s))
 }
 
 /// An instant within three days either side of the origin.
-pub fn instant() -> impl Strategy<Value = DateTime<Utc>> {
+pub(crate) fn instant() -> impl Strategy<Value = DateTime<Utc>> {
     instant_between(3 * 86_400, 3 * 86_400)
 }
 
 /// An instant up to three days before the origin (a past event).
-pub fn past_instant() -> impl Strategy<Value = DateTime<Utc>> {
+pub(crate) fn past_instant() -> impl Strategy<Value = DateTime<Utc>> {
     instant_between(3 * 86_400, 0)
 }
 
 /// An instant strictly after the origin, up to three days ahead.
-pub fn future_instant() -> impl Strategy<Value = DateTime<Utc>> {
+pub(crate) fn future_instant() -> impl Strategy<Value = DateTime<Utc>> {
     instant_between(-1, 3 * 86_400)
 }
 
-pub fn task_state() -> impl Strategy<Value = TaskState> {
+pub(crate) fn task_state() -> impl Strategy<Value = TaskState> {
     prop::sample::select(TaskState::ALL.to_vec())
 }
 
-pub fn session_state() -> impl Strategy<Value = SessionState> {
+#[expect(dead_code, reason = "Retain the shared session-state generator for focused model extensions.")]
+pub(crate) fn session_state() -> impl Strategy<Value = SessionState> {
     prop::sample::select(vec![
         SessionState::Launching,
         SessionState::Running,
@@ -69,14 +68,14 @@ pub fn session_state() -> impl Strategy<Value = SessionState> {
 }
 
 /// Launch/recovery observations, including a slow setup and an unrecorded agent.
-pub fn start_activity() -> impl Strategy<Value = crate::scheduler::launch::StartActivity> {
+pub(crate) fn start_activity() -> impl Strategy<Value = crate::scheduler::launch::StartActivity> {
     use crate::scheduler::launch::StartActivity::*;
     prop::sample::select(vec![InProgress, LivePane, LiveSetup, Abandoned])
 }
 
 /// Tick-boundary operations while setup workers and agent sessions coexist.
 #[derive(Debug, Clone)]
-pub enum SetupModelOp {
+pub(crate) enum SetupModelOp {
     Pass,
     Finish(usize, bool),
     Pause(usize),
@@ -87,7 +86,7 @@ pub enum SetupModelOp {
     Capacity(u32, u32),
 }
 
-pub fn setup_model_ops() -> impl Strategy<Value = Vec<SetupModelOp>> {
+pub(crate) fn setup_model_ops() -> impl Strategy<Value = Vec<SetupModelOp>> {
     use SetupModelOp::*;
     vec(
         prop_oneof![
@@ -106,7 +105,7 @@ pub fn setup_model_ops() -> impl Strategy<Value = Vec<SetupModelOp>> {
 
 /// Persistence and concurrent writes interleaved with abandoned-start recovery.
 #[derive(Debug, Clone, Copy)]
-pub enum StartRecoveryOp {
+pub(crate) enum StartRecoveryOp {
     Observe,
     Recover,
     FailRecovery,
@@ -118,7 +117,7 @@ pub enum StartRecoveryOp {
     ChangeProject,
 }
 
-pub fn start_recovery_ops() -> impl Strategy<Value = Vec<StartRecoveryOp>> {
+pub(crate) fn start_recovery_ops() -> impl Strategy<Value = Vec<StartRecoveryOp>> {
     use StartRecoveryOp::*;
     vec(
         prop::sample::select(vec![
@@ -136,51 +135,51 @@ pub fn start_recovery_ops() -> impl Strategy<Value = Vec<StartRecoveryOp>> {
     )
 }
 
-pub fn criticality() -> impl Strategy<Value = Criticality> {
+pub(crate) fn criticality() -> impl Strategy<Value = Criticality> {
     prop::sample::select(Criticality::ALL.to_vec())
 }
 
-pub fn provider() -> impl Strategy<Value = Provider> {
+pub(crate) fn provider() -> impl Strategy<Value = Provider> {
     prop::sample::select(Provider::ALL.to_vec())
 }
 
 /// The shipped models of every provider (what `BudgetConfig::default` knows).
-pub fn known_models() -> Vec<ModelTier> {
+pub(crate) fn known_models() -> Vec<ModelTier> {
     let cfg = BudgetConfig::default();
     Provider::ALL.iter().flat_map(|p| cfg.models_for(*p)).collect()
 }
 
 /// One of the shipped Claude models.
-pub fn claude_model() -> impl Strategy<Value = ModelTier> {
+pub(crate) fn claude_model() -> impl Strategy<Value = ModelTier> {
     prop::sample::select(BudgetConfig::default().models_for(Provider::Claude))
 }
 
 /// One of the shipped models of any provider.
-pub fn model() -> impl Strategy<Value = ModelTier> {
+pub(crate) fn model() -> impl Strategy<Value = ModelTier> {
     prop::sample::select(known_models())
 }
 
 /// Short identifier-like text (keys, names, reasons).
-pub fn word() -> impl Strategy<Value = String> {
+pub(crate) fn word() -> impl Strategy<Value = String> {
     "[a-z][a-z0-9-]{0,7}"
 }
 
 /// A sentence-ish line of text, possibly empty.
-pub fn line() -> impl Strategy<Value = String> {
+pub(crate) fn line() -> impl Strategy<Value = String> {
     "[A-Za-z0-9 ,.?!'-]{0,40}"
 }
 
 /// A GitHub PR URL `request_round` / the watcher can parse.
-pub fn pr_url() -> impl Strategy<Value = String> {
+pub(crate) fn pr_url() -> impl Strategy<Value = String> {
     (1u64..5000).prop_map(|n| format!("https://github.com/o/r/pull/{n}"))
 }
 
 /// A PR URL, usable or not.
-pub fn any_pr_url() -> impl Strategy<Value = String> {
+pub(crate) fn any_pr_url() -> impl Strategy<Value = String> {
     prop_oneof![4 => pr_url(), 1 => Just("not a pr".to_string()), 1 => Just("https://gitlab.com/o/r/-/merge_requests/3".to_string())]
 }
 
-pub fn linked_issue() -> impl Strategy<Value = LinkedIssue> {
+pub(crate) fn linked_issue() -> impl Strategy<Value = LinkedIssue> {
     (word(), prop::sample::select(vec!["unstarted", "started", "completed", "canceled", "cancelled", "backlog"]), any::<bool>())
         .prop_map(|(key, state_type, pr_merged)| LinkedIssue {
             key: format!("ENG-{key}"),
@@ -190,7 +189,7 @@ pub fn linked_issue() -> impl Strategy<Value = LinkedIssue> {
         })
 }
 
-pub fn review_relaunch() -> impl Strategy<Value = ReviewRelaunch> {
+pub(crate) fn review_relaunch() -> impl Strategy<Value = ReviewRelaunch> {
     (1u64..5000, prop::sample::select(vec!["conflict", "ci_failed", "review", "requested"]), line(), past_instant()).prop_map(
         |(pr_number, reason, detail, requested_at)| ReviewRelaunch {
             pr_number,
@@ -202,7 +201,7 @@ pub fn review_relaunch() -> impl Strategy<Value = ReviewRelaunch> {
 }
 
 /// A PR watch armed some time before the origin.
-pub fn review_watch() -> impl Strategy<Value = ReviewWatch> {
+pub(crate) fn review_watch() -> impl Strategy<Value = ReviewWatch> {
     (
         instant_between(3 * 86_400, 0),
         0u32..=6,
@@ -244,13 +243,13 @@ pub fn review_watch() -> impl Strategy<Value = ReviewWatch> {
 }
 
 /// Independent execution project IDs used across lifecycle and scheduling models.
-pub fn execution_project() -> impl Strategy<Value = String> {
+pub(crate) fn execution_project() -> impl Strategy<Value = String> {
     prop::sample::select(vec!["default".to_string(), "api".to_string(), "web".to_string()])
 }
 
 /// A queued candidate from each of three distinct execution projects. This
 /// guarantees shared-pass properties exercise every project on every case.
-pub fn three_project_candidates() -> impl Strategy<Value = Vec<Task>> {
+pub(crate) fn three_project_candidates() -> impl Strategy<Value = Vec<Task>> {
     prop::array::uniform3(task_in(TaskState::Queued)).prop_map(|tasks| {
         tasks
             .into_iter()
@@ -264,14 +263,14 @@ pub fn three_project_candidates() -> impl Strategy<Value = Vec<Task>> {
 }
 
 /// Project availability, checkout revision and independently chosen model preference.
-pub fn execution_project_settings() -> impl Strategy<Value = (bool, bool, ModelTier)> {
+pub(crate) fn execution_project_settings() -> impl Strategy<Value = (bool, bool, ModelTier)> {
     (prop::bool::weighted(0.8), any::<bool>(), prop::sample::select(known_models()))
 }
 
 /// What a task row looks like in each state, with independent source metadata
 /// and execution project: reviews have a PR/watch, terminal tasks a completion
 /// time, and tasks that ran have a branch.
-pub fn task_in(state: TaskState) -> impl Strategy<Value = Task> {
+pub(crate) fn task_in(state: TaskState) -> impl Strategy<Value = Task> {
     let ran = !matches!(state, TaskState::Queued | TaskState::Blocked | TaskState::Paused | TaskState::Throttled);
     let in_review = state == TaskState::InReview;
     let terminal = state.is_terminal();
@@ -332,12 +331,12 @@ pub fn task_in(state: TaskState) -> impl Strategy<Value = Task> {
 }
 
 /// A task in any state (see [`task_in`]).
-pub fn task() -> impl Strategy<Value = Task> {
+pub(crate) fn task() -> impl Strategy<Value = Task> {
     task_state().prop_flat_map(task_in)
 }
 
 /// A task in one of `states`.
-pub fn task_among(states: &[TaskState]) -> impl Strategy<Value = Task> {
+pub(crate) fn task_among(states: &[TaskState]) -> impl Strategy<Value = Task> {
     prop::sample::select(states.to_vec()).prop_flat_map(task_in)
 }
 
@@ -345,7 +344,7 @@ pub fn task_among(states: &[TaskState]) -> impl Strategy<Value = Task> {
 /// Live iff the task expects one ([`TaskState::has_live_session`]); either
 /// way for a paused or throttled task, which may keep its session
 /// ([`TaskState::may_keep_session`]).
-pub fn session_for(task: &Task) -> BoxedStrategy<Session> {
+pub(crate) fn session_for(task: &Task) -> BoxedStrategy<Session> {
     let task_id = task.id;
     let attempt = task.attempts.max(1);
     let live = [SessionState::Launching, SessionState::Running, SessionState::Idle];
@@ -399,7 +398,7 @@ pub fn session_for(task: &Task) -> BoxedStrategy<Session> {
 }
 
 /// A task with a matching session (see [`session_for`]).
-pub fn task_with_session() -> impl Strategy<Value = (Task, Session)> {
+pub(crate) fn task_with_session() -> impl Strategy<Value = (Task, Session)> {
     task().prop_flat_map(|t| {
         let s = session_for(&t);
         (Just(t), s)
@@ -407,7 +406,7 @@ pub fn task_with_session() -> impl Strategy<Value = (Task, Session)> {
 }
 
 /// A task in one of `states` with a matching session.
-pub fn task_with_session_among(states: &[TaskState]) -> impl Strategy<Value = (Task, Session)> {
+pub(crate) fn task_with_session_among(states: &[TaskState]) -> impl Strategy<Value = (Task, Session)> {
     task_among(states).prop_flat_map(|t| {
         let s = session_for(&t);
         (Just(t), s)
@@ -416,7 +415,7 @@ pub fn task_with_session_among(states: &[TaskState]) -> impl Strategy<Value = (T
 
 /// Scheduler knobs in a small range (backoff lists of 0..=3 entries so the
 /// "last value repeats" rule is exercised).
-pub fn scheduler_config() -> impl Strategy<Value = SchedulerConfig> {
+pub(crate) fn scheduler_config() -> impl Strategy<Value = SchedulerConfig> {
     (1u32..=5, vec(1u64..=600, 0..=3), 0u64..=600, 0u64..=3600, 0u64..=7200, 0u32..=5, 0u64..=48).prop_map(
         |(
             max_attempts,
@@ -429,9 +428,9 @@ pub fn scheduler_config() -> impl Strategy<Value = SchedulerConfig> {
         )| {
             SchedulerConfig {
                 max_attempts,
-                restart_backoff_secs,
                 idle_timeout_secs,
                 stale_session_secs,
+                restart_backoff_secs,
                 max_session_secs,
                 review_rounds_max,
                 review_stale_hours,
@@ -444,17 +443,19 @@ pub fn scheduler_config() -> impl Strategy<Value = SchedulerConfig> {
 /// Floats are whole or half numbers so a prediction survives a JSON round
 /// trip bit for bit (`serde_json` parses floats inexactly unless its
 /// `float_roundtrip` feature is on; a replayed trace must compare equal).
-pub fn prediction() -> impl Strategy<Value = Prediction> {
+#[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+#[expect(clippy::cast_precision_loss, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+pub(crate) fn prediction() -> impl Strategy<Value = Prediction> {
     (1u64..5_000_000, 1u64..20_000, 0u8..=10).prop_map(|(weighted_tokens, wall_secs, confidence)| Prediction {
         weighted_tokens: weighted_tokens as f64,
         wall_secs: wall_secs as f64,
-        confidence: confidence as f64 / 10.0,
+        confidence: f64::from(confidence) / 10.0,
         basis: "prop".into(),
     })
 }
 
 /// A policy decision: a model, or a throttle with an optional retry time.
-pub fn decision() -> impl Strategy<Value = Decision> {
+pub(crate) fn decision() -> impl Strategy<Value = Decision> {
     (prop::option::of(model()), prop::option::of(future_instant()), prediction()).prop_map(|(model, retry_at, prediction)| {
         Decision { retry_at: if model.is_some() { None } else { retry_at }, model, prediction, reasons: vec!["prop".into()] }
     })
@@ -464,7 +465,13 @@ pub fn decision() -> impl Strategy<Value = Decision> {
 /// period of 1..=14 days containing the origin at any elapsed fraction, a
 /// five-hour window, budgets up to 1e9 and each tier spent 0..=120% of its
 /// share. The observation is left `None` (set it in the property if needed).
-pub fn ledger_for(provider: Provider) -> impl Strategy<Value = Ledger> {
+#[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Fixture counts and timestamps are bounded to small values by the test inputs."
+)]
+#[expect(clippy::cast_precision_loss, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+pub(crate) fn ledger_for(provider: Provider) -> impl Strategy<Value = Ledger> {
     let cfg = BudgetConfig::default();
     let models = cfg.models_for(provider);
     let n = models.len();
@@ -505,7 +512,7 @@ pub fn ledger_for(provider: Provider) -> impl Strategy<Value = Ledger> {
 
 /// Ledgers for a non-empty subset of providers (Claude always included so
 /// the default config's enabled provider has one).
-pub fn ledgers() -> impl Strategy<Value = Ledgers> {
+pub(crate) fn ledgers() -> impl Strategy<Value = Ledgers> {
     (ledger_for(Provider::Claude), prop::option::of(ledger_for(Provider::Codex)), prop::option::of(ledger_for(Provider::Gemini)))
         .prop_map(|(claude, codex, gemini)| {
             let mut by_provider = BTreeMap::new();
@@ -522,7 +529,7 @@ pub fn ledgers() -> impl Strategy<Value = Ledgers> {
 
 /// A budget config with every provider enabled iff `enabled` says so
 /// (Claude always on), the shipped models.
-pub fn budget_config() -> impl Strategy<Value = BudgetConfig> {
+pub(crate) fn budget_config() -> impl Strategy<Value = BudgetConfig> {
     (any::<bool>(), any::<bool>(), 0.0f64..0.3, 0.5f64..1.0).prop_map(|(codex, gemini, safety_margin, endgame_fraction)| {
         let mut cfg = BudgetConfig::default();
         cfg.providers.codex.enabled = codex;
@@ -534,7 +541,7 @@ pub fn budget_config() -> impl Strategy<Value = BudgetConfig> {
 }
 
 /// Rate-limit marks on a few models, expiring around the origin.
-pub fn rate_limits() -> impl Strategy<Value = RateLimitState> {
+pub(crate) fn rate_limits() -> impl Strategy<Value = RateLimitState> {
     vec((model(), instant_between(3600, 3600)), 0..4).prop_map(|marks| {
         let mut state = RateLimitState::default();
         for (tier, until) in marks {
@@ -544,7 +551,7 @@ pub fn rate_limits() -> impl Strategy<Value = RateLimitState> {
     })
 }
 
-pub fn pr_check() -> impl Strategy<Value = PrCheck> {
+pub(crate) fn pr_check() -> impl Strategy<Value = PrCheck> {
     (
         prop::sample::select(vec!["test", "lint", "build"]),
         prop::sample::select(vec!["", "SUCCESS", "FAILURE", "NEUTRAL", "TIMED_OUT"]),
@@ -553,18 +560,18 @@ pub fn pr_check() -> impl Strategy<Value = PrCheck> {
         .prop_map(|(name, conclusion, required)| PrCheck { name: name.into(), conclusion: conclusion.into(), required })
 }
 
-pub fn pr_thread() -> impl Strategy<Value = PrThread> {
+pub(crate) fn pr_thread() -> impl Strategy<Value = PrThread> {
     (any::<bool>(), prop::option::of(instant_between(3 * 86_400, 0)))
         .prop_map(|(resolved, last_comment_at)| PrThread { resolved, last_comment_at })
 }
 
-pub fn queue_removal() -> impl Strategy<Value = QueueRemoval> {
+pub(crate) fn queue_removal() -> impl Strategy<Value = QueueRemoval> {
     (instant_between(3 * 86_400, 0), prop::sample::select(vec!["merged", "manual", "failed checks", "conflict"]))
         .prop_map(|(at, reason)| QueueRemoval { at, reason: reason.into() })
 }
 
 /// What `gh` might report for PR `number`.
-pub fn pr_status(number: u64) -> impl Strategy<Value = PrStatus> {
+pub(crate) fn pr_status(number: u64) -> impl Strategy<Value = PrStatus> {
     (
         prop::sample::select(vec!["OPEN", "MERGED", "CLOSED"]),
         prop::sample::select(vec!["MERGEABLE", "CONFLICTING", "UNKNOWN"]),
@@ -607,12 +614,12 @@ pub fn pr_status(number: u64) -> impl Strategy<Value = PrStatus> {
         )
 }
 
-pub fn hook_event() -> impl Strategy<Value = HookEvent> {
+pub(crate) fn hook_event() -> impl Strategy<Value = HookEvent> {
     prop::sample::select(HookEvent::ALL.to_vec())
 }
 
 /// Every hook outcome the daemon can drain, with small payloads.
-pub fn hook_outcome() -> impl Strategy<Value = HookOutcome> {
+pub(crate) fn hook_outcome() -> impl Strategy<Value = HookOutcome> {
     prop_oneof![
         (prop::option::of(Just("/t.jsonl".to_string())), prop::sample::select(vec!["startup", "resume", "compact", "clear"]))
             .prop_map(|(transcript_path, source)| HookOutcome::Started { transcript_path, source: source.into() }),
@@ -632,7 +639,7 @@ pub fn hook_outcome() -> impl Strategy<Value = HookOutcome> {
 }
 
 /// A liveness probe result: alive, dead with or without a status, or gone.
-pub fn session_probe() -> impl Strategy<Value = SessionProbe> {
+pub(crate) fn session_probe() -> impl Strategy<Value = SessionProbe> {
     prop_oneof![
         Just(SessionProbe {
             pane_exists: true,
@@ -653,7 +660,7 @@ pub fn session_probe() -> impl Strategy<Value = SessionProbe> {
 }
 
 /// Pane text that may or may not show the "waiting for reset" signature.
-pub fn pane_tail() -> impl Strategy<Value = Option<String>> {
+pub(crate) fn pane_tail() -> impl Strategy<Value = Option<String>> {
     prop::option::of(prop_oneof![
         line(),
         Just("Usage limit reached · continuing automatically at 3:45pm · esc to cancel".to_string()),
@@ -662,7 +669,7 @@ pub fn pane_tail() -> impl Strategy<Value = Option<String>> {
 }
 
 /// The event kinds of a list of effects (`Log` kinds; other variants by name).
-pub fn effect_kinds(effects: &[crate::scheduler::Effect]) -> Vec<String> {
+pub(crate) fn effect_kinds(effects: &[crate::scheduler::Effect]) -> Vec<String> {
     use crate::scheduler::Effect;
     effects
         .iter()
@@ -685,7 +692,7 @@ pub fn effect_kinds(effects: &[crate::scheduler::Effect]) -> Vec<String> {
 }
 
 /// Admission decisions from trusted approval, revocation, edits or unavailable evidence.
-pub fn admission_decision() -> impl Strategy<Value = crate::domain::GitHubAdmission> {
+pub(crate) fn admission_decision() -> impl Strategy<Value = crate::domain::GitHubAdmission> {
     prop::sample::select(vec![
         crate::domain::GitHubAdmission { approved: true, reason: "trusted approval event".into() },
         crate::domain::GitHubAdmission::denied("approval label removed"),
@@ -697,12 +704,12 @@ pub fn admission_decision() -> impl Strategy<Value = crate::domain::GitHubAdmiss
 
 /// A source sync's configured destination and independently verified approval.
 /// Missing destinations conflict with every registered task project in the model.
-pub fn source_routing_decision() -> impl Strategy<Value = (String, crate::domain::GitHubAdmission)> {
+pub(crate) fn source_routing_decision() -> impl Strategy<Value = (String, crate::domain::GitHubAdmission)> {
     (prop_oneof![4 => execution_project(), 1 => Just("missing".into())], admission_decision())
 }
 
 /// Mix ordinary tasks and GitHub tasks with missing, denied or verified admission.
-pub fn with_source_admission(task: Task) -> impl Strategy<Value = Task> {
+pub(crate) fn with_source_admission(task: Task) -> impl Strategy<Value = Task> {
     (any::<bool>(), prop::option::of(admission_decision())).prop_map(move |(github, admission)| {
         let mut task = task.clone();
         if github {
@@ -718,7 +725,7 @@ pub fn with_source_admission(task: Task) -> impl Strategy<Value = Task> {
 }
 
 /// GitHub task in any lifecycle state with initially unverified execution approval.
-pub fn github_task() -> impl Strategy<Value = Task> {
+pub(crate) fn github_task() -> impl Strategy<Value = Task> {
     (task(), 1u64..10000).prop_map(|(mut task, number)| {
         task.source = TaskSource::GitHub {
             repository: "acme/app".into(),
@@ -730,7 +737,7 @@ pub fn github_task() -> impl Strategy<Value = Task> {
 }
 
 /// Synthetic tasks covering the fields and legacy edge cases used by policy migration.
-pub fn policy_task() -> impl Strategy<Value = Task> {
+pub(crate) fn policy_task() -> impl Strategy<Value = Task> {
     (
         task(),
         prop::sample::select(vec!["PIN-1", "pin-1", "SKIP-1", "ENG-1"]),
@@ -755,7 +762,7 @@ pub fn policy_task() -> impl Strategy<Value = Task> {
 }
 
 /// Routing policies and source metadata with independent, possibly conflicting labels.
-pub fn routing_case() -> impl Strategy<Value = (crate::config::Config, Task)> {
+pub(crate) fn routing_case() -> impl Strategy<Value = (crate::config::Config, Task)> {
     (task(), any::<bool>(), any::<bool>(), any::<bool>()).prop_map(|(mut task, api, web, reverse)| {
         let mut cfg = crate::config::Config::default();
         cfg.repo.path = "/repos/default".into();
@@ -797,42 +804,42 @@ pub fn routing_case() -> impl Strategy<Value = (crate::config::Config, Task)> {
 }
 
 /// Failure domains seen while starting a task.
-pub fn launch_failure_scope() -> impl Strategy<Value = crate::scheduler::launch_failures::FailureScope> {
+pub(crate) fn launch_failure_scope() -> impl Strategy<Value = crate::scheduler::launch_failures::FailureScope> {
     use crate::scheduler::launch_failures::FailureScope;
     prop::sample::select(vec![FailureScope::Task, FailureScope::Project, FailureScope::Global])
 }
 
 /// Reloadable model preference rules: the first matching conditional wins,
 /// otherwise the criticality table supplies the fallback.
-pub fn conditional_model_policy() -> impl Strategy<Value = String> {
+pub(crate) fn conditional_model_policy() -> impl Strategy<Value = String> {
     (model(), model()).prop_map(|(preferred, fallback)| format!(
         "version = 1\n[[model_rules]]\nmodels = [\"{preferred}\"]\nall = [{{ field = \"label\", op = \"eq\", value = \"model/special\" }}]\n[models]\nnormal = [\"{fallback}\"]\n"
     ))
 }
 
 /// Boundary-focused time advances for rolling windows and weekly resets.
-pub fn budget_tick() -> impl Strategy<Value = i64> {
+pub(crate) fn budget_tick() -> impl Strategy<Value = i64> {
     prop_oneof![3 => 1i64..3 * 3600, 1 => prop::sample::select(vec![1, 5 * 3600 - 1, 5 * 3600, 5 * 3600 + 1, 7 * 86400])]
 }
 
 /// A provider reading, including exhausted windows and missing reset timestamps.
-pub fn provider_reading() -> impl Strategy<Value = (Provider, f64, bool)> {
+pub(crate) fn provider_reading() -> impl Strategy<Value = (Provider, f64, bool)> {
     (provider(), prop::sample::select(vec![0.0, 0.5, 0.95, 1.0]), any::<bool>())
 }
 
 /// Commands that can also be written by the CLI while the daemon is stopped.
-pub fn offline_control() -> impl Strategy<Value = u8> {
+pub(crate) fn offline_control() -> impl Strategy<Value = u8> {
     0u8..4
 }
 
 /// Dedicated queue capacities and live counts, including over-capacity reloads.
-pub fn queue_capacity_case() -> impl Strategy<Value = (u32, u32, u32, u32)> {
+pub(crate) fn queue_capacity_case() -> impl Strategy<Value = (u32, u32, u32, u32)> {
     (1u32..8, 1u32..8, 0u32..10, 0u32..10)
 }
 
 /// Operations in the stateful queue/workflow model.
 #[derive(Debug, Clone)]
-pub enum TriageModelOp {
+pub(crate) enum TriageModelOp {
     Launch(bool),
     Complete(usize, crate::execution::TriageOutcome),
     Done(usize),
@@ -846,7 +853,7 @@ pub enum TriageModelOp {
 }
 
 /// Queue/lifecycle interleavings, including removed queues and policy edits.
-pub fn triage_model_op() -> impl Strategy<Value = TriageModelOp> {
+pub(crate) fn triage_model_op() -> impl Strategy<Value = TriageModelOp> {
     use TriageModelOp::*;
     prop_oneof![
         5 => any::<bool>().prop_map(Launch),
@@ -863,7 +870,7 @@ pub fn triage_model_op() -> impl Strategy<Value = TriageModelOp> {
 }
 
 /// Analysis tasks with a pinned workflow, ready to record a triage result.
-pub fn triage_task() -> impl Strategy<Value = Task> {
+pub(crate) fn triage_task() -> impl Strategy<Value = Task> {
     task().prop_map(|mut task| {
         task.state = TaskState::Running;
         task.execution = Some(crate::execution::Execution {
@@ -881,12 +888,12 @@ pub fn triage_task() -> impl Strategy<Value = Task> {
 }
 
 /// Local user holds on either side of the model clock, with optional reasons.
-pub fn deferral() -> impl Strategy<Value = crate::deferral::Deferral> {
+pub(crate) fn deferral() -> impl Strategy<Value = crate::deferral::Deferral> {
     (instant(), prop::option::of(line())).prop_map(|(until, reason)| crate::deferral::Deferral { until, reason })
 }
 
 /// Source edits include removal, valid holds and malformed directives.
-pub fn deferral_description() -> impl Strategy<Value = String> {
+pub(crate) fn deferral_description() -> impl Strategy<Value = String> {
     prop_oneof![
         Just(String::new()),
         Just("Powerqueue-Defer-Until: tomorrow".into()),
@@ -900,7 +907,7 @@ pub fn deferral_description() -> impl Strategy<Value = String> {
 
 /// Persistence interleavings: edits, stale claims/writes, restart, rollback,
 /// and clock movement immediately before, at and after either hold expires.
-pub fn deferral_store_ops() -> impl Strategy<Value = Vec<u8>> {
+pub(crate) fn deferral_store_ops() -> impl Strategy<Value = Vec<u8>> {
     vec(0u8..17, 1..80)
 }
 
@@ -944,7 +951,7 @@ mod tests {
 }
 
 /// Arbitrary advisory proposals, including unsupported destinations and hostile prose.
-pub fn analysis_proposal() -> impl Strategy<Value = crate::analysis::Proposal> {
+pub(crate) fn analysis_proposal() -> impl Strategy<Value = crate::analysis::Proposal> {
     use crate::analysis::{Classification, Proposal};
     (
         prop::option::of(prop::sample::select(vec!["default", "web", "/tmp/evil", "agent:ready"])),
@@ -963,7 +970,7 @@ pub fn analysis_proposal() -> impl Strategy<Value = crate::analysis::Proposal> {
 
 /// Analysis snapshots/results interleaved with real scheduler lifecycle operations.
 #[derive(Debug, Clone)]
-pub enum AnalysisModelOp {
+pub(crate) enum AnalysisModelOp {
     Observe(Option<bool>),
     Finish,
     Edit,
@@ -976,7 +983,7 @@ pub enum AnalysisModelOp {
     Restart,
 }
 
-pub fn analysis_model_ops() -> impl Strategy<Value = Vec<AnalysisModelOp>> {
+pub(crate) fn analysis_model_ops() -> impl Strategy<Value = Vec<AnalysisModelOp>> {
     use AnalysisModelOp::*;
     prop::collection::vec(
         prop_oneof![
@@ -996,7 +1003,7 @@ pub fn analysis_model_ops() -> impl Strategy<Value = Vec<AnalysisModelOp>> {
 }
 
 /// Native GitHub prerequisite snapshots, with repository-qualified identities.
-pub fn github_blockers() -> impl Strategy<Value = Vec<LinkedIssue>> {
+pub(crate) fn github_blockers() -> impl Strategy<Value = Vec<LinkedIssue>> {
     prop::collection::vec((any::<bool>(), any::<bool>()), 0..8).prop_map(|rows| {
         rows.into_iter()
             .enumerate()

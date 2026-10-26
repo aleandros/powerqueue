@@ -111,6 +111,10 @@ pub enum CycleStatus {
 impl CycleStatus {
     /// Derive from the booleans Linear returns; `isActive` wins, then
     /// `isNext`, `isPast`, `isFuture`.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Keep the existing from_flags flag interface during lint adoption; callers already supply named state predicates."
+    )]
     pub fn from_flags(is_active: bool, is_next: bool, is_past: bool, is_future: bool) -> Self {
         if is_active {
             Self::Active
@@ -401,6 +405,10 @@ impl From<RawLinked> for LinkedIssue {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "These are independent configuration or observed-state flags, not mutually exclusive states."
+)]
 struct RawCycle {
     #[serde(default)]
     number: Option<f64>,
@@ -417,9 +425,21 @@ struct RawCycle {
 }
 
 impl From<RawCycle> for CycleInfo {
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the API normalization of bounded priorities, cycle numbers, page sizes and retry timings."
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Preserve the API normalization of bounded priorities, cycle numbers, page sizes and retry timings."
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "Preserve the API normalization of bounded priorities, cycle numbers, page sizes and retry timings."
+    )]
     fn from(raw: RawCycle) -> Self {
         CycleInfo {
-            number: raw.number.filter(|n| n.is_finite() && *n >= 0.0).map(|n| n.round() as u32).unwrap_or(0),
+            number: raw.number.filter(|n| n.is_finite() && *n >= 0.0).map_or(0, |n| n.round() as u32),
             name: raw.name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()),
             status: CycleStatus::from_flags(raw.is_active, raw.is_next, raw.is_past, raw.is_future),
         }
@@ -476,6 +496,18 @@ struct IssuePage {
 }
 
 impl From<RawIssue> for LinearIssue {
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the API normalization of bounded priorities, cycle numbers, page sizes and retry timings."
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Preserve the API normalization of bounded priorities, cycle numbers, page sizes and retry timings."
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "Preserve the API normalization of bounded priorities, cycle numbers, page sizes and retry timings."
+    )]
     fn from(raw: RawIssue) -> Self {
         let (state_name, state_type) = raw.state.map(|s| (s.name, s.kind)).unwrap_or_default();
         LinearIssue {
@@ -484,7 +516,7 @@ impl From<RawIssue> for LinearIssue {
             title: raw.title,
             description: raw.description.unwrap_or_default(),
             url: raw.url,
-            priority: raw.priority.map(|p| p.clamp(0.0, 4.0) as u8).unwrap_or(0),
+            priority: raw.priority.map_or(0, |p| p.clamp(0.0, 4.0) as u8),
             estimate: raw.estimate,
             labels: raw
                 .labels
@@ -538,6 +570,14 @@ impl LinearClient {
     /// and HTTP failures become `Err`; 429 (honouring `Retry-After`), 5xx
     /// and transport errors are retried up to three times with exponential
     /// backoff.
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the API normalization of bounded priorities, cycle numbers, page sizes and retry timings."
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Preserve the API normalization of bounded priorities, cycle numbers, page sizes and retry timings."
+    )]
     pub async fn graphql(&self, query: &str, variables: serde_json::Value) -> Result<serde_json::Value> {
         let body = serde_json::json!({ "query": query, "variables": variables });
         let op = operation_name(query);
@@ -597,7 +637,7 @@ impl LinearClient {
             {
                 let messages: Vec<String> = errors
                     .iter()
-                    .map(|e| e.get("message").and_then(|m| m.as_str()).map(str::to_string).unwrap_or_else(|| e.to_string()))
+                    .map(|e| e.get("message").and_then(|m| m.as_str()).map_or_else(|| e.to_string(), str::to_string))
                     .collect();
                 if status == reqwest::StatusCode::UNAUTHORIZED {
                     bail!("Linear rejected the API key (HTTP 401): {}", messages.join("; "));
@@ -654,7 +694,7 @@ impl LinearClient {
                 id: w.id,
                 name: w.name,
                 kind: w.kind,
-                team_key: w.team.map(|t| t.key).unwrap_or_else(|| team_key.to_string()),
+                team_key: w.team.map_or_else(|| team_key.to_string(), |t| t.key),
             })
             .collect())
     }
@@ -664,6 +704,14 @@ impl LinearClient {
     /// runs out of pages). Teams, states, projects and the cycle scope are
     /// filtered server-side ([`IssueFilter::server_filter`]);
     /// `assignee = "me"` is resolved to the viewer id.
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the API normalization of bounded priorities, cycle numbers, page sizes and retry timings."
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Preserve the API normalization of bounded priorities, cycle numbers, page sizes and retry timings."
+    )]
     pub async fn fetch_issues(&self, filter: &IssueFilter) -> Result<Vec<LinearIssue>> {
         let mut server_filter = filter.server_filter();
         if let Some(assignee) = filter.assignee.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
@@ -775,7 +823,7 @@ impl LinearClient {
         let mutation =
             "mutation($id: String!, $stateId: String!) { issueUpdate(id: $id, input: { stateId: $stateId }) { success } }";
         let data = self.graphql(mutation, serde_json::json!({ "id": issue_id, "stateId": state.id })).await?;
-        if data.pointer("/issueUpdate/success").and_then(|v| v.as_bool()) != Some(true) {
+        if data.pointer("/issueUpdate/success").and_then(serde_json::Value::as_bool) != Some(true) {
             bail!("Linear did not confirm the state change of {identifier} to `{}`", state.name);
         }
         debug!(target: "powerqueue::linear", issue = %identifier, state = %state.name, "issue state updated");
@@ -901,7 +949,7 @@ impl LinearClient {
     pub async fn post_comment(&self, issue_id: &str, body: &str) -> Result<Option<IssueComment>> {
         let mutation = "mutation($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id body createdAt user { displayName name } } } }";
         let data = self.graphql(mutation, serde_json::json!({ "issueId": issue_id, "body": body })).await?;
-        if data.pointer("/commentCreate/success").and_then(|v| v.as_bool()) != Some(true) {
+        if data.pointer("/commentCreate/success").and_then(serde_json::Value::as_bool) != Some(true) {
             bail!("Linear did not confirm the comment on issue {issue_id}");
         }
         debug!(target: "powerqueue::linear", issue = %issue_id, bytes = body.len(), "comment posted");
@@ -932,7 +980,7 @@ impl LinearClient {
                 serde_json::json!({"input": {"id": comment_id, "issueId": issue_id, "body": body}}),
             )
             .await?;
-        if data.pointer("/commentCreate/success").and_then(|v| v.as_bool()) != Some(true) {
+        if data.pointer("/commentCreate/success").and_then(serde_json::Value::as_bool) != Some(true) {
             bail!("Linear did not confirm report comment {comment_id}");
         }
         Ok(())
@@ -956,7 +1004,7 @@ impl LinearClient {
             for node in nodes {
                 labels.push(LabelRef::parse(node)?);
             }
-            if data.pointer("/issueLabels/pageInfo/hasNextPage").and_then(|v| v.as_bool()) != Some(true) {
+            if data.pointer("/issueLabels/pageInfo/hasNextPage").and_then(serde_json::Value::as_bool) != Some(true) {
                 break;
             }
             let next = data
@@ -985,7 +1033,7 @@ impl LinearClient {
             )
             .await
             .with_context(|| format!("read labels of {issue_id}"))?;
-        if data.pointer("/issue/labels/pageInfo/hasNextPage").and_then(|v| v.as_bool()) == Some(true) {
+        if data.pointer("/issue/labels/pageInfo/hasNextPage").and_then(serde_json::Value::as_bool) == Some(true) {
             bail!("issue {issue_id} has more than 100 labels; cannot safely replace the triage label");
         }
         let current = data
@@ -1005,7 +1053,7 @@ impl LinearClient {
                 serde_json::json!({"id": issue_id, "input": {"addedLabelIds": [wanted.id], "removedLabelIds": removed}}),
             )
             .await?;
-        if data.pointer("/issueUpdate/success").and_then(|v| v.as_bool()) != Some(true) {
+        if data.pointer("/issueUpdate/success").and_then(serde_json::Value::as_bool) != Some(true) {
             bail!("Linear did not confirm triage label for {issue_id}");
         }
         Ok(())
@@ -1144,7 +1192,7 @@ mod tests {
             url: String::new(),
             priority: 0,
             estimate: None,
-            labels: labels.iter().map(|s| s.to_string()).collect(),
+            labels: labels.iter().map(std::string::ToString::to_string).collect(),
             state_name: "Todo".into(),
             state_type: "unstarted".into(),
             team_key: "ENG".into(),
@@ -1240,7 +1288,7 @@ mod tests {
     #[test]
     fn filter_from_config_reads_cycle_and_projects() {
         let mut cfg = crate::config::LinearConfig { cycle: "current".into(), ..Default::default() };
-        cfg.projects = vec![" Launch ".into(), "".into()];
+        cfg.projects = vec![" Launch ".into(), String::new()];
         let f = IssueFilter::from_config(&cfg);
         assert_eq!(f.cycle, CycleScope::Active);
         assert_eq!(f.projects, vec!["Launch".to_string()]);
@@ -1259,6 +1307,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::similar_names,
+        reason = "The names distinguish related domain values and match the surrounding workflow terminology."
+    )]
     fn raw_issue_parses_cycle_and_tolerates_missing_cycle_fields() {
         let base = serde_json::json!({
             "id": "abc", "identifier": "ENG-9", "title": "T", "url": "https://x",

@@ -177,6 +177,7 @@ fn jev_request(cfg: &Config, input: &AnalysisInput) -> Value {
 }
 
 #[derive(Deserialize)]
+#[expect(clippy::struct_field_names, reason = "The field name matches the external JSON response schema.")]
 struct Choice {
     choice: String,
     confidence: f64,

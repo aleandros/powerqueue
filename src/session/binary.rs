@@ -149,7 +149,7 @@ impl BinaryTemplate {
 /// The program word of `binary` (the whole string when it does not parse),
 /// for PATH lookups.
 pub fn program_of(binary: &str) -> String {
-    BinaryTemplate::parse(binary).map(|t| t.program().to_string()).unwrap_or_else(|_| binary.trim().to_string())
+    BinaryTemplate::parse(binary).map_or_else(|_| binary.trim().to_string(), |t| t.program().to_string())
 }
 
 /// Render `binary` for a launch. Fails when it does not parse.
@@ -230,7 +230,7 @@ mod tests {
         assert!(t.is_per_task());
         assert!(t.host_argv().is_none());
         assert_eq!(t.placeholders(), vec!["task_dir", "worktree", "slug"]);
-        assert!(t.unknown_placeholders().is_empty());
+        assert_eq!((t.unknown_placeholders()).len(), 0);
         let argv = t.render(&vars());
         assert_eq!(
             argv,

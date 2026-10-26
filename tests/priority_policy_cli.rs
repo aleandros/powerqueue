@@ -3,6 +3,10 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::path::Path;
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn pq(home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("powerqueue").unwrap();
     cmd.env("POWERQUEUE_HOME", home)

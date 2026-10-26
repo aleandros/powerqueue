@@ -1,1 +1,7 @@
 too-many-arguments-threshold = 10
+
+# BeautifulRust: explicit flags in APIs, assertion-friendly tests.
+max-fn-params-bools = 0
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-print-in-tests = true

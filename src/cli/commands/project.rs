@@ -18,6 +18,11 @@ fn table<'a>(parent: &'a mut dyn toml_edit::TableLike, key: &str) -> Result<&'a 
 /// Register a checkout and optional intake source, or list effective settings.
 /// Invalid configuration/checkouts fail before writing. Existing source filters,
 /// project settings, comments and machine settings are retained unless specified.
+#[expect(
+    clippy::as_conversions,
+    reason = "This cast only coerces a mutable table reference to the table interface; no numeric conversion occurs."
+)]
+#[expect(clippy::too_many_lines, reason = "Keep the run workflow and its early exits together in execution order.")]
 pub fn run(ctx: &mut Context, cmd: ProjectCommand) -> Result<i32> {
     match cmd {
         ProjectCommand::List => list(ctx),
@@ -78,7 +83,7 @@ pub fn run(ctx: &mut Context, cmd: ProjectCommand) -> Result<i32> {
                         for entry in array {
                             let inline = entry.as_inline_table().context("github_sources entries must be tables")?;
                             let mut table = Table::new();
-                            for (key, value) in inline.iter() {
+                            for (key, value) in inline {
                                 table.insert(key, Item::Value(value.clone()));
                             }
                             tables.push(table);
@@ -87,16 +92,15 @@ pub fn run(ctx: &mut Context, cmd: ProjectCommand) -> Result<i32> {
                     }
                     let sources = doc
                         .entry("github_sources")
-                        .or_insert_with(|| Item::ArrayOfTables(Default::default()))
+                        .or_insert_with(|| Item::ArrayOfTables(toml_edit::ArrayOfTables::default()))
                         .as_array_of_tables_mut()
                         .context("github_sources must use [[github_sources]] tables")?;
                     let index = old.github_sources.iter().position(|s| s.repository.eq_ignore_ascii_case(repository));
-                    let index = match index {
-                        Some(i) => i,
-                        None => {
-                            sources.push(Table::new());
-                            sources.len() - 1
-                        }
+                    let index = if let Some(i) = index {
+                        i
+                    } else {
+                        sources.push(Table::new());
+                        sources.len() - 1
                     };
                     sources.get_mut(index).context("locate GitHub source table")? as &mut dyn toml_edit::TableLike
                 };

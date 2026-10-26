@@ -154,6 +154,10 @@ struct ProjectFetch {
 }
 
 /// Mutable runtime state that is not part of the public daemon surface.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "These are independent configuration or observed-state flags, not mutually exclusive states."
+)]
 struct RuntimeState {
     tmux: Tmux,
     repo: Repo,
@@ -361,6 +365,10 @@ impl Daemon {
     ///
     /// Takes an exclusive lock on `daemon.lock`; fails with "another daemon is
     /// running (pid …)" when it is held. Writes `daemon.pid` for the duration.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Keep the existing run flag interface during lint adoption; callers already supply named state predicates."
+    )]
     pub async fn run(mut self, once: bool) -> Result<()> {
         self.paths.ensure().with_context(|| format!("create {}", self.paths.state_dir.display()))?;
         let file = std::fs::OpenOptions::new()
@@ -373,9 +381,8 @@ impl Daemon {
         let _guard = match lock.try_write() {
             Ok(guard) => guard,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                let pid = std::fs::read_to_string(self.paths.daemon_pid())
-                    .map(|s| s.trim().to_string())
-                    .unwrap_or_else(|_| "unknown".into());
+                let pid =
+                    std::fs::read_to_string(self.paths.daemon_pid()).map_or_else(|_| "unknown".into(), |s| s.trim().to_string());
                 bail!("another daemon is running (pid {pid}); stop it with `powerqueue stop`");
             }
             Err(e) => return Err(e).with_context(|| format!("lock {}", self.lock_path.display())),
@@ -396,7 +403,7 @@ impl Daemon {
         let notify = Arc::new(Notify::new());
         {
             let handle = self.handle.clone();
-            let notify = notify.clone();
+            let notify = std::sync::Arc::<tokio::sync::Notify>::clone(&notify);
             tokio::spawn(async move {
                 wait_for_signal().await;
                 tracing::info!("shutdown signal received");
@@ -405,7 +412,7 @@ impl Daemon {
             });
         }
 
-        let result = self.main_loop(once, &notify).await;
+        let result = Box::pin(self.main_loop(once, &notify)).await;
         if let Some((_, handle)) = self.rt.analysis.take() {
             handle.abort();
         }
@@ -415,10 +422,14 @@ impl Daemon {
         result
     }
 
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Keep the existing main_loop flag interface during lint adoption; callers already supply named state predicates."
+    )]
     async fn main_loop(&mut self, once: bool, notify: &Notify) -> Result<()> {
         loop {
             let started = std::time::Instant::now();
-            if let Err(e) = self.tick().await {
+            if let Err(e) = Box::pin(self.tick()).await {
                 tracing::error!(error = %format!("{e:#}"), "tick failed");
                 self.log(None, None, EventLevel::Error, "daemon.error", &format!("tick failed: {e:#}"), serde_json::json!({}));
             }
@@ -436,8 +447,8 @@ impl Daemon {
             let period = std::time::Duration::from_secs(self.cfg.scheduler.tick_secs.max(1));
             let sleep = period.saturating_sub(started.elapsed());
             tokio::select! {
-                _ = tokio::time::sleep(sleep) => {}
-                _ = notify.notified() => {}
+                () = tokio::time::sleep(sleep) => {}
+                () = notify.notified() => {}
             }
             if self.handle.should_stop() {
                 return Ok(());
@@ -542,7 +553,7 @@ impl Daemon {
         self.report_phase("rules", r);
         // Inbox before hooks: a shim-delivered hook becomes a hook row that
         // the hook phase handles on this same tick.
-        let r = self.process_inbox(now).await;
+        let r = self.process_inbox(now);
         self.report_phase("inbox", r);
         let r = self.process_hooks(now).await;
         self.report_phase("hooks", r);
@@ -552,7 +563,7 @@ impl Daemon {
         self.report_phase("transcripts", r);
         let r = self.probe_sessions(now).await;
         self.report_phase("probes", r);
-        let r = self.poll_setups(now).await;
+        let r = Box::pin(self.poll_setups(now)).await;
         self.report_phase("setup", r);
         let r = self.recover_starting(now);
         self.report_phase("starting recovery", r);
@@ -565,7 +576,7 @@ impl Daemon {
         let r = self.sample_resources(now);
         self.report_phase("resources", r);
         self.run_usage_probes(now);
-        let r = self.launch_tasks(now).await;
+        let r = Box::pin(self.launch_tasks(now)).await;
         self.report_phase("launch", r);
         // Reports are delivered after session release and launch allocation.
         let r = self.publish_triage(now).await;
@@ -639,6 +650,14 @@ impl Daemon {
     /// at its period end), persist it and log `budget.rate_limited`. Used
     /// when a pane shows the agent waiting for a usage reset that no hook
     /// reported. Returns the cooldown end.
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
     fn start_provider_cooldown(&mut self, provider: Provider, task: &Task, reason: &str, now: DateTime<Utc>) -> DateTime<Utc> {
         let mins = self.cfg.budget.provider(provider).rate_limit_cooldown_mins.max(1) as i64;
         let until = (now + Duration::minutes(mins)).min(self.provider_period_end(provider, now)).max(now + Duration::minutes(1));
@@ -803,7 +822,7 @@ impl Daemon {
         for effect in effects {
             match effect {
                 Effect::Log { level, kind, message, data } => {
-                    self.log(Some(task.id), session.map(|s| s.id), level, &kind, &message, data)
+                    self.log(Some(task.id), session.map(|s| s.id), level, &kind, &message, data);
                 }
                 other => tracing::warn!(task = %task.key, effect = ?other, "effect ignored in a log-only phase"),
             }
@@ -868,7 +887,9 @@ impl Daemon {
                 }
             }
         }
-        let changed = !self.rt.rules_ready || !self.rt.rules_loaded || self.rt.watcher.as_mut().is_some_and(|w| w.take_changed());
+        let changed = !self.rt.rules_ready
+            || !self.rt.rules_loaded
+            || self.rt.watcher.as_mut().is_some_and(super::super::priority::watcher::RulesWatcher::take_changed);
         if changed {
             self.load_rules(&source);
         }
@@ -941,15 +962,23 @@ impl Daemon {
         Ok(())
     }
 
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
     fn refresh_project_fetches(&mut self, now: DateTime<Utc>) {
         for id in self.cfg.project_ids() {
             // The legacy checkout has one fetch timer in refresh_overrides.
             if id == "default" && !self.cfg.repo.path.trim().is_empty() {
                 continue;
             }
-            let cfg = self.cfg.projects.get(&id).map(|p| &p.repo).unwrap_or(&self.cfg.repo);
+            let cfg = self.cfg.projects.get(&id).map_or(&self.cfg.repo, |p| &p.repo);
             let state = self.rt.project_fetches.entry(id).or_default();
-            if state.handle.as_ref().is_some_and(|h| h.is_finished())
+            if state.handle.as_ref().is_some_and(tokio::task::JoinHandle::is_finished)
                 && let Some(handle) = state.handle.take()
             {
                 // Completed handles are collected without blocking the daemon.
@@ -1105,7 +1134,7 @@ impl Daemon {
         self.rt.rules_missing_logged = false;
         match PriorityRules::parse(&text) {
             Ok(rules) => {
-                let warnings: Vec<String> = rules.warnings.iter().map(|w| w.to_string()).collect();
+                let warnings: Vec<String> = rules.warnings.iter().map(std::string::ToString::to_string).collect();
                 self.log(
                     None,
                     None,
@@ -1118,7 +1147,7 @@ impl Daemon {
                 self.rt.rules_ready = true;
             }
             Err(errors) => {
-                let errors: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+                let errors: Vec<String> = errors.iter().map(std::string::ToString::to_string).collect();
                 self.log(
                     None,
                     None,
@@ -1146,6 +1175,14 @@ impl Daemon {
     /// failure (a git lock, a half-written `config.toml`) heals on its own.
     /// A git failure while fingerprinting is logged once and the last good
     /// fingerprint kept, so it never counts as a change.
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
     async fn refresh_overrides(&mut self, now: DateTime<Utc>) -> Result<()> {
         if !self.cfg.projects.is_empty() {
             self.refresh_project_fetches(now);
@@ -1192,13 +1229,12 @@ impl Daemon {
                 // A reachable remote answers within the grace period and the
                 // comparison happens right away; a hanging one keeps running
                 // on its thread while the tick goes on.
-                match tokio::time::timeout(std::time::Duration::from_secs(FETCH_GRACE_SECS), &mut handle).await {
-                    Ok(result) => report_fetch(result),
-                    Err(_) => {
-                        tracing::debug!("periodic fetch still running; checking overrides after it finishes");
-                        self.rt.periodic_fetch = Some(handle);
-                        return Ok(());
-                    }
+                if let Ok(result) = tokio::time::timeout(std::time::Duration::from_secs(FETCH_GRACE_SECS), &mut handle).await {
+                    report_fetch(result);
+                } else {
+                    tracing::debug!("periodic fetch still running; checking overrides after it finishes");
+                    self.rt.periodic_fetch = Some(handle);
+                    return Ok(());
                 }
             }
         }
@@ -1266,7 +1302,7 @@ impl Daemon {
             None,
             EventLevel::Warn,
             "daemon.overrides_check_failed",
-            &format!("cannot check {} for changes; keeping the last known state: {e:#}", REPO_CONFIG_FILE),
+            &format!("cannot check {REPO_CONFIG_FILE} for changes; keeping the last known state: {e:#}"),
             serde_json::json!({ "error": format!("{e:#}") }),
         );
     }
@@ -1309,6 +1345,14 @@ impl Daemon {
         self.jev_norm_with(task, now, &cfg, &rules).await
     }
 
+    #[expect(
+        clippy::as_conversions,
+        reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+    )]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+    )]
     async fn jev_norm_with(&mut self, task: &Task, now: DateTime<Utc>, cfg: &Config, rules: &PriorityRules) -> Option<f64> {
         let levels = rules.jev.levels.len().max(2);
         let normalise = |score: f64| (score / (levels as f64 - 1.0)).clamp(0.0, 1.0);
@@ -1416,6 +1460,15 @@ impl Daemon {
         }
     }
 
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
+    #[expect(clippy::too_many_lines, reason = "Keep the poll_linear workflow and its early exits together in execution order.")]
     async fn poll_linear(&mut self, now: DateTime<Utc>) -> Result<()> {
         if self.offline || !self.cfg.linear.enabled {
             return Ok(());
@@ -1558,6 +1611,14 @@ impl Daemon {
     /// looked up when `due` ([`PARENT_CHECK_INTERVAL`] or a forced sync).
     /// A completed container that had run before is cleaned up like any
     /// finished task (worktree, branch, window).
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Keep the existing close_finished_parents flag interface during lint adoption; callers already supply named state predicates."
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep the close_finished_parents workflow and its early exits together in execution order."
+    )]
     async fn close_finished_parents(
         &mut self,
         client: &LinearClient,
@@ -1577,7 +1638,7 @@ impl Daemon {
             .filter_map(|t| t.linear_identifier().map(str::to_string))
             .collect();
         watched.watch(containers);
-        let to_check = if due { watched.watching.clone() } else { Default::default() };
+        let to_check = if due { watched.watching.clone() } else { std::collections::BTreeSet::default() };
         if due {
             self.rt.last_parent_check = Some(now);
         }
@@ -1728,6 +1789,14 @@ impl Daemon {
         }
     }
 
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
     fn linear_failure(&mut self, now: DateTime<Utc>, message: &str) {
         let base = Duration::seconds(self.cfg.linear.poll_interval_secs.max(5) as i64);
         self.rt.linear_backoff =
@@ -1876,6 +1945,10 @@ impl Daemon {
     /// and start waiting for a reply ([`Daemon::relay_comments`]). An
     /// unconfirmed question (a turn that ended in `needs_attention`) is
     /// posted only when the session's agent ran `task block` itself.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Keep the existing post_question flag interface during lint adoption; callers already supply named state predicates."
+    )]
     async fn post_question(&mut self, task: &Task, session_id: uuid::Uuid, text: &str, reason: Option<&str>, confirmed: bool) {
         let allowed = match &task.source {
             TaskSource::Linear { .. } => self.cfg.linear.post_comments.questions(),
@@ -1935,6 +2008,14 @@ impl Daemon {
     /// Comments powerqueue posted are skipped. A failed Linear request backs
     /// off like the sync; a failed `tmux send-keys` is logged as
     /// `relay.error` (counted by `doctor`).
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
     async fn relay_comments(&mut self, now: DateTime<Utc>) -> Result<()> {
         if self.offline || !self.cfg.linear.enabled || !self.cfg.linear.post_comments.questions() {
             return Ok(());
@@ -2207,6 +2288,14 @@ impl Daemon {
         Ok(task.execution_approved() && !task.is_waiting())
     }
 
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
     async fn poll_github(&mut self, now: DateTime<Utc>) -> Result<()> {
         if self.offline {
             return Ok(());
@@ -2265,7 +2354,7 @@ impl Daemon {
     /// the CLI would apply them. Unparsable files move to `inbox/rejected/`
     /// (logged as `inbox.rejected`, reported by `doctor`); a message that
     /// cannot be applied is logged as `inbox.error` and dropped.
-    async fn process_inbox(&mut self, now: DateTime<Utc>) -> Result<()> {
+    fn process_inbox(&mut self, now: DateTime<Utc>) -> Result<()> {
         // Not gated on the current `shim` settings: a session launched with
         // a shim keeps using it after a config reload turned the setting
         // off, and an inbox directory only exists for such sessions.
@@ -2324,6 +2413,14 @@ impl Daemon {
         Ok(())
     }
 
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
     fn github_failure(&mut self, cfg: &GitHubConfig, error: &anyhow::Error) {
         let state = self.rt.github.entry(cfg.repository.to_ascii_lowercase()).or_default();
         let base = Duration::seconds(cfg.poll_interval_secs.clamp(5, 3600) as i64);
@@ -2666,6 +2763,10 @@ impl Daemon {
         Ok(())
     }
 
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Keep the existing cleanup_project_task flag interface during lint adoption; callers already supply named state predicates."
+    )]
     fn cleanup_project_task(&self, task: &mut Task, succeeded: bool, review: bool) -> Result<()> {
         let session = self.store.latest_session(task.id)?.map(|s| s.id);
         let mut pending =
@@ -2771,6 +2872,7 @@ impl Daemon {
 
     /// Carry out effects requested by a transition. Runtime failures are
     /// logged; they never propagate.
+    #[expect(clippy::too_many_lines, reason = "Keep the apply_effects workflow and its early exits together in execution order.")]
     async fn apply_effects(&mut self, task: &mut Task, session: Option<&Session>, effects: Vec<Effect>) {
         let session_id = session.map(|s| s.id);
         for effect in effects {
@@ -2794,20 +2896,19 @@ impl Daemon {
                 Effect::Linear { target, comment } => self.update_issue(task, target, comment).await,
                 Effect::Nudge { text } => {
                     if let Some(s) = session {
-                        match s.pane_id.as_deref() {
-                            Some(pane) => {
-                                if let Err(e) = self.rt.tmux.send_text(pane, &text) {
-                                    self.log(
-                                        Some(task.id),
-                                        session_id,
-                                        EventLevel::Warn,
-                                        "session.nudge_failed",
-                                        &format!("{e:#}"),
-                                        serde_json::json!({}),
-                                    );
-                                }
+                        if let Some(pane) = s.pane_id.as_deref() {
+                            if let Err(e) = self.rt.tmux.send_text(pane, &text) {
+                                self.log(
+                                    Some(task.id),
+                                    session_id,
+                                    EventLevel::Warn,
+                                    "session.nudge_failed",
+                                    &format!("{e:#}"),
+                                    serde_json::json!({}),
+                                );
                             }
-                            None => tracing::debug!(task = %task.key, "no pane id; cannot nudge"),
+                        } else {
+                            tracing::debug!(task = %task.key, "no pane id; cannot nudge");
                         }
                         self.rt.nudged.insert(s.id);
                     }
@@ -2841,7 +2942,7 @@ impl Daemon {
                     if let Some(watch) = task.review.as_mut()
                         && watch.worktree_path.is_none()
                     {
-                        watch.worktree_path = task.worktree_path.clone();
+                        watch.worktree_path.clone_from(&task.worktree_path);
                     }
                     if let Err(e) = self.cleanup_project_task(task, true, true) {
                         self.log(
@@ -2948,26 +3049,25 @@ impl Daemon {
         let keep: HashSet<uuid::Uuid> = active.iter().map(|s| s.id).collect();
         self.rt.readers.retain(|id, _| keep.contains(id));
         for mut session in active {
-            let path = match &session.transcript_path {
-                Some(p) => PathBuf::from(p),
-                None => {
-                    let Some(task) = self.store.get_task(session.task_id)? else { continue };
-                    let Some(wt) = &task.worktree_path else { continue };
-                    let cfg = match self.cfg.for_project(&task.execution_project, &self.paths) {
-                        Ok(cfg) => cfg,
-                        Err(e) => {
-                            self.project_error(&task.execution_project, &format!("{e:#}"));
-                            continue;
-                        }
-                    };
-                    let guess = transcript_path_for(&claude_home(&cfg), Path::new(wt), session.id);
-                    if !guess.exists() {
+            let path = if let Some(p) = &session.transcript_path {
+                PathBuf::from(p)
+            } else {
+                let Some(task) = self.store.get_task(session.task_id)? else { continue };
+                let Some(wt) = &task.worktree_path else { continue };
+                let cfg = match self.cfg.for_project(&task.execution_project, &self.paths) {
+                    Ok(cfg) => cfg,
+                    Err(e) => {
+                        self.project_error(&task.execution_project, &format!("{e:#}"));
                         continue;
                     }
-                    session.transcript_path = Some(guess.display().to_string());
-                    self.store.update_session(&session)?;
-                    guess
+                };
+                let guess = transcript_path_for(&claude_home(&cfg), Path::new(wt), session.id);
+                if !guess.exists() {
+                    continue;
                 }
+                session.transcript_path = Some(guess.display().to_string());
+                self.store.update_session(&session)?;
+                guess
             };
             let reader = self.rt.readers.entry(session.id).or_insert_with(|| {
                 TranscriptReader::for_provider(path, session.id, session.task_id, session.model.provider(), session.model.clone())
@@ -3136,6 +3236,14 @@ impl Daemon {
 
     // --------------------------------------------------------------- probes
 
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
     async fn probe_sessions(&mut self, now: DateTime<Utc>) -> Result<()> {
         for mut session in self.store.list_live_sessions()? {
             let Some(mut task) = self.store.get_task(session.task_id)? else {
@@ -3221,10 +3329,7 @@ impl Daemon {
         if task.leaves_ticket_open() {
             return false;
         }
-        let cfg = match self.cfg.for_task(task, &self.paths) {
-            Ok(cfg) => cfg,
-            Err(_) => return false,
-        };
+        let Ok(cfg) = self.cfg.for_task(task, &self.paths) else { return false };
         if task.state != TaskState::Completed || cfg.scheduler.pr_poll_secs == 0 {
             return false;
         }
@@ -3287,6 +3392,14 @@ impl Daemon {
     /// [`review::on_pr_status`]. A failed `gh` call never changes the task:
     /// it is noted in `last_error` (logged as `review.error` when the message
     /// changes) and retried at the next interval.
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
     async fn watch_reviews(&mut self, now: DateTime<Utc>) -> Result<()> {
         for mut task in self.store.list_tasks_in_states(&[TaskState::InReview])? {
             let cfg = match self.cfg.for_task(&task, &self.paths) {
@@ -3349,6 +3462,14 @@ impl Daemon {
 
     // ------------------------------------------------------------ resources
 
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
     fn sample_resources(&mut self, now: DateTime<Utc>) -> Result<()> {
         let interval = Duration::seconds(self.cfg.scheduler.resource_sample_secs.max(1) as i64);
         if self.rt.last_resource_sample.is_none_or(|t| now - t >= interval) {
@@ -3376,6 +3497,14 @@ impl Daemon {
     /// blocking thread and record their own results (kv + `budget.probe`
     /// events), so a slow CLI never delays the tick; a new round starts only
     /// after the previous one finished.
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
     fn run_usage_probes(&mut self, now: DateTime<Utc>) {
         if self.rt.usage_probe.as_ref().is_some_and(|h| !h.is_finished()) {
             return;
@@ -3411,6 +3540,15 @@ impl Daemon {
         LaunchContext { budget: &self.cfg.budget, rules: &self.rt.rules, rate_limits: &self.rt.rate_limits }
     }
 
+    #[expect(
+        clippy::as_conversions,
+        reason = "Collection and read lengths fit the platform counter type on supported 32-bit and 64-bit targets."
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Collection and read lengths fit the platform counter type on supported 32-bit and 64-bit targets."
+    )]
+    #[expect(clippy::too_many_lines, reason = "Keep the launch_tasks workflow and its early exits together in execution order.")]
     async fn launch_tasks(&mut self, now: DateTime<Utc>) -> Result<()> {
         if self.rt.draining_setups {
             return Ok(());
@@ -3490,7 +3628,7 @@ impl Daemon {
                 None => self.throttle(task, &decision, now)?,
                 Some(model) => {
                     let (key, id) = (task.key.clone(), task.id);
-                    match self.start_task(task, model, &decision, now).await {
+                    match Box::pin(self.start_task(task, model, &decision, now)).await {
                         Ok(Started::Preparing) => {
                             planner.started(&self.cfg.budget, &candidate);
                         }
@@ -3699,7 +3837,7 @@ impl Daemon {
         }
         let launch = PreparedLaunch { task, cfg, start, relaunch, answer, ready };
         if launch.cfg.repo.setup.is_empty() {
-            return self.finish_start(launch, now).await;
+            return Box::pin(self.finish_start(launch, now)).await;
         }
         let candidate = Candidate { task: launch.task.clone(), preferred: Vec::new(), decision: decision.clone() };
         let worker = crate::worktree::spawn_setup(
@@ -3783,7 +3921,7 @@ impl Daemon {
                 Ok(output) => {
                     self.log(Some(id), None, EventLevel::Debug, "worktree.setup", "setup commands finished",
                         serde_json::json!({ "output": output.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect::<String>() }));
-                    self.finish_start(launch, now).await
+                    Box::pin(self.finish_start(launch, now)).await
                 }
                 Err(e) => self.fail_preparation(launch.task, &launch.cfg, e.context(SetupCommandFailure), now).await,
             };
@@ -3802,6 +3940,11 @@ impl Daemon {
         Ok(())
     }
 
+    #[expect(
+        clippy::similar_names,
+        reason = "The names distinguish related domain values and match the surrounding workflow terminology."
+    )]
+    #[expect(clippy::too_many_lines, reason = "Keep the finish_start workflow and its early exits together in execution order.")]
     async fn finish_start(&mut self, launch: PreparedLaunch, now: DateTime<Utc>) -> Result<Started> {
         let PreparedLaunch { mut task, cfg, start, relaunch, answer, ready } = launch;
         let launch::Start { branch, worktree, attempt, .. } = start;
@@ -4126,7 +4269,7 @@ async fn wait_for_signal() {
         };
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
-            _ = term_fut => {}
+            () = term_fut => {}
         }
     }
     #[cfg(not(unix))]
@@ -4249,7 +4392,8 @@ mod tests {
                 "offline" => daemon.offline = true,
                 "disabled" => daemon.cfg.github.enabled = false,
                 "backoff" => {
-                    daemon.rt.github.entry("acme/app".into()).or_default().next_allowed = Some(Utc::now() + Duration::minutes(10))
+                    daemon.rt.github.entry("acme/app".into()).or_default().next_allowed =
+                        Some(Utc::now() + Duration::minutes(10));
                 }
                 "wrong-repository" => daemon.cfg.github.repository = "other/repo".into(),
                 _ => {}
@@ -4264,7 +4408,7 @@ mod tests {
             }
             assert_eq!(saved.state, TaskState::Queued);
             assert!(saved.worktree_path.is_none());
-            assert!(daemon.store.list_live_sessions().unwrap().is_empty());
+            assert_eq!((daemon.store.list_live_sessions().unwrap()).len(), 0);
             assert!(daemon.store.events_for_task(task.id, 20).unwrap().iter().any(|e| e.kind == "github.revoked"));
         }
     }
@@ -4560,7 +4704,7 @@ mod tests {
         let secrets = Secrets::with_backend(Box::new(FileBackend::new(paths.secrets_file())));
         let mut daemon = Daemon::new(Config::default(), paths.clone(), store, secrets).unwrap();
         assert!(daemon.refresh_rules(Utc::now()).await.is_err());
-        assert!(daemon.launch_tasks(Utc::now()).await.is_err());
+        assert!(Box::pin(daemon.launch_tasks(Utc::now())).await.is_err());
         std::fs::write(paths.priority_file(), "version = 1\n").unwrap();
         daemon.refresh_rules(Utc::now()).await.unwrap();
         assert!(daemon.rt.rules_ready);
@@ -4785,13 +4929,16 @@ mod tests {
     async fn dependency_daemon(store: &Store, dir: &Path) -> (Daemon, std::sync::Arc<MockState>, wiremock::MockServer) {
         let server = wiremock::MockServer::start().await;
         let state = std::sync::Arc::new(MockState::default());
-        wiremock::Mock::given(wiremock::matchers::method("POST")).respond_with(LinearMock(state.clone())).mount(&server).await;
-        let daemon = daemon_on(store, dir, &server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(LinearMock(std::sync::Arc::clone(&state)))
+            .mount(&server)
+            .await;
+        let daemon = daemon_on(store, dir, &server);
         (daemon, state, server)
     }
 
     /// A daemon (fresh runtime state) on `store`, polling `server`.
-    async fn daemon_on(store: &Store, dir: &Path, server: &wiremock::MockServer) -> Daemon {
+    fn daemon_on(store: &Store, dir: &Path, server: &wiremock::MockServer) -> Daemon {
         use crate::secrets::FileBackend;
         let paths = Paths::rooted(dir);
         let secrets = Secrets::with_backend(Box::new(FileBackend::new(paths.secrets_file())));
@@ -4835,7 +4982,7 @@ mod tests {
         store.kv_delete(SCHEDULING_PAUSE_KEY).unwrap();
         store.kv_set(SCHEDULING_PAUSE_KEY, &SchedulingPause { since: now, reason: None }).unwrap();
 
-        daemon.launch_tasks(now).await.unwrap();
+        Box::pin(daemon.launch_tasks(now)).await.unwrap();
         let t = store.get_task_by_key("PAUSE-1").unwrap().unwrap();
         assert_eq!(t.state, TaskState::Queued, "paused: the task is not even considered");
         for kind in ["task.starting", "task.throttled", "task.error"] {
@@ -4847,7 +4994,7 @@ mod tests {
         assert_eq!(store.count_events_of_kind("daemon.resumed", now - Duration::minutes(1)).unwrap(), 1);
         daemon.apply_command(&DaemonCommand::ResumeScheduling, now).await.unwrap();
         assert!(store.scheduling_pause().unwrap().is_none(), "resume is idempotent on the switch");
-        daemon.launch_tasks(now).await.unwrap();
+        Box::pin(daemon.launch_tasks(now)).await.unwrap();
         let t = store.get_task_by_key("PAUSE-1").unwrap().unwrap();
         assert_ne!(t.state, TaskState::Queued, "resumed: the task was considered (started or failed to start): {:?}", t.state);
     }
@@ -4892,7 +5039,7 @@ mod tests {
             SELECT RAISE(IGNORE); END;",
             )
             .unwrap();
-        daemon.launch_tasks(now).await.unwrap();
+        Box::pin(daemon.launch_tasks(now)).await.unwrap();
         let fresh = store.get_task(task.id).unwrap().unwrap();
         assert_eq!(fresh.state, TaskState::Paused);
         assert_eq!(fresh.attempts, 0);
@@ -4918,23 +5065,23 @@ mod tests {
             store.insert_task(&task).unwrap();
         }
 
-        daemon.launch_tasks(now).await.unwrap();
+        Box::pin(daemon.launch_tasks(now)).await.unwrap();
 
         let first = store.get_task_by_key("SLOT-1").unwrap().unwrap();
         assert_eq!(first.state, TaskState::Crashed);
         assert_eq!(first.attempts, 1);
         for _ in 0..10 {
-            daemon.launch_tasks(now).await.unwrap();
+            Box::pin(daemon.launch_tasks(now)).await.unwrap();
         }
         // Reconstruct the daemon from the same database: backoff must survive.
         let mut daemon =
             Daemon::new(daemon.cfg.clone(), daemon.paths.clone(), store.clone(), Secrets::auto(&daemon.paths)).unwrap();
         daemon.refresh_rules(now).await.unwrap();
-        daemon.launch_tasks(now).await.unwrap();
+        Box::pin(daemon.launch_tasks(now)).await.unwrap();
         let second = store.get_task_by_key("SLOT-2").unwrap().unwrap();
         assert_eq!(second.state, TaskState::Queued);
         assert_eq!(second.attempts, 0);
-        assert!(store.list_live_sessions().unwrap().is_empty());
+        assert_eq!((store.list_live_sessions().unwrap()).len(), 0);
         let failures = store.kv_get::<LaunchFailures>(super::super::launch_failures::KEY).unwrap().unwrap();
         assert!(!failures.permits("default", now));
         assert!(failures.permits("api", now));
@@ -5009,7 +5156,7 @@ mod tests {
         std::fs::write(&rules_path, "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"critical\"\nall = [{ field = \"priority\", op = \"eq\", value = \"high\" }]\n[models]\ncritical = [\"fable\"]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap();
         daemon.rt.force_sync = true;
         let before = Utc::now() - Duration::seconds(1);
-        daemon.tick().await.unwrap();
+        Box::pin(daemon.tick()).await.unwrap();
         let c2 = store.get_task_by_key("DEP-C2").unwrap().unwrap();
         assert_eq!(c2.criticality, Criticality::Critical);
         // The first scheduling decision about it (start attempt or throttle)
@@ -5051,7 +5198,7 @@ mod tests {
         let a = store.get_task_by_key("DEP-A").unwrap().unwrap();
         assert_eq!(a.state, TaskState::Queued, "B is Done: A is queued again");
         let p = store.get_task_by_key("DEP-P").unwrap().unwrap();
-        assert_eq!(p.state, TaskState::Completed, "{:?}", p);
+        assert_eq!(p.state, TaskState::Completed, "{p:?}");
         assert!(p.summary.as_deref().unwrap_or_default().contains("DEP-C1, DEP-C2"));
         let sent = mock.mutations.lock().unwrap().clone();
         assert!(
@@ -5104,7 +5251,7 @@ mod tests {
 
         // A restarted daemon whose attachment lookups fail keeps "merged".
         mock.attachments_fail.store(true, Ordering::SeqCst);
-        let mut restarted = daemon_on(&store, dir.path(), &server).await;
+        let mut restarted = daemon_on(&store, dir.path(), &server);
         sync_now(&mut restarted, t2).await;
         let a = store.get_task_by_key("DEP-A").unwrap().unwrap();
         assert_eq!(a.state, TaskState::Queued, "a failed lookup never re-blocks: {:?}", a.blocked_by);
@@ -5231,8 +5378,11 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let server = wiremock::MockServer::start().await;
         let mock = std::sync::Arc::new(CommentState::default());
-        wiremock::Mock::given(wiremock::matchers::method("POST")).respond_with(CommentMock(mock.clone())).mount(&server).await;
-        let mut daemon = daemon_on(&store, dir, &server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(CommentMock(std::sync::Arc::clone(&mock)))
+            .mount(&server)
+            .await;
+        let mut daemon = daemon_on(&store, dir, &server);
         daemon.cfg.linear.post_comments = crate::config::PostComments::Questions;
         let source = TaskSource::Linear {
             issue_id: "uuid-REL-1".into(),
@@ -5493,6 +5643,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep the committed_overrides_and_rules_reload_without_a_command workflow and its early exits together in execution order."
+    )]
     async fn committed_overrides_and_rules_reload_without_a_command() {
         use crate::secrets::FileBackend;
         if which::which("git").is_err() {
@@ -5970,7 +6124,15 @@ mod review_regressions {
         cfg.tmux.socket_name = Some(format!("powerqueue-test-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
         let daemon = daemon(cfg, &paths, &store);
         let tmux = daemon.rt.tmux.clone();
+        #[expect(
+            clippy::items_after_statements,
+            reason = "The local helper type is scoped beside the resource or compatibility operation that uses it."
+        )]
         struct Guard(Tmux);
+        #[expect(
+            clippy::items_after_statements,
+            reason = "The local helper type is scoped beside the resource or compatibility operation that uses it."
+        )]
         impl Drop for Guard {
             fn drop(&mut self) {
                 let _ = self.0.command().arg("kill-server").output();
@@ -6042,5 +6204,16 @@ mod review_regressions {
         assert!(
             store.kv_get::<std::collections::BTreeMap<TaskId, PendingCleanup>>(PENDING_CLEANUP_KEY).unwrap().unwrap().is_empty()
         );
+    }
+}
+
+impl std::fmt::Debug for Daemon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Daemon")
+            .field("paths", &self.paths)
+            .field("started_at", &self.started_at)
+            .field("lock_path", &self.lock_path)
+            .field("offline", &self.offline)
+            .finish_non_exhaustive()
     }
 }

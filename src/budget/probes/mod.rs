@@ -147,6 +147,14 @@ fn record(store: &Store, provider: Provider, result: &Result<Option<ObservedUsag
 }
 
 /// Two observations say the same thing (ignoring when they were taken).
+#[expect(
+    clippy::as_conversions,
+    reason = "Budget and score calculations intentionally round or clamp floating-point estimates into their output units."
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Budget and score calculations intentionally round or clamp floating-point estimates into their output units."
+)]
 fn same_reading(a: &ObservedUsage, b: &ObservedUsage) -> bool {
     let pct = |v: Option<f64>| v.map(|f| (f * 1000.0).round() as i64);
     pct(a.window_used) == pct(b.window_used)
@@ -174,6 +182,14 @@ pub fn describe(obs: &ObservedUsage) -> String {
 }
 
 /// Convert unix epoch seconds (integer or float JSON number) to UTC.
+#[expect(
+    clippy::as_conversions,
+    reason = "Budget and score calculations intentionally round or clamp floating-point estimates into their output units."
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Budget and score calculations intentionally round or clamp floating-point estimates into their output units."
+)]
 pub(crate) fn epoch_secs(v: &serde_json::Value) -> Option<DateTime<Utc>> {
     let secs = v.as_i64().or_else(|| v.as_f64().map(|f| f.round() as i64))?;
     DateTime::from_timestamp(secs, 0)
@@ -193,12 +209,9 @@ pub(crate) fn run_with_timeout(cmd: &mut Command, timeout: StdDuration) -> Resul
         .with_context(|| format!("run `{program}`"))?;
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
-    let status = match wait_until(&mut child, Instant::now() + timeout)? {
-        Some(status) => status,
-        None => {
-            kill(&mut child);
-            bail!("`{program}` did not finish within {}s", timeout.as_secs());
-        }
+    let Some(status) = wait_until(&mut child, Instant::now() + timeout)? else {
+        kill(&mut child);
+        bail!("`{program}` did not finish within {}s", timeout.as_secs());
     };
     let stdout = collect(&stdout, PIPE_GRACE);
     let stderr = collect(&stderr, PIPE_GRACE);
@@ -269,8 +282,8 @@ mod tests {
         obs.period_used = Some(0.4);
         obs.blocked = true;
         assert_eq!(describe(&obs), "window 17% (resets 2026-10-01 14:30 UTC) · period 40% · blocked");
-        assert_eq!(epoch_secs(&serde_json::json!(1791234430)), Some(at("2026-10-05T21:07:10Z")));
-        assert_eq!(epoch_secs(&serde_json::json!(1791234430.4)), Some(at("2026-10-05T21:07:10Z")));
+        assert_eq!(epoch_secs(&serde_json::json!(1_791_234_430)), Some(at("2026-10-05T21:07:10Z")));
+        assert_eq!(epoch_secs(&serde_json::json!(1_791_234_430.4)), Some(at("2026-10-05T21:07:10Z")));
         assert_eq!(epoch_secs(&serde_json::json!("x")), None);
     }
 
@@ -284,7 +297,7 @@ mod tests {
         let status = load_probe_status(&store, Provider::Codex).unwrap().unwrap();
         assert!(status.ok && status.learned);
         // Same reading later: stored (fresh timestamp) but no new event.
-        let later = ObservedUsage { observed_at: now + Duration::minutes(15), ..obs.clone() };
+        let later = ObservedUsage { observed_at: now + Duration::minutes(15), ..obs };
         record(&store, Provider::Codex, &Ok(Some(later.clone())), now + Duration::minutes(15)).unwrap();
         assert_eq!(load_observed(&store, Provider::Codex).unwrap(), Some(later));
         let events = store.recent_events(50).unwrap();

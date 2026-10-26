@@ -8,6 +8,10 @@ use crate::secrets::SecretKind;
 
 /// Analyze one existing task or display saved advice. Fails on invalid config or persistence.
 /// Returns 3 for unresolved/stale results. Automatic mode may update unstarted repository assignment.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 pub fn run(ctx: &mut Context, task_ref: &TaskRef, show: bool) -> Result<i32> {
     let cfg = load_config(&ctx.paths)?;
     let store = ctx.store()?.clone();

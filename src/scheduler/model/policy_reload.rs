@@ -3,6 +3,9 @@
 use super::*;
 use crate::domain::{DaemonCommand, Provider};
 
+#[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+#[expect(clippy::cast_possible_wrap, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+#[expect(clippy::cast_precision_loss, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
 pub(super) fn ready_world(count: usize, slots: u32) -> DaemonWorld {
     let mut cfg = Config::default();
     cfg.scheduler.max_concurrent = slots;
@@ -38,13 +41,17 @@ pub(super) fn ready_world(count: usize, slots: u32) -> DaemonWorld {
         rate_limits: RateLimitState::default(),
         estimator: Estimator::from_summaries(&[]),
         scheduling_paused: false,
-        launch_failures: Default::default(),
+        launch_failures: crate::scheduler::launch_failures::LaunchFailures::default(),
     };
     world.set_project("default", &(true, false, ModelTier::sonnet()));
     world.refresh_ledgers();
     world
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "The test or replay driver consumes each input operation before advancing to the next one."
+)]
 fn checked(world: &mut DaemonWorld, step: usize, op: DaemonOp) -> Result<(), TestCaseError> {
     let before = world.clone();
     prop_assert!(world.apply(step, &op)?);
@@ -55,6 +62,7 @@ proptest! {
     #![proptest_config(model_config(32))]
 
     #[test]
+    #[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
     fn lowered_concurrency_drains_existing_sessions(high in 2u32..=4, low in 1u32..=3) {
         let low = low.min(high - 1);
         let mut world = ready_world(high as usize + 1, high);
@@ -98,6 +106,9 @@ proptest! {
     }
 
     #[test]
+    #[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+    #[expect(clippy::cast_precision_loss, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+    #[expect(clippy::float_cmp, reason = "These values are exact discrete priorities or fixture constants; approximate equality would weaken the contract.")]
     fn dated_usage_and_observations_survive_launch_passes(tokens in 1u64..1_000_000, age in 2i64..5 * 3600, reset in any::<bool>()) {
         let mut world = ready_world(2, 1);
         prop_assert_eq!(world.launch_pass(0, &[])?.starts, 1);
@@ -175,7 +186,7 @@ proptest! {
         task.completed_at = Some(origin());
         task.attempts = old_attempt;
         store.insert_task(&task).unwrap();
-        let mut old = session.clone();
+        let mut old = session;
         old.attempt = old_attempt;
         old.state = SessionState::Exited;
         old.started_at = origin();

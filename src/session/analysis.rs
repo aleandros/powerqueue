@@ -38,7 +38,7 @@ pub async fn analyze(
             stdout.take(128 * 1024 + 1).read_to_end(&mut output).await?;
             Ok::<_, std::io::Error>(output)
         };
-        let (_, output) = tokio::try_join!(write, read).context("read/write Claude Code routing request")?;
+        let ((), output) = tokio::try_join!(write, read).context("read/write Claude Code routing request")?;
         if output.len() > 128 * 1024 {
             bail!("Claude Code routing response exceeds 128 KiB");
         }
@@ -51,14 +51,13 @@ pub async fn analyze(
         }
         Ok(raw)
     };
-    match tokio::time::timeout(Duration::from_secs(timeout_secs), request).await {
-        Ok(result) => result,
-        Err(_) => {
-            #[cfg(unix)]
-            drop(group);
-            let _ = child.kill().await;
-            bail!("Claude Code repository analysis timed out");
-        }
+    if let Ok(result) = tokio::time::timeout(Duration::from_secs(timeout_secs), request).await {
+        result
+    } else {
+        #[cfg(unix)]
+        drop(group);
+        let _ = child.kill().await;
+        bail!("Claude Code repository analysis timed out");
     }
 }
 

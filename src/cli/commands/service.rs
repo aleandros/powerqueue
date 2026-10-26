@@ -37,6 +37,14 @@ fn describe(manager: Manager) -> &'static str {
 }
 
 /// The pid of a live daemon that the service did not start, if any.
+#[expect(
+    clippy::as_conversions,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
 fn foreign_daemon(ctx: &mut Context, service_pid: Option<u32>) -> Option<u32> {
     if !ctx.paths.database().exists() {
         return None;
@@ -51,6 +59,10 @@ fn foreign_daemon(ctx: &mut Context, service_pid: Option<u32>) -> Option<u32> {
 }
 
 /// Refuse to stop a running service whose unit would take tmux down with it.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 fn guard_sessions(unit: Option<&InstalledUnit>, state: &ServiceState, force: bool, action: &str) -> Result<()> {
     if let Some(unit) = unit
         && !unit.keeps_sessions
@@ -73,6 +85,11 @@ fn settle(manager: Manager) -> Option<ServiceState> {
     query(manager).ok()
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Command dispatch transfers ownership of parsed arguments to the selected handler."
+)]
+#[expect(clippy::too_many_lines, reason = "Keep the install workflow and its early exits together in execution order.")]
 fn install(ctx: &mut Context, args: ServiceInstallArgs) -> Result<i32> {
     let manager = match args.manager {
         Some(m) => m,
@@ -97,7 +114,7 @@ fn install(ctx: &mut Context, args: ServiceInstallArgs) -> Result<i32> {
 
     let path = manager.unit_path()?;
     let existing = InstalledUnit::load(manager)?;
-    let changed = existing.as_ref().map(|u| u.text != text).unwrap_or(true);
+    let changed = existing.as_ref().is_none_or(|u| u.text != text);
     if let Some(old) = &existing
         && changed
         && !args.force
@@ -176,9 +193,9 @@ fn install(ctx: &mut Context, args: ServiceInstallArgs) -> Result<i32> {
     println!("   runs {} run", spec.binary.display());
     println!("   PATH {}", spec.env_value("PATH").unwrap_or("-"));
     match &after {
-        Some(s) if s.running => println!("   {action} (pid {})", s.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into())),
+        Some(s) if s.running => println!("   {action} (pid {})", s.pid.map_or_else(|| "?".into(), |p| p.to_string())),
         Some(s) if action == "started" || action.starts_with("restarted") => {
-            print_warning(&format!("the service is not running ({}); see `powerqueue service logs`", s.detail))
+            print_warning(&format!("the service is not running ({}); see `powerqueue service logs`", s.detail));
         }
         _ => println!("   {action}"),
     }
@@ -220,6 +237,10 @@ fn looks_like_build_output(binary: &Path) -> bool {
     parts.windows(2).any(|w| w[0] == "target" && (w[1] == "debug" || w[1] == "release"))
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Command dispatch transfers ownership of parsed arguments to the selected handler."
+)]
 fn uninstall(ctx: &mut Context, args: ServiceStopArgs) -> Result<i32> {
     let manager = Manager::detect()?;
     let Some(unit) = InstalledUnit::load(manager)? else {
@@ -265,7 +286,7 @@ fn start(ctx: &mut Context) -> Result<i32> {
     require_unit(manager)?;
     let state = query(manager)?;
     if state.running {
-        println!("already running (pid {})", state.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()));
+        println!("already running (pid {})", state.pid.map_or_else(|| "?".into(), |p| p.to_string()));
         return Ok(0);
     }
     if let Some(pid) = foreign_daemon(ctx, None) {
@@ -275,6 +296,14 @@ fn start(ctx: &mut Context) -> Result<i32> {
     report_started(ctx, manager, "started")
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Command dispatch transfers ownership of parsed arguments to the selected handler."
+)]
 fn stop_or_restart(ctx: &mut Context, args: ServiceStopArgs, restart: bool) -> Result<i32> {
     let manager = Manager::detect()?;
     let unit = require_unit(manager)?;
@@ -307,16 +336,17 @@ fn stop_or_restart(ctx: &mut Context, args: ServiceStopArgs, restart: bool) -> R
     Ok(0)
 }
 
+#[expect(clippy::unnecessary_wraps, reason = "Keep the fallible helper interface shared by the surrounding I/O workflow.")]
 fn report_started(ctx: &Context, manager: Manager, what: &str) -> Result<i32> {
     let state = settle(manager);
     let running = state.as_ref().is_some_and(|s| s.running);
     if ctx.json {
         println!("{}", serde_json::json!({ "manager": manager, "action": what, "state": state }));
     } else if running {
-        let pid = state.and_then(|s| s.pid).map(|p| p.to_string()).unwrap_or_else(|| "?".into());
+        let pid = state.and_then(|s| s.pid).map_or_else(|| "?".into(), |p| p.to_string());
         println!("{} {what} (pid {pid})", ok_mark());
     } else {
-        let detail = state.map(|s| s.detail).unwrap_or_else(|| "unknown".into());
+        let detail = state.map_or_else(|| "unknown".into(), |s| s.detail);
         print_warning(&format!("the service is not running ({detail}); see `powerqueue service logs`"));
         return Ok(1);
     }
@@ -362,12 +392,12 @@ fn status(ctx: &mut Context) -> Result<i32> {
     };
     let origin = if unit.generated { "generated by powerqueue" } else { "hand-written" };
     println!("{:<9}{} ({}, {origin})", "unit", unit.path.display(), describe(manager));
-    println!("{:<9}{}", "binary", unit.binary.as_ref().map(|b| b.display().to_string()).unwrap_or_else(|| "-".into()));
+    println!("{:<9}{}", "binary", unit.binary.as_ref().map_or_else(|| "-".into(), |b| b.display().to_string()));
     match &state {
         Ok(s) => {
             println!("{:<9}{}", "enabled", yes_no(s.enabled));
             let run = if s.running {
-                format!("yes (pid {}, {})", s.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()), s.detail)
+                format!("yes (pid {}, {})", s.pid.map_or_else(|| "?".into(), |p| p.to_string()), s.detail)
             } else {
                 format!("no ({})", s.detail)
             };
@@ -395,6 +425,10 @@ fn status(ctx: &mut Context) -> Result<i32> {
     Ok(if running { 0 } else { 3 })
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Command dispatch transfers ownership of parsed arguments to the selected handler."
+)]
 fn logs(ctx: &mut Context, args: ServiceLogsArgs) -> Result<i32> {
     let manager = Manager::detect()?;
     let mut cmd = manager.logs_command(&ctx.paths, args.lines, args.follow);

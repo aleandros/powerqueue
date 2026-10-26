@@ -87,6 +87,10 @@ pub fn handle_provider(
 
 /// Store an already-parsed (Claude-shaped) hook payload and apply completion
 /// markers; see [`handle`]. Always returns `Ok(0)`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Keep the established ownership-taking boundary for callers and serialized inputs."
+)]
 pub fn handle_payload(
     store: &Store,
     task_id: TaskId,
@@ -327,7 +331,7 @@ mod tests {
         assert_eq!(store.drain_hook_events().unwrap()[0].event, HookEvent::SessionStart);
         assert!(handle_provider(&store, Provider::Claude, id, None, "Bogus", "{}").is_err());
         assert_eq!(handle_provider(&store, Provider::Gemini, id, None, "PreToolUse", "{}").unwrap(), 0);
-        assert!(store.drain_hook_events().unwrap().is_empty());
+        assert_eq!((store.drain_hook_events().unwrap()).len(), 0);
         assert_eq!(parse_payload("[1]"), serde_json::json!({ "value": [1] }));
     }
 
@@ -344,8 +348,8 @@ mod tests {
         let payload = serde_json::json!({
             "model": { "id": "claude-opus-5-5", "display_name": "Opus 5.5" },
             "rate_limits": {
-                "five_hour": { "used_percentage": 75, "resets_at": 1790914200 },
-                "seven_day": { "used_percentage": 89, "resets_at": 1790920800 }
+                "five_hour": { "used_percentage": 75, "resets_at": 1_790_914_200 },
+                "seven_day": { "used_percentage": 89, "resets_at": 1_790_920_800 }
             }
         });
         let now = Utc::now();
@@ -355,7 +359,7 @@ mod tests {
         assert_eq!(obs.window_used, Some(0.75));
         assert_eq!(obs.period_used, Some(0.89));
         assert_eq!(obs.observed_at, now);
-        assert!(store.drain_hook_events().unwrap().is_empty());
+        assert_eq!((store.drain_hook_events().unwrap()).len(), 0);
 
         // Garbage in: still a status text, nothing stored over the last observation.
         assert_eq!(handle_status_line(Some(&store), &mut Cursor::new("not json"), now), "pq");

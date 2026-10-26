@@ -109,6 +109,10 @@ struct Planned {
     routing: Option<crate::routing::RoutingDecision>,
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 fn sync(ctx: &mut Context, apply: bool) -> Result<i32> {
     let cfg = ctx.config_cloned()?;
     let key = ctx.secrets().require(SecretKind::LinearApiKey)?;
@@ -201,7 +205,7 @@ fn sync(ctx: &mut Context, apply: bool) -> Result<i32> {
             p.key.clone(),
             truncate(&p.title, 60),
             p.detail.clone(),
-            p.routing.as_ref().map(|r| r.explanation()).unwrap_or_default(),
+            p.routing.as_ref().map(crate::routing::RoutingDecision::explanation).unwrap_or_default(),
         ]);
     }
     println!("{t}");
@@ -300,7 +304,7 @@ fn plan(
         let state_type = fetch_state(issue_id);
         let closed = matches!(
             state_type.as_deref().map(str::to_ascii_lowercase).as_deref(),
-            None | Some("completed") | Some("canceled") | Some("cancelled")
+            None | Some("completed" | "canceled" | "cancelled")
         );
         if closed {
             out.push(Planned {
@@ -308,7 +312,7 @@ fn plan(
                 action: "cancel",
                 key: task.key.clone(),
                 title: task.title.clone(),
-                detail: state_type.map(|s| format!("closed in Linear ({s})")).unwrap_or_else(|| "issue deleted".into()),
+                detail: state_type.map_or_else(|| "issue deleted".into(), |s| format!("closed in Linear ({s})")),
             });
         }
     }

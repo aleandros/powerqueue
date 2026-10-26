@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn source_fallback_and_deliberate_override_share_policy_conditions() {
         let cfg = config();
-        assert!(cfg.routing_problems().is_empty());
+        assert_eq!((cfg.routing_problems()).len(), 0);
         let mut task =
             Task::new("GH-1", "ignored", TaskSource::GitHub { repository: "ACME/ISSUES".into(), number: 1, url: String::new() });
         assert_eq!(cfg.route(&task).project.as_deref(), Some("default"));

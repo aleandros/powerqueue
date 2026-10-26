@@ -15,6 +15,10 @@ fn git(cwd: &Path, args: &[&str]) {
 }
 
 /// A fresh repo on `main` with one committed file.
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn fixture() -> Option<(TempDir, Repo)> {
     if which::which("git").is_err() {
         eprintln!("skipping: git not on PATH");
@@ -31,6 +35,10 @@ fn fixture() -> Option<(TempDir, Repo)> {
     Some((dir, repo))
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn commit_file(wt: &Path, name: &str, msg: &str) {
     std::fs::write(wt.join(name), format!("{name}\n")).unwrap();
     git(wt, &["add", "."]);
@@ -114,7 +122,7 @@ fn counts_unpushed_commits_and_logs() {
     let wt = dir.path().join("wt");
     repo.add_worktree(&wt, "pq/work", "main").unwrap();
     assert_eq!(repo.unpushed_commits(&wt, "pq/work", "main").unwrap(), 0);
-    assert!(repo.log_since(&wt, "main", 10).unwrap().is_empty());
+    assert_eq!((repo.log_since(&wt, "main", 10).unwrap()).len(), 0);
 
     commit_file(&wt, "a.txt", "add a");
     commit_file(&wt, "b.txt", "add b");
@@ -185,6 +193,10 @@ fn rev(cwd: &Path, rev: &str) -> String {
 
 /// `repo` gets a bare `origin`; returns a second clone that plays "GitHub
 /// merged a PR": commits pushed from it land on `origin/main` only.
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn with_remote(dir: &TempDir, repo: &Repo) -> PathBuf {
     let bare = dir.path().join("origin.git");
     let out = Command::new("git").args(["init", "-q", "--bare", "-b", "main"]).arg(&bare).output().unwrap();

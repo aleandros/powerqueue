@@ -127,7 +127,7 @@ impl FromStr for Criticality {
 pub enum Provider {
     /// Claude Code (`claude`).
     Claude,
-    /// OpenAI Codex CLI (`codex`).
+    /// `OpenAI` Codex CLI (`codex`).
     Codex,
     /// Google Antigravity CLI (`agy`), the CLI behind Google AI Pro/Ultra.
     Gemini,
@@ -1118,7 +1118,7 @@ impl Session {
     /// Wall time the agent has been working: the session's age minus the
     /// time it spent waiting (past waits and the current one).
     pub fn working_time(&self, now: DateTime<Utc>) -> chrono::Duration {
-        let current_wait = self.waiting_since.map(|since| now - since).unwrap_or_else(chrono::Duration::zero);
+        let current_wait = self.waiting_since.map_or_else(chrono::Duration::zero, |since| now - since);
         now - self.started_at - chrono::Duration::seconds(self.waited_secs) - current_wait
     }
 }
@@ -1140,6 +1140,14 @@ impl TokenUsage {
     /// "Weighted" tokens: an approximation of what subscription usage limits
     /// count. Cache reads are cheap (10%), cache writes cost more than plain
     /// input (125%), output is the most expensive (5x input for Claude 5 tiers).
+    #[expect(
+        clippy::as_conversions,
+        reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+    )]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+    )]
     pub fn weighted(&self) -> f64 {
         self.input_tokens as f64
             + self.cache_creation_input_tokens as f64 * 1.25

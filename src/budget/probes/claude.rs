@@ -64,7 +64,7 @@ pub fn parse_status_line(payload: &serde_json::Value, now: DateTime<Utc>) -> Opt
     let limits = payload.get("rate_limits").filter(|v| v.is_object())?;
     let bucket = |name: &str| -> Option<(f64, Option<DateTime<Utc>>)> {
         let b = limits.get(name)?;
-        let used = b.get("used_percentage").or_else(|| b.get("utilization")).and_then(|v| v.as_f64())?;
+        let used = b.get("used_percentage").or_else(|| b.get("utilization")).and_then(serde_json::Value::as_f64)?;
         let resets = b.get("resets_at").and_then(|v| {
             epoch_secs(v).or_else(|| v.as_str().and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|d| d.with_timezone(&Utc)))
         });
@@ -133,8 +133,8 @@ mod tests {
             "version": "2.1.287",
             "cost": { "total_cost_usd": 0.0419 },
             "rate_limits": {
-                "five_hour": { "used_percentage": 75, "resets_at": 1790914200 },
-                "seven_day": { "used_percentage": 89, "resets_at": 1790920800 }
+                "five_hour": { "used_percentage": 75, "resets_at": 1_790_914_200 },
+                "seven_day": { "used_percentage": 89, "resets_at": 1_790_920_800 }
             }
         })
     }
@@ -143,9 +143,9 @@ mod tests {
     fn status_line_rate_limits_become_an_observation() {
         let obs = parse_status_line(&payload(), now()).unwrap();
         assert_eq!(obs.window_used, Some(0.75));
-        assert_eq!(obs.window_resets_at, DateTime::from_timestamp(1790914200, 0));
+        assert_eq!(obs.window_resets_at, DateTime::from_timestamp(1_790_914_200, 0));
         assert_eq!(obs.period_used, Some(0.89));
-        assert_eq!(obs.period_resets_at, DateTime::from_timestamp(1790920800, 0));
+        assert_eq!(obs.period_resets_at, DateTime::from_timestamp(1_790_920_800, 0));
         assert!(!obs.blocked);
         assert_eq!(obs.observed_at, now());
         assert_eq!(status_line_text(&payload(), Some(&obs)), "pq sonnet 5h 75% · 7d 89%");

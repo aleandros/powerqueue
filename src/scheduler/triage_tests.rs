@@ -50,7 +50,7 @@ impl Respond for Reports {
 #[tokio::test]
 async fn triage_keeps_ticket_open_and_retries_delivery_after_restart_without_duplicate_comment() {
     let server = MockServer::start().await;
-    let reports = Reports { comment: Default::default(), labels_available: std::sync::Arc::new(false.into()) };
+    let reports = Reports { comment: std::sync::Arc::default(), labels_available: std::sync::Arc::new(false.into()) };
     Mock::given(method("POST")).respond_with(reports.clone()).mount(&server).await;
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths::rooted(dir.path());
@@ -125,7 +125,7 @@ async fn triage_parent_is_not_closed_by_coding_child_completion() {
 async fn failing_deliveries_do_not_starve_a_newly_completed_report() {
     let server = MockServer::start().await;
     let commented = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let seen = commented.clone();
+    let seen = std::sync::Arc::<std::sync::Mutex<std::vec::Vec<std::string::String>>>::clone(&commented);
     Mock::given(method("POST"))
         .respond_with(move |request: &Request| {
             let body: Value = request.body_json().unwrap();

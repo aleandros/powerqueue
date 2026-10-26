@@ -21,6 +21,14 @@ impl Period {
         self.end - self.start
     }
     /// 0.0 at start, 1.0 at end (clamped).
+    #[expect(
+        clippy::as_conversions,
+        reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+    )]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+    )]
     pub fn elapsed_fraction(&self, now: DateTime<Utc>) -> f64 {
         let total = self.len().num_seconds().max(1) as f64;
         ((now - self.start).num_seconds() as f64 / total).clamp(0.0, 1.0)
@@ -64,6 +72,14 @@ impl PeriodClock {
     /// reports it separately) and the Monday default is used instead. The
     /// period length is clamped to at least one hour so the clock never
     /// divides by zero; `window_hours = 0` is kept as "no window".
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing configuration-to-chrono conversion; overflow policy is unchanged by lint adoption."
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Preserve the existing configuration-to-chrono conversion; overflow policy is unchanged by lint adoption."
+    )]
     pub fn from_provider(budget: &ProviderBudget, now: DateTime<Utc>) -> Self {
         let configured = budget
             .period_anchor
@@ -84,6 +100,7 @@ impl PeriodClock {
 
     /// Replace the anchor with a reset instant a probe observed. Any instant
     /// on the period grid works because periods repeat around the anchor.
+    #[must_use]
     pub fn with_observed_anchor(mut self, resets_at: DateTime<Utc>) -> Self {
         self.anchor = resets_at;
         self.anchor_source = AnchorSource::Observed;
@@ -113,7 +130,7 @@ impl PeriodClock {
 
 /// Monday 00:00 UTC on or before `now`.
 fn most_recent_monday(now: DateTime<Utc>) -> DateTime<Utc> {
-    let days_since_monday = now.weekday().num_days_from_monday() as i64;
+    let days_since_monday = i64::from(now.weekday().num_days_from_monday());
     let date = now.date_naive() - Duration::days(days_since_monday);
     Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).expect("midnight is a valid time"))
 }
@@ -289,6 +306,9 @@ mod properties {
         /// Elapsed fraction is within `[0, 1]`, remaining time is never
         /// negative, and inside the period `elapsed + remaining == len`.
         #[test]
+        #[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+        #[expect(clippy::cast_precision_loss, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+        #[expect(clippy::float_cmp, reason = "These values are exact discrete priorities or fixture constants; approximate equality would weaken the contract.")]
         fn fractions_and_remaining_are_consistent((clock, now) in clock(), probe in instant_between(2 * MONTH, 2 * MONTH)) {
             let p = clock.current_period(now);
             let f = p.elapsed_fraction(probe);
@@ -328,12 +348,12 @@ mod properties {
             prop_assert_eq!(w.end, now);
             prop_assert_eq!(w.len(), clock.window);
             prop_assert_eq!(clock.has_window(), clock.window > Duration::zero());
-            if !clock.has_window() {
-                prop_assert_eq!(w.start, w.end);
-                prop_assert!(!w.contains(now));
-            } else {
+            if clock.has_window() {
                 prop_assert!(!w.contains(now), "half-open: now itself is outside");
                 prop_assert!(w.contains(now - Duration::seconds(1)));
+            } else {
+                prop_assert_eq!(w.start, w.end);
+                prop_assert!(!w.contains(now));
             }
         }
 

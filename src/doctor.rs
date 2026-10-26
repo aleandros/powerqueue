@@ -18,6 +18,8 @@
 //!   per provider: probe freshness, top-model under/over-reservation, window
 //!   pressure — each with a concrete suggestion
 
+use std::fmt::Write as _;
+
 use std::path::Path;
 
 use anyhow::{Context as _, Result, anyhow};
@@ -73,6 +75,7 @@ impl CheckResult {
     pub fn skipped(category: &str, name: &str, detail: impl Into<String>) -> Self {
         Self::new(category, name, Status::Skipped, detail)
     }
+    #[must_use]
     pub fn hint(mut self, hint: impl Into<String>) -> Self {
         let h = hint.into();
         self.fix_hint = if h.is_empty() { None } else { Some(h) };
@@ -106,6 +109,14 @@ pub const STALE_PROBE_INTERVALS: i64 = 3;
 
 /// Classify an event rate (`events / launches`): `Ok` when below the threshold
 /// or when there were no launches, `Warn` otherwise. Returns the rate too.
+#[expect(
+    clippy::as_conversions,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
 pub fn rate_status(events: u64, launches: u64, threshold: f64) -> (Status, f64) {
     if launches == 0 {
         return (Status::Ok, 0.0);
@@ -181,10 +192,14 @@ pub struct ClaudeAuth {
 
 /// Interpret the output of `claude auth status`: exit 0 means logged in
 /// unless the JSON says `loggedIn: false`.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing parse_claude_auth flag interface during lint adoption; callers already supply named state predicates."
+)]
 pub fn parse_claude_auth(exit_ok: bool, stdout: &str, stderr: &str) -> ClaudeAuth {
     let json: Option<serde_json::Value> = serde_json::from_str(stdout.trim()).ok();
     let get = |k: &str| json.as_ref().and_then(|j| j.get(k)).and_then(|v| v.as_str()).map(str::to_string);
-    let logged_in = match json.as_ref().and_then(|j| j.get("loggedIn")).and_then(|v| v.as_bool()) {
+    let logged_in = match json.as_ref().and_then(|j| j.get("loggedIn")).and_then(serde_json::Value::as_bool) {
         Some(v) => v && exit_ok,
         None => exit_ok,
     };
@@ -242,7 +257,7 @@ fn check_gh(cfg: &Config, store: &Store) -> CheckResult {
     if cfg.scheduler.pr_poll_secs == 0 {
         return CheckResult::skipped(ENV, NAME, "PR watcher disabled (scheduler.pr_poll_secs = 0)");
     }
-    let in_review = store.list_tasks_in_states(&[TaskState::InReview]).map(|t| t.len()).unwrap_or(0);
+    let in_review = store.list_tasks_in_states(&[TaskState::InReview]).map_or(0, |t| t.len());
     let bin = cfg.scheduler.gh_binary.as_str();
     let problem = |detail: String, hint: &str| {
         if in_review > 0 {
@@ -283,6 +298,10 @@ fn check_tmux(cfg: &Config) -> CheckResult {
 /// Terminal facts for the dashboard: `TERM` and the locale charset. Pure so
 /// it can be tested; `interactive` is whether stdout is a terminal (when it is
 /// not, e.g. in CI, the check is skipped rather than nagging).
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing terminal_status flag interface during lint adoption; callers already supply named state predicates."
+)]
 pub fn terminal_status(interactive: bool, term: Option<&str>, locale: Option<&str>) -> CheckResult {
     if !interactive {
         return CheckResult::skipped(
@@ -329,7 +348,10 @@ fn check_terminal() -> CheckResult {
 /// The program of a per-task `binary` template (one with placeholders),
 /// which can only be run for a launch, not from here.
 fn per_task_binary(binary: &str) -> Option<String> {
-    crate::session::BinaryTemplate::parse(binary).ok().filter(|t| t.is_per_task()).map(|t| t.program().to_string())
+    crate::session::BinaryTemplate::parse(binary)
+        .ok()
+        .filter(super::session::binary::BinaryTemplate::is_per_task)
+        .map(|t| t.program().to_string())
 }
 
 fn check_claude(cfg: &Config) -> Vec<CheckResult> {
@@ -515,7 +537,7 @@ fn check_worktree_root(cfg: &Config, paths: &Paths) -> CheckResult {
     let root = cfg.worktree_root(paths);
     let probe = root.join(".powerqueue-write-test");
     let result =
-        std::fs::create_dir_all(&root).and_then(|_| std::fs::write(&probe, b"ok")).and_then(|_| std::fs::remove_file(&probe));
+        std::fs::create_dir_all(&root).and_then(|()| std::fs::write(&probe, b"ok")).and_then(|()| std::fs::remove_file(&probe));
     match result {
         Ok(()) => CheckResult::ok(CONF, "worktree root", format!("{} is writable", root.display())),
         Err(e) => CheckResult::fail(
@@ -969,7 +991,7 @@ pub fn provider_models_status(cfg: &Config, p: Provider) -> CheckResult {
             "lower the shares so they add up to at most 1.0".to_string(),
         );
     }
-    let names: Vec<&str> = enabled.iter().map(|m| m.alias()).collect();
+    let names: Vec<&str> = enabled.iter().map(super::domain::ModelTier::alias).collect();
     CheckResult::ok(CONF, &name, format!("{} enabled model(s): {} (shares sum {share:.2})", enabled.len(), names.join(", ")))
 }
 
@@ -1140,6 +1162,10 @@ fn check_session_inbox(cfg: &Config, paths: &Paths) -> Option<CheckResult> {
 /// Interactive Claude Code blocks on a trust dialog in untrusted folders.
 /// With `claude.trust_workspace` the launcher pre-seeds trust; otherwise the
 /// repository root must already be trusted in `~/.claude.json`.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing check_workspace_trust flag interface during lint adoption; callers already supply named state predicates."
+)]
 fn check_workspace_trust(cfg: &Config, fix: bool) -> CheckResult {
     use crate::session::trust::{claude_json_path, ensure_trusted, is_trusted};
     let file = claude_json_path(cfg);
@@ -1180,13 +1206,16 @@ fn check_workspace_trust(cfg: &Config, fix: bool) -> CheckResult {
 
 // ------------------------------------------------------------------ secrets
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing check_secrets flag interface during lint adoption; callers already supply named state predicates."
+)]
+#[expect(clippy::too_many_lines, reason = "Keep the check_secrets workflow and its early exits together in execution order.")]
 async fn check_secrets(cfg: &Config, secrets: &Secrets, online: bool) -> Vec<CheckResult> {
     let mut out = vec![CheckResult::ok(SEC, "backend", secrets.backend_description())];
     match secrets.get_with_origin(SecretKind::LinearApiKey) {
         Ok(Some((key, origin))) if cfg.linear.enabled => {
-            if !online {
-                out.push(CheckResult::ok(SEC, "linear key", format!("present ({origin}); not verified offline")));
-            } else {
+            if online {
                 match LinearClient::new(cfg.linear.endpoint.clone(), key) {
                     Ok(client) => match client.viewer().await {
                         Ok(v) => out.push(CheckResult::ok(
@@ -1203,6 +1232,8 @@ async fn check_secrets(cfg: &Config, secrets: &Secrets, online: bool) -> Vec<Che
                     },
                     Err(e) => out.push(CheckResult::fail(SEC, "linear key", format!("{e:#}"), "check linear.endpoint")),
                 }
+            } else {
+                out.push(CheckResult::ok(SEC, "linear key", format!("present ({origin}); not verified offline")));
             }
         }
         Ok(Some((_, origin))) => out.push(CheckResult::ok(SEC, "linear key", format!("present ({origin}); Linear is disabled"))),
@@ -1266,7 +1297,7 @@ async fn check_secrets(cfg: &Config, secrets: &Secrets, online: bool) -> Vec<Che
                 }
             }
             Ok(Some((_, origin))) => {
-                out.push(CheckResult::ok(SEC, "jev key", format!("present ({origin}); not verified offline")))
+                out.push(CheckResult::ok(SEC, "jev key", format!("present ({origin}); not verified offline")));
             }
             Ok(None) => out.push(CheckResult::fail(
                 SEC,
@@ -1414,6 +1445,10 @@ fn check_scheduling_pause(store: &Store) -> CheckResult {
 /// to close parent issues (`parent_errors`, `linear.parent_error` events in
 /// the last day). `parent_closing` is false when `linear.manage_states` is
 /// off or `linear.done_state_parent` is empty.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing dependency_status flag interface during lint adoption; callers already supply named state predicates."
+)]
 pub fn dependency_status(tasks: &[Task], parent_errors: u64, parent_closing: bool) -> CheckResult {
     const NAME: &str = "dependencies";
     let open: Vec<&Task> = tasks.iter().filter(|t| !t.state.is_terminal()).collect();
@@ -1485,7 +1520,7 @@ fn blocker_cycles(tasks: &[&Task]) -> Vec<String> {
         // Depth-first walk from `start` looking for a path back to it.
         let mut stack: Vec<(&str, Vec<&str>)> = vec![(start, vec![start])];
         while let Some((node, path)) = stack.pop() {
-            for &next in edges.get(node).map(Vec::as_slice).unwrap_or(&[]) {
+            for &next in edges.get(node).map_or(&[][..], Vec::as_slice) {
                 if next == start {
                     let mut canon = path.clone();
                     canon.sort_unstable();
@@ -1628,6 +1663,10 @@ fn check_superseded_launches(store: &Store) -> CheckResult {
 /// (`linear.post_comments` not `false`), which tasks wait for a reply to a
 /// question posted on Linear (`waiting`), and failures typing replies or
 /// hints into a session (`relay_errors`: `relay.error` events in the last day).
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing question_relay_status flag interface during lint adoption; callers already supply named state predicates."
+)]
 pub fn question_relay_status(
     mode: crate::config::PostComments,
     linear_enabled: bool,
@@ -1758,6 +1797,10 @@ fn check_starting_tasks(store: &Store) -> CheckResult {
     }
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing check_stuck_tasks flag interface during lint adoption; callers already supply named state predicates."
+)]
 fn check_stuck_tasks(cfg: &Config, store: &Store, fix: bool) -> CheckResult {
     let tmux = Tmux::new(cfg.tmux.binary.clone(), cfg.tmux.socket_name.clone());
     let panes = pane_ids(&tmux, &cfg.tmux.session_name);
@@ -1828,6 +1871,10 @@ fn check_stuck_tasks(cfg: &Config, store: &Store, fix: bool) -> CheckResult {
     result
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing check_orphan_worktrees flag interface during lint adoption; callers already supply named state predicates."
+)]
 fn check_orphan_worktrees(cfg: &Config, paths: &Paths, store: &Store, fix: bool) -> CheckResult {
     let repo_path = cfg.repo_path();
     if !repo_path.exists() {
@@ -1857,7 +1904,7 @@ fn check_orphan_worktrees(cfg: &Config, paths: &Paths, store: &Store, fix: bool)
     let mut removed = 0usize;
     for wt in &orphans {
         let dirty = repo.is_dirty(&wt.path).unwrap_or(true);
-        let unpushed = wt.branch.as_deref().map(|b| repo.unpushed_commits(&wt.path, b, &base).unwrap_or(1)).unwrap_or(1);
+        let unpushed = wt.branch.as_deref().map_or(1, |b| repo.unpushed_commits(&wt.path, b, &base).unwrap_or(1));
         let safe = !dirty && unpushed == 0;
         if fix && safe {
             match repo.remove_worktree(&wt.path, true) {
@@ -1887,18 +1934,22 @@ fn check_orphan_worktrees(cfg: &Config, paths: &Paths, store: &Store, fix: bool)
         "`powerqueue doctor --fix` removes clean, pushed ones; inspect dirty/unpushed ones by hand (git worktree remove)",
     );
     if removed > 0 {
-        r.detail.push_str(&format!(" (removed {removed})"));
+        let _ = write!(r.detail, " (removed {removed})");
     }
     r
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing check_orphan_windows flag interface during lint adoption; callers already supply named state predicates."
+)]
 fn check_orphan_windows(cfg: &Config, store: &Store, fix: bool) -> CheckResult {
     let tmux = Tmux::new(cfg.tmux.binary.clone(), cfg.tmux.socket_name.clone());
     let Some(panes) = pane_ids(&tmux, &cfg.tmux.session_name) else {
         return CheckResult::skipped(STATE, "orphan tmux windows", "tmux unavailable");
     };
     let open: Vec<_> = store.list_open_tasks().unwrap_or_default();
-    let slugs: Vec<String> = open.iter().map(|t| t.slug()).collect();
+    let slugs: Vec<String> = open.iter().map(super::domain::Task::slug).collect();
     let orphans: Vec<_> = panes
         .iter()
         .filter(|p| {
@@ -1936,7 +1987,7 @@ fn check_orphan_windows(cfg: &Config, store: &Store, fix: bool) -> CheckResult {
         "`powerqueue doctor --fix` closes dead ones; close running ones with `tmux kill-window`",
     );
     if killed > 0 {
-        r.detail.push_str(&format!(" (closed {killed})"));
+        let _ = write!(r.detail, " (closed {killed})");
     }
     r
 }
@@ -1952,6 +2003,10 @@ pub fn process_alive(pid: u32) -> bool {
     system.process(sysinfo::Pid::from_u32(pid)).is_some()
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing check_stale_lock flag interface during lint adoption; callers already supply named state predicates."
+)]
 fn check_stale_lock(paths: &Paths, store: &Store, fix: bool) -> CheckResult {
     let pid_file = paths.daemon_pid();
     let lock_file = paths.daemon_lock();
@@ -1960,7 +2015,7 @@ fn check_stale_lock(paths: &Paths, store: &Store, fix: bool) -> CheckResult {
     }
     let pid: Option<u32> = std::fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse().ok());
     let heartbeat_alive = store.daemon_alive(Duration::seconds(30)).unwrap_or(false);
-    if heartbeat_alive || pid.map(process_alive).unwrap_or(false) {
+    if heartbeat_alive || pid.is_some_and(process_alive) {
         return CheckResult::ok(
             STATE,
             "daemon lock",
@@ -2046,6 +2101,14 @@ fn check_rates(cfg: &Config, store: &Store) -> Vec<CheckResult> {
 /// Freshness of a provider's observed usage, as a pure function of the
 /// facts: `None` observation = "no probe yet" (info), a failing probe warns,
 /// an observation older than [`STALE_PROBE_INTERVALS`] intervals warns.
+#[expect(
+    clippy::as_conversions,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
 pub fn probe_status(
     p: Provider,
     interval_mins: u64,
@@ -2272,13 +2335,18 @@ fn check_ledger(cfg: &Config, store: &Store) -> Vec<CheckResult> {
         .into_iter()
         .flat_map(|l| {
             let readings =
-                load_observations(store, l.provider).map(|h| h.iter().filter(|s| l.period.contains(s.at)).count()).unwrap_or(0);
+                load_observations(store, l.provider).map_or(0, |h| h.iter().filter(|s| l.period.contains(s.at)).count());
             ledger_checks(cfg, l, readings, typical)
         })
         .collect()
 }
 
 /// Run every check. `fix` applies safe repairs. `online` allows network calls.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing run_all flag interface during lint adoption; callers already supply named state predicates."
+)]
+#[expect(clippy::too_many_lines, reason = "Keep the run_all workflow and its early exits together in execution order.")]
 pub async fn run_all(
     cfg: &Config,
     paths: &Paths,
@@ -2389,13 +2457,7 @@ pub async fn run_all(
             matches!(t.source, crate::domain::TaskSource::GitHub { .. })
                 && !t.github_admission.as_ref().is_some_and(|a| a.approved)
         })
-        .map(|t| {
-            format!(
-                "{}: {}",
-                t.key,
-                t.github_admission.as_ref().map(|a| a.reason.as_str()).unwrap_or("approval not yet verified")
-            )
-        })
+        .map(|t| format!("{}: {}", t.key, t.github_admission.as_ref().map_or("approval not yet verified", |a| a.reason.as_str())))
         .collect();
     if !unapproved.is_empty() {
         results.push(CheckResult::warn(STATE, "GitHub admission", unapproved.join("; "),
@@ -2459,7 +2521,7 @@ pub async fn run_all(
 
 /// Exit code: 0 all ok/warn, 1 if any failure.
 pub fn exit_code(results: &[CheckResult]) -> i32 {
-    if results.iter().any(|r| r.status == Status::Fail) { 1 } else { 0 }
+    i32::from(results.iter().any(|r| r.status == Status::Fail))
 }
 
 #[cfg(test)]
@@ -2741,7 +2803,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, Status::Fail);
         let probes = check_probes(&cfg, &store);
-        assert!(probes.is_empty());
+        assert_eq!((probes).len(), 0);
     }
 
     #[test]
@@ -2852,7 +2914,7 @@ mod tests {
         let r = dependency_status(&tasks, 0, true);
         assert_eq!(r.status, Status::Fail);
         assert_eq!(r.detail.matches('→').count(), 3, "one cycle reported once: {}", r.detail);
-        let mut done = tasks.clone();
+        let mut done = tasks;
         done[2].state = TaskState::Completed;
         assert_ne!(dependency_status(&done, 0, true).status, Status::Fail, "a terminal task breaks the cycle");
 

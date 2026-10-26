@@ -610,7 +610,7 @@ impl Default for PriorityConfig {
     }
 }
 
-/// Optional Jev (TypeSafe "System One") scoring of tickets.
+/// Optional Jev (`TypeSafe` "System One") scoring of tickets.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct JevConfig {
@@ -701,6 +701,10 @@ impl Default for SchedulerConfig {
 }
 
 impl SchedulerConfig {
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+    )]
     pub fn backoff_for_attempt(&self, attempt: u32) -> u64 {
         if self.restart_backoff_secs.is_empty() {
             return 60;
@@ -777,7 +781,7 @@ pub const CODEX_APPROVAL_MODES: [&str; 4] = ["workspace-write", "approve-for-me"
 /// Permission modes for Antigravity sessions (`gemini.mode`).
 pub const GEMINI_MODES: [&str; 3] = ["skip-permissions", "accept-edits", "plan"];
 
-/// How OpenAI Codex CLI is launched (see `session::codex`).
+/// How `OpenAI` Codex CLI is launched (see `session::codex`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CodexConfig {
@@ -1308,8 +1312,7 @@ pub fn migrate_legacy_budget(table: &mut toml::Table) -> Vec<String> {
             }
             Some(existing) => {
                 notes.push(format!(
-                    "conflict: budget.{key} = {} differs from budget.providers.claude.{key} = {}; remove the old key",
-                    value, existing
+                    "conflict: budget.{key} = {value} differs from budget.providers.claude.{key} = {existing}; remove the old key"
                 ));
             }
         }
@@ -1320,6 +1323,10 @@ pub fn migrate_legacy_budget(table: &mut toml::Table) -> Vec<String> {
 /// What happens when a task completes or fails.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "These are independent configuration or observed-state flags, not mutually exclusive states."
+)]
 pub struct CleanupConfig {
     /// Remove the worktree after completion.
     pub remove_worktree: bool,
@@ -1852,6 +1859,10 @@ impl Config {
     /// Fold `ov` into this config: scalars replace, lists replace,
     /// `instructions` / `claude.append_system_prompt` append. Every key
     /// taken is appended to `overrides.keys` (dotted, as in `config get`).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Keep the merge_overrides workflow and its early exits together in execution order."
+    )]
     pub fn merge_overrides(&mut self, ov: RepoOverrides) {
         let keys = &mut self.overrides.keys;
         macro_rules! take {
@@ -1975,13 +1986,11 @@ impl Config {
 
     /// Where worktrees for this repo live.
     pub fn worktree_root(&self, paths: &Paths) -> PathBuf {
-        match &self.repo.worktree_root {
-            Some(p) => expand_tilde(p),
-            None => {
-                let name =
-                    self.repo_path().file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "repo".to_string());
-                paths.worktrees_dir().join(name)
-            }
+        if let Some(p) = &self.repo.worktree_root {
+            expand_tilde(p)
+        } else {
+            let name = self.repo_path().file_name().map_or_else(|| "repo".to_string(), |n| n.to_string_lossy().to_string());
+            paths.worktrees_dir().join(name)
         }
     }
 
@@ -2092,6 +2101,7 @@ impl Config {
     }
 
     /// Structural validation; returns a list of human-readable problems.
+    #[expect(clippy::too_many_lines, reason = "Keep the validate workflow and its early exits together in execution order.")]
     pub fn validate(&self) -> Vec<String> {
         let mut problems = self.project_problems();
         if self.repo.path.trim().is_empty() && self.projects.is_empty() {
@@ -2129,7 +2139,7 @@ impl Config {
         }
         match self.tune.model.parse::<ModelTier>() {
             Ok(m) if m.provider() != Provider::Claude => {
-                problems.push(format!("tune.model `{}` is not a Claude model (tune runs on Claude Code)", self.tune.model))
+                problems.push(format!("tune.model `{}` is not a Claude model (tune runs on Claude Code)", self.tune.model));
             }
             Ok(_) => {}
             Err(e) => problems.push(format!("tune.model: {e}")),
@@ -2301,7 +2311,7 @@ mod tests {
         let cfg = Config::default();
         let problems = cfg.validate();
         assert_eq!(problems, vec!["repo.path is empty".to_string()]);
-        assert!(cfg.deprecations().is_empty());
+        assert_eq!((cfg.deprecations()).len(), 0);
     }
 
     #[test]
@@ -2455,9 +2465,9 @@ mod tests {
         assert_eq!(table["budget"]["providers"]["claude"]["models"]["opus"]["share"].as_float(), Some(0.2));
         assert!(table["budget"].get("period_hours").is_none());
         assert!(table["budget"].get("models").is_none());
-        assert!(migrate_legacy_budget(&mut table).is_empty());
+        assert_eq!((migrate_legacy_budget(&mut table)).len(), 0);
         let mut none: toml::Table = "[repo]\npath = '/x'\n".parse().unwrap();
-        assert!(migrate_legacy_budget(&mut none).is_empty());
+        assert_eq!((migrate_legacy_budget(&mut none)).len(), 0);
     }
 
     #[test]
@@ -2543,7 +2553,7 @@ mod tests {
         assert!(error.contains("invalid"), "{error}");
         assert_eq!(cfg.overrides.error.as_deref(), Some(error.as_str()));
         assert_eq!(cfg.scheduler.max_concurrent, 5, "the global configuration stands");
-        assert!(cfg.overrides.keys.is_empty());
+        assert_eq!((cfg.overrides.keys).len(), 0);
         // A readable file clears it.
         std::fs::write(repo.join(REPO_CONFIG_FILE), "[scheduler]\nmax_concurrent = 3\n").unwrap();
         assert_eq!(cfg.apply_repo_overrides_or_record(&repo), None);
@@ -2662,7 +2672,7 @@ mod tests {
         assert!(text.contains("[budget.providers.gemini]\nenabled = false"), "{text}");
         assert!(text.contains("[codex]\n"), "{text}");
         assert!(text.contains("[gemini]\n"), "{text}");
-        assert!(cfg.budget.migrated_keys.is_empty());
+        assert_eq!((cfg.budget.migrated_keys).len(), 0);
     }
 
     #[test]
@@ -2688,7 +2698,7 @@ mod tests {
         cfg.linear.projects = vec![" ".into()];
         assert!(cfg.validate().iter().any(|p| p.contains("linear.projects")), "{:?}", cfg.validate());
         cfg.linear.projects = vec!["Launch".into(), " ".into()];
-        assert!(cfg.validate().is_empty());
+        assert_eq!((cfg.validate()).len(), 0);
         assert_eq!(cfg.linear.project_names(), vec!["Launch".to_string()]);
 
         let cfg = Config::from_toml("[linear]\ncycle = 'next'\nprojects = ['A', 'B']\nmanage_states = false\n").unwrap();
@@ -2894,7 +2904,7 @@ restart_backoff_secs = [5, 10]
         cfg.repo.overrides_from = OverridesSource::DefaultBranch;
         assert_eq!(cfg.apply_repo_overrides(&repo).unwrap(), None);
         assert_eq!(cfg.overrides.rev.as_deref(), Some("main"));
-        assert!(cfg.overrides.keys.is_empty());
+        assert_eq!((cfg.overrides.keys).len(), 0);
     }
 
     fn git(cwd: &Path, args: &[&str]) {
@@ -2978,7 +2988,7 @@ restart_backoff_secs = [5, 10]
         again.apply_repo_overrides(&repo).unwrap();
         assert_eq!(again.scheduler.max_concurrent, 5);
         // A branch without the file: no overrides at all.
-        let mut explicit = cfg.clone();
+        let mut explicit = cfg;
         explicit.repo.default_branch = Some("feature".into());
         git(&repo, &["rm", "-q", REPO_CONFIG_FILE]);
         git(&repo, &["commit", "-qm", "drop"]);

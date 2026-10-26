@@ -60,11 +60,10 @@ fn probe(ctx: &mut Context, provider: Option<Provider>) -> Result<i32> {
             out.insert(p.to_string(), v);
         }
         println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(out))?);
-        return Ok(if failed { 1 } else { 0 });
+        return Ok(i32::from(failed));
     }
-    let pct = |v: Option<f64>| v.map(|f| format!("{:.0}%", f * 100.0)).unwrap_or_else(|| "-".to_string());
-    let when =
-        |v: Option<DateTime<Utc>>| v.map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_else(|| "-".to_string());
+    let pct = |v: Option<f64>| v.map_or_else(|| "-".to_string(), |f| format!("{:.0}%", f * 100.0));
+    let when = |v: Option<DateTime<Utc>>| v.map_or_else(|| "-".to_string(), |t| t.format("%Y-%m-%d %H:%M UTC").to_string());
     let mut t = table();
     t.set_header(["provider", "result", "window", "window resets", "period", "period resets", "note"]);
     for (p, r) in &results {
@@ -98,7 +97,7 @@ fn probe(ctx: &mut Context, provider: Option<Provider>) -> Result<i32> {
         t.add_row(row);
     }
     println!("{t}");
-    Ok(if failed { 1 } else { 0 })
+    Ok(i32::from(failed))
 }
 
 fn load_ledgers(ctx: &mut Context, now: DateTime<Utc>) -> Result<(Config, Ledgers, RateLimitState)> {
@@ -141,7 +140,7 @@ fn probe_task(crit: Criticality) -> Task {
 /// or its observation says the allowance is exhausted (the later wins).
 fn provider_cooldown(cfg: &Config, ledger: &Ledger, limits: &RateLimitState, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let marks = limits.provider_blocked_until(&cfg.budget, ledger.provider, now);
-    let observed = ledger.observed.as_ref().and_then(|o| o.cooldown_until()).filter(|u| *u > now);
+    let observed = ledger.observed.as_ref().and_then(crate::budget::probe::ObservedUsage::cooldown_until).filter(|u| *u > now);
     match (marks, observed) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (a, b) => a.or(b),
@@ -217,7 +216,8 @@ fn show(ctx: &mut Context) -> Result<i32> {
         "pace = spent% − elapsed%; negative means the model is under-spent and will relax to lower criticalities"
             .if_supports_color(Stream::Stdout, |t| t.dimmed())
     );
-    let disabled: Vec<String> = Provider::ALL.iter().filter(|p| ledgers.get(**p).is_none()).map(|p| p.to_string()).collect();
+    let disabled: Vec<String> =
+        Provider::ALL.iter().filter(|p| ledgers.get(**p).is_none()).map(std::string::ToString::to_string).collect();
     if !disabled.is_empty() {
         println!(
             "\n{}",
@@ -254,7 +254,7 @@ fn show(ctx: &mut Context) -> Result<i32> {
             let wants = if q.preferred.is_empty() {
                 "-".to_string()
             } else {
-                q.preferred.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(" | ")
+                q.preferred.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(" | ")
             };
             t.add_row([
                 q.task.key.clone(),
@@ -313,6 +313,7 @@ fn queued_decisions(
 }
 
 /// Print one provider's section of `budget show`.
+#[expect(clippy::too_many_lines, reason = "Keep the show_provider workflow and its early exits together in execution order.")]
 fn show_provider(
     cfg: &Config,
     store: &crate::store::Store,
@@ -398,18 +399,15 @@ fn show_provider(
             human_duration((w.to - w.from).num_seconds())
         );
     }
-    match &ledger.observed {
-        Some(obs) => {
-            let age = human_duration((now - obs.observed_at).num_seconds().max(0));
-            println!("{} {} ({age} ago)", "observed".if_supports_color(Stream::Stdout, |t| t.bold()), describe(obs));
-        }
-        None => {
-            let how = match provider {
-                Provider::Claude => "a session's status line reports it after the first response",
-                _ => "run `powerqueue budget probe`",
-            };
-            println!("{} none yet; {how}", "observed".if_supports_color(Stream::Stdout, |t| t.bold()));
-        }
+    if let Some(obs) = &ledger.observed {
+        let age = human_duration((now - obs.observed_at).num_seconds().max(0));
+        println!("{} {} ({age} ago)", "observed".if_supports_color(Stream::Stdout, |t| t.bold()), describe(obs));
+    } else {
+        let how = match provider {
+            Provider::Claude => "a session's status line reports it after the first response",
+            _ => "run `powerqueue budget probe`",
+        };
+        println!("{} none yet; {how}", "observed".if_supports_color(Stream::Stdout, |t| t.bold()));
     }
     if let Some(status) = load_probe_status(store, provider)?
         && let Some(err) = &status.error
@@ -461,7 +459,7 @@ pub fn parse_reset(when: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Ok(dt.with_timezone(&Utc));
     }
-    let rel = s.strip_prefix("in ").map(str::trim).unwrap_or(s);
+    let rel = s.strip_prefix("in ").map_or(s, str::trim);
     let d = humantime::parse_duration(rel)
         .map_err(|e| anyhow!("`{when}` is neither RFC 3339 (2026-10-06T07:00:00Z) nor a duration like `in 3d4h`: {e}"))?;
     let d = Duration::from_std(d).context("duration too large")?;
@@ -555,51 +553,56 @@ fn clear_limits(ctx: &mut Context, provider: Provider) -> Result<i32> {
     Ok(0)
 }
 
+#[expect(
+    clippy::as_conversions,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
 fn estimate(ctx: &mut Context, task: Option<&str>) -> Result<i32> {
     let cfg = ctx.config_cloned()?;
     let store = ctx.store()?.clone();
     let estimator = Estimator::from_summaries(&store.task_usage_summaries()?);
-    match task {
-        Some(needle) => {
-            let task = store.find_task(needle)?.ok_or_else(|| anyhow!("no task matches `{needle}`"))?;
-            let p = estimator.predict(&task);
-            if ctx.json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "task": task.key, "prediction": p }))?);
-            } else {
-                println!("{} {} ({})", "task".if_supports_color(Stream::Stdout, |t| t.bold()), task.key, task.title);
-                println!(
-                    "  weighted tokens: {} (≈ {} on sonnet, {} on fable)",
-                    human_f64(p.weighted_tokens),
-                    human_f64(p.weighted_tokens * tier_weight(&cfg.budget, &ModelTier::sonnet())),
-                    human_f64(p.weighted_tokens * tier_weight(&cfg.budget, &ModelTier::fable()))
-                );
-                println!("  wall clock:      {}", human_duration(p.wall_secs as i64));
-                println!("  confidence:      {:.0}% — {}", p.confidence * 100.0, p.basis);
-            }
+    if let Some(needle) = task {
+        let task = store.find_task(needle)?.ok_or_else(|| anyhow!("no task matches `{needle}`"))?;
+        let p = estimator.predict(&task);
+        if ctx.json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "task": task.key, "prediction": p }))?);
+        } else {
+            println!("{} {} ({})", "task".if_supports_color(Stream::Stdout, |t| t.bold()), task.key, task.title);
+            println!(
+                "  weighted tokens: {} (≈ {} on sonnet, {} on fable)",
+                human_f64(p.weighted_tokens),
+                human_f64(p.weighted_tokens * tier_weight(&cfg.budget, &ModelTier::sonnet())),
+                human_f64(p.weighted_tokens * tier_weight(&cfg.budget, &ModelTier::fable()))
+            );
+            println!("  wall clock:      {}", human_duration(p.wall_secs as i64));
+            println!("  confidence:      {:.0}% — {}", p.confidence * 100.0, p.basis);
         }
-        None => {
-            let accuracy = estimator.accuracy();
-            if ctx.json {
-                println!("{}", serde_json::json!({ "samples": estimator.sample_count(), "mape": accuracy }));
-            } else {
-                println!(
-                    "{} {} task(s) with usage history",
-                    "samples".if_supports_color(Stream::Stdout, |t| t.bold()),
-                    estimator.sample_count()
-                );
-                match accuracy {
-                    Some(m) => {
-                        println!(
-                            "{} leave-one-out predictions are off by {:.0}% on average",
-                            "accuracy".if_supports_color(Stream::Stdout, |t| t.bold()),
-                            m * 100.0
-                        )
-                    }
-                    None => println!(
-                        "{} not enough completed tasks yet (need 4)",
-                        "accuracy".if_supports_color(Stream::Stdout, |t| t.bold())
-                    ),
+    } else {
+        let accuracy = estimator.accuracy();
+        if ctx.json {
+            println!("{}", serde_json::json!({ "samples": estimator.sample_count(), "mape": accuracy }));
+        } else {
+            println!(
+                "{} {} task(s) with usage history",
+                "samples".if_supports_color(Stream::Stdout, |t| t.bold()),
+                estimator.sample_count()
+            );
+            match accuracy {
+                Some(m) => {
+                    println!(
+                        "{} leave-one-out predictions are off by {:.0}% on average",
+                        "accuracy".if_supports_color(Stream::Stdout, |t| t.bold()),
+                        m * 100.0
+                    );
                 }
+                None => println!(
+                    "{} not enough completed tasks yet (need 4)",
+                    "accuracy".if_supports_color(Stream::Stdout, |t| t.bold())
+                ),
             }
         }
     }

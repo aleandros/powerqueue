@@ -18,9 +18,17 @@ fn issue(number: u64) -> Value {
 fn config(server: &MockServer) -> GitHubConfig {
     GitHubConfig { enabled: true, repository: "acme/app".into(), endpoint: server.uri(), ..Default::default() }
 }
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn client(server: &MockServer) -> GitHubClient {
     GitHubClient::new(&server.uri(), "test-token".into()).unwrap()
 }
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn evidence(issue: &Value, actor: &str) -> Value {
     json!({"data": {"repository": {"issue": {
         "title": issue["title"], "body": issue["body"], "state": issue["state"].as_str().unwrap().to_uppercase(),
@@ -29,6 +37,10 @@ fn evidence(issue: &Value, actor: &str) -> Value {
             "actor": {"login": actor}, "label": {"name": "agent:ready"}}], "pageInfo": {"hasNextPage": false, "endCursor": null}}
     }}}})
 }
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 async fn approval(server: &MockServer, issues: Vec<Value>) {
     Mock::given(method("GET"))
         .and(wiremock::matchers::path_regex(r"/repos/[^/]+/[^/]+/issues/\d+/dependencies/blocked_by"))
@@ -58,6 +70,10 @@ async fn list(server: &MockServer, issues: Vec<Value>) {
         .mount(server)
         .await;
 }
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn task(number: u64) -> Task {
     task_from_issue("acme/app", &serde_json::from_value::<GitHubIssue>(issue(number)).unwrap())
 }
@@ -243,7 +259,7 @@ fn defaults_and_validation_are_backwards_compatible() {
     let cfg = Config::from_toml("[linear]\nenabled = false\n").unwrap();
     assert!(!cfg.github.enabled);
     assert!(!cfg.github.close_on_complete);
-    assert!(GitHubConfig::default().validate().is_empty());
+    assert_eq!((GitHubConfig::default().validate()).len(), 0);
     for repository in ["", "owner", "a/b/c", "a/..", "a/b?x", "a/ b"] {
         let cfg = GitHubConfig { enabled: true, repository: repository.into(), ..Default::default() };
         assert!(!cfg.validate().is_empty(), "{repository}");
@@ -287,7 +303,7 @@ async fn cli_preview_apply_and_json_work_with_file_secrets() {
     command(&["--json", "github", "sync", "--apply"]).assert().success();
     let out = command(&["--json", "github", "sync"]).assert().success().get_output().stdout.clone();
     let repeat: Value = serde_json::from_slice(&out).unwrap();
-    assert!(repeat["changes"].as_array().unwrap().is_empty());
+    assert_eq!(repeat["changes"].as_array().unwrap().len(), 0);
     let out = command(&["--json", "task", "show", "acme/app#1"]).assert().success().get_output().stdout.clone();
     let saved: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(saved["task"]["execution_project"], "default");
@@ -710,7 +726,7 @@ fn schema_upgrade_leaves_legacy_github_tasks_unverified() {
 fn source_registry_migrates_legacy_and_rejects_unknown_or_conflicting_routes() {
     let mut cfg =
         Config::from_toml("[repo]\npath = '/tmp/default'\n[github]\nenabled = true\nrepository = 'acme/app'\n").unwrap();
-    assert!(cfg.github_routing_problems().is_empty());
+    assert_eq!((cfg.github_routing_problems()).len(), 0);
     assert_eq!(cfg.github_source("ACME/APP").unwrap().execution_project, "default");
     assert_eq!(cfg.github_sources().len(), 1);
     cfg.github_sources.push(GitHubConfig {
@@ -725,7 +741,7 @@ fn source_registry_migrates_legacy_and_rejects_unknown_or_conflicting_routes() {
     let mut project = powerqueue::projects::ProjectConfig::default();
     project.repo.path = "/tmp/api".into();
     cfg.projects.insert("api".into(), project);
-    assert!(cfg.github_routing_problems().is_empty());
+    assert_eq!((cfg.github_routing_problems()).len(), 0);
     let roundtrip = Config::from_toml(&toml::to_string(&cfg).unwrap()).unwrap();
     assert_eq!(roundtrip, cfg);
     let dir = tempfile::tempdir().unwrap();
@@ -907,6 +923,10 @@ async fn conflicting_source_identity_is_visible_in_preview_and_apply() {
     assert_eq!(store.get_task(manual.id).unwrap().unwrap(), manual);
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn routed_config(server: &MockServer) -> Config {
     let mut cfg: Config = toml::from_str(
         r#"
@@ -947,7 +967,7 @@ async fn deterministic_routing_preview_conflicts_and_restart_preserve_projects()
     conflict["labels"] = json!([{"name":"agent:ready"},{"name":"repo/api"},{"name":"repo/web"}]);
     list(&server, vec![api.clone(), web.clone(), conflict.clone()]).await;
     let preview = plan_sync_routed(&store, &cfg.github, &client(&server), &cfg).await.unwrap();
-    assert!(store.list_tasks().unwrap().is_empty());
+    assert_eq!((store.list_tasks().unwrap()).len(), 0);
     assert_eq!(preview.changes[0].task.execution_project, "api");
     assert_eq!(preview.changes[1].task.execution_project, "web");
     assert_eq!(preview.changes[2].task.execution_project, "");
@@ -1098,7 +1118,7 @@ async fn graphql_source_errors_abort_the_plan_and_preserve_rate_reset() {
         } else {
             assert!(error.is::<GraphQlFailure>());
         }
-        assert!(store.list_tasks().unwrap().is_empty());
+        assert_eq!((store.list_tasks().unwrap()).len(), 0);
     }
 }
 

@@ -5,6 +5,10 @@ use powerqueue::linear::{LinearIssue, sync_issues_routed};
 use powerqueue::scheduler::transitions::on_routing;
 use powerqueue::store::Store;
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn config() -> Config {
     toml::from_str(
         r#"

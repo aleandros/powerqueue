@@ -76,7 +76,7 @@ pub fn mode_flags(mode: &str) -> Result<Vec<String>> {
         "plan" => &["--mode", "plan"],
         other => bail!("gemini.mode `{other}` is not one of {}", GEMINI_MODES.join("|")),
     };
-    Ok(flags.iter().map(|s| s.to_string()).collect())
+    Ok(flags.iter().map(std::string::ToString::to_string).collect())
 }
 
 /// Full `agy` command line (last element: the prompt, after `-i`).
@@ -103,6 +103,8 @@ pub fn agy_command(ctx: &LaunchContext<'_>) -> Result<Vec<String>> {
 /// `<worktree>/.agents/hooks.json` with powerqueue's `Stop` hook merged into
 /// `existing` (the file as it is, if any). Earlier powerqueue entries are
 /// replaced; other hooks are kept.
+/// # Panics
+/// Panics if a JSON value checked as an object stops being an object before hook insertion.
 pub fn hooks_json(existing: Option<&str>, command: &str) -> Result<String> {
     let mut doc: serde_json::Value = match existing.map(str::trim).filter(|t| !t.is_empty()) {
         Some(text) => serde_json::from_str(text).context("parse existing .agents/hooks.json")?,
@@ -121,7 +123,7 @@ pub fn hooks_json(existing: Option<&str>, command: &str) -> Result<String> {
             .is_some_and(|hs| hs.iter().any(|h| h["command"].as_str().is_some_and(|c| c.contains(HOOK_MARKER))))
     });
     stop.push(serde_json::json!({ "hooks": [{ "type": "command", "command": command }] }));
-    Ok(serde_json::to_string_pretty(&doc).context("serialise .agents/hooks.json")? + "\n")
+    Ok(format!("{}\n", serde_json::to_string_pretty(&doc).context("serialise .agents/hooks.json")?))
 }
 
 /// The hook command for a session.
@@ -233,7 +235,7 @@ impl AgentCli for GeminiCli {
         let home = agy_home(cfg);
         let file = home.join("cache").join("last_conversations.json");
         let Ok(meta) = std::fs::metadata(&file) else { return Ok(None) };
-        let modified = meta.modified().map(DateTime::<Utc>::from).unwrap_or(started_after);
+        let modified = meta.modified().map_or(started_after, DateTime::<Utc>::from);
         if modified < started_after - DISCOVERY_SLACK {
             return Ok(None);
         }
@@ -467,7 +469,7 @@ mod tests {
             r#"{"step_index":2,"source":"MODEL","type":"RUN_COMMAND","status":"DONE","content":{"command":"ls"}}"#,
             r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":{"text":"All done [[POWERQUEUE:DONE]] ok"}}"#,
         ];
-        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
         assert_eq!(last_planner_response(&path).as_deref(), Some("All done [[POWERQUEUE:DONE]] ok"));
 
         let mut st = TranscriptState::default();

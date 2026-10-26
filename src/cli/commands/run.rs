@@ -11,6 +11,10 @@ use crate::scheduler::Daemon;
 use crate::secrets::Secrets;
 
 /// Start the scheduler in the foreground (one tick with `--once`).
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Command dispatch transfers ownership of parsed arguments to the selected handler."
+)]
 pub fn run(ctx: &mut Context, args: RunArgs) -> Result<i32> {
     let cfg = ctx.config_cloned()?;
     if let Some(error) = &cfg.overrides.error {
@@ -36,7 +40,8 @@ pub fn run(ctx: &mut Context, args: RunArgs) -> Result<i32> {
             cfg.tmux.session_name,
             paths.log_file().display()
         );
-        let providers: Vec<String> = cfg.budget.enabled_providers_in_order().iter().map(|p| p.to_string()).collect();
+        let providers: Vec<String> =
+            cfg.budget.enabled_providers_in_order().iter().map(std::string::ToString::to_string).collect();
         let probes = match cfg.budget.probe_interval_mins {
             0 => "usage probes off".to_string(),
             m => format!("usage probes every {m}m"),
@@ -59,6 +64,14 @@ pub fn run(ctx: &mut Context, args: RunArgs) -> Result<i32> {
 }
 
 /// Ask a running daemon to exit after its current tick.
+#[expect(
+    clippy::as_conversions,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
 pub fn stop(ctx: &mut Context) -> Result<i32> {
     let tick_secs = ctx.config_or_default()?.scheduler.tick_secs.max(1) as i64;
     let store = ctx.store()?;
@@ -87,6 +100,14 @@ pub fn stop(ctx: &mut Context) -> Result<i32> {
 /// `powerqueue pause`: stop launching sessions. A live daemon is asked to
 /// record the pause (so the event lands in its log); without one the pause
 /// is written directly and the next daemon honours it. Idempotent.
+#[expect(
+    clippy::as_conversions,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
 pub fn pause(ctx: &mut Context, args: PauseArgs) -> Result<i32> {
     let tick_secs = ctx.config_or_default()?.scheduler.tick_secs.max(1) as i64;
     let store = ctx.store()?;
@@ -98,16 +119,15 @@ pub fn pause(ctx: &mut Context, args: PauseArgs) -> Result<i32> {
     // The kv row is the switch the daemon reads every tick, so write it
     // here: it takes effect (and `resume`/`status` see it) at once. A live
     // daemon is also told, so the event lands in its log.
-    let pause = match already {
-        Some(p) => p,
-        None => {
-            let p = SchedulingPause { since: now, reason: reason.clone() };
-            store.kv_set(SCHEDULING_PAUSE_KEY, &p).context("record the pause")?;
-            if alive {
-                store.enqueue_command(&DaemonCommand::PauseScheduling { reason }).context("queue pause command")?;
-            }
-            p
+    let pause = if let Some(p) = already {
+        p
+    } else {
+        let p = SchedulingPause { since: now, reason: reason.clone() };
+        store.kv_set(SCHEDULING_PAUSE_KEY, &p).context("record the pause")?;
+        if alive {
+            store.enqueue_command(&DaemonCommand::PauseScheduling { reason }).context("queue pause command")?;
         }
+        p
     };
     let live = store.list_live_sessions()?.len();
     if ctx.json {
@@ -130,6 +150,14 @@ pub fn pause(ctx: &mut Context, args: PauseArgs) -> Result<i32> {
 }
 
 /// `powerqueue resume`: launch sessions again. Idempotent.
+#[expect(
+    clippy::as_conversions,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
 pub fn resume(ctx: &mut Context) -> Result<i32> {
     let tick_secs = ctx.config_or_default()?.scheduler.tick_secs.max(1) as i64;
     let store = ctx.store()?;

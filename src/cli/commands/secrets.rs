@@ -106,7 +106,7 @@ pub fn run(ctx: &mut Context, cmd: SecretsCommand) -> Result<i32> {
                 table.add_row(vec![
                     Cell::new(r.name),
                     Cell::new(configured),
-                    Cell::new(r.origin.map(|o| o.to_string()).unwrap_or_else(|| "-".into())),
+                    Cell::new(r.origin.map_or_else(|| "-".into(), |o| o.to_string())),
                     Cell::new(
                         r.masked
                             .clone()

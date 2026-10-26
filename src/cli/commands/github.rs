@@ -6,6 +6,11 @@ use anyhow::{Result, bail};
 
 /// Dispatch GitHub helpers. Valid sources continue after another source fails;
 /// errors are reported per repository and produce a nonzero exit status.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Command dispatch transfers ownership of parsed arguments to the selected handler."
+)]
+#[expect(clippy::too_many_lines, reason = "Keep the run workflow and its early exits together in execution order.")]
 pub fn run(ctx: &mut Context, cmd: GitHubCommand) -> Result<i32> {
     let cfg = ctx.config_cloned()?;
     let mut problems = cfg.github_routing_problems();
@@ -62,7 +67,7 @@ pub fn run(ctx: &mut Context, cmd: GitHubCommand) -> Result<i32> {
         })();
         match result {
             Ok(()) => {
-                results.push(serde_json::json!({"repository": source.repository, "execution_project": source.execution_project}))
+                results.push(serde_json::json!({"repository": source.repository, "execution_project": source.execution_project}));
             }
             Err(error) => errors.push(serde_json::json!({"repository": source.repository, "error": format!("{error:#}")})),
         }
@@ -109,7 +114,7 @@ pub fn run(ctx: &mut Context, cmd: GitHubCommand) -> Result<i32> {
                         change.task.key.clone(),
                         change.task.execution_project.clone(),
                         output::truncate(&change.task.title, 60),
-                        change.task.routing.as_ref().map(|r| r.explanation()).unwrap_or_default(),
+                        change.task.routing.as_ref().map(crate::routing::RoutingDecision::explanation).unwrap_or_default(),
                         change.task.github_admission.as_ref().map(|a| a.reason.clone()).unwrap_or_default(),
                     ]);
                 }
@@ -129,5 +134,5 @@ pub fn run(ctx: &mut Context, cmd: GitHubCommand) -> Result<i32> {
             );
         }
     }
-    Ok(if errors.is_empty() { 0 } else { 1 })
+    Ok(i32::from(!errors.is_empty()))
 }
