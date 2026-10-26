@@ -39,7 +39,7 @@ use crate::linear::{
 use crate::paths::Paths;
 use crate::priority::{PriorityRules, RulesWatcher};
 use crate::secrets::{SecretKind, Secrets};
-use crate::session::headless::{HeadlessExit, HeadlessFiles, HeadlessStatus, StreamEvent, StreamReader};
+use crate::session::headless::{Escalation, HeadlessExit, HeadlessFiles, HeadlessStatus, StreamEvent, StreamReader};
 use crate::session::{
     Launcher, SessionProbe, TranscriptReader, agent_for, interpret_hook, probe_session, sample_resources,
     transcript::claude_home, transcript_path_for,
@@ -2803,10 +2803,10 @@ impl Daemon {
             return Ok(());
         }
         let request = pending.get(&task.id).expect("cleanup intent was recorded").clone();
-        // A headless session has no window to keep for inspection: stop it
-        // before its worktree is pushed or removed.
+        // A headless session has no window to keep for inspection: stop it,
+        // and let it exit, before its worktree is pushed or removed.
         if let Some(session) = self.store.latest_session(task.id)? {
-            self.stop_headless(&session);
+            self.stop_headless(&session, Escalation::Wait);
         }
         let result = (|| {
             let cfg = self.cfg.for_task(task, &self.paths)?;
@@ -2876,7 +2876,7 @@ impl Daemon {
             return Ok(());
         }
         if session.is_headless() {
-            self.stop_headless(&session);
+            self.stop_headless(&session, Escalation::Background);
             return Ok(());
         }
         // A restarted tmux server can reuse window IDs; never close a window
@@ -2943,7 +2943,7 @@ impl Daemon {
                 Effect::KillWindow => {
                     if let Some(s) = session {
                         if s.is_headless() {
-                            self.stop_headless(s);
+                            self.stop_headless(s, Escalation::Background);
                         } else if let Err(e) = self.rt.tmux.kill_window(&s.tmux_window) {
                             tracing::debug!(task = %task.key, window = %s.tmux_window, error = %format!("{e:#}"), "kill window");
                         }
@@ -2964,7 +2964,7 @@ impl Daemon {
                 }
                 Effect::ReleaseForReview => {
                     if let Some(s) = session.filter(|s| s.is_headless()) {
-                        self.stop_headless(s);
+                        self.stop_headless(s, Escalation::Background);
                     } else if let Some(s) = session
                         && let Err(e) = self.rt.tmux.kill_window(&s.tmux_window)
                     {
@@ -3062,9 +3062,11 @@ impl Daemon {
     }
 
     /// Stop a headless session's process group if it still runs (cancel,
-    /// retry, pause, stale or timed out, cleanup). Failures are logged.
-    fn stop_headless(&self, session: &Session) {
-        match crate::session::headless::stop_session(&self.paths, session) {
+    /// retry, pause, stale or timed out, cleanup). `Wait` blocks until the
+    /// group is gone (at most [`crate::session::headless::KILL_GRACE`]).
+    /// Failures are logged.
+    fn stop_headless(&self, session: &Session, escalation: Escalation) {
+        match crate::session::headless::stop_session(&self.paths, session, escalation) {
             Ok(true) => self.log(
                 Some(session.task_id),
                 Some(session.id),
@@ -3248,7 +3250,9 @@ impl Daemon {
             });
             self.store.insert_hook_event(session.task_id, Some(session.id), crate::domain::HookEvent::StopFailure, &payload)?;
         }
-        if batch.lines > 0 && session.state.is_live() {
+        // Lines a restart replays are not new activity (a hung session's
+        // stale clock must not restart with the daemon).
+        if batch.fresh > 0 && session.state.is_live() {
             transitions::on_transcript_activity(&mut session, now);
             self.store.update_session(&session)?;
         }
@@ -3414,7 +3418,7 @@ impl Daemon {
             let Some(mut task) = self.store.get_task(session.task_id)? else {
                 transitions::orphan_session(&mut session, now);
                 self.store.update_session(&session)?;
-                self.stop_headless(&session);
+                self.stop_headless(&session, Escalation::Background);
                 self.forget_session(session.id);
                 continue;
             };
@@ -3953,6 +3957,10 @@ impl Daemon {
                 }
             };
             let setup_active = crate::worktree::setup_in_progress(&self.paths.task_dir(&task.id.to_string()).join("setup.lock"))?;
+            // A headless agent has no pane: its launch marker says whether
+            // one started without its session row being written.
+            let live_pane =
+                live_pane || crate::session::headless::unrecorded_launch_alive(&self.paths.task_dir(&task.id.to_string()));
             let activity = if live_pane {
                 launch::StartActivity::LivePane
             } else if setup_active {
@@ -4317,6 +4325,7 @@ impl Daemon {
             return Ok(Started::Launched);
         }
 
+        let resumed_stopped = resume && previous.as_ref().is_some_and(|p| p.id == session.id && p.state == SessionState::Stopped);
         let before = task.clone();
         let facts = launch::Launched {
             model: &model,
@@ -4328,6 +4337,7 @@ impl Daemon {
             branch: &branch,
             worktree: &worktree,
             answered: answer.is_some(),
+            resumed_stopped,
         };
         let effects = launch::on_launched(&mut task, &session, &facts, &cfg, now);
         self.commit(&before, &mut task, Some(&session), effects).await?;

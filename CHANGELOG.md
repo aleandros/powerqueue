@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the final result with its cost. When the process exits, it decides
   completed / blocked / throttled / crashed. Crashes resume the same session
   with backoff. A question, a pause or a usage limit leaves a resumable
-  `stopped` session without using up an attempt. Cancel, retry, pause and
+  `stopped` session, and resuming it does not count against `max_attempts`. Cancel, retry, pause and
   the stale/timeout limits stop the process group with SIGTERM. `attach`,
   `task show` and `task output` point to the log; `task send` refuses.
   `config validate` and `doctor` report the mode, warn about settings that
@@ -32,7 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - The database schema is v13: sessions record their runtime (`tmux` or
-  `headless`); existing rows migrate to `tmux`.
+  `headless`; existing rows migrate to `tmux`) and tasks count free attempts.
+- `tmux kill-window` is never run with an empty window id (tmux would kill its
+  current window). `powerqueue reset` also stops headless sessions.
 
 ## [0.22.0] - 2026-10-26
 

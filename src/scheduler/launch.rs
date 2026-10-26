@@ -514,17 +514,25 @@ pub struct Launched<'a> {
     pub worktree: &'a Path,
     /// A relayed answer was handed to the session (it is forgotten now).
     pub answered: bool,
+    /// The launch resumed a session powerqueue had stopped while the task
+    /// waited: it does not count against `max_attempts` (`free_attempts`).
+    pub resumed_stopped: bool,
 }
 
-/// The session is up: the task runs. Tells the source issue: a review round
+/// The session is up: the task runs; a launch that resumed a stopped session
+/// is counted in `free_attempts`. Tells the source issue: a review round
 /// only comments (the PR already moved the issue); a later attempt after a
 /// crash or timeout comments, since the first start already moved the issue
 /// and a PR may have moved it since (unless a blocked state/label is
 /// configured, in which case every attempt moves it, undoing a block); a
 /// first attempt moves it to in progress.
 pub fn on_launched(task: &mut Task, session: &Session, launched: &Launched<'_>, cfg: &Config, now: DateTime<Utc>) -> Vec<Effect> {
-    let Launched { model, attempt, resume, relaunch, review_prompt, resume_prompt, branch, worktree, answered } = *launched;
+    let Launched { model, attempt, resume, relaunch, review_prompt, resume_prompt, branch, worktree, answered, resumed_stopped } =
+        *launched;
     task.state = TaskState::Running;
+    if resumed_stopped {
+        task.free_attempts += 1;
+    }
     task.not_before = None;
     task.started_at = task.started_at.or(Some(now));
     let mut effects = Vec::new();
@@ -557,6 +565,7 @@ pub fn on_launched(task: &mut Task, session: &Session, launched: &Launched<'_>, 
             "pane": session.pane_id,
             "runtime": session.runtime,
             "pid": session.pid,
+            "resumed_stopped": resumed_stopped,
         }),
     ));
     let blocked_configured = match &task.source {
@@ -952,6 +961,7 @@ mod tests {
             branch: "pq/eng-7",
             worktree: Path::new("/wt/eng-7"),
             answered: false,
+            resumed_stopped: false,
         };
         let effects = on_launched(&mut t, &s, &base, &cfg, now());
         assert_eq!((t.state, t.started_at), (TaskState::Running, Some(now())));
@@ -1410,6 +1420,7 @@ mod properties {
             relaunch in prop::option::of(review_relaunch()),
             review_prompt in prop::option::of(line()),
             answered in any::<bool>(),
+            resumed_stopped in any::<bool>(),
             blocked_state in prop::option::of(Just("Blocked".to_string())),
         ) {
             let now = origin();
@@ -1425,11 +1436,13 @@ mod properties {
                 branch: "pq/x",
                 worktree: Path::new("/wt/x"),
                 answered,
+                resumed_stopped,
             };
             let mut t = task.clone();
             let effects = on_launched(&mut t, &session, &launched, &cfg, now);
             prop_assert_eq!((t.state, t.not_before), (TaskState::Running, None));
             prop_assert_eq!(t.started_at, task.started_at.or(Some(now)));
+            prop_assert_eq!(t.free_attempts, task.free_attempts + u32::from(resumed_stopped), "only a stopped session's resume is free");
             prop_assert!(task.state.can_transition_to(t.state));
             let forgot = effects.iter().any(|e| matches!(e, Effect::ForgetAnswer));
             prop_assert_eq!(forgot, answered);

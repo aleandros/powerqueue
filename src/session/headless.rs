@@ -10,8 +10,9 @@
 //! * `<session id>.<attempt>.exit` – the CLI's exit status, written by
 //!   `launch.sh` once the CLI exits
 //!
-//! `sh launch.sh` leads its own process group, so the session outlives a
-//! daemon restart just like a tmux window does. The daemon records the
+//! `sh launch.sh` leads its own session and process group (`setsid`, no
+//! controlling terminal), so the session outlives a daemon restart just like
+//! a tmux window does. The daemon records the
 //! group's pid on the session, reads the stream for activity, usage, API
 //! retries and the result ([`StreamReader`]), and decides how the attempt
 //! ended from the exit status and the `result` message ([`HeadlessExit`],
@@ -23,7 +24,7 @@
 //! SIGTERM to the whole process group: Claude Code exits with 143, leaves
 //! the current turn unfinished and runs its `SessionEnd` hooks; a resumed
 //! attempt continues the conversation with a new prompt. A group still alive
-//! [`KILL_GRACE`] later gets SIGKILL.
+//! [`KILL_GRACE`] later gets SIGKILL ([`Escalation`]).
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -71,11 +72,19 @@ impl HeadlessFiles {
         Self::new(&paths.task_dir(&session.task_id.to_string()), session.id, session.attempt)
     }
 
-    /// Create the directory and remove what an earlier launch of the same
-    /// attempt left behind, so a stale exit status never ends a new run.
+    /// Create the directory (owner-only: the stream holds the whole
+    /// conversation and tool output) and remove what an earlier launch of
+    /// the same attempt left behind, so a stale exit status never ends a new
+    /// run.
     pub fn reset(&self) -> Result<()> {
         if let Some(dir) = self.stream.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                    .with_context(|| format!("cannot chmod {}", dir.display()))?;
+            }
         }
         for path in [&self.stream, &self.stderr, &self.exit_status] {
             match std::fs::remove_file(path) {
@@ -187,6 +196,9 @@ pub struct StreamBatch {
     pub lines: usize,
     /// New usage records (one per assistant message id).
     pub usage: Vec<UsageRecord>,
+    /// Complete lines written after [`StreamReader::signal_floor`]: new
+    /// activity (a replay after a daemon restart is not).
+    pub fresh: usize,
     /// Events of lines written after [`StreamReader::signal_floor`]; older
     /// lines (a daemon restart replays the file) only update the reader's
     /// state.
@@ -272,6 +284,10 @@ impl StreamReader {
             }
             self.offset += n as u64;
             batch.lines += 1;
+            let fresh = self.offset > self.signal_floor;
+            if fresh {
+                batch.fresh += 1;
+            }
             let line = String::from_utf8_lossy(&buf);
             let Some(event) = parse_event(&line) else { continue };
             if let Some(rec) = crate::session::transcript::parse_line(&line, self.session_id, self.task_id)
@@ -288,7 +304,7 @@ impl StreamReader {
                 StreamEvent::Result(r) => self.result = Some(r.clone()),
                 _ => {}
             }
-            if self.offset > self.signal_floor && event != StreamEvent::Other {
+            if fresh && event != StreamEvent::Other {
                 batch.events.push(event);
             }
         }
@@ -361,36 +377,70 @@ pub enum HeadlessStatus {
 }
 
 /// Check a headless session: [`HeadlessStatus::Exited`] once its exit status
-/// is recorded, or when its process (group leader) is gone or is a different,
-/// later process that reused the pid.
+/// is recorded, or when no process of its process group is left. The group is
+/// probed rather than the `sh` leader alone, so a Claude Code process that
+/// outlives its wrapper still counts; a leader pid that a later, unrelated
+/// process reused never does.
 pub fn probe(system: &mut sysinfo::System, session: &Session, files: &HeadlessFiles) -> HeadlessStatus {
     if files.exit_status.exists() {
         return HeadlessStatus::Exited;
     }
     let Some(pid) = session.pid else { return HeadlessStatus::Exited };
+    // Two minutes of slack: the session row is written after the spawn.
+    if pid_reused(system, pid, session.started_at.timestamp() + 120) || !group_alive(system, pid) {
+        return HeadlessStatus::Exited;
+    }
+    HeadlessStatus::Running
+}
+
+/// True when a live process holds `pid` but started after `after` (Unix
+/// seconds): it is not the process that was recorded.
+fn pid_reused(system: &mut sysinfo::System, pid: u32, after: i64) -> bool {
     let pid = sysinfo::Pid::from_u32(pid);
     system.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::Some(&[pid]),
         true,
         sysinfo::ProcessRefreshKind::nothing().without_tasks(),
     );
-    let Some(process) = system.process(pid) else { return HeadlessStatus::Exited };
-    if process.status() == sysinfo::ProcessStatus::Zombie {
-        return HeadlessStatus::Exited;
-    }
-    // A process that started well after the session did is not ours.
-    let started = i64::try_from(process.start_time()).unwrap_or(i64::MAX);
-    if started > session.started_at.timestamp() + 120 {
-        return HeadlessStatus::Exited;
-    }
-    HeadlessStatus::Running
+    system.process(pid).is_some_and(|p| {
+        p.status() != sysinfo::ProcessStatus::Zombie && i64::try_from(p.start_time()).unwrap_or(i64::MAX) > after
+    })
+}
+
+/// Is any process left in the process group `pgid`? A group id is not reused
+/// while one of its members lives.
+#[cfg(unix)]
+fn group_alive(_system: &mut sysinfo::System, pgid: u32) -> bool {
+    i32::try_from(pgid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .is_some_and(|group| rustix::process::test_kill_process_group(group).is_ok())
+}
+
+#[cfg(not(unix))]
+fn group_alive(system: &mut sysinfo::System, pid: u32) -> bool {
+    let pid = sysinfo::Pid::from_u32(pid);
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    system.process(pid).is_some_and(|p| p.status() != sysinfo::ProcessStatus::Zombie)
+}
+
+/// How [`stop`] makes sure a process group that ignores SIGTERM ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Escalation {
+    /// SIGKILL from a background thread after [`KILL_GRACE`]: for the daemon,
+    /// whose tick must not wait.
+    Background,
+    /// Wait until the group is gone, SIGKILL after [`KILL_GRACE`]: before a
+    /// worktree is removed, and in short-lived CLI processes whose threads
+    /// would not outlive them.
+    Wait,
 }
 
 /// Stop `session`'s process group if it is a headless session that is still
 /// running (checked first, so a long-finished session's reused pid is never
 /// signalled). Returns whether a signal was sent; `Ok(false)` for tmux
 /// sessions.
-pub fn stop_session(paths: &Paths, session: &Session) -> Result<bool> {
+pub fn stop_session(paths: &Paths, session: &Session, escalation: Escalation) -> Result<bool> {
     if !session.is_headless() {
         return Ok(false);
     }
@@ -399,15 +449,42 @@ pub fn stop_session(paths: &Paths, session: &Session) -> Result<bool> {
     if probe(&mut sysinfo::System::new(), session, &files) == HeadlessStatus::Exited {
         return Ok(false);
     }
-    stop(pid)?;
+    stop(pid, escalation)?;
     tracing::info!(task = %session.task_id, session = %session.id, pid, "stopped headless session (SIGTERM to its process group)");
     Ok(true)
 }
 
-/// Start `sh <script>` in `worktree` as the leader of a new process group,
-/// with no terminal: stdin from `/dev/null`, its own output discarded (the
-/// script redirects the CLI's). A thread reaps it, so an exited session never
-/// lingers as a zombie while this process runs. Returns the pid.
+/// `<task dir>/headless/launch.pid`: the pid of the last headless process
+/// started for the task, written right after the spawn, before the session
+/// row exists (see [`unrecorded_launch_alive`]).
+pub fn launch_marker(task_dir: &Path) -> PathBuf {
+    task_dir.join("headless").join("launch.pid")
+}
+
+/// True when the process group named by the task's [`launch_marker`] is
+/// still running: a launch the daemon may not have recorded (it died between
+/// the spawn and writing the session row). Start recovery then waits instead
+/// of starting a second agent in the same worktree.
+pub fn unrecorded_launch_alive(task_dir: &Path) -> bool {
+    let marker = launch_marker(task_dir);
+    let Some(pid) = std::fs::read_to_string(&marker).ok().and_then(|s| s.trim().parse::<u32>().ok()) else { return false };
+    let written = std::fs::metadata(&marker)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .unwrap_or(0);
+    let mut system = sysinfo::System::new();
+    !pid_reused(&mut system, pid, written + 120) && group_alive(&mut system, pid)
+}
+
+/// Start `sh <script>` in `worktree` as the leader of a new session and
+/// process group (`setsid`): no controlling terminal, so a tool that opens
+/// `/dev/tty` fails instead of stopping the group, and the daemon's terminal
+/// closing does not hang it up. Stdin is `/dev/null` and its own output is
+/// discarded (the script redirects the CLI's). A thread reaps it, so an
+/// exited session never lingers as a zombie while this process runs. Returns
+/// the pid, which is also the process group id.
 pub fn spawn(script: &Path, worktree: &Path) -> Result<u32> {
     let mut command = std::process::Command::new("sh");
     command
@@ -419,7 +496,11 @@ pub fn spawn(script: &Path, worktree: &Path) -> Result<u32> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        command.process_group(0);
+        // SAFETY: the hook only makes the async-signal-safe setsid syscall in
+        // the forked child; it allocates nothing and touches no parent state.
+        unsafe {
+            command.pre_exec(|| rustix::process::setsid().map(drop).map_err(std::io::Error::from));
+        }
     }
     let mut child =
         command.spawn().with_context(|| format!("cannot start `sh {}` in {}", script.display(), worktree.display()))?;
@@ -433,30 +514,46 @@ pub fn spawn(script: &Path, worktree: &Path) -> Result<u32> {
     Ok(pid)
 }
 
-/// Stop a headless session: SIGTERM to its process group now, SIGKILL to
-/// whatever is left after [`KILL_GRACE`] (from a background thread). A
-/// group that is already gone is not an error.
-pub fn stop(pid: u32) -> Result<()> {
+/// Stop a headless session: SIGTERM to its process group now; whatever is
+/// left after [`KILL_GRACE`] gets SIGKILL, from a background thread or while
+/// waiting ([`Escalation`]). The SIGKILL is skipped when the group's id was
+/// meanwhile reused by a process started after the SIGTERM. A group that is
+/// already gone is not an error.
+pub fn stop(pid: u32, escalation: Escalation) -> Result<()> {
     #[cfg(unix)]
     {
         use rustix::process::{Pid, Signal, kill_process_group};
         let group = i32::try_from(pid).ok().and_then(Pid::from_raw).context("invalid process group id")?;
+        let signalled_at = chrono::Utc::now().timestamp();
         match kill_process_group(group, Signal::TERM) {
             Ok(()) => {}
             Err(rustix::io::Errno::SRCH) => return Ok(()),
             Err(e) => return Err(std::io::Error::from(e)).with_context(|| format!("cannot signal process group {pid}")),
         }
-        std::thread::Builder::new()
-            .name(format!("headless-kill-{pid}"))
-            .spawn(move || {
-                std::thread::sleep(KILL_GRACE);
+        let finish = move || {
+            let mut system = sysinfo::System::new();
+            let deadline = std::time::Instant::now() + KILL_GRACE;
+            while std::time::Instant::now() < deadline && group_alive(&mut system, pid) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if group_alive(&mut system, pid) && !pid_reused(&mut system, pid, signalled_at - 1) {
                 let _ = kill_process_group(group, Signal::KILL);
-            })
-            .context("cannot start the headless kill timer")?;
+            }
+        };
+        match escalation {
+            Escalation::Wait => finish(),
+            Escalation::Background => {
+                std::thread::Builder::new()
+                    .name(format!("headless-kill-{pid}"))
+                    .spawn(finish)
+                    .context("cannot start the headless kill timer")?;
+            }
+        }
         Ok(())
     }
     #[cfg(not(unix))]
     {
+        let _ = escalation;
         let mut system = sysinfo::System::new();
         let pid = sysinfo::Pid::from_u32(pid);
         system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
@@ -695,6 +792,12 @@ mod tests {
         assert_eq!(files.stderr, dir.path().join(format!("headless/{sid}.3.stderr.log")));
         assert_eq!(files.exit_status, dir.path().join(format!("headless/{sid}.3.exit")));
         files.reset().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(files.stream.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "the conversation log is owner-only");
+        }
         assert_eq!(files.read_exit_status(), None);
         assert_eq!(files.stderr_tail(5), None);
         std::fs::write(&files.exit_status, "137\n").unwrap();
@@ -746,15 +849,24 @@ mod tests {
         };
         let mut system = sysinfo::System::new();
         assert_eq!(probe(&mut system, &session, &files), HeadlessStatus::Running);
-        stop(pid).unwrap();
+        // Its own session and group: no controlling terminal, pgid = pid.
+        let group = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+        assert_eq!(rustix::process::getpgid(Some(group)).unwrap(), group);
+        assert_eq!(rustix::process::getsid(Some(group)).unwrap(), group);
+        // A launch the daemon did not record is still seen through its marker.
+        std::fs::write(launch_marker(dir.path()), format!("{pid}\n")).unwrap();
+        assert!(unrecorded_launch_alive(dir.path()));
+        stop(pid, Escalation::Background).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while probe(&mut system, &session, &files) == HeadlessStatus::Running {
             assert!(std::time::Instant::now() < deadline, "process group still running after SIGTERM");
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        assert!(!unrecorded_launch_alive(dir.path()), "the marked group is gone");
+        assert!(!unrecorded_launch_alive(&dir.path().join("elsewhere")), "no marker");
         // Stopping a group that is gone is fine.
         std::thread::sleep(std::time::Duration::from_millis(200));
-        stop(pid).unwrap();
+        stop(pid, Escalation::Wait).unwrap();
 
         // A normal exit records its status.
         std::fs::write(

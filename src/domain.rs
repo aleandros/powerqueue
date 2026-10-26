@@ -692,6 +692,13 @@ pub struct Task {
     pub branch: Option<String>,
     pub attempts: u32,
     pub max_attempts: Option<u32>,
+    /// Launches that only resumed a session powerqueue stopped while the
+    /// task waited (a headless session's question, pause or usage limit;
+    /// [`SessionState::Stopped`]). They are counted in `attempts` but not
+    /// against `max_attempts`, the way an interactive session that waited in
+    /// its window used none. Counted from the current review round's base.
+    #[serde(default)]
+    pub free_attempts: u32,
     /// Earliest time the scheduler should consider this task (backoff / throttling).
     pub not_before: Option<DateTime<Utc>>,
     /// Explicit local hold, independent of automatic backoff and source metadata.
@@ -753,6 +760,7 @@ impl Task {
             branch: None,
             attempts: 0,
             max_attempts: None,
+            free_attempts: 0,
             not_before: None,
             deferral: None,
             last_error: None,

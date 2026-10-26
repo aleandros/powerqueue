@@ -626,6 +626,12 @@ impl Launcher {
             .with_context(|| format!("pre-launch step of {} for {}", plan.provider, task.key))?;
         if plan.runtime == SessionRuntime::Headless {
             let pid = crate::session::headless::spawn(&plan.script_path, worktree).context(RuntimeLaunchFailure)?;
+            // Before the session row exists: start recovery must see this
+            // agent even if the daemon dies right now.
+            let marker = crate::session::headless::launch_marker(&plan.task_dir);
+            if let Err(e) = std::fs::write(&marker, format!("{pid}\n")) {
+                tracing::warn!(task = %task.key, pid, error = %e, path = %marker.display(), "cannot write the headless launch marker");
+            }
             tracing::info!(
                 task = %task.key,
                 session = %session_id,

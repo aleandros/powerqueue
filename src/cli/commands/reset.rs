@@ -619,7 +619,7 @@ fn stop_daemon(store: &Store, tick_secs: i64) -> Result<bool> {
 /// go down with); one that already exited is skipped.
 fn execute_headless(paths: &Paths, store: &Store, result: &mut ResetResult) {
     for session in store.list_live_sessions().unwrap_or_default().iter().filter(|s| s.is_headless()) {
-        match crate::session::headless::stop_session(paths, session) {
+        match crate::session::headless::stop_session(paths, session, crate::session::headless::Escalation::Wait) {
             Ok(true) => result.headless_sessions_stopped += 1,
             Ok(false) => {}
             Err(e) => result.errors.push(format!("headless session {}: {e:#}", session.id)),

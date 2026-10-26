@@ -123,7 +123,9 @@ then decides:
 A `crashed` or `stopped` session is what the next attempt resumes with
 `claude -p --resume <same session id>`: after the backoff for a crash, after
 `task resume` (or a reply on the issue) for a question or a pause, after the
-cooldown for a usage limit. A `stopped` session uses up no attempt. `task
+cooldown for a usage limit. Resuming a `stopped` session is counted in the
+task's attempts but not against `scheduler.max_attempts` (`free_attempts`),
+just as an interactive session that waited in its window used none. `task
 retry` and `task cancel` start over instead: the stopped session is closed as
 `killed`.
 
@@ -137,9 +139,13 @@ A group still alive 15 seconds later gets SIGKILL. The `SessionEnd` hook of
 a headless session never crashes the task by itself: `claude -p` ends its
 session after every run, and the exit status decides.
 
-The process outlives a daemon restart, like a tmux window. A daemon that
-starts and finds a recorded pid gone (killed while nobody watched, so no
-exit status was written) treats it as a crash and resumes the session.
+The process leads its own session (`setsid`, no controlling terminal) and
+outlives a daemon restart, like a tmux window. A daemon that starts and finds
+a recorded process group gone (killed while nobody watched, so no exit status
+was written) treats it as a crash and resumes the session. A launch the
+daemon could not record before it died is found through
+`<task dir>/headless/launch.pid`, so start recovery never runs a second agent
+next to it.
 
 There is nothing to attach to: `powerqueue attach <task>` prints the log
 paths, `powerqueue task output <task>` prints the last lines of the stream,

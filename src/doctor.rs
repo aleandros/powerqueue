@@ -1870,6 +1870,13 @@ fn check_stuck_tasks(cfg: &Config, paths: &Paths, store: &Store, fix: bool) -> C
         let session = store.latest_session(task.id).ok().flatten();
         let reason = match &session {
             None => Some("no session row".to_string()),
+            // A headless session ended while its task waits: resumed later.
+            Some(s)
+                if s.state == SessionState::Stopped
+                    && matches!(task.state, TaskState::NeedsAttention | TaskState::Throttled | TaskState::Paused) =>
+            {
+                None
+            }
             Some(s) if !s.state.is_live() => Some(format!("session is {}", s.state)),
             Some(s) if s.is_headless() => {
                 let files = crate::session::headless::HeadlessFiles::for_session(paths, s);
@@ -2594,6 +2601,69 @@ pub fn exit_code(results: &[CheckResult]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn headless_waits_are_not_stuck_and_dead_headless_processes_are() {
+        let store = Store::open_in_memory().unwrap();
+        let paths = Paths::rooted(std::path::Path::new("/nonexistent"));
+        let mut cfg = Config::default();
+        cfg.tmux.binary = "/nonexistent-test-tmux".into();
+        let now = Utc::now();
+        let session = |task: &Task, state: SessionState, pid: u32| crate::domain::Session {
+            id: uuid::Uuid::new_v4(),
+            task_id: task.id,
+            attempt: 1,
+            model: crate::domain::ModelTier::sonnet(),
+            state,
+            tmux_session: String::new(),
+            tmux_window: String::new(),
+            pane_id: None,
+            pid: Some(pid),
+            transcript_path: None,
+            exit_code: None,
+            started_at: now,
+            ended_at: None,
+            last_activity_at: now,
+            error: None,
+            agent_session_id: None,
+            waiting_since: None,
+            waited_secs: 0,
+            runtime: crate::domain::SessionRuntime::Headless,
+        };
+        // Waiting on a human with a stopped headless session: healthy.
+        let mut waiting = Task::new("HL-1", "asked a question", crate::domain::TaskSource::Manual);
+        waiting.state = TaskState::NeedsAttention;
+        store.insert_task(&waiting).unwrap();
+        store.insert_session(&session(&waiting, SessionState::Stopped, u32::MAX - 1)).unwrap();
+        let result = check_stuck_tasks(&cfg, &paths, &store, true);
+        assert_eq!(result.status, Status::Ok, "{}", result.detail);
+        assert_eq!(store.get_task(waiting.id).unwrap().unwrap().state, TaskState::NeedsAttention, "--fix leaves it alone");
+        // Running with a headless process that is gone: stuck.
+        let mut running = Task::new("HL-2", "lost its process", crate::domain::TaskSource::Manual);
+        running.state = TaskState::Running;
+        store.insert_task(&running).unwrap();
+        store.insert_session(&session(&running, SessionState::Running, u32::MAX - 1)).unwrap();
+        let result = check_stuck_tasks(&cfg, &paths, &store, false);
+        assert_eq!(result.status, Status::Warn);
+        assert!(result.detail.contains("HL-2") && result.detail.contains("headless process"), "{}", result.detail);
+        assert!(!result.detail.contains("HL-1"), "{}", result.detail);
+    }
+
+    #[test]
+    fn session_mode_check_flags_settings_that_break_headless_runs() {
+        let mut cfg = Config::default();
+        assert_eq!(check_session_mode(&cfg).status, Status::Ok);
+        cfg.claude.session_mode = crate::config::ClaudeSessionMode::Headless;
+        assert_eq!(check_session_mode(&cfg).status, Status::Ok);
+        cfg.claude.binary = "docker exec -it -w {worktree} pq-{slug} claude".into();
+        assert_eq!(check_session_mode(&cfg).status, Status::Warn);
+        cfg.claude.binary = "docker exec -i -w {worktree} pq-{slug} claude".into();
+        assert_eq!(check_session_mode(&cfg).status, Status::Ok);
+        cfg.claude.permission_mode = "default".into();
+        assert_eq!(check_session_mode(&cfg).status, Status::Warn);
+        assert_eq!(headless_denials_status(0).status, Status::Ok);
+        assert_eq!(headless_denials_status(3).status, Status::Warn);
+    }
 
     #[test]
     fn starting_diagnostic_reports_saved_target_and_fix_does_not_interrupt_setup() {

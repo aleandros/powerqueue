@@ -404,6 +404,7 @@ pub fn on_retry(task: &mut Task, session: Option<&mut Session>, now: DateTime<Ut
         }
     } else if task.state.is_terminal() {
         task.attempts = 0;
+        task.free_attempts = 0;
         task.last_error = None;
         task.summary = None;
         if let Some(execution) = &mut task.execution {

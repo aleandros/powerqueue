@@ -967,9 +967,10 @@ pub fn on_crash(
     task.last_error = Some(reason.to_string());
     let max = task.max_attempts.unwrap_or(cfg.max_attempts).max(1);
     // A review round gets its own `max_attempts`: attempts used before the
-    // watcher relaunched the task do not count.
+    // watcher relaunched the task do not count. Neither do launches that only
+    // resumed a stopped headless session (`free_attempts`).
     let base = task.review_relaunch().and(task.review.as_ref()).map_or(0, |r| r.attempt_base);
-    let used = attempt.saturating_sub(base);
+    let used = attempt.saturating_sub(base).saturating_sub(task.free_attempts);
     let mut data = serde_json::json!({ "reason": reason, "exit_status": exit_status, "attempt": attempt, "max_attempts": max, "pane_tail": pane_tail });
     if used >= max {
         task.state = TaskState::Failed;
@@ -1495,6 +1496,59 @@ mod tests {
             let (id, resume, _) = crate::scheduler::launch::resume_plan(Some(&s), &ModelTier::opus(), true, false);
             assert!(resume && id == s.id, "a stopped session is resumed");
         }
+    }
+
+    #[test]
+    fn resumes_of_stopped_sessions_do_not_count_against_max_attempts() {
+        // max_attempts = 3: a question, then a usage limit, then a turn that
+        // ends without a marker. The stops used no attempt: still a crash.
+        let mut cfg = cfg();
+        cfg.scheduler.max_attempts = 3;
+        let mut t = task(TaskState::Running, 1);
+        let mut s = headless(SessionState::Running, 1);
+        let launch_again = |t: &mut Task, s: &mut Session| {
+            let (_, resume, _) = crate::scheduler::launch::resume_plan(Some(s), &ModelTier::opus(), true, false);
+            assert!(resume);
+            let resumed_stopped = s.state == SessionState::Stopped;
+            t.attempts += 1;
+            *s = headless(SessionState::Launching, t.attempts);
+            let facts = crate::scheduler::launch::Launched {
+                model: &ModelTier::opus(),
+                attempt: t.attempts,
+                resume,
+                relaunch: None,
+                review_prompt: None,
+                resume_prompt: None,
+                branch: "pq/eng-1",
+                worktree: std::path::Path::new("/wt/eng-1"),
+                answered: false,
+                resumed_stopped,
+            };
+            crate::scheduler::launch::on_launched(t, s, &facts, &Config::default(), now());
+        };
+        on_hook_outcome(&mut t, &mut s, &stop_hook("Which database should I use?"), &cfg, now(), period_end());
+        on_headless_exit(&mut t, &mut s, &exit(Some(0), Some(("success", false, "Which?"))), &cfg, now(), period_end());
+        assert_eq!((t.state, s.state), (TaskState::NeedsAttention, SessionState::Stopped));
+        launch_again(&mut t, &mut s);
+        let mut limit = exit(Some(1), Some(("error_during_execution", true, "usage limit reached")));
+        limit.rate_limited = true;
+        on_headless_exit(&mut t, &mut s, &limit, &cfg, now(), period_end());
+        assert_eq!((t.state, s.state), (TaskState::Throttled, SessionState::Stopped));
+        launch_again(&mut t, &mut s);
+        assert_eq!((t.attempts, t.free_attempts), (3, 2));
+        on_headless_exit(&mut t, &mut s, &exit(Some(0), Some(("success", false, "done?"))), &cfg, now(), period_end());
+        assert_eq!(t.state, TaskState::Crashed, "attempt 1 of 3 crashed; two resumes were free");
+        // Crash resumes do count: two more crashes use up the rest.
+        for expected in [TaskState::Crashed, TaskState::Failed] {
+            launch_again(&mut t, &mut s);
+            on_headless_exit(&mut t, &mut s, &exit(Some(1), None), &cfg, now(), period_end());
+            assert_eq!(t.state, expected);
+        }
+        assert_eq!((t.attempts, t.free_attempts), (5, 2));
+    }
+
+    fn stop_hook(message: &str) -> HookOutcome {
+        crate::session::interpret_hook(HookEvent::Stop, &serde_json::json!({ "last_assistant_message": message }))
     }
 
     #[test]

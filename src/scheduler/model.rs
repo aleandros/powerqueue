@@ -482,6 +482,8 @@ impl TaskWorld {
                 let model = self.task.model.clone().unwrap_or_default();
                 let review = self.task.review_relaunch().is_some();
                 let (id, resume, agent_session_id) = launch::resume_plan(self.session.as_ref(), &model, true, review);
+                let resumed_stopped =
+                    resume && self.session.as_ref().is_some_and(|p| p.id == id && p.state == SessionState::Stopped);
                 let runtime = cfg.session_runtime(model.provider());
                 let headless = runtime == SessionRuntime::Headless;
                 let session = Session {
@@ -517,6 +519,7 @@ impl TaskWorld {
                     branch: &start.branch,
                     worktree: &start.worktree,
                     answered: *answered,
+                    resumed_stopped,
                 };
                 let effects = launch::on_launched(&mut self.task, &session, &facts, cfg, now);
                 self.session = Some(session);
@@ -812,6 +815,30 @@ fn check(
             matches!(a.state, TaskState::Paused | TaskState::NeedsAttention | TaskState::Throttled),
             "{}",
             ctx("stopped a session of a task that does not wait")
+        );
+    }
+    // Free attempts (resumes of stopped sessions) only grow by a launch that
+    // resumed a stopped session and only reset with a retry or a review
+    // round; the task fails only once its counted attempts reach the limit.
+    prop_assert!(a.free_attempts <= a.attempts, "{}", ctx("more free attempts than attempts"));
+    if a.free_attempts > b.free_attempts {
+        prop_assert!(matches!(op, Op::Launched { .. }), "{}", ctx("free attempts grew outside a launch"));
+        prop_assert_eq!(a.free_attempts, b.free_attempts + 1);
+        prop_assert!(
+            before.session.as_ref().is_some_and(|s| s.state == SessionState::Stopped),
+            "{}",
+            ctx("free launch without a stopped session")
+        );
+    } else if a.free_attempts < b.free_attempts {
+        prop_assert!(matches!(op, Op::Retry | Op::PrStatus(_)), "{}", ctx("free attempts reset outside a retry or review round"));
+    }
+    if a.state == TaskState::Failed && b.state != TaskState::Failed && !matches!(op, Op::Complete(_) | Op::HandOff(_)) {
+        let base = a.review_relaunch().and(a.review.as_ref()).map_or(0, |r| r.attempt_base);
+        let max = a.max_attempts.unwrap_or(cfg.scheduler.max_attempts).max(1);
+        prop_assert!(
+            a.attempts.saturating_sub(base).saturating_sub(a.free_attempts) >= max,
+            "{}",
+            ctx("failed before its counted attempts reached max_attempts")
         );
     }
     if let (Op::Launched { .. }, Some(previous), Some(launched)) = (op, &before.session, &after.session)
