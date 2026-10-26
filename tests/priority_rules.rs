@@ -67,6 +67,27 @@ fn customer_high_priority_adds_scoring_bonuses() {
 }
 
 #[test]
+fn new_high_priority_bug_runs_before_older_high_priority_work() {
+    let r = rules();
+    let mut bug = linear_task("AVS-2089", "Requested date displays the previous day");
+    bug.linear_priority = Some(2);
+    bug.labels = vec!["Bug".into()];
+    let mut ordinary = linear_task("AVS-2061", "Inventory search");
+    ordinary.linear_priority = Some(2);
+    let now = bug.created_at;
+    for hours in [70, 100, 1000] {
+        ordinary.created_at = now - Duration::hours(hours);
+        for task in [&mut bug, &mut ordinary] {
+            let evaluation = r.evaluate(task, now, None, 0.0, 2.0);
+            task.criticality = evaluation.criticality;
+            task.score = evaluation.score;
+        }
+        let tasks = [ordinary.clone(), bug.clone()];
+        assert_eq!(powerqueue::scheduler::lifecycle::pick_next(&tasks, now).unwrap().key, bug.key);
+    }
+}
+
+#[test]
 fn manual_task_without_matches_is_normal_with_bonus_and_age() {
     let r = rules();
     let t = Task::new("manual-1", "Tidy up", TaskSource::Manual);

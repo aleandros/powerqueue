@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The generated priority policy keeps high-priority bugs ahead of ordinary
+  high-priority work even at the waiting-age cap. Existing policy files remain
+  unchanged. `tune` now favors reusable category rules over ticket overrides
+  and identifies execution-project policies when explaining queue order.
+
 ### Changed
 
 - Enforce BeautifulRust's Rust and Clippy lint policy across all targets, with

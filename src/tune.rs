@@ -752,9 +752,17 @@ pub fn build_prompt(instruction: &str, scope: TuneScope, context_md: &str, repo_
     );
     p.push_str("## Guidelines\n\n");
     p.push_str(
-        "- Make the smallest change that achieves the request. A rule (`[[criticality]]`, `[[scoring]]`, ...) when the \
-         user describes a kind of task (\"bugs\", \"label x\", \"project y\"); an entry in `[[overrides]]` when they \
-         name one ticket.\n\
+        "- Prefer reusable rules (`[[criticality]]`, `[[scoring]]`, ...) for kinds of work (\"bugs\", \"label x\", \
+         \"project y\"). A named ticket can be an example of a general ranking problem; naming it alone is not \
+         a request for an override. Use `[[overrides]]` only for an explicitly requested ticket-specific exception. \
+         Never enumerate the current queue to implement a general policy.\n\
+         - Diagnose ranking with the score reasons. Waiting age contributes up to 200 points: a +40 bug bonus \
+         can lose to older ordinary work. When bugs should stay ahead, choose a reusable rule whose total bonus \
+         survives that cap and the other applicable deltas, not just today's age difference. Preserve urgency \
+         distinctions (for example, match both priority high and label bug).\n\
+         - Check the Policy target against each affected task's execution project. If this draft targets the \
+         machine policy but the task uses a different project policy, do not claim this draft will fix it; \
+         explain that tune must be rerun with `--project PROJECT`.\n\
          - Ordering, criticality, skipping and model preference belong in `priority.toml`; concurrency, budgets, \
          pacing, cleanup and provider settings belong in `config.toml`.\n\
          - Keep comments, structure and formatting; adjust or append rather than rewrite.\n\

@@ -112,6 +112,18 @@ fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
     }
     let ledgers = Ledgers::load(ctx.store()?, &cfg.budget, chrono::Utc::now())?;
     let mut context_md = context_markdown(&cfg, &live_priority, priority_text.is_some(), &live_sim, &sim_args, &tasks, &ledgers);
+    context_md.push_str("\n### Execution-project policies\n\n");
+    let projects: std::collections::BTreeSet<_> = tasks.iter().map(|task| &task.execution_project).collect();
+    for project in projects {
+        match cfg.for_project(project, &paths) {
+            Ok(project_cfg) => {
+                let _ = writeln!(context_md, "- `{project}`: {}", project_cfg.rules_source(&paths));
+            }
+            Err(error) => {
+                let _ = writeln!(context_md, "- `{project}`: policy unavailable ({error})");
+            }
+        }
+    }
     let repo_overrides =
         if selected.repo.path.trim().is_empty() { None } else { selected.read_repo_overrides(&selected.repo_path())?.text };
 
@@ -682,7 +694,7 @@ pub fn context_markdown(
     if !priority_exists {
         let _ = writeln!(
             md,
-            "_The live `{}` does not exist yet; the draft `priority.toml` starts from the template and every task is `normal`._\n",
+            "_The selected policy `{}` does not exist yet; the draft `priority.toml` starts from the template. Tasks with their own execution-project policy still use that policy._\n",
             live_priority.display()
         );
     }
@@ -701,14 +713,14 @@ pub fn context_markdown(
     } else {
         let _ = writeln!(
             md,
-            "| key | state | criticality | score | labels | linear priority | estimate | project | cycle | source | age | title |"
+            "| key | state | criticality | score | labels | linear priority | estimate | project | execution project | cycle | source | age | title |"
         );
-        let _ = writeln!(md, "|---|---|---|---|---|---|---|---|---|---|---|---|");
+        let _ = writeln!(md, "|---|---|---|---|---|---|---|---|---|---|---|---|---|");
         let now = chrono::Utc::now();
         for t in tasks {
             let _ = writeln!(
                 md,
-                "| {} | {} | {} | {:.0} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {:.0} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 t.key,
                 t.state,
                 t.criticality,
@@ -717,6 +729,7 @@ pub fn context_markdown(
                 t.linear_priority.map_or_else(|| "–".into(), |p| p.to_string()),
                 t.estimate.map_or_else(|| "–".into(), |e| format!("{e}")),
                 t.project.as_deref().unwrap_or("–"),
+                t.execution_project,
                 match (&t.cycle, t.cycle_number) {
                     (Some(c), Some(n)) => format!("{c} #{n}"),
                     (Some(c), None) => c.clone(),
@@ -836,6 +849,8 @@ mod tests {
         cfg.scheduler.max_concurrent = 2;
         let mut t = Task::new("ENG-1", "Fix | the thing", TaskSource::Manual);
         t.labels = vec!["bug".into()];
+        t.project = Some("Source project".into());
+        t.execution_project = "api".into();
         t.description = "line one\n\nline two".into();
         let sim = Simulation {
             rules: "/x/priority.toml".into(),
@@ -869,6 +884,8 @@ mod tests {
         let args = SimulateArgs { reasons: true, no_budget: true, ..SimulateArgs::default() };
         let md = context_markdown(&cfg, Path::new("/x/priority.toml"), false, &sim, &args, &[t], &ledgers);
         assert!(md.contains("does not exist yet"));
+        assert!(!md.contains("every task is `normal`"));
+        assert!(md.contains("| Source project | api |"));
         assert!(md.contains("| ENG-1 | queued | normal | 100 | bug |"));
         assert!(md.contains("Fix \\| the thing"));
         assert!(md.contains("- **ENG-1**: line one line two"));
