@@ -2648,12 +2648,26 @@ mod properties {
         /// last failure. A running or idle task never survives it.
         #[test]
         fn headless_exit_is_total_and_resumable(
-            (task, session) in task_with_session(),
+            // States that may hold a live session, plus the finished and
+            // handed-off ones whose session the finalize phase has not
+            // released yet.
+            (task, session) in task_with_session_among(&[
+                TaskState::Starting, TaskState::Running, TaskState::Idle, TaskState::NeedsAttention, TaskState::Paused,
+                TaskState::Throttled, TaskState::InReview, TaskState::Completed, TaskState::Failed, TaskState::Cancelled,
+            ]),
             exit in headless_exit(),
         ) {
-            prop_assume!(session.state.is_live());
             let mut task = task;
-            let mut session = Session { runtime: crate::domain::SessionRuntime::Headless, pane_id: None, tmux_window: String::new(), ..session };
+            // The exit of a live headless session.
+            let mut session = Session {
+                runtime: crate::domain::SessionRuntime::Headless,
+                pane_id: None,
+                tmux_window: String::new(),
+                state: if session.state.is_live() { session.state } else { SessionState::Running },
+                ended_at: None,
+                exit_code: None,
+                ..session
+            };
             let before = task.clone();
             let cfg = Config::default();
             let effects = on_headless_exit(&mut task, &mut session, &exit, &cfg, origin(), origin() + Duration::days(3));

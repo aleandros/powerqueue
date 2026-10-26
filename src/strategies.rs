@@ -391,6 +391,8 @@ pub(crate) fn session_for(task: &Task) -> BoxedStrategy<Session> {
             )| {
                 let last_activity_at = (started_at + Duration::seconds(activity_gap)).min(origin());
                 let ended = !state.is_live();
+                // Only Claude Code sessions run headless.
+                let runtime = if model.provider() == crate::domain::Provider::Claude { runtime } else { SessionRuntime::Tmux };
                 let headless = runtime == SessionRuntime::Headless;
                 Session {
                     id: uuid::Uuid::from_u128(id),

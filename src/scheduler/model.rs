@@ -841,9 +841,12 @@ fn check(
             ctx("failed before its counted attempts reached max_attempts")
         );
     }
+    // (The model always has the transcript; a CLI that picks its own session
+    // id is only resumed once that id was discovered.)
     if let (Op::Launched { .. }, Some(previous), Some(launched)) = (op, &before.session, &after.session)
         && previous.state.is_resumable()
         && previous.model.provider() == launched.model.provider()
+        && (crate::session::agent_for(launched.model.provider()).accepts_session_id() || previous.agent_session_id.is_some())
     {
         prop_assert_eq!(previous.id, launched.id, "{}", ctx("a crashed or stopped session was not resumed"));
     }

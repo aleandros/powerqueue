@@ -21,13 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the final result with its cost. When the process exits, it decides
   completed / blocked / throttled / crashed. Crashes resume the same session
   with backoff. A question, a pause or a usage limit leaves a resumable
-  `stopped` session, and resuming it does not count against `max_attempts`. Cancel, retry, pause and
-  the stale/timeout limits stop the process group with SIGTERM. `attach`,
-  `task show` and `task output` point to the log; `task send` refuses.
-  `config validate` and `doctor` report the mode, warn about settings that
-  break unattended runs (a TTY-allocating `claude.binary`, a permission mode
-  that denies everything) and count denied tool calls. Interactive tmux
-  sessions are unchanged.
+  `stopped` session, and resuming it does not count against `max_attempts`
+  (`task show` and `status` list these as free attempts). Cancel, retry, pause
+  and the stale/timeout limits stop the process group with SIGTERM. `attach`,
+  `task show` and `task output` point to the log; `task send` refuses. `config
+  validate` and `doctor` report the mode, warn about settings that break
+  unattended runs (a TTY-allocating `claude.binary`, a permission mode that
+  denies everything) and count denied tool calls. Interactive tmux sessions
+  are unchanged.
 
 ### Changed
 

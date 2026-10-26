@@ -2963,9 +2963,8 @@ impl Daemon {
                     }
                 }
                 Effect::ReleaseForReview => {
-                    if let Some(s) = session.filter(|s| s.is_headless()) {
-                        self.stop_headless(s, Escalation::Background);
-                    } else if let Some(s) = session
+                    // A headless session is stopped by the cleanup below.
+                    if let Some(s) = session.filter(|s| !s.is_headless())
                         && let Err(e) = self.rt.tmux.kill_window(&s.tmux_window)
                     {
                         tracing::debug!(task = %task.key, window = %s.tmux_window, error = %format!("{e:#}"), "kill window for review");

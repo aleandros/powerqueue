@@ -436,6 +436,8 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
         Some(max) => format!("{}/{}", task.attempts, max),
         None => task.attempts.to_string(),
     };
+    // Resumes of stopped headless sessions do not count against the limit.
+    let attempts = if task.free_attempts > 0 { format!("{attempts} ({} free)", task.free_attempts) } else { attempts };
     kv("attempts", attempts);
     kv(
         "tokens",

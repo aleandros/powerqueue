@@ -340,6 +340,7 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
             Some(max) => format!("{}/{}", t.attempts, max),
             None => t.attempts.to_string(),
         };
+        let attempts = if t.free_attempts > 0 { format!("{attempts} ({} free)", t.free_attempts) } else { attempts };
         let tokens = if row.usage.is_zero() { "-".to_string() } else { human_f64(row.weighted_tokens) };
         let mut cells = vec![
             Cell::new(&t.key),
