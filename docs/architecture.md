@@ -29,7 +29,9 @@ github.rs          `gh api graphql` PR status (state, mergeability, checks, thre
                      implementation per CLI: claude.rs, codex.rs, gemini.rs (experimental);
                      binary.rs (`<provider>.binary` command templates with per-task
                      placeholders), inbox.rs (the container shim + inbox transport for
-                     `<provider>.shim`), launcher (prompt, launch.sh), hook interpretation,
+                     `<provider>.shim`), headless.rs (headless Claude sessions: `claude -p`
+                     stream-json logs, stream reader, exit classification, process
+                     group start/stop), launcher (prompt, launch.sh), hook interpretation,
                      transcript tailing, liveness + resource probes
   scheduler/         daemon.rs (Daemon, tick loop, applies Effects against the store,
                      tmux, git, Linear and GitHub) around a pure core: transitions.rs
