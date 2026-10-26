@@ -692,6 +692,13 @@ pub struct Task {
     pub branch: Option<String>,
     pub attempts: u32,
     pub max_attempts: Option<u32>,
+    /// Launches that only resumed a session powerqueue stopped while the
+    /// task waited (a headless session's question, pause or usage limit;
+    /// [`SessionState::Stopped`]). They are counted in `attempts` but not
+    /// against `max_attempts`, the way an interactive session that waited in
+    /// its window used none. Counted from the current review round's base.
+    #[serde(default)]
+    pub free_attempts: u32,
     /// Earliest time the scheduler should consider this task (backoff / throttling).
     pub not_before: Option<DateTime<Utc>>,
     /// Explicit local hold, independent of automatic backoff and source metadata.
@@ -753,6 +760,7 @@ impl Task {
             branch: None,
             attempts: 0,
             max_attempts: None,
+            free_attempts: 0,
             not_before: None,
             deferral: None,
             last_error: None,
@@ -1037,6 +1045,10 @@ pub enum SessionState {
     Exited,
     Crashed,
     Killed,
+    /// powerqueue stopped a headless session whose work is not finished (the
+    /// task was paused, waits on a human or on a usage limit); the next
+    /// attempt resumes it like a crashed one.
+    Stopped,
 }
 
 impl SessionState {
@@ -1048,7 +1060,13 @@ impl SessionState {
             SessionState::Exited => "exited",
             SessionState::Crashed => "crashed",
             SessionState::Killed => "killed",
+            SessionState::Stopped => "stopped",
         }
+    }
+    /// The next attempt resumes this session (`--resume`): it crashed, or
+    /// powerqueue stopped it before its work was done.
+    pub fn is_resumable(&self) -> bool {
+        matches!(self, SessionState::Crashed | SessionState::Stopped)
     }
     pub fn is_live(&self) -> bool {
         matches!(self, SessionState::Launching | SessionState::Running | SessionState::Idle)
@@ -1071,12 +1089,52 @@ impl FromStr for SessionState {
             "exited" => Ok(SessionState::Exited),
             "crashed" => Ok(SessionState::Crashed),
             "killed" => Ok(SessionState::Killed),
+            "stopped" => Ok(SessionState::Stopped),
             other => Err(format!("unknown session state `{other}`")),
         }
     }
 }
 
-/// One attempt at a task: an agent CLI process inside a tmux window.
+/// Where a session's agent process runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRuntime {
+    /// An interactive CLI in a tmux window (`tmux_window`, `pane_id`).
+    #[default]
+    Tmux,
+    /// `claude -p --output-format stream-json` as a child process of its own
+    /// process group (`pid`); no tmux window. See [`crate::session::headless`].
+    Headless,
+}
+
+impl SessionRuntime {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionRuntime::Tmux => "tmux",
+            SessionRuntime::Headless => "headless",
+        }
+    }
+}
+
+impl fmt::Display for SessionRuntime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SessionRuntime {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "tmux" => Ok(SessionRuntime::Tmux),
+            "headless" => Ok(SessionRuntime::Headless),
+            other => Err(format!("unknown session runtime `{other}`")),
+        }
+    }
+}
+
+/// One attempt at a task: an agent CLI process inside a tmux window, or a
+/// headless Claude Code process ([`SessionRuntime`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     /// powerqueue's session id (UUID). For Claude Code it is passed as
@@ -1112,9 +1170,18 @@ pub struct Session {
     /// `waiting_since`). `max_session_secs` counts only working time.
     #[serde(default)]
     pub waited_secs: i64,
+    /// tmux window or headless process. Headless sessions have an empty
+    /// `tmux_window`, no `pane_id`, and `pid` is the process group leader.
+    #[serde(default)]
+    pub runtime: SessionRuntime,
 }
 
 impl Session {
+    /// True for a headless (`claude -p`) session.
+    pub fn is_headless(&self) -> bool {
+        self.runtime == SessionRuntime::Headless
+    }
+
     /// Wall time the agent has been working: the session's age minus the
     /// time it spent waiting (past waits and the current one).
     pub fn working_time(&self, now: DateTime<Utc>) -> chrono::Duration {

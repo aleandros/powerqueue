@@ -246,6 +246,7 @@ pub fn on_pr_status(task: &mut Task, status: &PrStatus, cfg: &SchedulerConfig, n
         } else {
             watch.rounds += 1;
             watch.attempt_base = task.attempts;
+            task.free_attempts = 0;
             task.state = TaskState::Queued;
             task.not_before = None;
             task.last_error = None;
@@ -278,6 +279,7 @@ pub fn request_round(task: &mut Task, now: DateTime<Utc>) -> Option<Effect> {
     let pr_number = task.pr_url.as_deref().and_then(pr_number_of)?;
     let mut watch = task.review.clone().unwrap_or_else(|| ReviewWatch::armed(now, None));
     watch.attempt_base = task.attempts;
+    task.free_attempts = 0;
     watch.waiting_manual_merge = false;
     watch.parked = false;
     watch.relaunch = Some(ReviewRelaunch { pr_number, reason: "requested".into(), detail: "by user".into(), requested_at: now });

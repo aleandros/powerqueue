@@ -404,6 +404,7 @@ pub fn on_retry(task: &mut Task, session: Option<&mut Session>, now: DateTime<Ut
         }
     } else if task.state.is_terminal() {
         task.attempts = 0;
+        task.free_attempts = 0;
         task.last_error = None;
         task.summary = None;
         if let Some(execution) = &mut task.execution {
@@ -446,13 +447,16 @@ pub fn on_retry(task: &mut Task, session: Option<&mut Session>, now: DateTime<Ut
 
 /// End the live session a command must not leave behind (it would keep the
 /// slot): `killed`, ended now, its window to be killed (the daemon forgets
-/// the session with it). Returns its attempt number; `None` when there is
-/// no live session.
+/// the session with it). A `stopped` headless session is marked `killed`
+/// too, so the next attempt starts over instead of resuming it. Returns its
+/// attempt number; `None` when there is no live or stopped session.
 fn end_live(session: Option<&mut Session>, now: DateTime<Utc>, effects: &mut Vec<Effect>) -> Option<u32> {
-    let session = session.filter(|s| s.state.is_live())?;
+    let session = session.filter(|s| s.state.is_live() || s.state == SessionState::Stopped)?;
+    if session.state.is_live() {
+        session.ended_at = Some(now);
+        effects.push(Effect::KillWindow);
+    }
     session.state = SessionState::Killed;
-    session.ended_at = Some(now);
-    effects.push(Effect::KillWindow);
     Some(session.attempt)
 }
 
@@ -518,6 +522,7 @@ mod tests {
             agent_session_id: None,
             waiting_since: None,
             waited_secs: 0,
+            runtime: crate::domain::SessionRuntime::Tmux,
         }
     }
 
@@ -822,8 +827,9 @@ mod properties {
         }
 
         /// Effects are justified: a window is killed iff the session handed
-        /// in was live (and it is then closed); cleanup only for a task that
-        /// ended; a relayed answer is forgotten only by a re-queue.
+        /// in was live (and it is then closed); a stopped headless session
+        /// is closed without a kill so it is never resumed; cleanup only for
+        /// a task that ended; a relayed answer is forgotten only by a re-queue.
         #[test]
         fn cancel_and_retry_effects_are_justified((task, session) in task_with_session()) {
             let now = origin();
@@ -839,8 +845,11 @@ mod properties {
                 prop_assert_eq!((t.state, t.completed_at, t.not_before), (TaskState::Cancelled, Some(now), None));
                 prop_assert!(effects.iter().any(|e| matches!(e, Effect::Cleanup { succeeded: false })), "no failed cleanup: {:?}", effects);
             }
+            let was_stopped = session.state == SessionState::Stopped;
             if was_live && !task.state.is_terminal() {
                 prop_assert_eq!((s.state, s.ended_at), (SessionState::Killed, Some(now)));
+            } else if was_stopped && !task.state.is_terminal() {
+                prop_assert_eq!(&s, &Session { state: SessionState::Killed, ..session.clone() });
             } else {
                 prop_assert_eq!(&s, &session);
             }
@@ -852,6 +861,9 @@ mod properties {
                 || matches!(task.state, TaskState::Crashed | TaskState::Throttled | TaskState::Paused | TaskState::NeedsAttention)
                 || (task.state == TaskState::InReview && task.pr_url.as_deref().and_then(pr_number_of).is_some());
             prop_assert_eq!(has_kill(&effects), applies && was_live);
+            if applies && was_stopped {
+                prop_assert_eq!(s.state, SessionState::Killed, "a retry never resumes a stopped session");
+            }
             prop_assert!(!effects.iter().any(|e| matches!(e, Effect::Cleanup { .. })), "retry never cleans up: {:?}", effects);
             let forgot = effects.iter().any(|e| matches!(e, Effect::ForgetAnswer));
             prop_assert_eq!(forgot, applies && task.state != TaskState::InReview);

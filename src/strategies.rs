@@ -20,10 +20,11 @@ use proptest::prelude::*;
 use crate::budget::{AnchorSource, Decision, Ledger, Ledgers, Period, Prediction, RateLimitState, TierLedger};
 use crate::config::{BudgetConfig, SchedulerConfig};
 use crate::domain::{
-    Criticality, HookEvent, LinkedIssue, ModelTier, Provider, ReviewRelaunch, ReviewWatch, Session, SessionState, Task, TaskId,
-    TaskSource, TaskState,
+    Criticality, HookEvent, LinkedIssue, ModelTier, Provider, ReviewRelaunch, ReviewWatch, Session, SessionRuntime, SessionState,
+    Task, TaskId, TaskSource, TaskState,
 };
 use crate::github::{PrCheck, PrStatus, PrThread, QueueRemoval};
+use crate::session::headless::{HeadlessExit, StreamResult};
 use crate::session::{HookOutcome, SessionProbe};
 
 /// `2026-10-01T12:00:00Z`: "now" for every property unless it says otherwise.
@@ -64,7 +65,13 @@ pub(crate) fn session_state() -> impl Strategy<Value = SessionState> {
         SessionState::Exited,
         SessionState::Crashed,
         SessionState::Killed,
+        SessionState::Stopped,
     ])
+}
+
+/// Where a session runs: mostly tmux, sometimes headless.
+pub(crate) fn session_runtime() -> impl Strategy<Value = SessionRuntime> {
+    prop::bool::weighted(0.25).prop_map(|headless| if headless { SessionRuntime::Headless } else { SessionRuntime::Tmux })
 }
 
 /// Launch/recovery observations, including a slow setup and an unrecorded agent.
@@ -348,7 +355,7 @@ pub(crate) fn session_for(task: &Task) -> BoxedStrategy<Session> {
     let task_id = task.id;
     let attempt = task.attempts.max(1);
     let live = [SessionState::Launching, SessionState::Running, SessionState::Idle];
-    let dead = [SessionState::Exited, SessionState::Crashed, SessionState::Killed];
+    let dead = [SessionState::Exited, SessionState::Crashed, SessionState::Killed, SessionState::Stopped];
     let states: Vec<SessionState> = if task.state.has_live_session() {
         live.to_vec()
     } else if task.state.may_keep_session() {
@@ -367,11 +374,26 @@ pub(crate) fn session_for(task: &Task) -> BoxedStrategy<Session> {
         0i64..=3600,
         prop::option::of(Just("thread-1".to_string())),
         prop::option::of(Just("/transcripts/s.jsonl".to_string())),
+        session_runtime(),
     )
         .prop_map(
-            move |(id, state, model, started_at, activity_gap, waiting_since, waited_secs, agent_session_id, transcript_path)| {
+            move |(
+                id,
+                state,
+                model,
+                started_at,
+                activity_gap,
+                waiting_since,
+                waited_secs,
+                agent_session_id,
+                transcript_path,
+                runtime,
+            )| {
                 let last_activity_at = (started_at + Duration::seconds(activity_gap)).min(origin());
                 let ended = !state.is_live();
+                // Only Claude Code sessions run headless.
+                let runtime = if model.provider() == crate::domain::Provider::Claude { runtime } else { SessionRuntime::Tmux };
+                let headless = runtime == SessionRuntime::Headless;
                 Session {
                     id: uuid::Uuid::from_u128(id),
                     task_id,
@@ -379,18 +401,19 @@ pub(crate) fn session_for(task: &Task) -> BoxedStrategy<Session> {
                     model,
                     state,
                     tmux_session: "powerqueue".into(),
-                    tmux_window: "@1".into(),
-                    pane_id: Some("%1".into()),
+                    tmux_window: if headless { String::new() } else { "@1".into() },
+                    pane_id: (!headless).then(|| "%1".into()),
                     pid: Some(42),
                     transcript_path,
                     exit_code: if ended { Some(1) } else { None },
                     started_at,
                     ended_at: if ended { Some(last_activity_at) } else { None },
                     last_activity_at,
-                    error: if state == SessionState::Crashed { Some("boom".into()) } else { None },
+                    error: if state.is_resumable() { Some("boom".into()) } else { None },
                     agent_session_id,
                     waiting_since: waiting_since.filter(|_| !ended).map(|w| w.max(started_at)),
                     waited_secs,
+                    runtime,
                 }
             },
         )
@@ -666,6 +689,40 @@ pub(crate) fn pane_tail() -> impl Strategy<Value = Option<String>> {
         Just("Usage limit reached · continuing automatically at 3:45pm · esc to cancel".to_string()),
         line().prop_map(|l| format!("{l}\ncontinuing automatically at 9am\n")),
     ])
+}
+
+/// How a headless run ended: an exit status (success, failure, SIGTERM,
+/// SIGKILL, or none recorded), maybe a `result` (successful, an error, or one
+/// naming the usage limit), maybe the rate-limit flag and a stderr tail.
+pub(crate) fn headless_exit() -> impl Strategy<Value = HeadlessExit> {
+    let result = prop_oneof![
+        line().prop_map(|text| StreamResult { subtype: "success".into(), is_error: false, text, ..StreamResult::default() }),
+        line().prop_map(|text| StreamResult {
+            subtype: "error_during_execution".into(),
+            is_error: true,
+            text,
+            ..StreamResult::default()
+        }),
+        Just(StreamResult {
+            subtype: "error_during_execution".into(),
+            is_error: true,
+            text: "Claude AI usage limit reached".into(),
+            total_cost_usd: Some(0.1),
+            ..StreamResult::default()
+        }),
+    ];
+    (
+        prop::option::of(prop::sample::select(vec![0, 1, 2, 130, 137, 143])),
+        prop::option::of(result),
+        prop::bool::weighted(0.2),
+        prop::option::of(line()),
+    )
+        .prop_map(|(exit_status, result, rate_limited, stderr_tail)| HeadlessExit {
+            exit_status,
+            result,
+            rate_limited,
+            stderr_tail,
+        })
 }
 
 /// The event kinds of a list of effects (`Log` kinds; other variants by name).

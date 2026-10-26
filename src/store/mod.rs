@@ -16,7 +16,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::domain::{
     Criticality, DaemonCommand, Event, EventLevel, HookEvent, ModelTier, ResourceSample, SCHEDULING_PAUSE_KEY, SchedulingPause,
-    Session, SessionState, Task, TaskId, TaskState, TokenUsage, UsageRecord,
+    Session, SessionRuntime, SessionState, Task, TaskId, TaskState, TokenUsage, UsageRecord,
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
@@ -38,7 +38,10 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// * v10: pinned execution queue and workflow policy.
 /// * v11: explicit local deferral, independent of automatic `not_before`.
 /// * v12: explicit and automatic repository assignment provenance.
-pub const SCHEMA_VERSION: i64 = 12;
+/// * v13: `sessions.runtime` (`tmux` or `headless`; see
+///   [`crate::domain::SessionRuntime`]) and `tasks.free_attempts` (resumes of
+///   stopped headless sessions, not counted against `max_attempts`).
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// kv key of the Claude calibration before schema v2.
 const LEGACY_CALIBRATION_KEY: &str = "budget.calibration";
@@ -238,6 +241,17 @@ impl Store {
                 tracing::info!(from = version, to = SCHEMA_VERSION, columns_added = ?added, "migrated database schema to v6");
             }
         }
+        if version < 13 {
+            if !columns_of("sessions")?.iter().any(|c| c == "runtime") {
+                conn.execute("ALTER TABLE sessions ADD COLUMN runtime TEXT NOT NULL DEFAULT 'tmux'", [])
+                    .context("add sessions.runtime")?;
+            }
+            if !columns_of("tasks")?.iter().any(|c| c == "free_attempts") {
+                conn.execute("ALTER TABLE tasks ADD COLUMN free_attempts INTEGER NOT NULL DEFAULT 0", [])
+                    .context("add tasks.free_attempts")?;
+            }
+            tracing::info!(from = version, to = SCHEMA_VERSION, "migrated database schema to v13");
+        }
         if version < SCHEMA_VERSION {
             let cols = columns_of("tasks")?;
             for (name, sql) in [
@@ -283,9 +297,10 @@ impl Store {
             "INSERT INTO tasks (id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score,
                 labels, linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts,
                 not_before, last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number,
-                blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing, execution, deferral, project_assignment)
+                blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing, execution, deferral, project_assignment,
+                free_attempts)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-                ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42)",
+                ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43)",
             params![
                 task.id.to_string(),
                 task.key,
@@ -329,6 +344,7 @@ impl Store {
                 task.execution.as_ref().map(json),
                 task.deferral.as_ref().map(json),
                 task.project_assignment.as_ref().map(json),
+                task.free_attempts,
             ],
         )
         .with_context(|| format!("insert task {}", task.key))?;
@@ -365,7 +381,8 @@ impl Store {
                 criticality=?9, score=?10, labels=?11, linear_priority=?12, estimate=?13, project=?14, model_override=?15,
                 model=?16, worktree_path=?17, branch=?18, attempts=?19, max_attempts=?20, not_before=?21, last_error=?22,
                 summary=?23, score_reasons=?24, updated_at=?25, started_at=?26, completed_at=?27, cycle=?28, cycle_number=?29,
-                blocked_by=?30, children=?31, parent=?32, pr_url=?33, review=?34, execution_project=?35, execution_repo=?36, github_admission=?37, routing=?38, execution=?39, project_assignment=?40
+                blocked_by=?30, children=?31, parent=?32, pr_url=?33, review=?34, execution_project=?35, execution_repo=?36, github_admission=?37, routing=?38, execution=?39, project_assignment=?40,
+                free_attempts=?41
              WHERE id=?1",
             params![
                 task.id.to_string(),
@@ -408,6 +425,7 @@ impl Store {
                 assignment.routing.as_ref().map(json),
                 task.execution.as_ref().map(json),
                 current.project_assignment.as_ref().map(json),
+                task.free_attempts,
             ],
         )?;
         if n == 0 {
@@ -826,6 +844,7 @@ impl Store {
             branch: row.get("branch")?,
             attempts: row.get("attempts")?,
             max_attempts: row.get("max_attempts")?,
+            free_attempts: row.get("free_attempts")?,
             not_before: opt_ts(row.get("not_before")?).map_err(conv)?,
             deferral: row.get::<_, Option<String>>("deferral")?.as_deref().map(from_json).transpose().map_err(conv)?,
             last_error: row.get("last_error")?,
@@ -844,7 +863,7 @@ impl Store {
         "id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score, labels,
         linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts, not_before,
         last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number,
-        blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing, execution, deferral, project_assignment";
+        blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing, execution, deferral, project_assignment, free_attempts";
 
     pub fn get_task(&self, id: TaskId) -> Result<Option<Task>> {
         let conn = self.lock();
@@ -937,8 +956,8 @@ impl Store {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO sessions (id, task_id, attempt, model, state, tmux_session, tmux_window, pane_id, pid, transcript_path,
-                exit_code, started_at, ended_at, last_activity_at, error, agent_session_id, waiting_since, waited_secs)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                exit_code, started_at, ended_at, last_activity_at, error, agent_session_id, waiting_since, waited_secs, runtime)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 s.id.to_string(),
                 s.task_id.to_string(),
@@ -958,6 +977,7 @@ impl Store {
                 s.agent_session_id,
                 s.waiting_since.as_ref().map(ts),
                 s.waited_secs,
+                s.runtime.as_str(),
             ],
         )?;
         Ok(())
@@ -968,7 +988,7 @@ impl Store {
         let n = conn.execute(
             "UPDATE sessions SET task_id=?2, attempt=?3, model=?4, state=?5, tmux_session=?6, tmux_window=?7, pane_id=?8, pid=?9,
                 transcript_path=?10, exit_code=?11, started_at=?12, ended_at=?13, last_activity_at=?14, error=?15,
-                agent_session_id=?16, waiting_since=?17, waited_secs=?18 WHERE id=?1",
+                agent_session_id=?16, waiting_since=?17, waited_secs=?18, runtime=?19 WHERE id=?1",
             params![
                 s.id.to_string(),
                 s.task_id.to_string(),
@@ -988,6 +1008,7 @@ impl Store {
                 s.agent_session_id,
                 s.waiting_since.as_ref().map(ts),
                 s.waited_secs,
+                s.runtime.as_str(),
             ],
         )?;
         if n == 0 {
@@ -1016,6 +1037,7 @@ impl Store {
         let state: String = row.get("state")?;
         let started_at: String = row.get("started_at")?;
         let last_activity_at: String = row.get("last_activity_at")?;
+        let runtime: String = row.get("runtime")?;
         Ok(Session {
             id: uuid::Uuid::parse_str(&id).map_err(|e| conv(e.into()))?,
             task_id: TaskId::from_str(&task_id).map_err(|e| conv(e.into()))?,
@@ -1035,12 +1057,13 @@ impl Store {
             agent_session_id: row.get("agent_session_id")?,
             waiting_since: opt_ts(row.get("waiting_since")?).map_err(conv)?,
             waited_secs: row.get("waited_secs")?,
+            runtime: SessionRuntime::from_str(&runtime).map_err(|e| conv(anyhow!(e)))?,
         })
     }
 
     const SESSION_COLS: &'static str =
         "id, task_id, attempt, model, state, tmux_session, tmux_window, pane_id, pid, transcript_path,
-        exit_code, started_at, ended_at, last_activity_at, error, agent_session_id, waiting_since, waited_secs";
+        exit_code, started_at, ended_at, last_activity_at, error, agent_session_id, waiting_since, waited_secs, runtime";
 
     pub fn get_session(&self, id: uuid::Uuid) -> Result<Option<Session>> {
         let conn = self.lock();
@@ -2032,8 +2055,28 @@ mod tests {
             agent_session_id: None,
             waiting_since: None,
             waited_secs: 0,
+            runtime: crate::domain::SessionRuntime::Tmux,
         };
         store.insert_session(&s).unwrap();
+        assert_eq!(store.list_live_sessions().unwrap().len(), 1);
+        // A headless session round-trips its runtime; a stopped one is not live.
+        let headless = Session {
+            id: uuid::Uuid::new_v4(),
+            tmux_window: String::new(),
+            pane_id: None,
+            runtime: crate::domain::SessionRuntime::Headless,
+            ..s.clone()
+        };
+        store.insert_session(&headless).unwrap();
+        let read = store.get_session(headless.id).unwrap().unwrap();
+        assert_eq!(
+            (read.runtime, read.pane_id, read.tmux_window),
+            (crate::domain::SessionRuntime::Headless, None, String::new())
+        );
+        let stopped = Session { state: SessionState::Stopped, ended_at: Some(now), ..headless };
+        store.update_session(&stopped).unwrap();
+        let read = store.get_session(stopped.id).unwrap().unwrap();
+        assert_eq!((read.state, read.runtime), (SessionState::Stopped, crate::domain::SessionRuntime::Headless));
         assert_eq!(store.list_live_sessions().unwrap().len(), 1);
         store.set_agent_session_id(s.id, "thread-123").unwrap();
         assert_eq!(store.get_session(s.id).unwrap().unwrap().agent_session_id.as_deref(), Some("thread-123"));
@@ -2190,6 +2233,58 @@ mod tests {
             assert_eq!(restored.execution_project, task.execution_project);
             assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         }
+    }
+
+    #[test]
+    fn migrates_v12_sessions_to_the_tmux_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pq.sqlite");
+        let task = linear_task("ENG-v12");
+        let now = parse_ts("2026-10-01T12:00:00.000Z").unwrap();
+        let session = Session {
+            id: uuid::Uuid::new_v4(),
+            task_id: task.id,
+            attempt: 1,
+            model: ModelTier::sonnet(),
+            state: SessionState::Running,
+            tmux_session: "powerqueue".into(),
+            tmux_window: "@4".into(),
+            pane_id: Some("%4".into()),
+            pid: Some(1),
+            transcript_path: None,
+            exit_code: None,
+            started_at: now,
+            ended_at: None,
+            last_activity_at: now,
+            error: None,
+            agent_session_id: None,
+            waiting_since: None,
+            waited_secs: 0,
+            runtime: crate::domain::SessionRuntime::Tmux,
+        };
+        {
+            let store = Store::open(&path).unwrap();
+            store.insert_task(&task).unwrap();
+            store.insert_session(&session).unwrap();
+        }
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE sessions DROP COLUMN runtime; ALTER TABLE tasks DROP COLUMN free_attempts; PRAGMA user_version = 12;",
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.get_session(session.id).unwrap().as_ref(), Some(&session));
+            assert_eq!(store.get_task(task.id).unwrap().unwrap().free_attempts, 0);
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        }
+        let store = Store::open(&path).unwrap();
+        let mut stored = store.get_task(task.id).unwrap().unwrap();
+        stored.free_attempts = 2;
+        store.update_task(&stored).unwrap();
+        assert_eq!(store.get_task(task.id).unwrap().unwrap().free_attempts, 2);
     }
 
     /// The v1 schema as `powerqueue` 0.1.0 created it (no `agent_session_id`,

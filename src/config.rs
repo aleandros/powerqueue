@@ -714,6 +714,34 @@ impl SchedulerConfig {
     }
 }
 
+/// How a Claude Code session runs (`claude.session_mode`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClaudeSessionMode {
+    /// The interactive CLI in a tmux window a human can attach to.
+    #[default]
+    Interactive,
+    /// `claude -p --output-format stream-json` as a background process: no
+    /// tmux window, nobody can answer a question or a permission prompt
+    /// mid-run. See [`crate::session::headless`].
+    Headless,
+}
+
+impl ClaudeSessionMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ClaudeSessionMode::Interactive => "interactive",
+            ClaudeSessionMode::Headless => "headless",
+        }
+    }
+}
+
+impl std::fmt::Display for ClaudeSessionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// How Claude Code is launched.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -725,6 +753,10 @@ pub struct ClaudeConfig {
     /// {task_dir}/env -w {worktree} pq-{slug} claude`. See
     /// [`crate::session::binary`].
     pub binary: String,
+    /// `interactive` (default): the CLI in a tmux window. `headless`: `claude
+    /// -p --output-format stream-json` as a background process whose output
+    /// goes to `<task dir>/headless/`; it cannot be attached to.
+    pub session_mode: ClaudeSessionMode,
     /// The session runs where the daemon's `powerqueue` binary cannot (a
     /// container): write a shell shim to `<task dir>/bin/powerqueue` and
     /// route the hooks, the status line and `powerqueue task complete|block`
@@ -758,6 +790,7 @@ impl Default for ClaudeConfig {
     fn default() -> Self {
         Self {
             binary: "claude".to_string(),
+            session_mode: ClaudeSessionMode::Interactive,
             shim: false,
             permission_mode: "acceptEdits".to_string(),
             effort: None,
@@ -1526,6 +1559,7 @@ pub struct CleanupOverrides {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClaudeOverrides {
+    pub session_mode: Option<ClaudeSessionMode>,
     pub permission_mode: Option<String>,
     pub effort: Option<String>,
     pub extra_args: Option<Vec<String>>,
@@ -1885,6 +1919,7 @@ impl Config {
             take!(self.cleanup.close_tmux_window, c.close_tmux_window, "cleanup.close_tmux_window");
         }
         if let Some(c) = ov.claude {
+            take!(self.claude.session_mode, c.session_mode, "claude.session_mode");
             take!(self.claude.permission_mode, c.permission_mode, "claude.permission_mode");
             take!(self.claude.effort, c.effort.map(Some), "claude.effort");
             take!(self.claude.extra_args, c.extra_args, "claude.extra_args");
@@ -2055,6 +2090,15 @@ impl Config {
                 trust_workspace: false,
                 shim: self.gemini.shim,
             },
+        }
+    }
+
+    /// Where sessions of `provider` run: headless only for Claude with
+    /// `claude.session_mode = "headless"`; every other provider uses tmux.
+    pub fn session_runtime(&self, provider: Provider) -> crate::domain::SessionRuntime {
+        match (provider, self.claude.session_mode) {
+            (Provider::Claude, ClaudeSessionMode::Headless) => crate::domain::SessionRuntime::Headless,
+            _ => crate::domain::SessionRuntime::Tmux,
         }
     }
 
@@ -2481,6 +2525,26 @@ mod tests {
         assert_eq!(rewrite_legacy_key("budget.default_model"), None);
         assert_eq!(rewrite_legacy_key("budget.providers.claude.period_hours"), None);
         assert_eq!(rewrite_legacy_key("claude.binary"), None);
+    }
+
+    #[test]
+    fn claude_session_mode_defaults_to_interactive_and_only_affects_claude() {
+        let cfg = Config::default();
+        assert_eq!(cfg.claude.session_mode, ClaudeSessionMode::Interactive);
+        assert_eq!(cfg.session_runtime(Provider::Claude), crate::domain::SessionRuntime::Tmux);
+        let cfg = Config::from_toml("[claude]\nsession_mode = \"headless\"\n").unwrap();
+        assert_eq!(cfg.claude.session_mode, ClaudeSessionMode::Headless);
+        assert_eq!(cfg.session_runtime(Provider::Claude), crate::domain::SessionRuntime::Headless);
+        assert_eq!(cfg.session_runtime(Provider::Codex), crate::domain::SessionRuntime::Tmux);
+        assert_eq!(cfg.session_runtime(Provider::Gemini), crate::domain::SessionRuntime::Tmux);
+        let err = format!("{:#}", Config::from_toml("[claude]\nsession_mode = \"batch\"\n").unwrap_err());
+        assert!(err.contains("session_mode") || err.contains("batch"), "{err}");
+        // A repository may opt in (or out).
+        let mut cfg = Config::default();
+        let ov: RepoOverrides = toml::from_str("[claude]\nsession_mode = 'headless'\n").unwrap();
+        cfg.merge_overrides(ov);
+        assert_eq!(cfg.claude.session_mode, ClaudeSessionMode::Headless);
+        assert!(cfg.overrides.keys.contains(&"claude.session_mode".to_string()), "{:?}", cfg.overrides.keys);
     }
 
     #[test]

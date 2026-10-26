@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{Config, SchedulerConfig};
 use crate::domain::{EventLevel, HookEvent, LinkedIssue, ModelTier, Provider, Session, SessionState, Task, TaskState};
 use crate::priority::Evaluation;
+use crate::session::headless::HeadlessExit;
 use crate::session::{HookOutcome, SessionProbe};
 
 /// `last_error` marker for tasks paused by a priority.toml `skip` override.
@@ -45,14 +46,16 @@ pub enum Effect {
     Linear { target: LinearTarget, comment: Option<String> },
     /// Type text into the session's pane.
     Nudge { text: String },
-    /// Kill the session's tmux window.
+    /// Kill the session's tmux window, or stop a headless session's process
+    /// group (SIGTERM; see [`crate::session::headless::stop`]).
     KillWindow,
     /// Record a rate-limit cooldown for a tier.
     RateLimit { tier: ModelTier, until: DateTime<Utc> },
     /// Record a cooldown for every model of a provider (account-wide limits).
     RateLimitProvider { provider: Provider, until: DateTime<Utc> },
-    /// The task went `in_review`: kill the session's window and release the
-    /// worktree, keeping the branch for a later review round.
+    /// The task went `in_review`: kill the session's window (or stop its
+    /// headless process) and release the worktree, keeping the branch for a
+    /// later review round.
     ReleaseForReview,
     /// Post a comment on the Linear issue without moving it (best effort).
     LinearComment { body: String },
@@ -467,6 +470,17 @@ pub fn on_hook_outcome(
         HookOutcome::SessionEnded { reason } => {
             if task.state == TaskState::InReview {
                 effects.extend(end_review_session(session, &format!("session ended ({reason})"), now));
+            } else if session.is_headless() {
+                // `claude -p` ends its session after every run; the exit
+                // status and the stream's result decide what that means
+                // (`on_headless_exit`), and a terminal task still needs the
+                // finalize phase to release it.
+                effects.push(Effect::log(
+                    EventLevel::Debug,
+                    "session.end_hook",
+                    format!("headless session ending ({reason}); its exit decides the outcome"),
+                    serde_json::json!({ "reason": reason }),
+                ));
             } else if task.state.is_terminal() || task.state == TaskState::Paused {
                 session.state = SessionState::Exited;
                 session.ended_at = Some(now);
@@ -821,6 +835,106 @@ pub fn on_probe(
     effects
 }
 
+/// The process of a live headless session ended (see
+/// [`crate::session::headless`]); `exit` is what its exit status, stream and
+/// stderr say. `period_end` caps a rate-limit cooldown as in
+/// [`on_hook_outcome`].
+///
+/// * In review: the session is released for the review.
+/// * Terminal task (`task complete`, a done marker): logged only; the
+///   session stays live so the finalize phase releases it with cleanup.
+/// * The run failed on a usage or rate limit: the task is throttled like a
+///   `StopFailure{rate_limit}` hook would (unless paused or waiting on a
+///   human), and the session is `stopped`.
+/// * Paused, waiting on a human or throttled: the session is `stopped` and
+///   the next attempt resumes it (no attempt is used up here).
+/// * Otherwise (the turn ended without a completion marker, a failed run, a
+///   non-zero exit, a missing or truncated result) it is a crash:
+///   [`on_crash`] with the exit status and the stderr tail.
+pub fn on_headless_exit(
+    task: &mut Task,
+    session: &mut Session,
+    exit: &HeadlessExit,
+    cfg: &Config,
+    now: DateTime<Utc>,
+    period_end: DateTime<Utc>,
+) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    if !session.state.is_live() {
+        return effects;
+    }
+    session.exit_code = exit.exit_status;
+    let data = serde_json::json!({
+        "exit_status": exit.exit_status,
+        "result": exit.result,
+        "rate_limited": exit.rate_limited,
+        "stderr_tail": exit.stderr_tail,
+    });
+    if task.state == TaskState::InReview {
+        return end_review_session(session, "headless session exited", now);
+    }
+    if task.state.is_terminal() {
+        effects.push(Effect::log(
+            EventLevel::Debug,
+            "session.process_exited",
+            format!("headless session exited; task is {}; finalizing", task.state),
+            data,
+        ));
+        return effects;
+    }
+    if exit.rate_limited && !matches!(task.state, TaskState::Paused | TaskState::NeedsAttention | TaskState::Throttled) {
+        let message =
+            exit.result.as_ref().map(|r| r.text.clone()).filter(|t| !t.trim().is_empty()).unwrap_or_else(|| exit.describe());
+        effects.extend(on_hook_outcome(
+            task,
+            session,
+            &HookOutcome::RateLimited { error_type: "rate_limit".into(), message },
+            cfg,
+            now,
+            period_end,
+        ));
+    }
+    if matches!(task.state, TaskState::Paused | TaskState::NeedsAttention | TaskState::Throttled) {
+        session.state = SessionState::Stopped;
+        session.ended_at = Some(now);
+        session.error = Some(format!("stopped while the task is {}", task.state));
+        effects.push(Effect::log(
+            EventLevel::Info,
+            "session.stopped",
+            format!("headless session ended while the task is {}; the next attempt resumes it", task.state),
+            data,
+        ));
+        return effects;
+    }
+    let reason = exit.describe();
+    effects.extend(on_crash(task, Some(session), &reason, exit.exit_status, &cfg.scheduler, now, exit.stderr_tail.as_deref()));
+    effects
+}
+
+/// Stop the live headless session of a paused task: it would otherwise run
+/// its whole turn (the rest of the task) before pausing. The session is
+/// `stopped` (the next attempt after `task resume` resumes it) and its
+/// process group gets SIGTERM ([`Effect::KillWindow`]). Anything else (a tmux
+/// session, which finishes its turn and waits; a task that is not paused; no
+/// live session) returns nothing.
+pub fn stop_for_pause(task: &Task, session: &mut Session, now: DateTime<Utc>) -> Vec<Effect> {
+    if task.state != TaskState::Paused || !session.is_headless() || !session.state.is_live() {
+        return Vec::new();
+    }
+    session.state = SessionState::Stopped;
+    session.ended_at = Some(now);
+    session.error = Some("stopped: task paused".to_string());
+    vec![
+        Effect::KillWindow,
+        Effect::log(
+            EventLevel::Info,
+            "session.stopped",
+            "task paused; stopped the headless session (SIGTERM), `task resume` resumes it",
+            serde_json::json!({ "attempt": session.attempt, "pid": session.pid }),
+        ),
+    ]
+}
+
 /// An attempt died (dead pane, stale session, setup failure). Either schedule
 /// a retry with backoff or give up after `max_attempts`. `session` is `None`
 /// when the failure happened before a session existed (worktree/setup).
@@ -853,9 +967,10 @@ pub fn on_crash(
     task.last_error = Some(reason.to_string());
     let max = task.max_attempts.unwrap_or(cfg.max_attempts).max(1);
     // A review round gets its own `max_attempts`: attempts used before the
-    // watcher relaunched the task do not count.
+    // watcher relaunched the task do not count. Neither do launches that only
+    // resumed a stopped headless session (`free_attempts`).
     let base = task.review_relaunch().and(task.review.as_ref()).map_or(0, |r| r.attempt_base);
-    let used = attempt.saturating_sub(base);
+    let used = attempt.saturating_sub(base).saturating_sub(task.free_attempts);
     let mut data = serde_json::json!({ "reason": reason, "exit_status": exit_status, "attempt": attempt, "max_attempts": max, "pane_tail": pane_tail });
     if used >= max {
         task.state = TaskState::Failed;
@@ -1272,7 +1387,260 @@ mod tests {
             agent_session_id: None,
             waiting_since: None,
             waited_secs: 0,
+            runtime: crate::domain::SessionRuntime::Tmux,
         }
+    }
+
+    fn has<F: Fn(&Effect) -> bool>(effects: &[Effect], f: F) -> bool {
+        effects.iter().any(f)
+    }
+
+    fn headless(state: SessionState, attempt: u32) -> Session {
+        Session {
+            tmux_session: String::new(),
+            tmux_window: String::new(),
+            pane_id: None,
+            runtime: crate::domain::SessionRuntime::Headless,
+            ..session(state, attempt)
+        }
+    }
+
+    fn exit(status: Option<i32>, result: Option<(&str, bool, &str)>) -> HeadlessExit {
+        HeadlessExit {
+            exit_status: status,
+            result: result.map(|(subtype, is_error, text)| crate::session::headless::StreamResult {
+                subtype: subtype.into(),
+                is_error,
+                text: text.into(),
+                ..Default::default()
+            }),
+            rate_limited: false,
+            stderr_tail: Some("stderr says hi".into()),
+        }
+    }
+
+    #[test]
+    fn headless_exit_without_completion_is_a_crash_and_resumes() {
+        let mut cfg = cfg();
+        cfg.scheduler.max_attempts = 3;
+        // The turn ended cleanly but nobody completed the task.
+        let mut t = task(TaskState::Running, 1);
+        let mut s = headless(SessionState::Running, 1);
+        let effects = on_headless_exit(
+            &mut t,
+            &mut s,
+            &exit(Some(0), Some(("success", false, "I think it works."))),
+            &cfg,
+            now(),
+            period_end(),
+        );
+        assert_eq!(t.state, TaskState::Crashed);
+        assert_eq!(s.state, SessionState::Crashed);
+        assert_eq!(s.exit_code, Some(0));
+        assert_eq!(t.last_error.as_deref(), Some("headless Claude Code ended its turn without a completion marker"));
+        assert!(
+            has(
+                &effects,
+                |e| matches!(e, Effect::Log { kind, data, .. } if kind == "session.crashed" && data["pane_tail"] == "stderr says hi")
+            ),
+            "{effects:?}"
+        );
+        // The crashed session is what the next attempt resumes.
+        let (id, resume, _) = crate::scheduler::launch::resume_plan(Some(&s), &ModelTier::opus(), true, false);
+        assert!(resume && id == s.id);
+
+        // A failed run, a non-zero exit, a missing result: crashes too.
+        for e in [
+            exit(Some(1), Some(("error_max_turns", true, ""))),
+            exit(Some(1), None),
+            exit(Some(0), None),
+            exit(None, None),
+            exit(Some(143), Some(("success", false, "partial"))),
+        ] {
+            let mut t = task(TaskState::Running, 1);
+            let mut s = headless(SessionState::Running, 1);
+            on_headless_exit(&mut t, &mut s, &e, &cfg, now(), period_end());
+            assert_eq!((t.state, s.state), (TaskState::Crashed, SessionState::Crashed), "{e:?}");
+            assert_eq!(t.last_error, Some(e.describe()));
+        }
+
+        // The last allowed attempt fails the task.
+        let mut t = task(TaskState::Idle, 3);
+        let mut s = headless(SessionState::Idle, 3);
+        let effects = on_headless_exit(&mut t, &mut s, &exit(Some(1), None), &cfg, now(), period_end());
+        assert_eq!(t.state, TaskState::Failed);
+        assert!(has(&effects, |e| matches!(e, Effect::Cleanup { succeeded: false })));
+    }
+
+    #[test]
+    fn headless_exit_while_waiting_stops_the_session_for_resume() {
+        for state in [TaskState::NeedsAttention, TaskState::Paused, TaskState::Throttled] {
+            let mut t = task(state, 2);
+            if state == TaskState::Throttled {
+                t.not_before = Some(now() + Duration::minutes(30));
+            }
+            let before = t.clone();
+            let mut s = headless(SessionState::Idle, 2);
+            let effects = on_headless_exit(
+                &mut t,
+                &mut s,
+                &exit(Some(0), Some(("success", false, "Which one?"))),
+                &cfg(),
+                now(),
+                period_end(),
+            );
+            assert_eq!(t, before, "the task keeps waiting");
+            assert_eq!(s.state, SessionState::Stopped);
+            assert_eq!(s.ended_at, Some(now()));
+            assert!(matches!(&effects[..], [Effect::Log { kind, .. }] if kind == "session.stopped"), "{effects:?}");
+            let (id, resume, _) = crate::scheduler::launch::resume_plan(Some(&s), &ModelTier::opus(), true, false);
+            assert!(resume && id == s.id, "a stopped session is resumed");
+        }
+    }
+
+    #[test]
+    fn resumes_of_stopped_sessions_do_not_count_against_max_attempts() {
+        // max_attempts = 3: a question, then a usage limit, then a turn that
+        // ends without a marker. The stops used no attempt: still a crash.
+        let mut cfg = cfg();
+        cfg.scheduler.max_attempts = 3;
+        let mut t = task(TaskState::Running, 1);
+        let mut s = headless(SessionState::Running, 1);
+        let launch_again = |t: &mut Task, s: &mut Session| {
+            let (_, resume, _) = crate::scheduler::launch::resume_plan(Some(s), &ModelTier::opus(), true, false);
+            assert!(resume);
+            let resumed_stopped = s.state == SessionState::Stopped;
+            t.attempts += 1;
+            *s = headless(SessionState::Launching, t.attempts);
+            let facts = crate::scheduler::launch::Launched {
+                model: &ModelTier::opus(),
+                attempt: t.attempts,
+                resume,
+                relaunch: None,
+                review_prompt: None,
+                resume_prompt: None,
+                branch: "pq/eng-1",
+                worktree: std::path::Path::new("/wt/eng-1"),
+                answered: false,
+                resumed_stopped,
+            };
+            crate::scheduler::launch::on_launched(t, s, &facts, &Config::default(), now());
+        };
+        on_hook_outcome(&mut t, &mut s, &stop_hook("Which database should I use?"), &cfg, now(), period_end());
+        on_headless_exit(&mut t, &mut s, &exit(Some(0), Some(("success", false, "Which?"))), &cfg, now(), period_end());
+        assert_eq!((t.state, s.state), (TaskState::NeedsAttention, SessionState::Stopped));
+        launch_again(&mut t, &mut s);
+        let mut limit = exit(Some(1), Some(("error_during_execution", true, "usage limit reached")));
+        limit.rate_limited = true;
+        on_headless_exit(&mut t, &mut s, &limit, &cfg, now(), period_end());
+        assert_eq!((t.state, s.state), (TaskState::Throttled, SessionState::Stopped));
+        launch_again(&mut t, &mut s);
+        assert_eq!((t.attempts, t.free_attempts), (3, 2));
+        on_headless_exit(&mut t, &mut s, &exit(Some(0), Some(("success", false, "done?"))), &cfg, now(), period_end());
+        assert_eq!(t.state, TaskState::Crashed, "attempt 1 of 3 crashed; two resumes were free");
+        // Crash resumes do count: two more crashes use up the rest.
+        for expected in [TaskState::Crashed, TaskState::Failed] {
+            launch_again(&mut t, &mut s);
+            on_headless_exit(&mut t, &mut s, &exit(Some(1), None), &cfg, now(), period_end());
+            assert_eq!(t.state, expected);
+        }
+        assert_eq!((t.attempts, t.free_attempts), (5, 2));
+    }
+
+    fn stop_hook(message: &str) -> HookOutcome {
+        crate::session::interpret_hook(HookEvent::Stop, &serde_json::json!({ "last_assistant_message": message }))
+    }
+
+    #[test]
+    fn headless_exit_on_a_rate_limit_throttles_instead_of_crashing() {
+        let mut t = task(TaskState::Running, 1);
+        let mut s = headless(SessionState::Running, 1);
+        let mut e = exit(Some(1), Some(("error_during_execution", true, "Claude AI usage limit reached")));
+        e.rate_limited = true;
+        let effects = on_headless_exit(&mut t, &mut s, &e, &cfg(), now(), period_end());
+        assert_eq!(t.state, TaskState::Throttled);
+        assert!(t.not_before.is_some_and(|n| n > now()));
+        assert_eq!(t.attempts, 1, "no attempt used up");
+        assert_eq!(s.state, SessionState::Stopped);
+        assert!(has(&effects, |e| matches!(e, Effect::RateLimitProvider { provider: Provider::Claude, .. })), "{effects:?}");
+        assert!(has(&effects, |e| matches!(e, Effect::Log { kind, .. } if kind == "budget.rate_limited")));
+    }
+
+    #[test]
+    fn headless_exit_of_a_finished_or_reviewed_task() {
+        // `task complete` landed first: the finalize phase releases the session.
+        let mut t = task(TaskState::Completed, 1);
+        t.completed_at = Some(now());
+        let mut s = headless(SessionState::Running, 1);
+        let effects =
+            on_headless_exit(&mut t, &mut s, &exit(Some(0), Some(("success", false, "done"))), &cfg(), now(), period_end());
+        assert!(s.state.is_live(), "left for finalize_terminal");
+        assert_eq!(s.exit_code, Some(0));
+        assert!(matches!(&effects[..], [Effect::Log { kind, .. }] if kind == "session.process_exited"), "{effects:?}");
+        assert!(release_session(&t, &mut s, now()).iter().any(|e| matches!(e, Effect::Cleanup { succeeded: true })));
+
+        let mut t = task(TaskState::InReview, 1);
+        let mut s = headless(SessionState::Running, 1);
+        let effects = on_headless_exit(&mut t, &mut s, &exit(Some(0), None), &cfg(), now(), period_end());
+        assert_eq!(s.state, SessionState::Exited);
+        assert!(has(&effects, |e| matches!(e, Effect::ReleaseForReview)));
+
+        // An ended session is not touched again.
+        let mut t = task(TaskState::Running, 1);
+        let mut s = headless(SessionState::Killed, 1);
+        assert_eq!(on_headless_exit(&mut t, &mut s, &exit(Some(143), None), &cfg(), now(), period_end()).len(), 0);
+        assert_eq!(t.state, TaskState::Running);
+    }
+
+    #[test]
+    fn session_end_hook_of_a_headless_session_leaves_the_decision_to_its_exit() {
+        for state in [TaskState::Running, TaskState::Idle, TaskState::NeedsAttention, TaskState::Completed] {
+            let mut t = task(state, 1);
+            let mut s = headless(SessionState::Running, 1);
+            let effects = on_hook_outcome(
+                &mut t,
+                &mut s,
+                &HookOutcome::SessionEnded { reason: "other".into() },
+                &cfg(),
+                now(),
+                period_end(),
+            );
+            assert_eq!(t.state, state, "a headless SessionEnd never crashes or ends the task");
+            assert!(s.state.is_live(), "the probe classifies the exit");
+            assert!(matches!(&effects[..], [Effect::Log { kind, .. }] if kind == "session.end_hook"), "{effects:?}");
+        }
+        // A tmux session's SessionEnd still means the window is gone.
+        let mut t = task(TaskState::Running, 1);
+        let mut s = session(SessionState::Running, 1);
+        on_hook_outcome(&mut t, &mut s, &HookOutcome::SessionEnded { reason: "other".into() }, &cfg(), now(), period_end());
+        assert_eq!(t.state, TaskState::Crashed);
+    }
+
+    #[test]
+    fn pause_stops_only_a_live_headless_session() {
+        let mut t = task(TaskState::Running, 1);
+        crate::scheduler::commands::on_pause(&mut t, true);
+        let mut s = headless(SessionState::Running, 1);
+        let effects = stop_for_pause(&t, &mut s, now());
+        assert_eq!(s.state, SessionState::Stopped);
+        assert!(
+            matches!(&effects[..], [Effect::KillWindow, Effect::Log { kind, .. }] if kind == "session.stopped"),
+            "{effects:?}"
+        );
+        // Stopped already, a tmux session, or a task that is not paused: nothing.
+        assert_eq!(stop_for_pause(&t, &mut s, now()).len(), 0);
+        let mut tmux = session(SessionState::Running, 1);
+        assert_eq!(stop_for_pause(&t, &mut tmux, now()).len(), 0);
+        assert_eq!(tmux.state, SessionState::Running);
+        let running = task(TaskState::Running, 1);
+        let mut s = headless(SessionState::Running, 1);
+        assert_eq!(stop_for_pause(&running, &mut s, now()).len(), 0);
+        // `task resume` re-queues; the next launch resumes the stopped session.
+        let mut s = headless(SessionState::Running, 1);
+        stop_for_pause(&t, &mut s, now());
+        crate::scheduler::commands::on_resume(&mut t, false, now());
+        assert_eq!(t.state, TaskState::Queued);
+        assert!(crate::scheduler::launch::resume_plan(Some(&s), &ModelTier::opus(), true, false).1);
     }
 
     fn alive() -> SessionProbe {
@@ -2236,6 +2604,7 @@ mod properties {
             agent_session_id: None,
             waiting_since: None,
             waited_secs: 0,
+            runtime: crate::domain::SessionRuntime::Tmux,
         }
     }
 
@@ -2271,6 +2640,76 @@ mod properties {
     }
 
     proptest! {
+        /// Whatever a headless run left behind, its exit ends a live
+        /// session exactly once with a legal move: a finished task is left
+        /// for the finalize phase, a waiting task keeps waiting with a
+        /// resumable (`stopped`) session and its attempt, a usage limit
+        /// throttles, and everything else is a crash with backoff or the
+        /// last failure. A running or idle task never survives it.
+        #[test]
+        fn headless_exit_is_total_and_resumable(
+            // States that may hold a live session, plus the finished and
+            // handed-off ones whose session the finalize phase has not
+            // released yet.
+            (task, session) in task_with_session_among(&[
+                TaskState::Starting, TaskState::Running, TaskState::Idle, TaskState::NeedsAttention, TaskState::Paused,
+                TaskState::Throttled, TaskState::InReview, TaskState::Completed, TaskState::Failed, TaskState::Cancelled,
+            ]),
+            exit in headless_exit(),
+        ) {
+            let mut task = task;
+            // The exit of a live headless session.
+            let mut session = Session {
+                runtime: crate::domain::SessionRuntime::Headless,
+                pane_id: None,
+                tmux_window: String::new(),
+                state: if session.state.is_live() { session.state } else { SessionState::Running },
+                ended_at: None,
+                exit_code: None,
+                ..session
+            };
+            let before = task.clone();
+            let cfg = Config::default();
+            let effects = on_headless_exit(&mut task, &mut session, &exit, &cfg, origin(), origin() + Duration::days(3));
+            prop_assert!(before.state.can_transition_to(task.state), "{:?} -> {:?}", before.state, task.state);
+            prop_assert!(logs_are_well_formed(&effects));
+            prop_assert_eq!(session.exit_code, exit.exit_status);
+            prop_assert!(!matches!(task.state, TaskState::Running | TaskState::Idle | TaskState::Starting) || before.state.is_terminal());
+            prop_assert_eq!(task.attempts, before.attempts, "an exit never uses up an attempt by itself");
+            if before.state.is_terminal() {
+                prop_assert_eq!(&task, &before);
+                prop_assert!(session.state.is_live(), "the finalize phase releases it");
+                let only_logs = effects.iter().all(|e| matches!(e, Effect::Log { .. }));
+                prop_assert!(only_logs);
+            } else if before.state == TaskState::InReview {
+                prop_assert_eq!(session.state, SessionState::Exited);
+                prop_assert!(has(&effects, |e| matches!(e, Effect::ReleaseForReview)));
+            } else if matches!(before.state, TaskState::Paused | TaskState::NeedsAttention | TaskState::Throttled)
+                || exit.rate_limited
+            {
+                prop_assert_eq!(session.state, SessionState::Stopped);
+                prop_assert!(session.state.is_resumable());
+                prop_assert!(!matches!(task.state, TaskState::Crashed | TaskState::Failed));
+                if exit.rate_limited && !matches!(before.state, TaskState::Paused | TaskState::NeedsAttention | TaskState::Throttled) {
+                    prop_assert_eq!(task.state, TaskState::Throttled);
+                    prop_assert!(task.not_before.is_some_and(|t| t > origin()));
+                } else {
+                    prop_assert_eq!(task.state, before.state);
+                }
+            } else {
+                prop_assert_eq!(session.state, SessionState::Crashed);
+                prop_assert!(matches!(task.state, TaskState::Crashed | TaskState::Failed));
+                prop_assert_eq!(task.last_error.clone(), Some(exit.describe()));
+            }
+            // Applying it again changes nothing.
+            let (t2, s2) = (task.clone(), session.clone());
+            let again = on_headless_exit(&mut task, &mut session, &exit, &cfg, origin(), origin() + Duration::days(3));
+            if !session.state.is_live() {
+                prop_assert!(again.is_empty());
+                prop_assert_eq!((&task, &session), (&t2, &s2));
+            }
+        }
+
         #[test]
         fn routing_preserves_execution_and_blocks_conflicts((cfg, mut task) in crate::strategies::routing_case()) {
             let before = task.clone();

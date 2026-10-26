@@ -546,6 +546,7 @@ pub fn run(ctx: &mut Context, cmd: ConfigCommand) -> Result<i32> {
                     "{}",
                     serde_json::json!({
                         "ok": problems.is_empty(), "file": shown, "problems": problems,
+                        "claude_session_mode": merged.claude.session_mode,
                         "repo_overrides": {
                             "file": merged.overrides.file, "source": merged.repo.overrides_from,
                             "rev": merged.overrides.rev, "keys": merged.overrides.keys,
@@ -563,10 +564,21 @@ pub fn run(ctx: &mut Context, cmd: ConfigCommand) -> Result<i32> {
                         if merged.overrides.keys.is_empty() { "no keys".to_string() } else { merged.overrides.keys.join(", ") }
                     );
                 }
+                println!("claude sessions: {}", session_mode_summary(merged.claude.session_mode));
             } else {
                 print_problems(&problems);
             }
             Ok(i32::from(!problems.is_empty()))
+        }
+    }
+}
+
+/// One line for `config validate`: the effective `claude.session_mode`.
+fn session_mode_summary(mode: crate::config::ClaudeSessionMode) -> &'static str {
+    match mode {
+        crate::config::ClaudeSessionMode::Interactive => "interactive (tmux window; `powerqueue attach` works)",
+        crate::config::ClaudeSessionMode::Headless => {
+            "headless (`claude -p --output-format stream-json`; no window, nobody can answer prompts mid-run)"
         }
     }
 }

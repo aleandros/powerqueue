@@ -45,7 +45,9 @@ lifecycle, with hooks and completion commands delivered through the task inbox.
    `exec`s `claude --session-id <uuid> --model <tier> --permission-mode <mode> --settings settings.json --name <key> …`
    with the prompt (read from `prompt.md`) as the last argument, so it is the
    first message. The session is interactive, so `powerqueue attach` drops
-   you into it at any time.
+   you into it at any time. With `claude.session_mode = "headless"` there is
+   no window: `sh launch.sh` runs `claude -p --output-format stream-json
+   --verbose …` in the background instead (see [Headless sessions](#headless-sessions)).
 6. Hooks (`SessionStart`, `Stop`, `StopFailure`, `SessionEnd`, `Notification`,
    `PreCompact`, `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`) call `powerqueue hook`, which stores the
    payload in SQLite. The daemon drains these, tails the transcript JSONL for
@@ -96,6 +98,61 @@ with your own Markdown (see [`[prompt]`](configuration.md#prompt)); `powerqueue 
   may be In Review by now); only attempt 1 moves it to
   `linear.in_progress_state`. With `linear.blocked_state` set, every attempt
   moves it, to undo a block.
+
+## Headless sessions
+
+With `claude.session_mode = "headless"` (see
+[configuration](configuration.md#headless-sessions)) a Claude Code attempt is
+one `claude -p` run. Its process leads its own process group; the daemon
+records the pid on the session row (`tmux_window` stays empty) and reads the
+`stream-json` log under `<task dir>/headless/` for activity, usage, API
+retries and the final `result`. Hooks and the completion commands work as
+above. When the process exits, the daemon first takes in what it left (the
+rest of the stream, the hook events it fired on its way out, the shim inbox),
+then decides:
+
+| How the run ended | Task | Session |
+|-------------------|------|---------|
+| `powerqueue task complete` / the done marker | `completed` (cleanup, issue update) | `exited` |
+| `--pr` hand-off | `in_review` | `exited` |
+| a question / `task block` / the blocked marker | `needs_attention` | `stopped` |
+| a usage limit: an error `result` naming it, or a failure right after `system/api_retry` with `rate_limit` | `throttled` until the cooldown ends | `stopped` |
+| paused (`task pause` stops the process) | `paused` | `stopped` |
+| the turn ended without a marker, a failed `result`, a non-zero exit, no `result` at all (a truncated stream, a killed process) | `crashed` with backoff, or `failed` after `max_attempts` | `crashed` |
+
+A `crashed` or `stopped` session is what the next attempt resumes with
+`claude -p --resume <same session id>`: after the backoff for a crash, after
+`task resume` (or a reply on the issue) for a question or a pause, after the
+cooldown for a usage limit. Resuming a `stopped` session is counted in the
+task's attempts but not against `scheduler.max_attempts` (`free_attempts`),
+just as an interactive session that waited in its window used none. `task
+retry` and `task cancel` start over instead: the stopped session is closed as
+`killed`.
+
+To stop a session (cancel, retry, pause, `stale_session_secs`,
+`max_session_secs`, cleanup) the daemon sends **SIGTERM** to the process
+group: Claude Code exits with 143, leaves the current turn unfinished, runs
+its `SessionEnd` hooks and terminates running Bash commands; the resumed
+attempt continues the conversation with a new prompt. SIGINT would let the
+turn finish first, which for a headless run is often the rest of the task.
+A group still alive 15 seconds later gets SIGKILL. The `SessionEnd` hook of
+a headless session never crashes the task by itself: `claude -p` ends its
+session after every run, and the exit status decides.
+
+The process leads its own session (`setsid`, no controlling terminal) and
+outlives a daemon restart, like a tmux window. A daemon that starts and finds
+a recorded process group gone (killed while nobody watched, so no exit status
+was written) treats it as a crash and resumes the session. A launch the
+daemon could not record before it died is found through
+`<task dir>/headless/launch.pid`, so start recovery never runs a second agent
+next to it.
+
+There is nothing to attach to: `powerqueue attach <task>` prints the log
+paths, `powerqueue task output <task>` prints the last lines of the stream,
+and `powerqueue task send` refuses. Questions and permission prompts cannot be
+answered mid-run; permission requests are denied (`session.permission_denied`
+events, counted by `doctor`). Keep headless mode for tasks that can run
+unattended.
 
 ## Review (pull requests)
 

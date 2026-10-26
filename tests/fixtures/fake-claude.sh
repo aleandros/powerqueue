@@ -14,7 +14,15 @@
 #   crash-once first run exits 1 after some usage; the resumed run completes
 #   idle       end the turn without a completion marker and wait
 #   ratelimit  report a StopFailure{rate_limit} then exit 0
+#   slow       the first run works for $FAKE_CLAUDE_IDLE_SECS before it
+#              completes; resumed runs complete at once
 # FAKE_CLAUDE_STATE_DIR (default: $TMPDIR) stores run counters.
+#
+# Headless task sessions (`-p --output-format stream-json`, the launcher's
+# claude.session_mode = "headless") run the same modes, also print the
+# stream-json events on stdout and end after one turn instead of waiting:
+# `idle` ends its turn with a question and exits 0, `ratelimit` retries a
+# rate-limited API call and fails with the usage-limit result (exit 1).
 
 set -u
 mode="${FAKE_CLAUDE_MODE:-complete}"
@@ -38,10 +46,14 @@ mkdir -p "$state_dir"
 # through PATH and its exit code saved to tune-check-exit.txt, so tests can
 # verify that the session sees the right binary and home.
 headless=0
+stream=0
 for arg in "$@"; do
-  case "$arg" in -p|--print) headless=1 ;; esac
+  case "$arg" in
+    -p|--print) headless=1 ;;
+    stream-json) stream=1 ;;
+  esac
 done
-if [ "$headless" = 1 ]; then
+if [ "$headless" = 1 ] && [ "$stream" = 0 ]; then
   tune_mode="${FAKE_TUNE_MODE:-edit}"
   printf '%s\n' "$@" > "$state_dir/tune-argv.txt"
   cat > "$state_dir/tune-prompt.md"
@@ -102,6 +114,7 @@ while [ $# -gt 0 ]; do
     --settings) settings="$2"; shift 2 ;;
     --model) model="$2"; shift 2 ;;
     --permission-mode|--name|--effort|--fallback-model|--allowedTools|--append-system-prompt|--output-format) shift 2 ;;
+    -p|--print) shift ;;
     --*) shift ;;
     *) prompt="$1"; shift ;;
   esac
@@ -137,7 +150,16 @@ fire() { # $1 = event, $2 = extra json fields (object body without braces)
   cmd="$(hook_cmd "$1")"
   [ -n "$cmd" ] || return 0
   printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s","hook_event_name":"%s","permission_mode":"acceptEdits"%s}' \
-    "$session" "$transcript" "$cwd" "$1" "${2:+,$2}" | sh -c "$cmd" || true
+    "$session" "$transcript" "$cwd" "$1" "${2:+,$2}" | if [ "$stream" = 1 ]; then sh -c "$cmd" >/dev/null; else sh -c "$cmd"; fi || true
+}
+
+emit() { # $1 = one stream-json event (headless sessions only)
+  [ "$stream" = 1 ] && printf '%s\n' "$1"
+  return 0
+}
+
+result() { # $1 = subtype, $2 = is_error, $3 = text (JSON-escaped)
+  emit "{\"type\":\"result\",\"subtype\":\"$1\",\"is_error\":$2,\"duration_ms\":1200,\"num_turns\":2,\"result\":\"$3\",\"session_id\":\"$session\",\"total_cost_usd\":0.0123,\"permission_denials\":[]}"
 }
 
 usage_line() { # $1 = msg id, $2 = output tokens, $3 = text
@@ -154,11 +176,14 @@ usage_line() { # $1 = msg id, $2 = output tokens, $3 = text
   for block in '{"type":"thinking","thinking":"..."}' "{\"type\":\"text\",\"text\":\"$3\"}"; do
     printf '{"type":"assistant","uuid":"%s-%s","sessionId":"%s","timestamp":"%s","cwd":"%s","requestId":"req_%s","message":{"id":"%s","model":"%s","role":"assistant","content":[%s],"usage":{"input_tokens":2,"output_tokens":%s,"cache_creation_input_tokens":1200,"cache_read_input_tokens":8000}}}\n' \
       "$1" "$RANDOM" "$session" "$ts" "$cwd" "$1" "$1" "$model_id" "$block" "$2" >> "$transcript"
+    emit "$(printf '{"type":"assistant","message":{"id":"%s","model":"%s","role":"assistant","content":[%s],"usage":{"input_tokens":2,"output_tokens":%s,"cache_creation_input_tokens":1200,"cache_read_input_tokens":8000}},"parent_tool_use_id":null,"session_id":"%s","uuid":"%s-%s"}' \
+      "$1" "$model_id" "$block" "$2" "$session" "$1" "$RANDOM")"
   done
 }
 
 source_kind="startup"; [ "$resume" = 1 ] && source_kind="resume"
 fire SessionStart "\"source\":\"$source_kind\",\"model\":\"$model\""
+emit "{\"type\":\"system\",\"subtype\":\"init\",\"cwd\":\"$cwd\",\"session_id\":\"$session\",\"model\":\"$model\",\"tools\":[]}"
 
 task_id="${POWERQUEUE_TASK_ID:-}"
 counter="$state_dir/runs-$session"
@@ -173,9 +198,20 @@ case "$mode" in
       exit 1
     fi
     ;;
+  slow)
+    if [ "$runs" -eq 1 ]; then
+      usage_line "msg_${session:0:8}_slow" 100 "Working slowly"
+      sleep "${FAKE_CLAUDE_IDLE_SECS:-120}"
+    fi
+    ;;
   idle|attention-reply)
     usage_line "msg_${session:0:8}_idle" 50 "Should I continue?"
     fire Stop "\"last_assistant_message\":\"I made some changes. Should I continue?\",\"stop_hook_active\":false"
+    if [ "$stream" = 1 ]; then
+      result success false "I made some changes. Should I continue?"
+      fire SessionEnd "\"reason\":\"other\""
+      exit 0
+    fi
     if [ "$mode" = attention-reply ]; then
       IFS= read -r reply
       fire UserPromptSubmit '"prompt":"continue"'
@@ -220,6 +256,16 @@ case "$mode" in
     exit 0
     ;;
   ratelimit)
+    if [ "$stream" = 1 ]; then
+      usage_line "msg_${session:0:8}_rl" 20 "Starting"
+      for attempt in 1 2; do
+        emit "{\"type\":\"system\",\"subtype\":\"api_retry\",\"attempt\":$attempt,\"max_retries\":2,\"retry_delay_ms\":10,\"error_status\":429,\"error\":\"rate_limit\",\"session_id\":\"$session\",\"uuid\":\"r$attempt\"}"
+      done
+      result error_during_execution true "Claude AI usage limit reached"
+      echo "fake-claude: usage limit reached" >&2
+      fire SessionEnd "\"reason\":\"other\""
+      exit 1
+    fi
     fire StopFailure "\"error_type\":\"rate_limit\",\"error_message\":\"Rate limit exceeded\""
     sleep 1
     fire SessionEnd "\"reason\":\"other\""
@@ -236,5 +282,6 @@ if [ -n "$task_id" ] && command -v "${POWERQUEUE_BIN:-powerqueue}" >/dev/null 2>
   "${POWERQUEUE_BIN:-powerqueue}" task complete "$task_id" --summary "fake-claude finished" >/dev/null 2>&1 || true
 fi
 fire Stop "\"last_assistant_message\":\"All done.\\n[[POWERQUEUE:DONE]] fake-claude finished\",\"stop_hook_active\":false"
+result success false "All done.\\n[[POWERQUEUE:DONE]] fake-claude finished"
 fire SessionEnd "\"reason\":\"prompt_input_exit\""
 exit 0

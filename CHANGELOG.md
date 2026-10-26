@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-10-26
+
+### Added
+
+- Optional headless execution mode for Claude Code tasks (#83):
+  `claude.session_mode = "headless"` (default `interactive`, also settable in
+  `.powerqueue.toml`) runs `claude -p --output-format stream-json --verbose`
+  as a background process with no tmux window. The launch keeps the prompt,
+  hooks, permission mode and allowed tools of an interactive session. The
+  daemon reads the stream under `<task dir>/headless/` for activity, usage
+  (deduplicated with the transcript), rate-limit retries, permission denials
+  and the final result with its cost. When the process exits, it decides
+  completed / blocked / throttled / crashed. Crashes resume the same session
+  with backoff. A question, a pause or a usage limit leaves a resumable
+  `stopped` session, and resuming it does not count against `max_attempts`
+  (`task show` and `status` list these as free attempts). Cancel, retry, pause
+  and the stale/timeout limits stop the process group with SIGTERM. `attach`,
+  `task show` and `task output` point to the log; `task send` refuses. `config
+  validate` and `doctor` report the mode, warn about settings that break
+  unattended runs (a TTY-allocating `claude.binary`, a permission mode that
+  denies everything) and count denied tool calls. Interactive tmux sessions
+  are unchanged.
+
+### Changed
+
+- The database schema is v13: sessions record their runtime (`tmux` or
+  `headless`; existing rows migrate to `tmux`) and tasks count free attempts.
+- `tmux kill-window` is never run with an empty window id (tmux would kill its
+  current window). `powerqueue reset` also stops headless sessions.
+
 ## [0.22.0] - 2026-10-26
 
 ### Fixed
@@ -1151,7 +1181,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/aleandros/powerqueue/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/aleandros/powerqueue/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/aleandros/powerqueue/compare/v0.20.1...v0.21.0
 [0.20.1]: https://github.com/aleandros/powerqueue/compare/v0.20.0...v0.20.1

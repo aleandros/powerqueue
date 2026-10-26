@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::budget::{Decision, Estimator, Ledgers, Policy, RateLimitState, WINDOW_RECHECK, tier_weight};
 use crate::config::{BudgetConfig, Config, SchedulerConfig};
-use crate::domain::{EventLevel, ModelTier, ReviewRelaunch, Session, SessionState, Task, TaskId, TaskSource, TaskState};
+use crate::domain::{EventLevel, ModelTier, ReviewRelaunch, Session, Task, TaskId, TaskSource, TaskState};
 use crate::priority::PriorityRules;
 use crate::session::agent_for;
 use crate::worktree::branch_name;
@@ -420,8 +420,9 @@ pub fn on_abandoned_start(
 
 /// How to start the next attempt: `(session id, resume?, provider session id)`.
 ///
-/// A crashed previous session — or, for a review round (`review`), the
-/// session that armed the merge, whatever its state — is resumed when it ran
+/// A crashed or stopped previous session ([`crate::domain::SessionState::is_resumable`]) —
+/// or, for a review round (`review`), the session that armed the merge,
+/// whatever its state — is resumed when it ran
 /// on the same provider and, for CLIs that generate their own ids, its id
 /// was discovered; otherwise the attempt starts fresh with a new session id.
 /// `transcript_present` says whether the crashed session left the transcript
@@ -439,9 +440,7 @@ pub fn resume_plan(
     review: bool,
 ) -> (uuid::Uuid, bool, Option<String>) {
     match previous {
-        Some(p)
-            if (p.state == SessionState::Crashed || review) && p.model.provider() == model.provider() && transcript_present =>
-        {
+        Some(p) if (p.state.is_resumable() || review) && p.model.provider() == model.provider() && transcript_present => {
             if agent_for(model.provider()).accepts_session_id() {
                 (p.id, true, None)
             } else if let Some(id) = &p.agent_session_id {
@@ -515,17 +514,25 @@ pub struct Launched<'a> {
     pub worktree: &'a Path,
     /// A relayed answer was handed to the session (it is forgotten now).
     pub answered: bool,
+    /// The launch resumed a session powerqueue had stopped while the task
+    /// waited: it does not count against `max_attempts` (`free_attempts`).
+    pub resumed_stopped: bool,
 }
 
-/// The session is up: the task runs. Tells the source issue: a review round
+/// The session is up: the task runs; a launch that resumed a stopped session
+/// is counted in `free_attempts`. Tells the source issue: a review round
 /// only comments (the PR already moved the issue); a later attempt after a
 /// crash or timeout comments, since the first start already moved the issue
 /// and a PR may have moved it since (unless a blocked state/label is
 /// configured, in which case every attempt moves it, undoing a block); a
 /// first attempt moves it to in progress.
 pub fn on_launched(task: &mut Task, session: &Session, launched: &Launched<'_>, cfg: &Config, now: DateTime<Utc>) -> Vec<Effect> {
-    let Launched { model, attempt, resume, relaunch, review_prompt, resume_prompt, branch, worktree, answered } = *launched;
+    let Launched { model, attempt, resume, relaunch, review_prompt, resume_prompt, branch, worktree, answered, resumed_stopped } =
+        *launched;
     task.state = TaskState::Running;
+    if resumed_stopped {
+        task.free_attempts += 1;
+    }
     task.not_before = None;
     task.started_at = task.started_at.or(Some(now));
     let mut effects = Vec::new();
@@ -536,10 +543,14 @@ pub fn on_launched(task: &mut Task, session: &Session, launched: &Launched<'_>, 
         EventLevel::Info,
         "session.launched",
         format!(
-            "launched {model} session (attempt {attempt}{}{}) in window {}",
+            "launched {model} session (attempt {attempt}{}{}) {}",
             if resume { ", resumed" } else { "" },
             relaunch.map(|r| format!(", review: {}", r.reason)).unwrap_or_default(),
-            session.tmux_window
+            if session.is_headless() {
+                format!("headless (pid {})", session.pid.map_or_else(|| "?".to_string(), |p| p.to_string()))
+            } else {
+                format!("in window {}", session.tmux_window)
+            }
         ),
         serde_json::json!({
             "model": model,
@@ -552,6 +563,9 @@ pub fn on_launched(task: &mut Task, session: &Session, launched: &Launched<'_>, 
             "worktree": worktree,
             "window": session.tmux_window,
             "pane": session.pane_id,
+            "runtime": session.runtime,
+            "pid": session.pid,
+            "resumed_stopped": resumed_stopped,
         }),
     ));
     let blocked_configured = match &task.source {
@@ -702,6 +716,7 @@ mod tests {
             agent_session_id: agent.map(str::to_string),
             waiting_since: None,
             waited_secs: 0,
+            runtime: crate::domain::SessionRuntime::Tmux,
         }
     }
 
@@ -946,6 +961,7 @@ mod tests {
             branch: "pq/eng-7",
             worktree: Path::new("/wt/eng-7"),
             answered: false,
+            resumed_stopped: false,
         };
         let effects = on_launched(&mut t, &s, &base, &cfg, now());
         assert_eq!((t.state, t.started_at), (TaskState::Running, Some(now())));
@@ -1335,7 +1351,7 @@ mod properties {
         }
 
         /// A session is resumed only with a transcript, on the same provider,
-        /// and only a crashed one (or, for a review round, whatever ended).
+        /// and only a crashed or stopped one (or, for a review round, whatever ended).
         #[test]
         fn resume_plan_never_crosses_providers(
             (task, session) in task_with_session(),
@@ -1351,7 +1367,7 @@ mod properties {
                 let p = previous.expect("a previous session");
                 prop_assert!(transcript_present);
                 prop_assert_eq!(p.model.provider(), model.provider());
-                prop_assert!(p.state == SessionState::Crashed || review);
+                prop_assert!(p.state.is_resumable() || review);
                 prop_assert_eq!(id, p.id);
                 let needs_agent_id = !agent_for(model.provider()).accepts_session_id();
                 prop_assert_eq!(agent_id.is_some(), needs_agent_id);
@@ -1404,6 +1420,7 @@ mod properties {
             relaunch in prop::option::of(review_relaunch()),
             review_prompt in prop::option::of(line()),
             answered in any::<bool>(),
+            resumed_stopped in any::<bool>(),
             blocked_state in prop::option::of(Just("Blocked".to_string())),
         ) {
             let now = origin();
@@ -1419,11 +1436,13 @@ mod properties {
                 branch: "pq/x",
                 worktree: Path::new("/wt/x"),
                 answered,
+                resumed_stopped,
             };
             let mut t = task.clone();
             let effects = on_launched(&mut t, &session, &launched, &cfg, now);
             prop_assert_eq!((t.state, t.not_before), (TaskState::Running, None));
             prop_assert_eq!(t.started_at, task.started_at.or(Some(now)));
+            prop_assert_eq!(t.free_attempts, task.free_attempts + u32::from(resumed_stopped), "only a stopped session's resume is free");
             prop_assert!(task.state.can_transition_to(t.state));
             let forgot = effects.iter().any(|e| matches!(e, Effect::ForgetAnswer));
             prop_assert_eq!(forgot, answered);
