@@ -48,6 +48,7 @@ const STUTTERS: &[&str] = &[
     "session.marker_polled",
     "session.rate_limit_detected",
     "github.sync",
+    "github.dependencies_changed",
     "github.label",
     "github.closed",
     "github.comment",
@@ -269,7 +270,14 @@ fn project(mut events: Vec<Event>) -> Result<(Vec<Observation>, Coverage)> {
                 ensure!(permitted == (kind == "routing.selected"), "event {}: inconsistent routing decision", event.id);
                 if permitted { Op::RouteAllow } else { Op::RouteBlock }
             }
-            "github.launch_held" | "routing.launch_held" => Op::Hold,
+            "github.launch_held" | "routing.launch_held" => {
+                if data.get("waiting_on").and_then(|v| v.as_array()).is_some_and(|keys| !keys.is_empty()) {
+                    previous_state = "starting";
+                    Op::DependencyBlock
+                } else {
+                    Op::Hold
+                }
+            }
             "task.starting" => Op::Start,
             "session.launched" => Op::Launch,
             "session.crashed" => Op::Crash,

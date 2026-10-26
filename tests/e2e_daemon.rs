@@ -1035,7 +1035,13 @@ impl wiremock::Respond for GitHubFixture {
             state.issue["html_url"].as_str().unwrap().trim_start_matches("https://github.com/").split("/issues/").next().unwrap();
         let normalized = request.url.path().replace(&format!("/repos/{repository}"), "/repos/acme/app");
         let path = normalized.as_str();
+        let dependencies = state.issue.get("test_dependencies").cloned().unwrap_or_else(|| json!([]));
+        state.issue["issue_dependencies_summary"] = json!({
+            "blocked_by":dependencies.as_array().unwrap().iter().filter(|d| d["state"] == "open").count(),
+            "total_blocked_by":dependencies.as_array().unwrap().len()
+        });
         match (method, path) {
+            ("GET", "/repos/acme/app/issues/1/dependencies/blocked_by") => ResponseTemplate::new(200).set_body_json(dependencies),
             ("POST", "/graphql") => ResponseTemplate::new(200).set_body_json(json!({"data":{"repository":{"issue":{
                 "title":state.issue["title"], "body":state.issue["body"], "state":state.issue["state"].as_str().unwrap().to_uppercase(),
                 "updatedAt":state.issue["updated_at"], "lastEditedAt":null,
@@ -1869,4 +1875,59 @@ fn background_setup_scheduling_pause_holds_completed_setup() {
     assert!(!has_event(&show, "session.launched"));
     env.run_ok(&["resume"]);
     assert_eq!(env.wait_for_state(&slow, "completed", Duration::from_secs(30)), "completed", "{}", env.daemon_log());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn github_dependency_added_during_setup_holds_then_closed_prerequisite_releases() {
+    use serde_json::json;
+    use wiremock::{Mock, MockServer};
+    let Some(mut env) = Env::new("complete", "") else { return };
+    let server = MockServer::start().await;
+    let remote = GitHubFixture(std::sync::Arc::new(std::sync::Mutex::new(GitHubFixtureState {
+        issue: json!({"number":1,"title":"Dependent task","body":"Work after prerequisite",
+            "html_url":"https://github.com/acme/app/issues/1","state":"open",
+            "labels":[{"name":"agent:ready"}],"created_at":"2026-09-01T12:00:00Z",
+            "updated_at":"2026-09-01T12:01:00Z"}),
+        comments: Vec::new(),
+        operations: Vec::new(),
+    })));
+    Mock::given(wiremock::matchers::any()).respond_with(remote.clone()).mount(&server).await;
+    let setup_entered = env.root.path().join("setup-entered");
+    let release_setup = env.root.path().join("release-setup");
+    let config_path = env.home().join("config/config.toml");
+    let mut cfg = powerqueue::config::Config::from_toml(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    cfg.github.enabled = true;
+    cfg.github.repository = "acme/app".into();
+    cfg.github.endpoint = server.uri();
+    cfg.github.poll_interval_secs = 1;
+    cfg.github.post_comments = false;
+    cfg.budget.probe_interval_mins = 0;
+    cfg.repo.setup =
+        vec![format!("touch '{}'; while [ ! -f '{}' ]; do sleep 0.1; done", setup_entered.display(), release_setup.display())];
+    std::fs::write(&config_path, cfg.to_toml().unwrap()).unwrap();
+    env.run_ok(&["secrets", "set", "github", "github-e2e-token"]);
+    env.start_daemon();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !setup_entered.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(setup_entered.exists(), "{}", env.daemon_log());
+    remote.0.lock().unwrap().issue["test_dependencies"] = json!([{
+        "number":9,"title":"Prerequisite in another repository","repository_url":format!("{}/repos/acme/core",server.uri()),"state":"open"
+    }]);
+    std::fs::write(&release_setup, "continue").unwrap();
+    assert_eq!(env.wait_for_state("acme/app#1", "blocked", Duration::from_secs(30)), "blocked", "{}", env.daemon_log());
+    let held = env.wait_for_show("acme/app#1", |v| has_event(v, "github.launch_held"));
+    assert!(has_event(&held, "github.launch_held"));
+    assert!(!has_event(&held, "session.launched"), "must not start a pane after dependency change: {held}");
+    let worktree = held["task"]["worktree_path"].as_str().unwrap().to_string();
+    assert!(Path::new(&worktree).exists(), "preserve prepared worktree");
+    assert_eq!(held["task"]["blocked_by"][0]["key"], "acme/core#9");
+    remote.0.lock().unwrap().issue["test_dependencies"][0]["state"] = json!("closed");
+    assert_eq!(env.wait_for_state("acme/app#1", "completed", Duration::from_secs(60)), "completed", "{}", env.daemon_log());
+    let done = env.wait_for_show("acme/app#1", |v| has_event(v, "cleanup.done"));
+    assert!(has_event(&done, "task.unblocked"));
+    assert_eq!(done["events"].as_array().unwrap().iter().filter(|e| e["kind"] == "session.launched").count(), 1);
+    assert_eq!(done["task"]["worktree_path"], worktree);
+    env.run_ok(&["stop"]);
 }

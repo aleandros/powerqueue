@@ -1682,6 +1682,8 @@ proptest! {
         task.state = TaskState::Queued;
         task.execution_repo = Some(checkout.clone());
         task.attempts = previous_attempts;
+        task.blocked_by.clear();
+        task.children.clear();
         task.worktree_path = None;
         task.github_admission = Some(crate::domain::GitHubAdmission { approved: true, reason: "verified".into() });
         store.insert_task(&task).unwrap();

@@ -2178,7 +2178,11 @@ impl Daemon {
                             );
                         }
                         effects.extend(transitions::on_routing(task, decision, false));
-                        client.admission(&cfg, &issue).await
+                        let (admission, blockers) = client.execution_admission(&cfg, &issue).await?;
+                        if let Some(blockers) = blockers {
+                            effects.extend(transitions::on_github_dependencies(task, blockers, false));
+                        }
+                        Ok(admission)
                     }
                     .await;
                     match result {
@@ -2200,7 +2204,7 @@ impl Daemon {
             return Ok(false);
         }
         self.log_only(task, None, effects);
-        Ok(task.execution_approved())
+        Ok(task.execution_approved() && !task.is_waiting())
     }
 
     async fn poll_github(&mut self, now: DateTime<Utc>) -> Result<()> {
@@ -3823,7 +3827,7 @@ impl Daemon {
                             ),
                             false,
                         )
-                    } else if current.execution_approved() {
+                    } else if current.execution_approved() && !current.is_waiting() {
                         transitions::on_github_admission(
                             &mut current,
                             crate::domain::GitHubAdmission::denied("task changed during approval verification; retry after sync"),
@@ -4323,7 +4327,13 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/api/issues/1/dependencies/blocked_by"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
         let issue = serde_json::json!({"number":1, "title":"API work", "body":"", "state":"open",
+            "issue_dependencies_summary":{"blocked_by":0,"total_blocked_by":0},
             "html_url":"https://github.com/acme/api/issues/1", "labels":[{"name":"agent:ready"}],
             "created_at":"2026-09-01T12:00:00Z", "updated_at":"2026-09-01T12:01:00Z"});
         for (url, value) in [("/repos/acme/api/issues", serde_json::json!([issue.clone()])), ("/repos/acme/api/issues/1", issue)]
@@ -5869,6 +5879,11 @@ mod review_regressions {
         assert!(!daemon.github_backoff("owner/repo", Utc::now()));
         assert!(!daemon.update_github(&bad, Some(LinearTarget::Done), None).await);
         assert!(!daemon.github_backoff("owner/repo", Utc::now()));
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/issues/2/dependencies/blocked_by"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
         let mut good = Task::new(
             "owner/repo#2",
             "good",
@@ -5880,6 +5895,7 @@ mod review_regressions {
         Mock::given(method("GET"))
             .and(path("/repos/owner/repo/issues/2"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"number":2,"title":"good","body":"",
+                "issue_dependencies_summary":{"blocked_by":0,"total_blocked_by":0},
                 "html_url":"https://github.com/owner/repo/issues/2","state":"open", "labels":[{"name":"agent:ready"}],
                 "created_at":"2026-09-01T12:00:00Z","updated_at":"2026-09-01T12:01:00Z"})))
             .mount(&server)

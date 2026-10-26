@@ -35,6 +35,9 @@ flowchart LR
     Cleanup --> Updates["Source issue updates"]
 ```
 
+GitHub and Linear blocking relationships keep dependent coding tasks queued until
+their prerequisites are satisfied. See [dependency rules](docs/configuration.md#github-dependencies).
+
 Sessions that need input wait for a human. A PR in review releases its session
 slot so another task can start. Details: [task lifecycle](docs/task-lifecycle.md).
 

@@ -239,6 +239,34 @@ Intake uses the [GitHub Issues REST API](https://docs.github.com/en/rest/issues/
 | `max_issues` | `100` | cap raw entries scanned per poll before PR/excluded-label filtering; locally finished tasks do not count; raise it for larger intake queues |
 | `endpoint` | `https://api.github.com` | REST API base URL; supports Enterprise `/api/v3` and test servers |
 
+### GitHub dependencies
+
+Use GitHub's **Relationships → Mark as blocked by** on the dependent issue.
+Both issues may carry `agent:ready`: powerqueue keeps the dependent task `blocked`
+until every prerequisite is closed in GitHub or its blocking relationship is
+removed. Reopening a prerequisite holds future starts again. A merged PR satisfies
+this gate when it closes its prerequisite issue (for example with `Closes #123`
+or `close_on_complete = true`); an open issue with only a linked/merged PR remains
+blocking. No issue-body syntax or `blocked` label is interpreted as a dependency.
+
+Native prerequisites may be in another repository and do not need to be in this
+queue or approved for execution. The source token must be able to read them.
+Every page is checked against GitHub's dependency counts. Missing summaries,
+hidden/inaccessible prerequisites, malformed responses, unsupported GitHub
+Enterprise dependency APIs and partial pagination hold execution; they never
+mean that a prerequisite is done. `task show`, `task explain` and `doctor` report
+waiting keys or the verification error. Fix access and let the next poll retry;
+removing/reapplying approval is not needed for a dependency-only change.
+
+Dependencies are refreshed during source polling and immediately before every
+new start, crash restart and review round, both before and after worktree setup.
+Changes during setup preserve the worktree and release the reserved slot.
+Active sessions continue their current work; pause/cancel them explicitly if
+needed. Manual pauses remain paused after blockers clear. Analysis workflows
+with `completion = "leave-ticket-open"` retain their existing exemption from
+dependency waits. Remote changes after the final API response cannot be atomic
+with launching a local process.
+
 ### Multiple GitHub sources
 
 Keep `[github]` for the original source and add `[[github_sources]]` tables, or

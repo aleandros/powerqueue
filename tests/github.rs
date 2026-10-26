@@ -12,6 +12,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 fn issue(number: u64) -> Value {
     json!({"number": number, "title": format!("Issue {number}"), "body": "Fix the bug",
         "html_url": format!("https://github.com/acme/app/issues/{number}"), "state": "open",
+        "issue_dependencies_summary": {"blocked_by":0,"total_blocked_by":0},
         "labels": [{"name": "agent:ready"}], "created_at": "2026-09-01T12:00:00Z", "updated_at": "2026-09-01T12:01:00Z"})
 }
 fn config(server: &MockServer) -> GitHubConfig {
@@ -29,6 +30,12 @@ fn evidence(issue: &Value, actor: &str) -> Value {
     }}}})
 }
 async fn approval(server: &MockServer, issues: Vec<Value>) {
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex(r"/repos/[^/]+/[^/]+/issues/\d+/dependencies/blocked_by"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .with_priority(100)
+        .mount(server)
+        .await;
     if issues.is_empty() {
         return;
     }

@@ -63,6 +63,15 @@ Rust integration tests; Quint assumes their resulting decision, rather than prov
 the external API or trust policy. Remote changes after the final verification response
 are outside the atomic `Launch` abstraction.
 
+Native GitHub prerequisites reuse the dependency gate. `DependencyBlock` also
+covers a dependency discovered during setup: the starting task becomes blocked
+without a live session and retains its worktree. `dependencyDuringSetupTest`
+checks the hold/release sequence; the replay adapter maps a launch hold carrying
+`waiting_on` keys to that operation. Rust properties, API fixtures and a real-daemon
+fake-agent test cover complete pagination, inaccessible prerequisites, stale database
+claims, and a blocker added after setup begins. Closed GitHub issues satisfy the
+gate; open ones remain blocking until closed or the relationship is removed.
+
 The Rust one-task and whole-daemon models generate approved, denied and unverified
 GitHub tasks, admission changes, restart round trips and revocation during setup.
 A separate SQLite stateful property interleaves saved candidates, approval changes,

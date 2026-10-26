@@ -9,7 +9,9 @@ use serde::Serialize;
 use super::client::{GitHubClient, GitHubIssue};
 use crate::config::{Config, GitHubConfig};
 use crate::domain::{EventLevel, GitHubAdmission, Task, TaskSource, TaskState};
-use crate::scheduler::transitions::{Effect, on_github_admission, on_github_closed, on_github_source_admission, on_routing};
+use crate::scheduler::transitions::{
+    Effect, on_github_admission, on_github_closed, on_github_dependencies, on_github_source_admission, on_routing,
+};
 use crate::store::Store;
 
 /// One planned local queue change. The task is the complete updated snapshot.
@@ -90,7 +92,12 @@ fn reconcile(
     source: &GitHubConfig,
     config: Option<&Config>,
     fresh: bool,
+    live_session: bool,
+    blockers: Option<Vec<crate::domain::LinkedIssue>>,
 ) {
+    if let Some(blockers) = blockers {
+        on_github_dependencies(task, blockers, live_session);
+    }
     if let Some(config) = config {
         let decision = config.route(task);
         on_routing(task, decision, fresh);
@@ -131,13 +138,13 @@ async fn plan_sync_inner(store: &Store, cfg: &GitHubConfig, client: &GitHubClien
             });
             continue;
         }
-        let admission = match client.admission(cfg, issue).await {
-            Ok(admission) => admission,
-            Err(error) => issue_failure(&mut plan, &fresh.key, error)?,
+        let (admission, blockers) = match client.execution_admission(cfg, issue).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => (issue_failure(&mut plan, &fresh.key, error)?, None),
         };
         match current {
             None => {
-                reconcile(&mut fresh, admission, cfg, routing, true);
+                reconcile(&mut fresh, admission, cfg, routing, true, false, blockers);
                 plan.changes.push(Change { action: "create", task: fresh });
             }
             Some(mut task)
@@ -147,7 +154,8 @@ async fn plan_sync_inner(store: &Store, cfg: &GitHubConfig, client: &GitHubClien
             {
                 let before = task.clone();
                 update_issue(&mut task, issue);
-                reconcile(&mut task, admission, cfg, routing, false);
+                let live_session = store.latest_session(task.id)?.is_some_and(|s| s.state.is_live());
+                reconcile(&mut task, admission, cfg, routing, false, live_session, blockers);
                 if task != before {
                     plan.changes.push(Change { action: "update", task });
                 }
@@ -161,18 +169,19 @@ async fn plan_sync_inner(store: &Store, cfg: &GitHubConfig, client: &GitHubClien
             continue;
         }
         let before = task.clone();
-        let (admission, closed) = match client.get_issue(repository, *number).await {
+        let (admission, blockers, closed) = match client.get_issue(repository, *number).await {
             Ok(issue) => {
                 update_issue(&mut task, &issue);
-                let admission = match client.admission(cfg, &issue).await {
-                    Ok(admission) => admission,
-                    Err(error) => issue_failure(&mut plan, &task.key, error)?,
+                let (admission, blockers) = match client.execution_admission(cfg, &issue).await {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => (issue_failure(&mut plan, &task.key, error)?, None),
                 };
-                (admission, issue.state == "closed" && issue.pull_request.is_none())
+                (admission, blockers, issue.state == "closed" && issue.pull_request.is_none())
             }
-            Err(error) => (issue_failure(&mut plan, &task.key, error)?, false),
+            Err(error) => (issue_failure(&mut plan, &task.key, error)?, None, false),
         };
-        reconcile(&mut task, admission, cfg, routing, false);
+        let live_session = store.latest_session(task.id)?.is_some_and(|s| s.state.is_live());
+        reconcile(&mut task, admission, cfg, routing, false, live_session, blockers);
         if closed {
             on_github_closed(&mut task, Utc::now());
         }
@@ -197,6 +206,7 @@ pub fn apply_plan(store: &Store, plan: &SyncPlan) -> Result<()> {
         let mut task = change.task.clone();
         let admission = task.github_admission.take();
         let routing = task.routing.take();
+        let blockers = std::mem::take(&mut task.blocked_by);
         let effects;
         if change.action == "create" {
             if let Some(current) = store.get_task_by_key(&task.key)? {
@@ -214,7 +224,15 @@ pub fn apply_plan(store: &Store, plan: &SyncPlan) -> Result<()> {
                 }
                 continue;
             }
-            effects = apply_decisions(&mut task, admission, routing, &plan.execution_project);
+            // Rebuild the initial state so application emits the transitions previewed above.
+            let mut fresh = Task::new(&task.key, &task.title, task.source.clone());
+            fresh.id = task.id;
+            fresh.created_at = task.created_at;
+            fresh.description = task.description;
+            fresh.labels = task.labels;
+            fresh.execution_project = task.execution_project;
+            task = fresh;
+            effects = apply_decisions(&mut task, admission, routing, &plan.execution_project, blockers, false);
             store.insert_task(&task).with_context(|| format!("create GitHub task {}", task.key))?;
         } else {
             let Some(mut current) = store.get_task(task.id)? else { continue };
@@ -223,7 +241,7 @@ pub fn apply_plan(store: &Store, plan: &SyncPlan) -> Result<()> {
                 continue;
             }
             if change.action == "cancel" {
-                if !(current.state.is_schedulable() || current.state == TaskState::Paused) {
+                if !(current.state.is_schedulable() || matches!(current.state, TaskState::Paused | TaskState::Blocked)) {
                     continue;
                 }
                 on_github_closed(&mut current, Utc::now());
@@ -233,7 +251,8 @@ pub fn apply_plan(store: &Store, plan: &SyncPlan) -> Result<()> {
                 current.labels = task.labels;
                 current.source = task.source;
             }
-            effects = apply_decisions(&mut current, admission, routing, &plan.execution_project);
+            let live_session = store.latest_session(current.id)?.is_some_and(|s| s.state.is_live());
+            effects = apply_decisions(&mut current, admission, routing, &plan.execution_project, blockers, live_session);
             current.updated_at = Utc::now();
             if !store.update_source_task(&before, &current).with_context(|| format!("update GitHub task {}", current.key))? {
                 continue;
@@ -283,8 +302,11 @@ fn apply_decisions(
     admission: Option<crate::domain::GitHubAdmission>,
     routing: Option<crate::routing::RoutingDecision>,
     fallback: &str,
+    blockers: Vec<crate::domain::LinkedIssue>,
+    live_session: bool,
 ) -> Vec<Effect> {
-    if let Some(mut routing) = routing {
+    let mut dependency_effects = on_github_dependencies(task, blockers, live_session);
+    let effects = if let Some(mut routing) = routing {
         // The saved assignment may have changed since preview; compare again.
         routing.permitted = routing.project.is_some();
         let mut effects = on_routing(task, routing, false);
@@ -294,5 +316,7 @@ fn apply_decisions(
         effects
     } else {
         admission.map(|a| on_github_source_admission(task, a, fallback)).unwrap_or_default()
-    }
+    };
+    dependency_effects.extend(effects);
+    dependency_effects
 }

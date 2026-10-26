@@ -303,7 +303,7 @@ pub fn on_starting(
     root: &Path,
     resuming_with_prompt: bool,
 ) -> Option<Start> {
-    if !task.execution_approved() {
+    if !task.execution_approved() || task.is_waiting() {
         return None;
     }
     if !cfg.queues.is_empty() {
@@ -1172,7 +1172,13 @@ mod properties {
             let cfg = Config::default();
             let root = Path::new("/wt");
             let mut t = task.clone();
-            let start = on_starting(&mut t, &model, &decision, &cfg, root, resuming).unwrap();
+            let start = on_starting(&mut t, &model, &decision, &cfg, root, resuming);
+            if task.is_waiting() {
+                prop_assert!(start.is_none());
+                prop_assert_eq!(t, task);
+                return Ok(());
+            }
+            let start = start.unwrap();
             prop_assert_eq!((t.state, t.model.clone()), (TaskState::Starting, Some(model.clone())));
             prop_assert_eq!(start.attempt, task.attempts + 1);
             if let Some(branch) = &task.branch {
