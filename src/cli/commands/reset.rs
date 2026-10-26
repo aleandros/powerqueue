@@ -2,8 +2,8 @@
 //!
 //! The command first builds a [`ResetPlan`] without touching anything
 //! (that is what `--dry-run` prints), asks for confirmation, and then runs
-//! the steps in a fixed order: stop the daemon, kill the tmux session,
-//! remove worktrees, delete branches (opt-in), remove per-task state
+//! the steps in a fixed order: stop the daemon, kill the tmux session and
+//! stop headless sessions, remove worktrees, delete branches (opt-in), remove per-task state
 //! directories, empty the database. Every step continues past per-item
 //! failures and the summary lists what was removed, kept and why.
 //!
@@ -47,6 +47,9 @@ pub struct ResetPlan {
     /// Number of tasks per state name.
     pub tasks_by_state: BTreeMap<String, usize>,
     pub tmux: TmuxPlan,
+    /// Process group ids of live headless sessions (no tmux window), stopped
+    /// with SIGTERM.
+    pub headless_pids: Vec<u32>,
     /// Directory every worktree must live under.
     pub worktree_root: PathBuf,
     pub worktrees: Vec<WorktreePlan>,
@@ -160,6 +163,7 @@ pub struct ResetResult {
     pub daemon_stopped: bool,
     pub tmux_windows_killed: usize,
     pub tmux_session_killed: bool,
+    pub headless_sessions_stopped: usize,
     pub worktrees_removed: Vec<PathBuf>,
     pub worktrees_kept: Vec<Kept>,
     pub branches_deleted: Vec<String>,
@@ -245,6 +249,7 @@ pub fn run(ctx: &mut Context, args: ResetArgs) -> Result<i32> {
 
     let repo = repo_for(&cfg);
     execute_tmux(&cfg, &plan, &mut result);
+    execute_headless(&paths, &store, &mut result);
     execute_worktrees(repo.as_ref(), &plan, &args, &mut result);
     execute_branches(repo.as_ref(), &plan, &mut result);
     execute_task_dirs(&plan, &mut result);
@@ -336,11 +341,14 @@ fn build_plan(cfg: &Config, paths: &Paths, store: &Store, args: &ResetArgs, have
 
     let linear = plan_linear(cfg, &tasks, args, have_linear_key);
 
+    let headless_pids =
+        store.list_live_sessions().unwrap_or_default().iter().filter(|s| s.is_headless()).filter_map(|s| s.pid).collect();
     Ok(ResetPlan {
         daemon,
         tasks: task_plans,
         tasks_by_state,
         tmux,
+        headless_pids,
         worktree_root,
         worktrees,
         branches,
@@ -607,6 +615,18 @@ fn stop_daemon(store: &Store, tick_secs: i64) -> Result<bool> {
     Ok(!store.daemon_alive(max_age)?)
 }
 
+/// Stop the live headless sessions (their processes have no tmux window to
+/// go down with); one that already exited is skipped.
+fn execute_headless(paths: &Paths, store: &Store, result: &mut ResetResult) {
+    for session in store.list_live_sessions().unwrap_or_default().iter().filter(|s| s.is_headless()) {
+        match crate::session::headless::stop_session(paths, session) {
+            Ok(true) => result.headless_sessions_stopped += 1,
+            Ok(false) => {}
+            Err(e) => result.errors.push(format!("headless session {}: {e:#}", session.id)),
+        }
+    }
+}
+
 fn execute_tmux(cfg: &Config, plan: &ResetPlan, result: &mut ResetResult) {
     if !plan.tmux.installed || !plan.tmux.session_exists {
         return;
@@ -769,6 +789,9 @@ fn print_plan(plan: &ResetPlan, args: &ResetArgs) {
         )
     };
     println!("  {:<11}{tmux}", "tmux");
+    if !plan.headless_pids.is_empty() {
+        println!("  {:<11}stop {} headless session(s) (SIGTERM)", "headless", plan.headless_pids.len());
+    }
 
     println!("  {:<11}{} under {}", "worktrees", plan.worktrees.len(), plan.worktree_root.display());
     for w in &plan.worktrees {
@@ -854,6 +877,9 @@ fn print_result(plan: &ResetPlan, result: &ResetResult, args: &ResetArgs) {
         "no session to kill".to_string()
     };
     println!("  {:<11}{tmux}", "tmux");
+    if result.headless_sessions_stopped > 0 {
+        println!("  {:<11}stopped {} session(s)", "headless", result.headless_sessions_stopped);
+    }
     println!("  {:<11}removed {}, kept {}", "worktrees", result.worktrees_removed.len(), result.worktrees_kept.len());
     for k in &result.worktrees_kept {
         println!("    kept    {}: {}", k.path.display(), k.reason);
