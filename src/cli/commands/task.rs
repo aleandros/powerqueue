@@ -681,11 +681,16 @@ pub fn dependency_lines(task: &Task) -> Vec<String> {
     if !task.blocked_by.is_empty() {
         let pending = task.pending_blockers();
         out.push(if pending.is_empty() {
-            "  blocked by nothing pending: every blocker is done or its PR is merged".to_string()
+            "  blocked by nothing pending: all prerequisites are satisfied".to_string()
         } else {
             format!(
-                "  waiting on {}: not scheduled until each is Done/Canceled in Linear or its PR is merged",
-                pending.iter().map(|b| b.key.as_str()).collect::<Vec<_>>().join(", ")
+                "  waiting on {}: not scheduled until {}",
+                pending.iter().map(|b| b.key.as_str()).collect::<Vec<_>>().join(", "),
+                if matches!(task.source, crate::domain::TaskSource::GitHub { .. }) {
+                    "each prerequisite is closed in GitHub or its blocking relationship is removed"
+                } else {
+                    "each is Done/Canceled in Linear or its PR is merged"
+                }
             )
         });
         for b in &task.blocked_by {

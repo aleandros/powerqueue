@@ -549,10 +549,10 @@ impl Store {
                 "UPDATE tasks SET title=?2, description=?3, labels=?4, source=?5,
              linear_priority=?6, estimate=?7, project=?8, cycle=?9, cycle_number=?10,
              blocked_by=?11, children=?12, parent=?13, github_admission=?14, routing=?15,
-             state=?16, last_error=?17, completed_at=?18, updated_at=?19
+             state=?16, last_error=?17, completed_at=?18, updated_at=?19, not_before=?28
              WHERE id=?1 AND execution_project=?20 AND state=?21 AND attempts=?22
              AND routing IS ?23 AND github_admission IS ?24 AND updated_at=?25
-             AND execution_repo IS ?26",
+             AND execution_repo IS ?26 AND blocked_by=?27",
                 params![
                     task.id.to_string(),
                     task.title,
@@ -579,7 +579,9 @@ impl Store {
                     before.routing.as_ref().map(json),
                     before.github_admission.as_ref().map(json),
                     ts(&before.updated_at),
-                    before.execution_repo
+                    before.execution_repo,
+                    json(&before.blocked_by),
+                    task.not_before.as_ref().map(ts)
                 ],
             )
             .context("apply source sync without overwriting concurrent execution")?;
@@ -597,15 +599,16 @@ impl Store {
         Ok(changed != 0)
     }
 
-    /// Persist admission only if the verified task snapshot is still current.
-    /// Leaves execution state untouched; returns false when a concurrent update won.
+    /// Persist verified admission, prerequisites and dependency state for the same snapshot.
+    /// Returns false when a concurrent update won; active execution is preserved by transitions.
     pub fn record_github_admission(&self, before: &Task, task: &Task) -> Result<bool> {
         let changed = self
             .lock()
             .execute(
-                "UPDATE tasks SET github_admission=?2, routing=?9 WHERE id=?1 AND title=?3 AND description=?4
+                "UPDATE tasks SET github_admission=?2, routing=?9, blocked_by=?15, state=?16, not_before=?17, updated_at=?18 WHERE id=?1 AND title=?3 AND description=?4
              AND state=?5 AND attempts=?6 AND github_admission IS ?7 AND execution_project=?8
-             AND routing IS ?10 AND labels=?11 AND project IS ?12 AND source=?13 AND project_assignment IS ?14",
+             AND routing IS ?10 AND labels=?11 AND project IS ?12 AND source=?13 AND project_assignment IS ?14
+             AND blocked_by=?19 AND updated_at=?20",
                 params![
                     task.id.to_string(),
                     task.github_admission.as_ref().map(json),
@@ -620,7 +623,13 @@ impl Store {
                     json(&before.labels),
                     before.project,
                     json(&before.source),
-                    before.project_assignment.as_ref().map(json)
+                    before.project_assignment.as_ref().map(json),
+                    json(&task.blocked_by),
+                    task.state.as_str(),
+                    task.not_before.as_ref().map(ts),
+                    ts(&task.updated_at),
+                    json(&before.blocked_by),
+                    ts(&before.updated_at)
                 ],
             )
             .context("record verified GitHub admission")?;
@@ -657,7 +666,12 @@ impl Store {
         target: Option<&crate::tmux::LaunchTarget>,
         now: DateTime<Utc>,
     ) -> Result<bool> {
-        if !before.execution_approved() || !starting.execution_approved() || !before.deferral_allows(now) {
+        if !before.execution_approved()
+            || !starting.execution_approved()
+            || before.is_waiting()
+            || starting.is_waiting()
+            || !before.deferral_allows(now)
+        {
             return Ok(false);
         }
         let mut conn = self.lock();
@@ -668,7 +682,8 @@ impl Store {
              attempts=?13, branch=?14, worktree_path=?15, execution=?20
              WHERE id=?1 AND execution_project=?2 AND state=?3 AND attempts=?4
              AND github_admission IS ?10 AND title=?11 AND description=?12
-             AND routing IS ?16 AND labels=?17 AND project IS ?18 AND source=?19 AND deferral IS ?21 AND project_assignment IS ?22",
+             AND routing IS ?16 AND labels=?17 AND project IS ?18 AND source=?19 AND deferral IS ?21 AND project_assignment IS ?22
+             AND blocked_by=?23 AND children=?24",
                 params![
                     before.id.to_string(),
                     before.execution_project,
@@ -691,7 +706,9 @@ impl Store {
                     json(&before.source),
                     starting.execution.as_ref().map(json),
                     before.deferral.as_ref().map(json),
-                    before.project_assignment.as_ref().map(json)
+                    before.project_assignment.as_ref().map(json),
+                    json(&before.blocked_by),
+                    json(&before.children)
                 ],
             )
             .context("claim task start in its execution project")?;

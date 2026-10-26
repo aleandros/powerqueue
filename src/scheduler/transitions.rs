@@ -149,24 +149,43 @@ pub fn on_github_admission(task: &mut Task, admission: crate::domain::GitHubAdmi
     vec![effect]
 }
 
+/// Replace verified GitHub prerequisites and reconcile dependency waits.
+/// Active, paused and crashed tasks retain their state; future starts still check blockers.
+pub fn on_github_dependencies(task: &mut Task, blockers: Vec<crate::domain::LinkedIssue>, live_session: bool) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    if task.blocked_by != blockers {
+        task.blocked_by = blockers;
+        effects.push(Effect::log(
+            EventLevel::Info,
+            "github.dependencies_changed",
+            format!("GitHub prerequisites refreshed; waiting on {}", list_or_none(&task.waiting_on())),
+            serde_json::json!({"blocked_by": task.blocked_by}),
+        ));
+    }
+    if !live_session {
+        effects.extend(on_dependencies(task));
+    }
+    effects
+}
+
 /// Hold a launch revoked during setup, preserving the prepared worktree and branch.
 /// Only a starting task without routing/approval changes; active sessions are untouched.
 pub fn on_github_launch_held(task: &mut Task) -> Vec<Effect> {
-    if task.state != TaskState::Starting || task.execution_approved() {
+    if task.state != TaskState::Starting || (task.execution_approved() && !task.is_waiting()) {
         return Vec::new();
     }
-    task.state = TaskState::Queued;
+    task.state = if task.is_waiting() { TaskState::Blocked } else { TaskState::Queued };
     vec![Effect::log(
         EventLevel::Info,
         if task.routing.as_ref().is_some_and(|r| !r.permitted) { "routing.launch_held" } else { "github.launch_held" },
-        "routing or approval changed during setup; launch held and worktree preserved",
-        serde_json::json!({}),
+        "routing, approval or dependencies changed during setup; launch held and worktree preserved",
+        serde_json::json!({"waiting_on": task.waiting_on()}),
     )]
 }
 
 /// A confirmed remote closure cancels only inactive GitHub tasks, preserving active work.
 pub fn on_github_closed(task: &mut Task, now: DateTime<Utc>) -> Vec<Effect> {
-    if !(task.state.is_schedulable() || task.state == TaskState::Paused) {
+    if !(task.state.is_schedulable() || matches!(task.state, TaskState::Paused | TaskState::Blocked)) {
         return Vec::new();
     }
     task.state = TaskState::Cancelled;
@@ -850,7 +869,7 @@ fn end_review_session(session: &mut Session, why: &str, now: DateTime<Utc>) -> V
     ]
 }
 
-/// Move a task between `queued` and `blocked` from its Linear dependencies
+/// Move a task between `queued` and `blocked` from its source dependencies
 /// (see [`Task::is_waiting`]). Only `queued` / `throttled` tasks are
 /// blocked: paused tasks stay paused, and a task that already ran (crashed,
 /// live) is never pulled back — [`crate::scheduler::pick_next`] still
@@ -2221,10 +2240,38 @@ mod properties {
                 let mut starting = task.clone();
                 starting.state = TaskState::Starting;
                 let effects = on_github_launch_held(&mut starting);
-                prop_assert_eq!(starting.state, TaskState::Queued);
+                prop_assert_eq!(starting.state, if starting.is_waiting() { TaskState::Blocked } else { TaskState::Queued });
                 prop_assert_eq!(&starting.execution_project, &task.execution_project);
                 prop_assert_eq!(&starting.execution_repo, &task.execution_repo);
                 prop_assert!(effects.iter().any(|effect| matches!(effect, Effect::Log { kind, .. } if kind == "routing.launch_held")), "routing holds emit a diagnostic event");
+            }
+        }
+
+        #[test]
+        fn github_dependencies_preserve_work_and_gate_setup(
+            mut task in github_task(), blockers in crate::strategies::github_blockers(), live_session in any::<bool>()
+        ) {
+            task.github_admission = Some(crate::domain::GitHubAdmission { approved: true, reason: "approved".into() });
+            let before = task.clone();
+            let effects = on_github_dependencies(&mut task, blockers.clone(), live_session);
+            prop_assert_eq!(&task.blocked_by, &blockers);
+            let expected = match before.state {
+                TaskState::Queued | TaskState::Throttled if !live_session && task.is_waiting() => TaskState::Blocked,
+                TaskState::Blocked if !live_session && !task.is_waiting() => TaskState::Queued,
+                other => other,
+            };
+            prop_assert_eq!(task.state, expected);
+            prop_assert_eq!(&task.github_admission, &before.github_admission);
+            prop_assert_eq!(&task.worktree_path, &before.worktree_path);
+            prop_assert_eq!(&task.branch, &before.branch);
+            prop_assert!(effects.iter().all(|e| matches!(e, Effect::Log { .. })), "dependency transitions only log");
+            prop_assert!(on_github_dependencies(&mut task, blockers, live_session).is_empty());
+            if task.is_waiting() {
+                prop_assert!(crate::scheduler::pick_next(std::slice::from_ref(&task), origin()).is_none());
+                task.state = TaskState::Starting;
+                on_github_launch_held(&mut task);
+                prop_assert_eq!(task.state, TaskState::Blocked);
+                prop_assert_eq!(&task.worktree_path, &before.worktree_path);
             }
         }
 
@@ -2244,7 +2291,7 @@ mod properties {
         fn holding_revoked_setup_preserves_artifacts(mut task in github_task()) {
             task.github_admission = Some(crate::domain::GitHubAdmission::denied("revoked"));
             let mut expected = task.clone();
-            if task.state == TaskState::Starting { expected.state = TaskState::Queued; }
+            if task.state == TaskState::Starting { expected.state = if task.is_waiting() { TaskState::Blocked } else { TaskState::Queued }; }
             let effects = on_github_launch_held(&mut task);
             prop_assert_eq!(task, expected);
             prop_assert!(effects.iter().all(|e| matches!(e, Effect::Log { .. })), "holding must only log");
@@ -2268,7 +2315,7 @@ mod properties {
         fn github_closure_only_cancels_inactive_tasks(mut task in github_task()) {
             let before = task.clone();
             let effects = on_github_closed(&mut task, origin());
-            if before.state.is_schedulable() || before.state == TaskState::Paused {
+            if before.state.is_schedulable() || matches!(before.state, TaskState::Paused | TaskState::Blocked) {
                 prop_assert_eq!(task.state, TaskState::Cancelled);
                 prop_assert_eq!(task.completed_at, Some(origin()));
                 prop_assert_eq!(effects.len(), 1);

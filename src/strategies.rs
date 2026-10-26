@@ -994,3 +994,18 @@ pub fn analysis_model_ops() -> impl Strategy<Value = Vec<AnalysisModelOp>> {
         1..50,
     )
 }
+
+/// Native GitHub prerequisite snapshots, with repository-qualified identities.
+pub fn github_blockers() -> impl Strategy<Value = Vec<LinkedIssue>> {
+    prop::collection::vec((any::<bool>(), any::<bool>()), 0..8).prop_map(|rows| {
+        rows.into_iter()
+            .enumerate()
+            .map(|(i, (other_repo, closed))| LinkedIssue {
+                key: format!("acme/{}#{}", if other_repo { "api" } else { "app" }, i + 1),
+                title: "Prerequisite".into(),
+                state_type: if closed { "completed" } else { "started" }.into(),
+                pr_merged: false,
+            })
+            .collect()
+    })
+}

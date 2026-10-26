@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-10-26
+
+### Added
+
+- GitHub Issues native blocking relationships now hold dependent tasks until all
+  prerequisites close or the relationships are removed, including cross-repository
+  dependencies. Polling and fresh pre-launch/post-setup checks fail closed on
+  inaccessible or incomplete dependency data, preserve active/manual-paused work,
+  and expose prerequisites in status, task explain and doctor.
+
 ## [0.20.1] - 2026-10-23
 
 ### Fixed
@@ -1125,7 +1135,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.20.1...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/aleandros/powerqueue/compare/v0.20.1...v0.21.0
 [0.20.1]: https://github.com/aleandros/powerqueue/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/aleandros/powerqueue/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/aleandros/powerqueue/compare/v0.19.0...v0.19.1

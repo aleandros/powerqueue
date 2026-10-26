@@ -938,16 +938,16 @@ pub struct ReviewRelaunch {
     pub requested_at: DateTime<Utc>,
 }
 
-/// Another Linear issue a task depends on (a blocker or a sub-issue), as
-/// last seen by the Linear sync.
+/// Another issue a task depends on, as last verified by source sync.
+/// GitHub uses native blocking relationships; Linear also supplies sub-issues.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkedIssue {
-    /// Linear identifier (`ENG-123`).
+    /// Linear identifier (`ENG-123`) or GitHub repository-qualified key (`owner/repo#123`).
     pub key: String,
     #[serde(default)]
     pub title: String,
     /// Workflow state *type* in Linear (`unstarted`, `started`,
-    /// `completed`, `canceled`, ...).
+    /// `completed`, `canceled`, ...). GitHub maps open/closed to started/completed.
     pub state_type: String,
     /// The issue's pull request is known to be merged (GitHub attachment
     /// on the Linear issue), even if Linear has not moved it to Done yet.
@@ -956,7 +956,7 @@ pub struct LinkedIssue {
 }
 
 impl LinkedIssue {
-    /// True if the issue is closed in Linear (`completed` or `canceled`).
+    /// True if the issue is closed (`completed` or `canceled`).
     pub fn is_closed(&self) -> bool {
         is_closed_state_type(&self.state_type)
     }

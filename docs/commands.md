@@ -58,7 +58,7 @@ Project filters on `status`, `task list` and `dashboard` affect only the task li
 | `task pause <task>` | do not schedule; a running session stops after its turn |
 | `task resume <task>` | resume a paused or needs-attention task; one the PR watcher parked goes back to `in_review` |
 | `task retry <task>` | re-queue a failed, cancelled or completed task (also crashed, throttled, paused, needs-attention); one parked with its review rounds used up runs one more round; one `in_review` resumes its session for a review round now; in any other state the daemon ignores it (`task.retry_ignored`, debug) |
-| `task explain <task>` | execution project/configured checkout, saved/current routing decisions, current score and model decision, with reasons; for Linear tasks also what it waits on (pending `blocked by` issues, open sub-issues of a parent) |
+| `task explain <task>` | execution project/configured checkout, saved/current routing decisions, current score and model decision, with reasons; pending GitHub/Linear `blocked by` prerequisites and open Linear sub-issues of a parent |
 | `task model <task> <model\|auto>` | force (or clear) the model for the next attempt (`fable`, `opus`, `sonnet`, `haiku`, or another provider's model such as `gpt-6.1-sol`, `gemini-3-pro`, `codex:<name>`); the policy may still downgrade it within the same provider when the model is out of budget |
 | `task prompt <task>` | print the prompt the next attempt would receive (renders `prompt.template` with attempt = attempts + 1, the task's last error and its forced/last model); nothing is launched. `--json` prints `{"task", "template", "prompt", "warnings"}` |
 | `task output <task> [-n LINES]` | last screen of the task's tmux pane (default 60 lines) |

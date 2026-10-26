@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::admission::{Actor, ApprovalEvent, evaluate};
 use crate::config::GitHubConfig;
-use crate::domain::GitHubAdmission;
+use crate::domain::{GitHubAdmission, LinkedIssue};
 
 /// GitHub requested that API calls pause until this time.
 #[derive(Debug, thiserror::Error)]
@@ -77,6 +77,26 @@ pub struct GitHubIssue {
     pub updated_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub pull_request: Option<serde_json::Value>,
+    /// Counts include dependencies hidden by token permissions; verify list completeness.
+    #[serde(default)]
+    pub issue_dependencies_summary: Option<DependencySummary>,
+}
+
+/// GitHub's total and still-open prerequisite counts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DependencySummary {
+    pub blocked_by: usize,
+    pub total_blocked_by: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct Dependency {
+    number: u64,
+    title: String,
+    repository_url: String,
+    state: String,
+    #[serde(default)]
+    pull_request: Option<serde_json::Value>,
 }
 
 /// An issue label returned by GitHub.
@@ -229,6 +249,89 @@ impl GitHubClient {
             .json()
             .await
             .context("decode GitHub issue")
+    }
+
+    /// Verify approval and, when approved, fetch every native GitHub prerequisite.
+    /// Missing/inconsistent counts, inaccessible pages, malformed rows and pagination
+    /// limits fail closed. No approval means existing dependency evidence is retained.
+    pub async fn execution_admission(
+        &self,
+        cfg: &GitHubConfig,
+        issue: &GitHubIssue,
+    ) -> Result<(GitHubAdmission, Option<Vec<LinkedIssue>>)> {
+        let admission = self.admission(cfg, issue).await?;
+        let blockers = if admission.approved { Some(self.dependencies(&cfg.repository, issue).await?) } else { None };
+        Ok((admission, blockers))
+    }
+
+    /// Read native blocking relationships, including closed and cross-repository issues.
+    /// Requires a complete list consistent with the issue's dependency summary;
+    /// API errors, missing/private rows and unknown states never imply no blockers.
+    pub async fn dependencies(&self, repository: &str, issue: &GitHubIssue) -> Result<Vec<LinkedIssue>> {
+        let summary = issue
+            .issue_dependencies_summary
+            .as_ref()
+            .context("GitHub dependency summary unavailable; cannot verify prerequisites")?;
+        let mut blockers = Vec::new();
+        let mut seen = HashSet::new();
+        // Construct requests only from the configured endpoint; never follow response URLs.
+        let repo_prefix = format!("{}/", self.url(&["repos"])?);
+        for page in 1..=100 {
+            let mut url = self.issue_url(repository, Some(issue.number), &["dependencies", "blocked_by"])?;
+            url.query_pairs_mut().append_pair("per_page", "100").append_pair("page", &page.to_string());
+            let response = self
+                .request(Method::GET, url, None)
+                .await
+                .with_context(|| format!("read GitHub dependencies for {repository}#{} page {page}", issue.number))?;
+            let has_next = response
+                .headers()
+                .get("link")
+                .map(|v| v.to_str())
+                .transpose()
+                .context("invalid GitHub dependency pagination")?
+                .is_some_and(|links| links.split(',').any(|link| link.contains("rel=\"next\"")));
+            let rows: Vec<Dependency> = response.json().await.context("decode GitHub dependencies")?;
+            let len = rows.len();
+            for row in rows {
+                let repo = row
+                    .repository_url
+                    .strip_prefix(&repo_prefix)
+                    .context("GitHub dependency repository URL is outside the configured API")?;
+                let parts: Vec<_> = repo.split('/').collect();
+                if parts.len() != 2
+                    || parts
+                        .iter()
+                        .any(|part| part.is_empty() || !part.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c)))
+                    || row.number == 0
+                    || row.pull_request.is_some()
+                {
+                    bail!("invalid GitHub dependency identity");
+                }
+                let key = format!("{repo}#{}", row.number);
+                if !seen.insert(key.to_ascii_lowercase()) {
+                    bail!("duplicate GitHub dependency; list changed during pagination");
+                }
+                let state_type = match row.state.as_str() {
+                    "open" => "started",
+                    "closed" => "completed",
+                    _ => bail!("unknown GitHub dependency state for {key}"),
+                };
+                blockers.push(LinkedIssue { key, title: row.title, state_type: state_type.into(), pr_merged: false });
+            }
+            if blockers.len() > summary.total_blocked_by {
+                bail!("GitHub dependency count changed during verification; retry after sync");
+            }
+            if !has_next && len < 100 {
+                if blockers.len() != summary.total_blocked_by
+                    || blockers.iter().filter(|b| !b.is_closed()).count() != summary.blocked_by
+                {
+                    bail!("GitHub dependency list is incomplete or changed; check access to every prerequisite");
+                }
+                blockers.sort_by_cached_key(|b| b.key.to_ascii_lowercase());
+                return Ok(blockers);
+            }
+        }
+        bail!("GitHub dependency list exceeds 100 pages; cannot verify complete prerequisites")
     }
 
     /// Verify approval history and material edits using GraphQL. Fails closed on

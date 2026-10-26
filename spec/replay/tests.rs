@@ -932,3 +932,31 @@ fn quint_routing_holds_preserve_setup_and_active_work_and_survive_retry() {
         false,
     );
 }
+
+fn github_dependency_setup_history() -> Vec<Event> {
+    vec![
+        event(1, "task.created"),
+        payload(2, "task.blocked", json!({"previous_state":"queued", "waiting_on":["acme/core#9"], "container":false})),
+        event(3, "task.unblocked"),
+        payload(4, "task.starting", json!({"attempt":1})),
+        event(5, "github.dependencies_changed"),
+        payload(6, "github.launch_held", json!({"waiting_on":["acme/core#9"]})),
+        event(7, "task.unblocked"),
+        payload(8, "task.starting", json!({"attempt":2})),
+        payload(9, "session.launched", json!({"attempt":2})),
+    ]
+}
+
+#[test]
+fn github_dependency_hold_during_setup_projects_as_dependency_block() {
+    let (observations, _) = project(github_dependency_setup_history()).unwrap();
+    let hold = observations.iter().find(|o| o.event == 6).unwrap();
+    assert_eq!(hold.op, Op::DependencyBlock);
+    assert_eq!(hold.previous_state, "starting");
+}
+
+#[test]
+#[ignore = "requires Quint"]
+fn quint_accepts_github_dependency_hold_during_setup() {
+    check_trace(github_dependency_setup_history(), true);
+}

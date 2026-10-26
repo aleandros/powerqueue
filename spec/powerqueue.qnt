@@ -23,7 +23,7 @@ module lifecycle {
     else if (op == "Finish") (t.state == "completed" and t.live) or Set("running", "idle", "paused", "throttled", "crashed", "failed", "needs_attention").contains(t.state)
     else if (op == "Complete") Set("running", "idle", "paused", "throttled", "crashed", "failed", "needs_attention", "blocked", "in_review").contains(t.state)
     else if (op == "Release") t.live and terminal(t)
-    else if (op == "DependencyBlock") Set("queued", "throttled").contains(t.state) and not(t.live)
+    else if (op == "DependencyBlock") Set("queued", "throttled", "starting").contains(t.state) and not(t.live)
     else if (op == "Unblock") t.state == "blocked"
     else if (op == "HandOff") Set("running", "idle", "paused", "needs_attention", "in_review").contains(t.state)
     else if (op == "ReviewRelease") t.state == "in_review" and t.live
@@ -315,6 +315,13 @@ module powerqueue {
     tasks' = tasks.set(id, advance(tasks.get(id), "Hold", -1)),
     keepProjects, keepPass, keepClock,
   }
+  // A fresh prerequisite observed during setup holds the launch without a live session.
+  action dependencyHold(id: int): bool = all {
+    tasks.get(id).state == "starting",
+    allowed(tasks.get(id), "DependencyBlock", now, -1, maxAttempts),
+    tasks' = tasks.set(id, advance(tasks.get(id), "DependencyBlock", -1)),
+    keepProjects, keepPass, keepClock,
+  }
   action step = {
     nondet scope = Set("task", "project", "global").oneOf()
     nondet id = ids.oneOf()
@@ -323,7 +330,7 @@ module powerqueue {
     nondet revision = Set(0, 1).oneOf()
     nondet op = Set("Finish", "Complete", "Release", "Wake", "Pause", "Resume", "Cancel", "Retry", "Idle", "Block", "Progress",
       "DependencyBlock", "Unblock", "HandOff", "ReviewRelease", "ReviewRetry", "Merge", "ReviewPark").oneOf()
-    any { beginPass, endPass, start(id), launch(id), throttle(id), crashScoped(id, scope), command(id, op), rateLimit(id), tick, pauseScheduling, reassign(id, p), configure(p, present, revision), rejectCheckout(id), repositoryOp(id), admission(id, present), routing(id, present), hold(id) }
+    any { beginPass, endPass, start(id), launch(id), throttle(id), crashScoped(id, scope), command(id, op), rateLimit(id), tick, pauseScheduling, reassign(id, p), configure(p, present, revision), rejectCheckout(id), repositoryOp(id), admission(id, present), routing(id, present), hold(id), dependencyHold(id) }
   }
 
   val projectSafety = all {
@@ -428,6 +435,13 @@ module powerqueue {
     .expect(safety and not(allowed(tasks.get(0), "Start", now, -1, maxAttempts)))
     .then(command(0, "Unblock")).then(beginPass).then(start(0)).then(launch(0))
     .expect(safety and tasks.get(0).attempts == 1)
+  run dependencyDuringSetupTest = init.then(routing(1, false)).then(routing(2, false))
+    .then(beginPass).then(start(0))
+    .then(dependencyHold(0))
+    .expect(safety and tasks.get(0).state == "blocked" and not(tasks.get(0).live))
+    .then(endPass).then(command(0, "Unblock"))
+    .then(beginPass).then(start(0)).then(launch(0)).then(endPass)
+    .expect(safety and tasks.get(0).attempts == 2 and live == 1)
   run reviewRoundTest = init.then(beginPass).then(start(0)).then(launch(0))
     .then(start(1)).then(launch(1)).then(endPass).then(command(0, "HandOff"))
     .expect(safety and tasks.get(0).live and not(allowed(tasks.get(0), "Merge", now, -1, maxAttempts)))

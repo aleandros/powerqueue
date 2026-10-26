@@ -746,3 +746,17 @@ all new launches because the daemon shares that runtime. Existing sessions keep
 being monitored. If storage cannot save the hold, the running daemon retains it
 in memory and reports the persistence error; durability across a restart requires
 the database to accept writes again.
+
+## A GitHub issue waits on dependencies
+
+Use `powerqueue task explain 'owner/repo#123'` to see its prerequisites.
+Close the prerequisite issue after its PR merges, or remove the native blocking
+relationship when it no longer applies. A `blocked` label or body text alone
+has no scheduling effect. Other independent issues can still run.
+
+If the admission reason reports unavailable/incomplete dependencies, verify that
+this source's token has Issues read access to every prerequisite repository and
+that the GitHub server supports the dependency API and issue dependency summary.
+HTTP 404, unknown states and missing rows never imply completion. Fix access and
+retry `powerqueue github sync`; normal polling also recovers automatically.
+An already running agent is preserved, and manually paused tasks stay paused.

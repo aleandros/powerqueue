@@ -1409,7 +1409,7 @@ fn check_scheduling_pause(store: &Store) -> CheckResult {
     }
 }
 
-/// Linear dependencies: which tasks are `blocked` and on what, `blocked by`
+/// Source dependencies: which tasks are `blocked` and on what, `blocked by`
 /// cycles between open tasks (they would wait forever), and failed attempts
 /// to close parent issues (`parent_errors`, `linear.parent_error` events in
 /// the last day). `parent_closing` is false when `linear.manage_states` is
@@ -1423,7 +1423,7 @@ pub fn dependency_status(tasks: &[Task], parent_errors: u64, parent_closing: boo
             STATE,
             NAME,
             format!("`blocked by` cycle between open tasks: {}; none of them can ever start", cycles.join("; ")),
-            "remove one of the `blocks` relations in Linear",
+            "remove a blocking relationship in the source tracker",
         );
     }
     if parent_errors > 0 {
@@ -2399,7 +2399,7 @@ pub async fn run_all(
         .collect();
     if !unapproved.is_empty() {
         results.push(CheckResult::warn(STATE, "GitHub admission", unapproved.join("; "),
-            "inspect task show/explain and github.admitted/revoked/admission_blocked events; verify GraphQL access, required_labels and trusted_approvers; review title/body changes before removing and reapplying approval labels. Active sessions are preserved; future starts require fresh approval"));
+            "inspect task show/explain and github.admitted/revoked/admission_blocked events; verify GraphQL/dependency API access to every prerequisite, required_labels and trusted_approvers; review title/body changes before removing and reapplying approval labels. Active sessions are preserved; future starts require fresh approval"));
     }
 
     results.push(check_db(store));
