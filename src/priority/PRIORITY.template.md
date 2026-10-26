@@ -10,6 +10,8 @@ Run `powerqueue tune "translate the intent document into policy" --scope priorit
 Restore service and address security incidents promptly. Customer-facing problems
 usually matter more than housekeeping. Prefer smaller tasks when their impact is
 similar so useful work ships sooner.
+High-priority bugs should run ahead of ordinary high-priority tasks even when
+those tasks have waited longer. Express this as a reusable rule, not a list of tickets.
 
 ## Examples to discuss
 

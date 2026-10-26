@@ -65,6 +65,9 @@ model maps are empty. Unconfigured policies use normal criticality, no custom
 scores/skips/model preferences, and disabled Jev. `init` writes the richer
 shipped template (incident/security/urgent critical; customer/high high;
 normal priority normal; chore/docs low).
+The template also adds 250 points for tasks with both high priority and a `bug`
+label, so older ordinary high-priority tasks cannot win through age alone.
+Existing policy files are not rewritten when powerqueue is upgraded.
 
 All tables reject unknown keys. Duplicate TOML keys, invalid criticalities,
 unknown models, duplicate model preferences, case-insensitive duplicate task
@@ -118,6 +121,27 @@ condition separators. A regex with `|` keeps its normal regex meaning.
    (capped at 200), as before.
 4. Model preference is task override → first matching `model_rules` row in
    file order → `models.<effective criticality>` → budget defaults.
+
+Queue order is highest score first, then criticality, then oldest creation time.
+A small bonus is not a guarantee: +40 for bugs loses to an ordinary task with
+more than 40 points of extra age. To keep high-priority bugs ahead of ordinary
+high-priority work, use one rule for the category rather than ticket overrides:
+
+```toml
+[[scoring]]
+delta = 250
+all = [
+  { field = "priority", op = "eq", value = "high" },
+  { field = "label", op = "eq", value = "bug" },
+]
+```
+
+This exceeds the 200-point age cap. Other scoring rules, overrides and enabled
+Jev scores still add, so check their combined effect with `simulate --reasons`.
+When tuning repository-owned policy, select its execution project with
+`tune --project PROJECT`; tuning the machine policy does not replace a project's
+own policy. Ticket names in a general ranking complaint are examples, not a
+reason to maintain an override for each task.
 
 The existing budget/provider eligibility, reservations, fallback, downgrade
 chains and CLI `task model` behavior are unchanged. Policy model lists are

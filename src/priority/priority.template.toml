@@ -31,6 +31,13 @@ all = [{ field = "label", op = "eq", value = "customer" }]
 [[scoring]]
 delta = 20.0
 all = [{ field = "priority", op = "eq", value = "high" }]
+# Exceed the 200-point age cap so older ordinary work cannot bury high-priority bugs.
+[[scoring]]
+delta = 250.0
+all = [
+  { field = "priority", op = "eq", value = "high" },
+  { field = "label", op = "eq", value = "bug" },
+]
 [[scoring]]
 delta = -30.0
 all = [{ field = "estimate", op = "gt", value = 8.0 }]
