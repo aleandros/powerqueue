@@ -39,9 +39,10 @@ use crate::linear::{
 use crate::paths::Paths;
 use crate::priority::{PriorityRules, RulesWatcher};
 use crate::secrets::{SecretKind, Secrets};
+use crate::session::headless::{HeadlessExit, HeadlessFiles, HeadlessStatus, StreamEvent, StreamReader};
 use crate::session::{
-    Launcher, TranscriptReader, agent_for, interpret_hook, probe_session, sample_resources, transcript::claude_home,
-    transcript_path_for,
+    Launcher, SessionProbe, TranscriptReader, agent_for, interpret_hook, probe_session, sample_resources,
+    transcript::claude_home, transcript_path_for,
 };
 use crate::store::{JevCached, PendingHookEvent, Store};
 use crate::tmux::Tmux;
@@ -176,6 +177,8 @@ struct RuntimeState {
     watcher: Option<RulesWatcher>,
     watcher_failed: bool,
     readers: HashMap<uuid::Uuid, TranscriptReader>,
+    /// Stream readers of headless sessions (see [`crate::session::headless`]).
+    streams: HashMap<uuid::Uuid, StreamReader>,
     nudged: HashSet<uuid::Uuid>,
     rate_limits: RateLimitState,
     launch_failures: LaunchFailures,
@@ -314,6 +317,7 @@ impl Daemon {
             watcher: None,
             watcher_failed: false,
             readers: HashMap::new(),
+            streams: HashMap::new(),
             nudged: HashSet::new(),
             rate_limits,
             launch_failures: store
@@ -701,13 +705,7 @@ impl Daemon {
 
     async fn apply_command(&mut self, cmd: &DaemonCommand, now: DateTime<Utc>) -> Result<()> {
         match cmd {
-            DaemonCommand::Pause { task_id } => {
-                let mut task = self.require_task(*task_id)?;
-                let live = self.store.latest_session(task.id)?.is_some_and(|s| s.state.is_live());
-                let before = task.clone();
-                let effects = commands::on_pause(&mut task, live);
-                self.commit(&before, &mut task, None, effects).await?;
-            }
+            DaemonCommand::Pause { task_id } => self.pause_task(*task_id, now).await?,
             DaemonCommand::Resume { task_id } => {
                 let mut task = self.require_task(*task_id)?;
                 let live = self.store.latest_session(task.id)?.filter(|s| s.state.is_live());
@@ -717,7 +715,8 @@ impl Daemon {
             }
             DaemonCommand::Cancel { task_id } => {
                 let mut task = self.require_task(*task_id)?;
-                let mut session = self.store.latest_session(task.id)?.filter(|s| s.state.is_live());
+                let mut session =
+                    self.store.latest_session(task.id)?.filter(|s| s.state.is_live() || s.state == SessionState::Stopped);
                 let before = (task.clone(), session.clone());
                 let effects = commands::on_cancel(&mut task, session.as_mut(), now);
                 let ended = session.as_ref().filter(|s| Some(*s) != before.1.as_ref());
@@ -728,7 +727,8 @@ impl Daemon {
             }
             DaemonCommand::Retry { task_id } => {
                 let mut task = self.require_task(*task_id)?;
-                let mut session = self.store.latest_session(task.id)?.filter(|s| s.state.is_live());
+                let mut session =
+                    self.store.latest_session(task.id)?.filter(|s| s.state.is_live() || s.state == SessionState::Stopped);
                 let before = (task.clone(), session.clone());
                 let effects = commands::on_retry(&mut task, session.as_mut(), now);
                 if task.leaves_ticket_open() {
@@ -796,6 +796,24 @@ impl Daemon {
             }
         }
         Ok(())
+    }
+
+    /// `task pause`. A headless session would run the rest of the task
+    /// before pausing: it is stopped too (also when the CLI already paused
+    /// the task offline and this command only arrives now).
+    async fn pause_task(&mut self, task_id: TaskId, now: DateTime<Utc>) -> Result<()> {
+        let mut task = self.require_task(task_id)?;
+        let mut session = self.store.latest_session(task.id)?.filter(|s| s.state.is_live());
+        let before = task.clone();
+        let mut effects = commands::on_pause(&mut task, session.is_some());
+        if let Some(s) = session.as_mut() {
+            effects.extend(transitions::stop_for_pause(&task, s, now));
+        }
+        let stopped = session.filter(|s| !s.state.is_live());
+        if let Some(s) = &stopped {
+            self.store.update_session(s)?;
+        }
+        self.commit(&before, &mut task, stopped.as_ref(), effects).await
     }
 
     /// Persist what a pure transition changed on `task` (compared with
@@ -2785,6 +2803,11 @@ impl Daemon {
             return Ok(());
         }
         let request = pending.get(&task.id).expect("cleanup intent was recorded").clone();
+        // A headless session has no window to keep for inspection: stop it
+        // before its worktree is pushed or removed.
+        if let Some(session) = self.store.latest_session(task.id)? {
+            self.stop_headless(&session);
+        }
         let result = (|| {
             let cfg = self.cfg.for_task(task, &self.paths)?;
             let repo = Repo::new(cfg.repo_path());
@@ -2852,6 +2875,10 @@ impl Daemon {
         if session.task_id != task || session.state.is_live() {
             return Ok(());
         }
+        if session.is_headless() {
+            self.stop_headless(&session);
+            return Ok(());
+        }
         // A restarted tmux server can reuse window IDs; never close a window
         // now owned by another live execution.
         if self.store.list_live_sessions()?.iter().any(|s| s.tmux_window == session.tmux_window) {
@@ -2915,7 +2942,9 @@ impl Daemon {
                 }
                 Effect::KillWindow => {
                     if let Some(s) = session {
-                        if let Err(e) = self.rt.tmux.kill_window(&s.tmux_window) {
+                        if s.is_headless() {
+                            self.stop_headless(s);
+                        } else if let Err(e) = self.rt.tmux.kill_window(&s.tmux_window) {
                             tracing::debug!(task = %task.key, window = %s.tmux_window, error = %format!("{e:#}"), "kill window");
                         }
                         self.forget_session(s.id);
@@ -2934,7 +2963,9 @@ impl Daemon {
                     }
                 }
                 Effect::ReleaseForReview => {
-                    if let Some(s) = session
+                    if let Some(s) = session.filter(|s| s.is_headless()) {
+                        self.stop_headless(s);
+                    } else if let Some(s) = session
                         && let Err(e) = self.rt.tmux.kill_window(&s.tmux_window)
                     {
                         tracing::debug!(task = %task.key, window = %s.tmux_window, error = %format!("{e:#}"), "kill window for review");
@@ -3027,6 +3058,30 @@ impl Daemon {
                     }
                 }
             }
+        }
+    }
+
+    /// Stop a headless session's process group if it still runs (cancel,
+    /// retry, pause, stale or timed out, cleanup). Failures are logged.
+    fn stop_headless(&self, session: &Session) {
+        match crate::session::headless::stop_session(&self.paths, session) {
+            Ok(true) => self.log(
+                Some(session.task_id),
+                Some(session.id),
+                EventLevel::Info,
+                "session.signalled",
+                &format!("sent SIGTERM to headless session process group {}", session.pid.unwrap_or_default()),
+                serde_json::json!({ "pid": session.pid, "signal": "TERM" }),
+            ),
+            Ok(false) => {}
+            Err(e) => self.log(
+                Some(session.task_id),
+                Some(session.id),
+                EventLevel::Warn,
+                "session.stop_failed",
+                &format!("cannot stop headless session: {e:#}"),
+                serde_json::json!({ "pid": session.pid }),
+            ),
         }
     }
 
@@ -3132,7 +3187,114 @@ impl Daemon {
             }
             tracing::debug!(session = %session.id, inserted, weighted, "recorded transcript usage");
         }
+        self.tail_streams(now)
+    }
+
+    /// Read the streams of headless sessions that are live or ended within
+    /// the transcript grace period (see [`Daemon::tail_stream`]).
+    fn tail_streams(&mut self, now: DateTime<Utc>) -> Result<()> {
+        let active: Vec<Session> =
+            self.store.list_sessions_active_since(now - TRANSCRIPT_GRACE)?.into_iter().filter(Session::is_headless).collect();
+        let keep: HashSet<uuid::Uuid> = active.iter().map(|s| s.id).collect();
+        self.rt.streams.retain(|id, _| keep.contains(id));
+        for session in active {
+            let id = session.id;
+            if let Err(e) = self.tail_stream(session, now) {
+                tracing::warn!(session = %id, error = %format!("{e:#}"), "headless stream read failed");
+            }
+        }
         Ok(())
+    }
+
+    /// Read new lines of one headless session's stream: usage goes to the
+    /// ledger (deduplicated by message id with the transcript), any line is
+    /// activity, the first `api_retry` of a rate-limit burst becomes a
+    /// `StopFailure{rate_limit}` hook event (the account is throttled; the
+    /// run keeps retrying), and retries, permission denials and the result
+    /// are logged. Lines written before this daemon started only update
+    /// the reader (see [`StreamReader::new`]).
+    fn tail_stream(&mut self, mut session: Session, now: DateTime<Utc>) -> Result<()> {
+        let files = HeadlessFiles::for_session(&self.paths, &session);
+        let replayed = session.started_at < self.started_at;
+        let fresh = || {
+            let reader = StreamReader::new(files.stream.clone(), session.id, session.task_id);
+            if replayed { reader.replayed() } else { reader }
+        };
+        let reader = self.rt.streams.entry(session.id).or_insert_with(fresh);
+        if reader.path != files.stream {
+            // A resumed attempt writes a new file under the same session id.
+            *reader = fresh();
+        }
+        let batch = reader.read_new()?;
+        let report_limit = !reader.rate_limit_reported && batch.events.iter().any(StreamEvent::is_rate_limit_retry);
+        if report_limit {
+            reader.rate_limit_reported = true;
+        }
+        let mut inserted = 0usize;
+        for rec in &batch.usage {
+            if self.store.record_usage(rec)? {
+                inserted += 1;
+            }
+        }
+        for event in &batch.events {
+            self.log_stream_event(&session, event);
+        }
+        if report_limit && session.state.is_live() {
+            let payload = serde_json::json!({
+                "error_type": "rate_limit",
+                "error": "rate_limit",
+                "error_message": "the API is rate limiting this account; Claude Code is retrying",
+                "source": "headless stream",
+            });
+            self.store.insert_hook_event(session.task_id, Some(session.id), crate::domain::HookEvent::StopFailure, &payload)?;
+        }
+        if batch.lines > 0 && session.state.is_live() {
+            transitions::on_transcript_activity(&mut session, now);
+            self.store.update_session(&session)?;
+        }
+        if inserted > 0 {
+            tracing::debug!(session = %session.id, inserted, "recorded headless stream usage");
+        }
+        Ok(())
+    }
+
+    /// Timeline event for a stream event worth keeping (`session.api_retry`,
+    /// `session.permission_denied`, `session.result`).
+    fn log_stream_event(&self, session: &Session, event: &StreamEvent) {
+        let (level, kind, message, data) = match event {
+            StreamEvent::ApiRetry { attempt, max_retries, error, error_status } => (
+                if error == "rate_limit" { EventLevel::Warn } else { EventLevel::Info },
+                "session.api_retry",
+                format!(
+                    "API call failed ({error}{}); retry {attempt} of {max_retries}",
+                    error_status.map(|s| format!(", HTTP {s}")).unwrap_or_default()
+                ),
+                serde_json::json!({ "attempt": attempt, "max_retries": max_retries, "error": error, "error_status": error_status }),
+            ),
+            StreamEvent::PermissionDenied { tool, message } => (
+                EventLevel::Warn,
+                "session.permission_denied",
+                format!(
+                    "{} denied: nobody can approve permission prompts in a headless session{}",
+                    tool.as_deref().unwrap_or("a tool call"),
+                    if message.is_empty() { String::new() } else { format!(" ({message})") }
+                ),
+                serde_json::json!({ "tool": tool, "message": message }),
+            ),
+            StreamEvent::Result(r) => (
+                if r.is_error { EventLevel::Warn } else { EventLevel::Info },
+                "session.result",
+                format!(
+                    "headless run ended: {}{}{}",
+                    r.subtype,
+                    r.num_turns.map(|n| format!(", {n} turn(s)")).unwrap_or_default(),
+                    r.total_cost_usd.map(|c| format!(", ${c:.4} estimated")).unwrap_or_default()
+                ),
+                serde_json::to_value(r).unwrap_or_default(),
+            ),
+            StreamEvent::Init { .. } | StreamEvent::Message { .. } | StreamEvent::Other => return,
+        };
+        self.log(Some(session.task_id), Some(session.id), level, kind, &message, data);
     }
 
     /// For sessions of CLIs that generate their own session id (Codex
@@ -3245,18 +3407,39 @@ impl Daemon {
         reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
     )]
     async fn probe_sessions(&mut self, now: DateTime<Utc>) -> Result<()> {
-        for mut session in self.store.list_live_sessions()? {
+        for listed in self.store.list_live_sessions()? {
+            // Re-read: finishing a headless session earlier in this loop
+            // drains hook events, which may have changed this one.
+            let Some(mut session) = self.store.get_session(listed.id)?.filter(|s| s.state.is_live()) else { continue };
             let Some(mut task) = self.store.get_task(session.task_id)? else {
                 transitions::orphan_session(&mut session, now);
                 self.store.update_session(&session)?;
+                self.stop_headless(&session);
                 self.forget_session(session.id);
                 continue;
             };
-            let probe = match probe_session(&self.rt.tmux, &session) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(task = %task.key, error = %format!("{e:#}"), "probe failed");
+            let probe = if session.is_headless() {
+                let files = HeadlessFiles::for_session(&self.paths, &session);
+                if crate::session::headless::probe(&mut self.rt.system, &session, &files) == HeadlessStatus::Exited {
+                    if let Err(e) = self.finish_headless(session.id, &files, now).await {
+                        tracing::warn!(task = %task.key, error = %format!("{e:#}"), "headless exit handling failed");
+                    }
                     continue;
+                }
+                SessionProbe {
+                    pane_exists: true,
+                    pane_dead: false,
+                    exit_status: None,
+                    pane_pid: session.pid,
+                    current_command: Some("claude -p".to_string()),
+                }
+            } else {
+                match probe_session(&self.rt.tmux, &session) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(task = %task.key, error = %format!("{e:#}"), "probe failed");
+                        continue;
+                    }
                 }
             };
             // A shim session may have queued `task complete` and exited
@@ -3282,10 +3465,12 @@ impl Daemon {
                 && silent > Duration::seconds(sc.stale_session_secs as i64);
             let timeout = transitions::session_timed_out(&task, &session, sc, now);
             let dying = !(probe.is_alive() || task.state.is_handed_off() || task.state == TaskState::Paused);
-            let pane_tail = if dying || stale || timeout {
-                session.pane_id.as_deref().and_then(|p| self.rt.tmux.capture_pane(p, CRASH_TAIL_LINES).ok())
-            } else {
+            let pane_tail = if !(dying || stale || timeout) {
                 None
+            } else if session.is_headless() {
+                HeadlessFiles::for_session(&self.paths, &session).stderr_tail(CRASH_TAIL_LINES.try_into().unwrap_or(40))
+            } else {
+                session.pane_id.as_deref().and_then(|p| self.rt.tmux.capture_pane(p, CRASH_TAIL_LINES).ok())
             };
             let provider = session.model.provider();
             let mut provider_cooldown_until = None;
@@ -3315,6 +3500,48 @@ impl Daemon {
             if !session.state.is_live() {
                 self.forget_session(session.id);
             }
+        }
+        Ok(())
+    }
+
+    /// The process of headless session `id` is gone. First take in what it
+    /// left: the shim inbox, the rest of its stream (usage, a rate-limit
+    /// signal) and the hook events it fired on the way out (`Stop`, ...),
+    /// so the task reflects them. Then, if the session is still live,
+    /// classify the exit ([`transitions::on_headless_exit`]).
+    async fn finish_headless(&mut self, id: uuid::Uuid, files: &HeadlessFiles, now: DateTime<Utc>) -> Result<()> {
+        let Some(session) = self.store.get_session(id)? else { return Ok(()) };
+        if let Some(task) = self.store.get_task(session.task_id)? {
+            self.drain_task_inbox(&task, now)?;
+        }
+        self.tail_stream(session, now)?;
+        self.process_hooks(now).await?;
+        let Some(mut session) = self.store.get_session(id)?.filter(|s| s.state.is_live()) else { return Ok(()) };
+        let Some(mut task) = self.store.get_task(session.task_id)? else { return Ok(()) };
+        let cfg = match self.cfg.for_project(&task.execution_project, &self.paths) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                self.project_error(&task.execution_project, &format!("{e:#}"));
+                return Ok(());
+            }
+        };
+        let provider = session.model.provider();
+        let exit = match self.rt.streams.get(&id) {
+            Some(reader) => HeadlessExit::observe(reader, files, agent_for(provider).rate_limit_signatures()),
+            None => HeadlessExit {
+                exit_status: files.read_exit_status(),
+                stderr_tail: files.stderr_tail(20),
+                ..HeadlessExit::default()
+            },
+        };
+        let period_end = self.provider_period_end(provider, now);
+        let effects = transitions::on_headless_exit(&mut task, &mut session, &exit, &cfg, now, period_end);
+        self.store.update_session(&session)?;
+        self.store.update_task(&task)?;
+        self.apply_effects(&mut task, Some(&session), effects).await;
+        self.store.update_task(&task)?;
+        if !session.state.is_live() {
+            self.forget_session(session.id);
         }
         Ok(())
     }
@@ -4000,11 +4227,11 @@ impl Daemon {
         let mut previous = self.store.latest_session(task.id)?;
         if let Some(p) = previous.take() {
             // Last chance to learn the id of a crashed session before resuming it.
-            previous = Some(if p.state == SessionState::Crashed { self.discover_agent_session(p)? } else { p });
+            previous = Some(if p.state.is_resumable() { self.discover_agent_session(p)? } else { p });
         }
         let transcript_present =
             previous.as_ref().and_then(|p| p.transcript_path.as_deref()).is_none_or(|p| Path::new(p).exists());
-        if let Some(p) = previous.as_ref().filter(|p| p.state == SessionState::Crashed && !transcript_present) {
+        if let Some(p) = previous.as_ref().filter(|p| p.state.is_resumable() && !transcript_present) {
             self.log(
                 Some(task.id),
                 Some(p.id),
@@ -4611,6 +4838,7 @@ mod tests {
             agent_session_id: None,
             waiting_since: None,
             waited_secs: 0,
+            runtime: crate::domain::SessionRuntime::Tmux,
         };
         store.insert_session(&session).unwrap();
         let mut transcript = std::fs::File::create(&path).unwrap();
@@ -4795,6 +5023,7 @@ mod tests {
                 agent_session_id: None,
                 waiting_since: None,
                 waited_secs: 0,
+                runtime: crate::domain::SessionRuntime::Tmux,
             })
             .unwrap();
 
@@ -5113,6 +5342,7 @@ mod tests {
             agent_session_id: None,
             waiting_since: None,
             waited_secs: 0,
+            runtime: crate::domain::SessionRuntime::Tmux,
         };
 
         // Waiting on a human, nudged once: the retry ends the session, and
@@ -5414,6 +5644,7 @@ mod tests {
             agent_session_id: None,
             waiting_since: None,
             waited_secs: 0,
+            runtime: crate::domain::SessionRuntime::Tmux,
         };
         store.insert_session(&session).unwrap();
         (daemon, store, task, session, mock, server)
@@ -6165,6 +6396,7 @@ mod review_regressions {
             agent_session_id: None,
             waiting_since: None,
             waited_secs: 0,
+            runtime: crate::domain::SessionRuntime::Tmux,
         };
         store.insert_session(&session).unwrap();
         std::fs::write(dir.path().join("repo/.powerqueue.toml"), "[broken").unwrap();

@@ -337,6 +337,9 @@ fn apply(
         Action::Retry(id) => control(app, store, DaemonCommand::Retry { task_id: id }, "retry")?,
         Action::Attach(id) => match app.snapshot.latest_session(id).cloned() {
             None => app.status_line = Some("no session to attach to yet".into()),
+            Some(s) if s.is_headless() => {
+                app.status_line = Some(format!("{} runs headless: no window; see `powerqueue attach` for its log", s.id));
+            }
             Some(s) if s.tmux_window.trim().is_empty() => {
                 app.status_line = Some("the session has no tmux window recorded".into());
             }

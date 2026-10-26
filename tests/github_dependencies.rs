@@ -269,6 +269,7 @@ async fn dependency_sync_preserves_a_live_rate_limited_session() {
             agent_session_id: None,
             waiting_since: None,
             waited_secs: 0,
+            runtime: powerqueue::domain::SessionRuntime::Tmux,
         })
         .unwrap();
     for state in ["open", "closed"] {

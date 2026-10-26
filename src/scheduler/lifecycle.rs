@@ -376,9 +376,12 @@ pub fn cleanup_task(
     Ok(())
 }
 
-/// Kill the latest session's tmux window; returns whether it happened.
+/// Kill the latest session's tmux window; returns whether it happened. A
+/// headless session has no window (the daemon stops its process before
+/// cleanup starts).
 fn close_window(store: &Store, tmux: &Tmux, task: &Task) -> bool {
     let session = match store.latest_session(task.id) {
+        Ok(Some(s)) if s.is_headless() => return false,
         Ok(Some(s)) => s,
         Ok(None) => return false,
         Err(e) => {

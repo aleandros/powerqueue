@@ -135,6 +135,7 @@ mod tests {
             agent_session_id: None,
             waiting_since: None,
             waited_secs: 0,
+            runtime: crate::domain::SessionRuntime::Tmux,
         }
     }
 

@@ -47,6 +47,15 @@ const STUTTERS: &[&str] = &[
     "relay.hint_sent",
     "session.marker_polled",
     "session.rate_limit_detected",
+    // Headless sessions: stream observations and process signals; the task
+    // moves only through the events they lead to (crash, rate limit, ...).
+    "session.api_retry",
+    "session.permission_denied",
+    "session.result",
+    "session.end_hook",
+    "session.process_exited",
+    "session.signalled",
+    "session.stop_failed",
     "github.sync",
     "github.dependencies_changed",
     "github.label",
@@ -66,6 +75,8 @@ const OUT_OF_SCOPE: &[&str] = &[
     "task.error",
     "launch.superseded",
     "session.exited",
+    // A headless session ended while its task waits; resumable, no task move.
+    "session.stopped",
     "task.blocked_by_command",
     "session.permission_prompt",
     "session.ended",

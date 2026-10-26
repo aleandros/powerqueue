@@ -71,9 +71,12 @@ use proptest::test_runner::Config as ProptestConfig;
 
 use crate::budget::{Decision, Estimator, Ledgers, RateLimitState, WINDOW_RECHECK};
 use crate::config::{Config, SchedulerConfig};
-use crate::domain::{Criticality, LinkedIssue, ModelTier, Session, SessionState, Task, TaskId, TaskSource, TaskState};
+use crate::domain::{
+    Criticality, LinkedIssue, ModelTier, Session, SessionRuntime, SessionState, Task, TaskId, TaskSource, TaskState,
+};
 use crate::github::PrStatus;
 use crate::priority::{Evaluation, PriorityRules};
+use crate::session::headless::HeadlessExit;
 use crate::session::{HookOutcome, SessionProbe};
 use crate::strategies::*;
 
@@ -240,6 +243,9 @@ enum Op {
         pane_tail: Option<String>,
         cooldown_secs: Option<i64>,
     },
+    /// The process of a headless session ended (`finish_headless`):
+    /// `on_headless_exit`, then the finalize phase.
+    HeadlessExit(HeadlessExit),
     /// `powerqueue task complete` (no PR): a direct write.
     Complete(Option<String>),
     /// `powerqueue task complete --pr <url>`: a direct write.
@@ -303,6 +309,7 @@ fn task_op() -> impl Strategy<Value = Op> {
         8 => hook_outcome().prop_map(Op::Hook),
         6 => (session_probe(), any::<bool>(), pane_tail(), prop::option::of(60i64..7200))
             .prop_map(|(probe, nudged, pane_tail, cooldown_secs)| Op::Probe { probe, nudged, pane_tail, cooldown_secs }),
+        4 => headless_exit().prop_map(Op::HeadlessExit),
         2 => prop::option::of(line()).prop_map(Op::Complete),
         3 => any_pr_url().prop_map(Op::HandOff),
         1 => prop::option::of(line()).prop_map(Op::Block),
@@ -409,7 +416,14 @@ impl TaskWorld {
                 self.task.description = description.clone();
                 Some(commands::source_deferral_events(&before, &self.task))
             }
-            Op::Pause => Some(commands::on_pause(&mut self.task, live)),
+            Op::Pause => {
+                // `pause_task`: a live headless session is stopped as well.
+                let mut effects = commands::on_pause(&mut self.task, live);
+                if let Some(s) = self.session.as_mut() {
+                    effects.extend(transitions::stop_for_pause(&self.task, s, now));
+                }
+                Some(effects)
+            }
             Op::Resume => Some(commands::on_resume(&mut self.task, live, now)),
             Op::Cancel => Some(commands::on_cancel(&mut self.task, self.session.as_mut(), now)),
             Op::Retry => Some(commands::on_retry(&mut self.task, self.session.as_mut(), now)),
@@ -468,6 +482,8 @@ impl TaskWorld {
                 let model = self.task.model.clone().unwrap_or_default();
                 let review = self.task.review_relaunch().is_some();
                 let (id, resume, agent_session_id) = launch::resume_plan(self.session.as_ref(), &model, true, review);
+                let runtime = cfg.session_runtime(model.provider());
+                let headless = runtime == SessionRuntime::Headless;
                 let session = Session {
                     id,
                     task_id: self.task.id,
@@ -475,8 +491,8 @@ impl TaskWorld {
                     model: model.clone(),
                     state: SessionState::Launching,
                     tmux_session: "powerqueue".into(),
-                    tmux_window: "@1".into(),
-                    pane_id: Some("%1".into()),
+                    tmux_window: if headless { String::new() } else { "@1".into() },
+                    pane_id: (!headless).then(|| "%1".into()),
                     pid: Some(42),
                     transcript_path: None,
                     exit_code: None,
@@ -487,6 +503,7 @@ impl TaskWorld {
                     agent_session_id,
                     waiting_since: None,
                     waited_secs: 0,
+                    runtime,
                 };
                 let relaunch = self.task.review_relaunch().cloned();
                 let review_prompt = relaunch.as_ref().map(|r| format!("/ship-pr {} --reason {}", r.pr_number, r.reason));
@@ -510,13 +527,23 @@ impl TaskWorld {
                 Some(transitions::on_hook_outcome(&mut self.task, session, outcome, cfg, now, now + Duration::days(3)))
             }
             Op::Probe { probe, nudged, pane_tail, cooldown_secs } => {
-                if !live {
+                // A headless session's end goes through `HeadlessExit`, never a dead pane.
+                if !live || (self.session.as_ref().is_some_and(Session::is_headless) && !probe.is_alive()) {
                     return None;
                 }
                 let cooldown = self.provider_cooldown(cfg, now, pane_tail.as_deref(), *cooldown_secs);
                 let session = self.session.as_mut()?;
                 let ctx = ProbeContext { now, nudged: *nudged, pane_tail: pane_tail.clone(), provider_cooldown_until: cooldown };
                 Some(transitions::on_probe(&mut self.task, session, probe, &cfg.scheduler, &ctx))
+            }
+            Op::HeadlessExit(exit) => {
+                if !live || !self.session.as_ref().is_some_and(Session::is_headless) {
+                    return None;
+                }
+                let session = self.session.as_mut()?;
+                let mut effects = transitions::on_headless_exit(&mut self.task, session, exit, cfg, now, now + Duration::days(3));
+                effects.extend(self.finalize(now));
+                Some(effects)
             }
             Op::Complete(summary) => {
                 // `task complete` as the CLI writes it, then the daemon's finalize.
@@ -771,6 +798,29 @@ fn check(
         prop_assert!(after.session_live(), "{}", ctx("running/idle without a live session"));
     }
 
+    // Headless sessions: their exit always ends them; a session is only
+    // `stopped` for a task that waits (paused, on a human, on a usage
+    // limit), without using up an attempt; and the next launch resumes it.
+    if matches!(op, Op::HeadlessExit(_)) {
+        prop_assert!(!after.session_live(), "{}", ctx("a headless exit left the session live"));
+    }
+    let stopped_now = after.session.as_ref().is_some_and(|s| s.state == SessionState::Stopped)
+        && before.session.as_ref().is_none_or(|s| s.state != SessionState::Stopped);
+    if stopped_now {
+        prop_assert!(after.session.as_ref().is_some_and(Session::is_headless), "{}", ctx("a tmux session was stopped"));
+        prop_assert!(
+            matches!(a.state, TaskState::Paused | TaskState::NeedsAttention | TaskState::Throttled),
+            "{}",
+            ctx("stopped a session of a task that does not wait")
+        );
+    }
+    if let (Op::Launched { .. }, Some(previous), Some(launched)) = (op, &before.session, &after.session)
+        && previous.state.is_resumable()
+        && previous.model.provider() == launched.model.provider()
+    {
+        prop_assert_eq!(previous.id, launched.id, "{}", ctx("a crashed or stopped session was not resumed"));
+    }
+
     // Backoff and retry times only while crashed or throttled.
     if a.not_before.is_some() {
         prop_assert!(matches!(a.state, TaskState::Crashed | TaskState::Throttled), "{}", ctx("not_before set"));
@@ -861,8 +911,13 @@ proptest! {
     /// Any sequence of daemon calls keeps the task, its session and the
     /// effect trace consistent (see the module doc for the invariants).
     #[test]
-    fn a_task_survives_any_sequence_of_daemon_calls(task in fresh_task(), cfg in scheduler_config(), ops in vec(op(), 1..model_steps())) {
-        let cfg = Config { scheduler: cfg, ..Config::default() };
+    fn a_task_survives_any_sequence_of_daemon_calls(
+        task in fresh_task(), cfg in scheduler_config(), headless in any::<bool>(), ops in vec(op(), 1..model_steps())
+    ) {
+        let mut cfg = Config { scheduler: cfg, ..Config::default() };
+        if headless {
+            cfg.claude.session_mode = crate::config::ClaudeSessionMode::Headless;
+        }
         let mut now = origin();
         let mut world = TaskWorld::new(task);
         for (step, op) in ops.iter().enumerate() {
@@ -1499,8 +1554,9 @@ fn daemon_world() -> impl Strategy<Value = DaemonWorld> {
         rate_limits(),
         1u32..=3,
         prop::array::uniform3(execution_project_settings()),
+        any::<bool>(),
     )
-        .prop_map(|(mut tasks, scheduler, budget, rate_limits, max_concurrent, projects)| {
+        .prop_map(|(mut tasks, scheduler, budget, rate_limits, max_concurrent, projects, headless)| {
             let mut seen = HashSet::new();
             tasks.retain(|t| seen.insert(t.task.id));
             // The store enforces distinct keys and session IDs. Preserve that
@@ -1511,7 +1567,10 @@ fn daemon_world() -> impl Strategy<Value = DaemonWorld> {
                     session.id = task.task.id.0;
                 }
             }
-            let cfg = Config { scheduler: SchedulerConfig { max_concurrent, ..scheduler }, budget, ..Config::default() };
+            let mut cfg = Config { scheduler: SchedulerConfig { max_concurrent, ..scheduler }, budget, ..Config::default() };
+            if headless {
+                cfg.claude.session_mode = crate::config::ClaudeSessionMode::Headless;
+            }
             let mut world = DaemonWorld {
                 cfg,
                 rules: HashMap::new(),

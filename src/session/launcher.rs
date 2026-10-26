@@ -8,8 +8,10 @@
 //!
 //! The provider-specific parts (extra files, env, argv, transcript path) come
 //! from [`crate::session::agent::AgentCli::prepare`]; this module owns the
-//! provider-neutral files and the tmux window. Resuming after a crash reuses
-//! the same session id (`--resume` for Claude Code).
+//! provider-neutral files and the tmux window (or, for a headless Claude
+//! session, the background process: see [`crate::session::headless`]).
+//! Resuming after a crash reuses the same session id (`--resume` for Claude
+//! Code).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -22,12 +24,13 @@ use serde_json::json;
 
 use crate::config::{ClaudeConfig, Config};
 use crate::domain::{
-    BLOCKED_MARKER, DONE_MARKER, HookEvent, ModelTier, Provider, Session, SessionState, Task, TaskId, TaskSource,
+    BLOCKED_MARKER, DONE_MARKER, HookEvent, ModelTier, Provider, Session, SessionRuntime, SessionState, Task, TaskId, TaskSource,
 };
 use crate::paths::Paths;
 use crate::priority::rules::priority_name;
 pub use crate::session::agent::prompt_arg;
 use crate::session::agent::{LaunchContext, agent_for};
+use crate::session::headless::HeadlessFiles;
 use crate::tmux::{Tmux, shell_quote};
 use crate::worktree::branch_name;
 
@@ -68,6 +71,12 @@ pub struct LaunchPlan {
     /// placeholders). The daemon logs each as a `prompt.template_error` event.
     #[serde(default)]
     pub prompt_warnings: Vec<String>,
+    /// tmux window or headless process.
+    #[serde(default)]
+    pub runtime: SessionRuntime,
+    /// Where a headless attempt writes its output; `None` for tmux.
+    #[serde(default)]
+    pub headless: Option<HeadlessFiles>,
 }
 
 fn default_provider() -> Provider {
@@ -523,6 +532,11 @@ impl Launcher {
             self_bin: powerqueue_bin,
         };
         let launch = agent.prepare(&ctx).with_context(|| format!("prepare {provider} launch for {}", task.key))?;
+        let runtime = cfg.session_runtime(provider);
+        let headless = (runtime == SessionRuntime::Headless).then(|| HeadlessFiles::new(&task_dir, session_id, attempt));
+        if let Some(files) = &headless {
+            files.reset()?;
+        }
         for (path, contents, mode) in &launch.files {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).with_context(|| format!("cannot create {}", parent.display()))?;
@@ -563,7 +577,7 @@ impl Launcher {
         if let Some(dir) = self.self_bin.parent() {
             path_dirs.push(dir.to_path_buf());
         }
-        let script = launch_script(task, attempt, worktree, &env, &argv, &path_dirs);
+        let script = launch_script(task, attempt, worktree, &env, &argv, &path_dirs, headless.as_ref());
         // The script exports `claude.env`, which may hold secrets: owner-only.
         crate::config::write_private(&script_path, script.as_bytes())
             .with_context(|| format!("cannot write {}", script_path.display()))?;
@@ -574,7 +588,7 @@ impl Launcher {
                 .with_context(|| format!("cannot chmod {}", script_path.display()))?;
         }
 
-        tracing::info!(task = %task.key, session = %session_id, attempt, resume, model = %model, provider = %provider, shim = shim.is_some(), dir = %task_dir.display(), "prepared launch files");
+        tracing::info!(task = %task.key, session = %session_id, attempt, resume, model = %model, provider = %provider, shim = shim.is_some(), runtime = %runtime, dir = %task_dir.display(), "prepared launch files");
         Ok(LaunchPlan {
             shell_command: format!("sh {}", shell_quote(&script_path.to_string_lossy())),
             task_dir,
@@ -587,12 +601,16 @@ impl Launcher {
             poll_transcript_for_completion: launch.poll_transcript_for_completion,
             prompt_template: prompt.template,
             prompt_warnings: prompt.warnings,
+            runtime,
+            headless,
         })
     }
 
     /// Run the provider's pre-launch step (trust seeding for Claude Code,
-    /// the info/exclude entry for Antigravity's hook file),
-    /// create the tmux window and return the new [`Session`] record.
+    /// the info/exclude entry for Antigravity's hook file), create the tmux
+    /// window (or start the headless process) and return the new
+    /// [`Session`] record. Failing to reach tmux or to start `sh` is a
+    /// [`RuntimeLaunchFailure`].
     pub fn launch(
         &self,
         cfg: &Config,
@@ -606,6 +624,41 @@ impl Launcher {
         agent_for(plan.provider)
             .pre_launch(cfg, &cfg.repo_path(), worktree)
             .with_context(|| format!("pre-launch step of {} for {}", plan.provider, task.key))?;
+        if plan.runtime == SessionRuntime::Headless {
+            let pid = crate::session::headless::spawn(&plan.script_path, worktree).context(RuntimeLaunchFailure)?;
+            tracing::info!(
+                task = %task.key,
+                session = %session_id,
+                attempt,
+                model = %model,
+                resume = plan.resume,
+                pid,
+                provider = %plan.provider,
+                "launched headless agent session"
+            );
+            let now = Utc::now();
+            return Ok(Session {
+                id: session_id,
+                task_id: task.id,
+                attempt,
+                model: model.clone(),
+                state: SessionState::Launching,
+                tmux_session: String::new(),
+                tmux_window: String::new(),
+                pane_id: None,
+                pid: Some(pid),
+                transcript_path: plan.transcript_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                exit_code: None,
+                started_at: now,
+                ended_at: None,
+                last_activity_at: now,
+                error: None,
+                agent_session_id: None,
+                waiting_since: None,
+                waited_secs: 0,
+                runtime: SessionRuntime::Headless,
+            });
+        }
         let tmux_session = cfg.tmux.session_name.clone();
         self.tmux.ensure_session(&tmux_session, &cfg.repo_path()).context(RuntimeLaunchFailure)?;
         let window = self
@@ -644,6 +697,7 @@ impl Launcher {
             agent_session_id: None,
             waiting_since: None,
             waited_secs: 0,
+            runtime: SessionRuntime::Tmux,
         })
     }
 
@@ -654,10 +708,15 @@ impl Launcher {
     /// last element is the prompt, expressed as the shell snippet
     /// `$(cat '<prompt_path>')` so the script (and a human re-running it)
     /// reads the prompt from disk. Everything in between is a literal
-    /// argument. Fails when `claude.binary` does not parse.
+    /// argument. With `claude.session_mode = "headless"` the program is
+    /// followed by [`crate::session::headless::HEADLESS_FLAGS`]. Fails when
+    /// `claude.binary` does not parse.
     pub fn claude_command(ctx: &LaunchContext<'_>, settings_path: &Path) -> Result<Vec<String>> {
         let c = &ctx.cfg.claude;
         let mut argv = crate::session::binary::launch_argv(&c.binary, ctx).context("claude.binary")?;
+        if ctx.cfg.session_runtime(Provider::Claude) == SessionRuntime::Headless {
+            argv.extend(crate::session::headless::HEADLESS_FLAGS.iter().map(std::string::ToString::to_string));
+        }
         argv.push(if ctx.resume.is_some() { "--resume" } else { "--session-id" }.to_string());
         argv.push(ctx.resume.unwrap_or(&ctx.session_id.to_string()).to_string());
         argv.extend(["--model".to_string(), ctx.model.alias().to_string()]);
@@ -726,6 +785,9 @@ fn worktree_of(task: &Task) -> Result<&Path> {
 }
 
 /// Render `launch.sh`. `path_dirs` go in front of `PATH`, first entry first.
+/// A tmux session `exec`s the CLI; a headless one (`headless` set) runs it
+/// with stdin from `/dev/null`, stdout and stderr into its files, and then
+/// records the exit status.
 #[expect(
     clippy::similar_names,
     reason = "The names distinguish related domain values and match the surrounding workflow terminology."
@@ -737,6 +799,7 @@ fn launch_script(
     env: &[(String, String)],
     argv: &[String],
     path_dirs: &[PathBuf],
+    headless: Option<&HeadlessFiles>,
 ) -> String {
     let mut s = String::new();
     s.push_str("#!/bin/sh\n");
@@ -753,7 +816,19 @@ fn launch_script(
     }
     let (prompt, args) = argv.split_last().expect("argv always ends with the prompt argument");
     let quoted: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
-    let _ = writeln!(s, "exec {} \"{prompt}\"", quoted.join(" "));
+    match headless {
+        None => {
+            let _ = writeln!(s, "exec {} \"{prompt}\"", quoted.join(" "));
+        }
+        Some(files) => {
+            let path = |p: &Path| shell_quote(&p.to_string_lossy());
+            let _ =
+                writeln!(s, "{} \"{prompt}\" </dev/null >{} 2>{}", quoted.join(" "), path(&files.stream), path(&files.stderr));
+            s.push_str("status=$?\n");
+            let _ = writeln!(s, "printf '%s\\n' \"$status\" >{}", path(&files.exit_status));
+            s.push_str("exit \"$status\"\n");
+        }
+    }
     s
 }
 
@@ -1041,6 +1116,88 @@ mod tests {
         let settings = std::fs::read_to_string(&plan.settings_path).unwrap();
         assert!(settings.contains("/usr/local/bin/powerqueue hook --task"), "{settings}");
         assert!(std::fs::read_to_string(&plan.prompt_path).unwrap().contains("run `powerqueue task complete"));
+    }
+
+    #[test]
+    fn headless_argv_is_the_interactive_one_plus_print_flags() {
+        let mut cfg = config();
+        cfg.claude.allowed_tools = vec!["Bash(git:*)".into()];
+        cfg.claude.append_system_prompt = Some("Be terse.".into());
+        let sid = uuid::Uuid::new_v4();
+        let t = task();
+        let paths = Paths::rooted(Path::new("/pq"));
+        let opus = ModelTier::opus();
+        let ctx = launch_ctx(&cfg, &t, &opus, sid, None, &paths, Path::new("/bin/powerqueue"));
+        let interactive = Launcher::claude_command(&ctx, Path::new("/s/settings.json")).unwrap();
+        cfg.claude.session_mode = crate::config::ClaudeSessionMode::Headless;
+        let ctx = launch_ctx(&cfg, &t, &opus, sid, None, &paths, Path::new("/bin/powerqueue"));
+        let headless = Launcher::claude_command(&ctx, Path::new("/s/settings.json")).unwrap();
+        assert_eq!(&headless[..5], &["claude", "-p", "--output-format", "stream-json", "--verbose"]);
+        let mut without = headless;
+        without.drain(1..5);
+        assert_eq!(without, interactive, "same session id, model, permissions, settings, tools and prompt");
+        // A resume keeps the flags.
+        let sid_s = sid.to_string();
+        let ctx = launch_ctx(&cfg, &t, &opus, sid, Some(&sid_s), &paths, Path::new("/bin/powerqueue"));
+        let resumed = Launcher::claude_command(&ctx, Path::new("/s/settings.json")).unwrap();
+        assert_eq!(&resumed[..7], &["claude", "-p", "--output-format", "stream-json", "--verbose", "--resume", sid_s.as_str()]);
+    }
+
+    #[test]
+    fn prepare_headless_redirects_output_and_records_the_exit_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::rooted(dir.path());
+        let launcher = Launcher { paths, tmux: Tmux::new("tmux", None), self_bin: PathBuf::from("/usr/local/bin/powerqueue") };
+        let mut cfg = config();
+        cfg.claude.session_mode = crate::config::ClaudeSessionMode::Headless;
+        // A stand-in CLI: one stream line on stdout, a note on stderr, exit 3.
+        let fake = dir.path().join("fake-claude");
+        write_executable(&fake, "#!/bin/sh\necho '{\"type\":\"system\",\"subtype\":\"init\"}'\necho oops >&2\nexit 3\n").unwrap();
+        cfg.claude.binary = fake.to_string_lossy().to_string();
+        let mut t = task();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        t.worktree_path = Some(wt.to_string_lossy().to_string());
+        let sid = uuid::Uuid::new_v4();
+        let files = crate::session::headless::HeadlessFiles::new(&launcher.paths.task_dir(&t.id.to_string()), sid, 2);
+        std::fs::create_dir_all(files.exit_status.parent().unwrap()).unwrap();
+        std::fs::write(&files.exit_status, "0\n").unwrap();
+
+        let plan = launcher.prepare(&cfg, &t, sid, &ModelTier::sonnet(), 2, true, None).unwrap();
+        assert_eq!(plan.runtime, SessionRuntime::Headless);
+        assert_eq!(plan.headless.as_ref(), Some(&files));
+        assert!(!files.exit_status.exists(), "a stale exit status is removed before the launch");
+        assert!(plan.transcript_path.is_some(), "the Claude transcript is still tailed for usage");
+        let script = std::fs::read_to_string(&plan.script_path).unwrap();
+        assert!(!script.contains("exec "), "{script}");
+        let run = script.lines().find(|l| l.contains("--output-format")).expect("command line");
+        assert!(run.contains(" -p --output-format stream-json --verbose --resume "), "{run}");
+        assert!(
+            run.ends_with(&format!(
+                "</dev/null >{} 2>{}",
+                shell_quote(&files.stream.to_string_lossy()),
+                shell_quote(&files.stderr.to_string_lossy())
+            )),
+            "{run}"
+        );
+        assert_eq!(script.lines().last(), Some("exit \"$status\""));
+
+        #[cfg(unix)]
+        {
+            let out = std::process::Command::new("sh").arg(&plan.script_path).output().unwrap();
+            assert_eq!(out.status.code(), Some(3));
+            assert_eq!(std::fs::read_to_string(&files.stream).unwrap(), "{\"type\":\"system\",\"subtype\":\"init\"}\n");
+            assert_eq!(std::fs::read_to_string(&files.stderr).unwrap(), "oops\n");
+            assert_eq!(files.read_exit_status(), Some(3));
+        }
+
+        // Interactive mode (the default) is unchanged: exec in tmux, no files.
+        cfg.claude.session_mode = crate::config::ClaudeSessionMode::Interactive;
+        let plan = launcher.prepare(&cfg, &t, sid, &ModelTier::sonnet(), 3, true, None).unwrap();
+        assert_eq!((plan.runtime, plan.headless), (SessionRuntime::Tmux, None));
+        let script = std::fs::read_to_string(&plan.script_path).unwrap();
+        assert!(script.lines().last().unwrap().starts_with("exec "), "{script}");
+        assert!(!script.contains("stream-json"));
     }
 
     #[test]

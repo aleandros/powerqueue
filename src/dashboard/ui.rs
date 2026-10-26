@@ -531,7 +531,11 @@ fn draw_detail(frame: &mut Frame<'_>, app: &DashboardApp, area: Rect, sym: &Symb
                 Span::raw(format!("session #{} ", s.attempt)),
                 Span::styled(s.model.as_str(), model_style(Some(&s.model))),
                 Span::raw(format!(" {} started {started}", s.state)),
-                Span::raw(s.pane_id.as_ref().map(|p| format!(" pane {p}")).unwrap_or_default()),
+                Span::raw(if s.is_headless() {
+                    format!(" headless pid {}", s.pid.map_or_else(|| "?".to_string(), |p| p.to_string()))
+                } else {
+                    s.pane_id.as_ref().map(|p| format!(" pane {p}")).unwrap_or_default()
+                }),
             ]));
         }
         None => lines.push(Line::from(Span::styled("no session yet", Style::default().fg(Color::DarkGray)))),

@@ -641,6 +641,7 @@ without it the session has no way to tell powerqueue it is done.
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `binary` | `"claude"` | the command that runs Claude Code: a program, or a command line with leading arguments and per-task placeholders (`{key}`, `{slug}`, `{task_id}`, `{session_id}`, `{worktree}`, `{task_dir}`, `{repo}`, `{attempt}`, `{model}`), e.g. `"docker exec -it --env-file {task_dir}/env -w {worktree} pq-{slug} claude"`; see [Running sessions in containers](containers.md) |
+| `session_mode` | `"interactive"` | `interactive`: Claude Code runs in a tmux window you can attach to. `headless`: `claude -p --output-format stream-json --verbose` runs as a background process with no window; see [Headless sessions](#headless-sessions) |
 | `shim` | `false` | the session runs where the daemon's `powerqueue` binary cannot (a container): hooks, the status line and `powerqueue task complete\|block` go through a shell shim at `<task dir>/bin/powerqueue` and the task inbox the daemon drains |
 | `permission_mode` | `"acceptEdits"` | `--permission-mode`; `auto` is the unattended choice, `bypassPermissions` never asks at all |
 | `effort` | none | `--effort` value |
@@ -664,6 +665,68 @@ unattended runs (a VPS, a daemon nobody watches) pick `auto`, where Claude
 Code's own classifier approves routine commands, or `bypassPermissions`,
 and/or pre-approve what your repo needs in `allowed_tools`, for example
 `["Bash(git *)", "Bash(cargo *)", "Bash(npm test*)"]`.
+
+### Headless sessions
+
+```toml
+[claude]
+session_mode = "headless"
+permission_mode = "auto"          # or acceptEdits plus allowed_tools
+```
+
+With `session_mode = "headless"` powerqueue starts Claude Code tasks as
+`claude -p --output-format stream-json --verbose` instead of the interactive
+CLI. Everything else about the launch is the same: the prompt, `claude.env`,
+the hook `--settings`, `--session-id`/`--resume`, `--permission-mode`,
+`--allowedTools`, `--append-system-prompt`, `--effort`, `--fallback-model`
+and `extra_args`. The process runs in the task's worktree in its own process
+group, with no tmux window; it outlives a daemon restart the way a tmux window
+does. Codex and Antigravity sessions always use tmux.
+
+Each attempt writes three files under `<state>/tasks/<task id>/headless/`:
+
+| File | Content |
+|------|---------|
+| `<session id>.<attempt>.stream.jsonl` | stdout: the `stream-json` events (`system/init`, messages, `system/api_retry`, the final `result`) |
+| `<session id>.<attempt>.stderr.log` | stderr |
+| `<session id>.<attempt>.exit` | the exit status, written when the CLI exits |
+
+`powerqueue task show` names the log (`headless log`), and `powerqueue attach`
+prints its path instead of attaching. The daemon reads the stream as it grows:
+
+- **Progress**: every line is activity, so `scheduler.stale_session_secs`,
+  `max_session_secs` and the dashboard work without a pane.
+- **Usage**: assistant messages go to the budget ledger, deduplicated by
+  message id with the Claude transcript, which is still tailed. The numbers
+  match what an interactive session would record. The `result` message's
+  estimated cost, turn count and duration are logged as a `session.result`
+  event.
+- **Rate limits**: `system/api_retry` events with `error = "rate_limit"` put
+  Claude on its rate-limit cooldown (`budget.rate_limited`) while the run keeps
+  retrying, and a run that fails on a usage limit throttles the task instead
+  of crashing it.
+- **Permission denials**: nobody can answer a permission prompt, so Claude
+  Code denies the call and goes on; each denial is logged as
+  `session.permission_denied` and counted by `powerqueue doctor`. Pick
+  `permission_mode = "auto"` or list what tasks need in `allowed_tools`.
+
+Hooks, `powerqueue task complete|block` and the DONE / BLOCKED markers work as
+in an interactive session. When the process exits, the daemon decides how the
+attempt ended (see [task lifecycle](task-lifecycle.md#headless-sessions)):
+completed or blocked through those signals, throttled on a usage limit,
+`crashed` (backoff, then `--resume` of the same session) on a non-zero exit,
+a missing or failed `result`, or a turn that ended without a completion
+marker. Cancel, retry, pause and the stale/timeout limits stop the process
+with SIGTERM to its process group (SIGKILL 15 s later if it is still there).
+
+The tradeoff: a headless session cannot be watched or steered mid-run.
+`AskUserQuestion` and permission prompts have nobody to answer them, and
+`powerqueue task send` refuses. A question ends the run (`needs_attention`);
+`powerqueue task resume` or a reply on the issue resumes the same session.
+Use headless mode for work that can run unattended. A repository can opt in
+or out with `[claude] session_mode` in `.powerqueue.toml`. `claude.binary`
+must not ask for a terminal (`docker exec -t`/`-it`): a headless session has
+none, and `doctor` warns about it.
 
 ## `[codex]`
 
@@ -951,7 +1014,7 @@ review_rounds_max = 5
 remove_worktree = false     # also: push_branch, delete_branch, keep_failed, run, close_tmux_window
 
 [claude]
-permission_mode = "plan"    # also: effort, extra_args, allowed_tools, append_system_prompt
+permission_mode = "plan"    # also: session_mode, effort, extra_args, allowed_tools, append_system_prompt
 
 [codex]
 approval = "on-request"     # also: reasoning_effort, extra_args

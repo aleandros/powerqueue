@@ -791,6 +791,212 @@ fn terminal_reply_clears_attention_in_status_and_dashboard() {
     assert_eq!(task["state"], "running");
 }
 
+// ------------------------------------------------------------ headless
+
+/// `claude.session_mode = "headless"`: the fixture runs as `claude -p
+/// --output-format stream-json` in the background, no tmux window.
+fn headless_env(mode: &str, extra_scheduler: &str) -> Option<Env> {
+    Env::with_opts(Opts { mode, extra_scheduler, extra_claude: "session_mode = \"headless\"", ..Opts::default() }, |_| {
+        String::new()
+    })
+}
+
+/// The latest session row of a `task show --json` snapshot.
+fn last_session(show: &serde_json::Value) -> serde_json::Value {
+    show["sessions"].as_array().and_then(|s| s.last()).map(|s| s["session"].clone()).unwrap_or_default()
+}
+
+fn launch_messages(show: &serde_json::Value) -> Vec<String> {
+    show["events"]
+        .as_array()
+        .map(|evs| {
+            evs.iter()
+                .filter(|e| e["kind"] == "session.launched")
+                .filter_map(|e| e["message"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Is a process with `pid` (or its group) still running?
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
+fn process_alive(pid: u64) -> bool {
+    Command::new("kill").args(["-0", &pid.to_string()]).output().unwrap().status.success()
+}
+
+#[test]
+fn headless_task_runs_to_completion_without_a_window() {
+    let Some(mut env) = headless_env("complete", "") else { return };
+    let key = add_task(&env, "Say hello headless", &[]);
+    env.start_daemon();
+    let st = env.wait_for_state(&key, "completed", Duration::from_secs(60));
+    assert_eq!(st, "completed", "daemon log:\n{}", env.daemon_log());
+    let v =
+        env.wait_for_show(&key, |v| output_tokens(v) >= 1400 && has_event(v, "cleanup.done") && has_event(v, "session.result"));
+    assert_eq!(v["task"]["summary"].as_str(), Some("fake-claude finished"));
+    assert_eq!(v["task"]["attempts"].as_u64(), Some(1));
+    assert!(output_tokens(&v) >= 1400, "usage from the stream and transcript: {}", v["usage"]);
+    let session = last_session(&v);
+    assert_eq!(session["runtime"], "headless");
+    assert_eq!(session["tmux_window"], "");
+    assert!(session["pane_id"].is_null());
+    let stream = v["sessions"][0]["headless"]["stream"].as_str().expect("headless log path").to_string();
+    let text = std::fs::read_to_string(&stream).unwrap();
+    assert!(text.lines().any(|l| l.contains("\"type\":\"result\"")), "{text}");
+    let kinds = event_kinds(&v);
+    assert!(completed_event(&kinds), "{kinds:?}");
+    assert!(!kinds.iter().any(|k| k == "session.crashed"), "{kinds:?}");
+    let result = v["events"].as_array().unwrap().iter().find(|e| e["kind"] == "session.result").unwrap();
+    assert_eq!(result["data"]["total_cost_usd"].as_f64(), Some(0.0123));
+    assert!(launch_messages(&v)[0].contains("headless (pid "), "{:?}", launch_messages(&v));
+    // No tmux window was ever opened for it.
+    let windows = Command::new("tmux").args(["-L", &env.socket, "list-windows", "-a", "-F", "#{window_name}"]).output().unwrap();
+    assert!(!String::from_utf8_lossy(&windows.stdout).contains("say-hello"), "{}", String::from_utf8_lossy(&windows.stdout));
+    // `attach` explains instead of failing and points to the log.
+    let attach = env.run_ok(&["attach", &key]);
+    assert!(attach.contains("runs headless") && attach.contains(&stream), "{attach}");
+    let text = env.run_ok(&["task", "show", &key]);
+    assert!(text.contains("headless log") && text.contains(&stream), "{text}");
+}
+
+#[test]
+fn headless_crash_resumes_the_same_session() {
+    let Some(mut env) = headless_env("crash-once", "") else { return };
+    let key = add_task(&env, "Crashy headless", &[]);
+    env.start_daemon();
+    let st = env.wait_for_state(&key, "completed", Duration::from_secs(90));
+    assert_eq!(st, "completed", "daemon log:\n{}", env.daemon_log());
+    let v = env.wait_for_show(&key, |v| has_event(v, "cleanup.done"));
+    assert_eq!(v["task"]["attempts"].as_u64(), Some(2));
+    let crash = v["events"].as_array().unwrap().iter().find(|e| e["kind"] == "session.crashed").expect("a crash event");
+    assert!(crash["message"].as_str().unwrap().contains("headless Claude Code exited with status 1 without a result"), "{crash}");
+    assert!(crash["data"]["pane_tail"].as_str().unwrap_or_default().contains("simulating crash"), "stderr tail: {crash}");
+    let launched = launch_messages(&v);
+    assert_eq!(launched.len(), 2, "{launched:?}");
+    assert!(launched[1].contains("resumed") && launched[1].contains("headless"), "{launched:?}");
+    assert_eq!(v["sessions"].as_array().unwrap().len(), 1, "a resumed attempt reuses the session row");
+    // Each attempt kept its own log.
+    let id = v["task"]["id"].as_str().unwrap();
+    let sid = last_session(&v)["id"].as_str().unwrap().to_string();
+    let dir = env.home().join("state/tasks").join(id).join("headless");
+    for attempt in [1, 2] {
+        assert!(dir.join(format!("{sid}.{attempt}.stream.jsonl")).exists(), "attempt {attempt} log in {}", dir.display());
+    }
+    assert_eq!(std::fs::read_to_string(dir.join(format!("{sid}.1.exit"))).unwrap().trim(), "1");
+}
+
+#[test]
+fn headless_question_waits_for_a_human_and_resume_continues_the_session() {
+    let Some(mut env) = headless_env("idle", "") else { return };
+    let key = add_task(&env, "Asks a question headless", &[]);
+    env.start_daemon();
+    assert_eq!(env.wait_for_state(&key, "needs_attention", Duration::from_secs(60)), "needs_attention", "{}", env.daemon_log());
+    let v = env.wait_for_show(&key, |v| last_session(v)["state"] == "stopped");
+    assert_eq!(last_session(&v)["state"], "stopped", "the exit stops the session without a crash: {}", env.daemon_log());
+    assert!(!event_kinds(&v).iter().any(|k| k == "session.crashed"), "{:?}", event_kinds(&v));
+    assert_eq!(v["task"]["attempts"].as_u64(), Some(1));
+    let out = env.cmd().args(["task", "send", &key, "yes"]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("runs headless"), "{}", String::from_utf8_lossy(&out.stderr));
+    // `task resume` re-queues; the next launch resumes the same session.
+    env.run_ok(&["task", "resume", &key]);
+    let v = env.wait_for_show(&key, |v| launch_messages(v).len() == 2 && v["task"]["state"] == "needs_attention");
+    let launched = launch_messages(&v);
+    assert_eq!(launched.len(), 2, "{launched:?}\n{}", env.daemon_log());
+    assert!(launched[1].contains("resumed"), "{launched:?}");
+    assert_eq!(v["sessions"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn headless_rate_limit_throttles_instead_of_crashing() {
+    let Some(mut env) = headless_env("ratelimit", "") else { return };
+    let key = add_task(&env, "Rate limited headless", &[]);
+    env.start_daemon();
+    assert_eq!(env.wait_for_state(&key, "throttled", Duration::from_secs(60)), "throttled", "{}", env.daemon_log());
+    let v = env.wait_for_show(&key, |v| last_session(v)["state"] == "stopped" && has_event(v, "budget.rate_limited"));
+    let kinds = event_kinds(&v);
+    assert!(kinds.iter().any(|k| k == "budget.rate_limited"), "{kinds:?}");
+    assert!(kinds.iter().any(|k| k == "session.api_retry"), "{kinds:?}");
+    assert!(!kinds.iter().any(|k| k == "session.crashed"), "{kinds:?}\n{}", env.daemon_log());
+    assert_eq!(last_session(&v)["state"], "stopped");
+    assert_eq!(v["task"]["attempts"].as_u64(), Some(1));
+    assert!(v["task"]["not_before"].is_string(), "{}", v["task"]);
+}
+
+#[test]
+fn headless_pause_stops_the_process_and_resume_continues_the_session() {
+    let Some(mut env) = headless_env("slow", "") else { return };
+    let key = add_task(&env, "Slow headless", &[]);
+    env.start_daemon();
+    let v = env.wait_for_show(&key, |v| v["task"]["state"] == "running" && last_session(v)["pid"].is_u64());
+    assert_eq!(v["task"]["state"], "running", "{}", env.daemon_log());
+    let pid = last_session(&v)["pid"].as_u64().unwrap();
+    assert!(process_alive(pid));
+    env.run_ok(&["task", "pause", &key]);
+    let v = env.wait_for_show(&key, |v| last_session(v)["state"] == "stopped");
+    assert_eq!(v["task"]["state"], "paused");
+    assert_eq!(last_session(&v)["state"], "stopped", "{}", env.daemon_log());
+    assert!(has_event(&v, "session.signalled"), "{:?}", event_kinds(&v));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while process_alive(pid) {
+        assert!(Instant::now() < deadline, "headless process {pid} survived the pause");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    env.run_ok(&["task", "resume", &key]);
+    assert_eq!(env.wait_for_state(&key, "completed", Duration::from_secs(60)), "completed", "{}", env.daemon_log());
+    let v = env.wait_for_show(&key, |v| has_event(v, "cleanup.done"));
+    let launched = launch_messages(&v);
+    assert!(launched.len() == 2 && launched[1].contains("resumed"), "{launched:?}");
+    assert!(!event_kinds(&v).iter().any(|k| k == "session.crashed"));
+}
+
+#[test]
+fn headless_cancel_stops_the_process() {
+    let Some(mut env) = headless_env("slow", "") else { return };
+    let key = add_task(&env, "Cancelled headless", &[]);
+    env.start_daemon();
+    let v = env.wait_for_show(&key, |v| v["task"]["state"] == "running" && last_session(v)["pid"].is_u64());
+    let pid = last_session(&v)["pid"].as_u64().expect("pid");
+    env.run_ok(&["task", "cancel", &key]);
+    assert_eq!(env.wait_for_state(&key, "cancelled", Duration::from_secs(30)), "cancelled");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while process_alive(pid) {
+        assert!(Instant::now() < deadline, "headless process {pid} survived the cancel");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let v = env.wait_for_show(&key, |v| last_session(v)["state"] == "killed");
+    assert_eq!(last_session(&v)["state"], "killed");
+}
+
+#[test]
+fn headless_session_killed_while_the_daemon_is_down_is_resumed() {
+    let Some(mut env) = headless_env("slow", "") else { return };
+    let key = add_task(&env, "Restart headless", &[]);
+    env.start_daemon();
+    let v = env.wait_for_show(&key, |v| v["task"]["state"] == "running" && last_session(v)["pid"].is_u64());
+    let pid = last_session(&v)["pid"].as_u64().expect("pid");
+    env.run_ok(&["stop"]);
+    assert!(env.daemon.take().unwrap().wait().unwrap().success());
+    assert!(process_alive(pid), "the session outlives the daemon, like a tmux window");
+    // Killed outright while nobody watches: no exit status is recorded.
+    Command::new("kill").args(["-KILL", &format!("-{pid}")]).status().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while process_alive(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    env.start_daemon();
+    assert_eq!(env.wait_for_state(&key, "completed", Duration::from_secs(90)), "completed", "{}", env.daemon_log());
+    let v = env.wait_for_show(&key, |v| has_event(v, "cleanup.done"));
+    let crash = v["events"].as_array().unwrap().iter().find(|e| e["kind"] == "session.crashed").expect("a crash event");
+    assert!(crash["message"].as_str().unwrap().contains("without an exit status"), "{crash}");
+    let launched = launch_messages(&v);
+    assert!(launched.len() == 2 && launched[1].contains("resumed"), "{launched:?}");
+    assert_eq!(v["task"]["attempts"].as_u64(), Some(2));
+}
+
 #[test]
 fn task_runs_on_codex_when_selected() {
     let Some(mut env) = Env::codex("complete") else { return };

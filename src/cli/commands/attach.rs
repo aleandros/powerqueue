@@ -2,7 +2,8 @@
 //!
 //! With a task: select that task's tmux window and attach (or `switch-client`
 //! when already inside tmux). Without one: attach to the hosting session.
-//! `--print` shows the tmux command line instead of running it.
+//! `--print` shows the tmux command line instead of running it. A headless
+//! session has no window: `attach` says so and names its log files.
 
 use anyhow::{Result, anyhow, bail};
 
@@ -19,7 +20,13 @@ pub fn run(ctx: &mut Context, args: AttachArgs) -> Result<i32> {
     let session_name = cfg.tmux.session_name;
 
     let window = match args.task.as_deref() {
-        Some(needle) => Some(resolve_window(ctx, needle)?),
+        Some(needle) => match resolve_window(ctx, needle)? {
+            Target::Window(w) => Some(w),
+            Target::Headless(text) => {
+                println!("{text}");
+                return Ok(0);
+            }
+        },
         None => None,
     };
 
@@ -47,8 +54,17 @@ pub fn run(ctx: &mut Context, args: AttachArgs) -> Result<i32> {
     Ok(0)
 }
 
+/// What `attach <task>` reaches.
+enum Target {
+    /// The tmux window id of the latest session.
+    Window(String),
+    /// The latest session is headless: what to tell the user instead.
+    Headless(String),
+}
+
 /// Resolve a task reference to the tmux window id of its latest session.
-fn resolve_window(ctx: &mut Context, needle: &str) -> Result<String> {
+fn resolve_window(ctx: &mut Context, needle: &str) -> Result<Target> {
+    let paths = ctx.paths.clone();
     let store = ctx.store()?;
     let task = store.find_task(needle)?.ok_or_else(|| anyhow!("no task matches `{needle}` (see `powerqueue status --all`)"))?;
     let session = store.latest_session(task.id)?.ok_or_else(|| {
@@ -59,13 +75,32 @@ fn resolve_window(ctx: &mut Context, needle: &str) -> Result<String> {
             task.state
         )
     })?;
+    if session.is_headless() {
+        return Ok(Target::Headless(headless_message(&paths, &task.key, &session)));
+    }
     if session.tmux_window.trim().is_empty() {
         bail!("task {} has a session record without a tmux window; was it launched by an older version?", task.key);
     }
     if !session.state.is_live() {
         tracing::warn!(task = %task.key, session = %session.id, state = %session.state, "latest session is not live; attaching anyway");
     }
-    Ok(session.tmux_window)
+    Ok(Target::Window(session.tmux_window))
+}
+
+/// Why a headless session cannot be attached to, and where its output is.
+pub fn headless_message(paths: &crate::paths::Paths, key: &str, session: &crate::domain::Session) -> String {
+    let files = crate::session::headless::HeadlessFiles::for_session(paths, session);
+    format!(
+        "{key} runs headless (`claude -p`, session {} is {}): there is no tmux window to attach to and it takes no input.\n\
+         stream log: {}\n\
+         stderr:     {}\n\
+         Follow it with `tail -f {}`; `powerqueue task show {key}` has the timeline.",
+        session.id,
+        session.state,
+        files.stream.display(),
+        files.stderr.display(),
+        shell_quote(&files.stream.to_string_lossy()),
+    )
 }
 
 /// The shell line equivalent to what [`Tmux::attach`] does.

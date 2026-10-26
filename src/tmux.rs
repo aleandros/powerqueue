@@ -282,6 +282,10 @@ impl Tmux {
 
     /// Kill a window by id (`@3`) or name.
     pub fn kill_window(&self, window_id: &str) -> Result<()> {
+        // An empty target would name tmux's current window.
+        if window_id.trim().is_empty() {
+            bail!("no tmux window to kill (empty window id)");
+        }
         self.run(&["kill-window", "-t", window_id])?;
         tracing::info!(window = window_id, "killed tmux window");
         Ok(())

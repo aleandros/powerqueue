@@ -305,6 +305,7 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
                 "peak_rss_bytes": stats.map(|x| x.0),
                 "avg_cpu_percent": stats.map(|x| x.1),
                 "samples": stats.map(|x| x.2),
+                "headless": s.is_headless().then(|| crate::session::headless::HeadlessFiles::for_session(&ctx.paths, s)),
             })).collect::<Vec<_>>(),
             "events": events,
             "pr_timeline": pr_events,
@@ -508,6 +509,11 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
             ]);
         }
         println!("{table}");
+        if let Some((s, _, _)) = session_rows.iter().rev().find(|(s, _, _)| s.is_headless()) {
+            let files = crate::session::headless::HeadlessFiles::for_session(&ctx.paths, s);
+            kv("headless log", files.stream.display().to_string());
+            kv("headless stderr", files.stderr.display().to_string());
+        }
     }
 
     if !pr_events.is_empty() {
@@ -992,6 +998,18 @@ pub fn run(ctx: &mut Context, cmd: TaskCommand) -> Result<i32> {
         TaskCommand::Output { task, lines } => {
             let store = ctx.store()?.clone();
             let t = find_task(&store, &task.task)?;
+            if let Some(session) = store.latest_session(t.id)?.filter(Session::is_headless) {
+                // No pane: the last lines of the stream log instead.
+                let files = crate::session::headless::HeadlessFiles::for_session(&ctx.paths, &session);
+                let text = std::fs::read_to_string(&files.stream).unwrap_or_default();
+                let all: Vec<&str> = text.lines().collect();
+                let n = usize::try_from(lines).unwrap_or(usize::MAX);
+                for line in &all[all.len().saturating_sub(n)..] {
+                    println!("{line}");
+                }
+                eprintln!("(headless session: last lines of {})", files.stream.display());
+                return Ok(0);
+            }
             let (_, pane) = live_pane(&store, &t)?;
             let tmux = tmux_for(ctx)?;
             let text = tmux.capture_pane(&pane, lines).with_context(|| format!("capture tmux pane {pane} of {}", t.key))?;
@@ -1004,6 +1022,14 @@ pub fn run(ctx: &mut Context, cmd: TaskCommand) -> Result<i32> {
         TaskCommand::Send { task, message } => {
             let store = ctx.store()?.clone();
             let t = find_task(&store, &task.task)?;
+            if let Some(session) = store.latest_session(t.id)?.filter(Session::is_headless) {
+                bail!(
+                    "{} runs headless (`claude -p`): it takes no input while it runs. Answer with `powerqueue task resume` \
+                     once it waits (the next attempt resumes session {}), or relay the answer on the issue",
+                    t.key,
+                    session.id
+                );
+            }
             let (session, pane) = live_pane(&store, &t)?;
             if !session.state.is_live() {
                 bail!("session {} of {} is {}; nothing is listening", session.id, t.key, session.state);

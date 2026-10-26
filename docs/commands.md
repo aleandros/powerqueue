@@ -61,9 +61,9 @@ Project filters on `status`, `task list` and `dashboard` affect only the task li
 | `task explain <task>` | execution project/configured checkout, saved/current routing decisions, current score and model decision, with reasons; pending GitHub/Linear `blocked by` prerequisites and open Linear sub-issues of a parent |
 | `task model <task> <model\|auto>` | force (or clear) the model for the next attempt (`fable`, `opus`, `sonnet`, `haiku`, or another provider's model such as `gpt-6.1-sol`, `gemini-3-pro`, `codex:<name>`); the policy may still downgrade it within the same provider when the model is out of budget |
 | `task prompt <task>` | print the prompt the next attempt would receive (renders `prompt.template` with attempt = attempts + 1, the task's last error and its forced/last model); nothing is launched. `--json` prints `{"task", "template", "prompt", "warnings"}` |
-| `task output <task> [-n LINES]` | last screen of the task's tmux pane (default 60 lines) |
-| `task send <task> "message"` | type a message into the running session |
-| `attach [<task>] [--print]` | open the task's tmux window; no task = the powerqueue session |
+| `task output <task> [-n LINES]` | last screen of the task's tmux pane (default 60 lines); for a headless session, the last lines of its `stream-json` log |
+| `task send <task> "message"` | type a message into the running session (refused for a headless session, which takes no input) |
+| `attach [<task>] [--print]` | open the task's tmux window; no task = the powerqueue session. A headless task (`claude.session_mode = "headless"`) has no window: `attach` says so and prints its log paths |
 
 In the dashboard, **P** opens the repository picker for unstarted work; arrows or
 `j`/`k` navigate, Enter selects, Escape cancels. Explicit routing mode opens the

@@ -66,7 +66,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     error            TEXT,
     agent_session_id TEXT,                     -- the CLI's own id (Codex thread, agy conversation); NULL for Claude
     waiting_since    TEXT,                     -- start of the current wait on a human (v6)
-    waited_secs      INTEGER NOT NULL DEFAULT 0 -- earlier waits on a human, excluded from max_session_secs (v6)
+    waited_secs      INTEGER NOT NULL DEFAULT 0, -- earlier waits on a human, excluded from max_session_secs (v6)
+    runtime          TEXT NOT NULL DEFAULT 'tmux' -- `tmux` or `headless` (v13)
 );
 CREATE INDEX IF NOT EXISTS sessions_task_idx ON sessions(task_id);
 CREATE INDEX IF NOT EXISTS sessions_state_idx ON sessions(state);

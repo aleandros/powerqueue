@@ -1,7 +1,8 @@
 //! Agent session runtime: the provider abstraction ([`agent`]) and its
 //! implementations ([`claude`], [`codex`], [`gemini`]), the `binary`
 //! command template ([`binary`]), prompt + launch script generation, Claude
-//! Code hook settings, the container shim and inbox ([`inbox`]), transcript
+//! Code hook settings, the container shim and inbox ([`inbox`]), headless
+//! Claude Code processes ([`headless`]), transcript
 //! tailing for token usage, liveness probing and resource sampling.
 
 pub mod agent;
@@ -10,6 +11,7 @@ pub mod binary;
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod headless;
 pub mod hooks;
 pub mod inbox;
 pub mod launcher;

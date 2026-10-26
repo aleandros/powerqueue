@@ -1159,6 +1159,63 @@ fn check_session_inbox(cfg: &Config, paths: &Paths) -> Option<CheckResult> {
     ))
 }
 
+/// `claude.session_mode`: interactive (tmux) or headless (`claude -p`), and
+/// the settings that break unattended headless runs: a permission mode that
+/// denies every prompted tool call, and a `claude.binary` that asks for a
+/// terminal (`docker exec -t`) a background process does not have.
+pub fn check_session_mode(cfg: &Config) -> CheckResult {
+    const NAME: &str = "claude session mode";
+    if cfg.claude.session_mode == crate::config::ClaudeSessionMode::Interactive {
+        return CheckResult::ok(CONF, NAME, "interactive: Claude Code runs in a tmux window you can attach to");
+    }
+    let tty =
+        shlex::split(&cfg.claude.binary).unwrap_or_default().iter().any(|a| matches!(a.as_str(), "-t" | "-it" | "-ti" | "--tty"));
+    if tty {
+        return CheckResult::warn(
+            CONF,
+            NAME,
+            format!("headless, but claude.binary `{}` asks for a terminal; a headless session has none", cfg.claude.binary),
+            "drop `-t`/`-it` from claude.binary (keep `-i` only if the command needs stdin), or set claude.session_mode = \"interactive\"",
+        );
+    }
+    if matches!(cfg.claude.permission_mode.as_str(), "default" | "manual" | "plan") {
+        return CheckResult::warn(
+            CONF,
+            NAME,
+            format!(
+                "headless with claude.permission_mode `{}`: every tool call that needs approval is denied, nobody can answer",
+                cfg.claude.permission_mode
+            ),
+            "use acceptEdits or auto with claude.allowed_tools for the commands tasks need, or set claude.session_mode = \"interactive\"",
+        );
+    }
+    CheckResult::ok(
+        CONF,
+        NAME,
+        format!(
+            "headless: `claude -p --output-format stream-json` in the background (permission mode {}); no window to attach to, \
+             questions and permission prompts cannot be answered mid-run",
+            cfg.claude.permission_mode
+        ),
+    )
+}
+
+/// Tool calls headless sessions could not make because nobody can approve a
+/// permission prompt (`session.permission_denied` events in the last day).
+pub fn headless_denials_status(denied: u64) -> CheckResult {
+    const NAME: &str = "headless permissions";
+    if denied > 0 {
+        return CheckResult::warn(
+            STATE,
+            NAME,
+            format!("{denied} tool call(s) in headless sessions were denied in the last 24h (nobody can approve a prompt)"),
+            "`powerqueue logs --events` shows which tools (session.permission_denied); allow them with claude.allowed_tools \
+             or claude.permission_mode = \"auto\", or run those tasks interactively",
+        );
+    }
+    CheckResult::ok(STATE, NAME, "no tool call of a headless session was denied in the last 24h")
+}
+
 /// Interactive Claude Code blocks on a trust dialog in untrusted folders.
 /// With `claude.trust_workspace` the launcher pre-seeds trust; otherwise the
 /// repository root must already be trusted in `~/.claude.json`.
@@ -1801,7 +1858,7 @@ fn check_starting_tasks(store: &Store) -> CheckResult {
     clippy::fn_params_excessive_bools,
     reason = "Keep the existing check_stuck_tasks flag interface during lint adoption; callers already supply named state predicates."
 )]
-fn check_stuck_tasks(cfg: &Config, store: &Store, fix: bool) -> CheckResult {
+fn check_stuck_tasks(cfg: &Config, paths: &Paths, store: &Store, fix: bool) -> CheckResult {
     let tmux = Tmux::new(cfg.tmux.binary.clone(), cfg.tmux.socket_name.clone());
     let panes = pane_ids(&tmux, &cfg.tmux.session_name);
     let tasks = match store.list_tasks() {
@@ -1814,6 +1871,12 @@ fn check_stuck_tasks(cfg: &Config, store: &Store, fix: bool) -> CheckResult {
         let reason = match &session {
             None => Some("no session row".to_string()),
             Some(s) if !s.state.is_live() => Some(format!("session is {}", s.state)),
+            Some(s) if s.is_headless() => {
+                let files = crate::session::headless::HeadlessFiles::for_session(paths, s);
+                let status = crate::session::headless::probe(&mut sysinfo::System::new(), s, &files);
+                (status == crate::session::headless::HeadlessStatus::Exited)
+                    .then(|| format!("headless process {} is gone", s.pid.unwrap_or_default()))
+            }
             Some(s) => match (&panes, &s.pane_id) {
                 (Some(list), Some(pane)) => {
                     let live = list.iter().any(|p| &p.pane_id == pane && !p.dead);
@@ -2383,6 +2446,7 @@ pub async fn run_all(
                     check_overrides_source(&project),
                     check_prompt_template(&project),
                     check_workspace_trust(&project, fix),
+                    check_session_mode(&project),
                 ];
                 results.extend(checks.into_iter().map(|mut check| {
                     if !cfg.projects.is_empty() {
@@ -2496,7 +2560,10 @@ pub async fn run_all(
         results.push(CheckResult::warn(STATE, "Issue analysis", analysis_problems.join("; "),
             "inspect task analyze <task> --show and analysis.recorded events; fix model credentials/configuration or clarify the issue/project descriptions, then explicitly rerun analysis. Resolve ambiguous work and destinations with a human; doctor --fix does not approve or route work"));
     }
-    results.push(check_stuck_tasks(cfg, store, fix));
+    results.push(check_stuck_tasks(cfg, paths, store, fix));
+    results.push(headless_denials_status(
+        store.count_events_of_kind("session.permission_denied", Utc::now() - Duration::hours(24)).unwrap_or(0),
+    ));
     results.push(check_dependencies(cfg, store));
     results.push(check_reviews(cfg, store));
     results.push(check_worktree_base(store));
@@ -2554,7 +2621,7 @@ mod tests {
         assert!(result.fix_hint.unwrap().contains("Doctor --fix leaves starting attempts untouched"));
         let mut cfg = Config::default();
         cfg.tmux.binary = "/nonexistent-test-tmux".into();
-        assert!(!check_stuck_tasks(&cfg, &store, true).fixed);
+        assert!(!check_stuck_tasks(&cfg, &Paths::rooted(std::path::Path::new("/nonexistent")), &store, true).fixed);
         assert_eq!(store.get_task(task.id).unwrap().unwrap(), before);
     }
 
