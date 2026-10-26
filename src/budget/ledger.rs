@@ -38,7 +38,7 @@ pub struct TierLedger {
     pub tier: ModelTier,
     pub period_usage: TokenUsage,
     pub window_usage: TokenUsage,
-    /// Weighted tokens spent this period (usage.weighted() × tier weight).
+    /// Weighted tokens spent this period (`usage.weighted()` × tier weight).
     pub period_weighted: f64,
     pub window_weighted: f64,
     /// Weighted budget for this tier in the period (`share × period_budget`,
@@ -137,6 +137,7 @@ pub fn learn_rate(
 
 /// Tier-weighted spend of one provider as a running total per minute, so
 /// the spend between any two instants is two lookups.
+#[derive(Debug)]
 pub struct SpendSeries {
     /// `(minute start, cumulative weighted tokens through the end of that minute)`, oldest first.
     points: Vec<(DateTime<Utc>, f64)>,
@@ -221,12 +222,12 @@ fn default_true() -> bool {
 /// Cost weight for a model: the configured one, else 1.0 (Sonnet-equivalent)
 /// for models that are not in the config.
 pub fn tier_weight(cfg: &BudgetConfig, tier: &ModelTier) -> f64 {
-    cfg.model_budget(tier).map(|m| m.weight).unwrap_or(1.0)
+    cfg.model_budget(tier).map_or(1.0, |m| m.weight)
 }
 
 /// Budget share for a model: 0 when it is absent from config or disabled.
 pub fn tier_share(cfg: &BudgetConfig, tier: &ModelTier) -> f64 {
-    cfg.model_budget(tier).filter(|m| m.enabled).map(|m| m.share.max(0.0)).unwrap_or(0.0)
+    cfg.model_budget(tier).filter(|m| m.enabled).map_or(0.0, |m| m.share.max(0.0))
 }
 
 /// Tier-weighted tokens of `provider`'s models in a set of usage rows.
@@ -276,6 +277,14 @@ impl Ledger {
     /// effective budgets are the learned ones when available), applies the
     /// per-model cost weights and shares, and folds in the latest
     /// observation ([`apply_observed`]).
+    #[expect(
+        clippy::as_conversions,
+        reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+    )]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+    )]
     pub fn build(
         cfg: &BudgetConfig,
         provider: Provider,
@@ -299,8 +308,8 @@ impl Ledger {
         };
         let configured_period_budget = budget.period_weighted_tokens as f64;
         let configured_window_budget = budget.window_weighted_tokens as f64;
-        let period_budget = learned.period.map(|r| r.budget).unwrap_or(configured_period_budget);
-        let window_budget = learned.window.map(|r| r.budget).unwrap_or(configured_window_budget);
+        let period_budget = learned.period.map_or(configured_period_budget, |r| r.budget);
+        let window_budget = learned.window.map_or(configured_window_budget, |r| r.budget);
 
         let mut models = cfg.models_for(provider);
         for row in &period_rows {
@@ -1026,6 +1035,7 @@ mod properties {
         /// Every shipped model has a positive cost weight; unknown models cost
         /// as much as Sonnet (1.0) and have no share.
         #[test]
+        #[expect(clippy::float_cmp, reason = "These values are exact discrete priorities or fixture constants; approximate equality would weaken the contract.")]
         fn weights_are_positive(name in "[a-z]{3,8}") {
             let cfg = BudgetConfig::default();
             for m in known_models() {
@@ -1044,6 +1054,7 @@ mod properties {
         /// window fraction is only bounded below (the policy compares it
         /// against the margin, so a value above 2 is as blocking as 2).
         #[test]
+        #[expect(clippy::float_cmp, reason = "These values are exact discrete priorities or fixture constants; approximate equality would weaken the contract.")]
         fn build_is_monotone_in_usage(
             provider in prop::sample::select(Provider::ALL.to_vec()),
             period_rows in tier_rows(),

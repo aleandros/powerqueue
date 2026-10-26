@@ -6,7 +6,7 @@
 //! response with id 1 (notifications without an id are ignored), then kill
 //! the process. The call is fast and consumes no quota.
 //!
-//! [`parse_rate_limits`] also decodes the snake_case `rate_limits` snapshot
+//! [`parse_rate_limits`] also decodes the `snake_case` `rate_limits` snapshot
 //! Codex writes into rollout `token_count` events, so the transcript tailer
 //! can feed the same [`ObservedUsage`].
 
@@ -120,9 +120,9 @@ impl CodexProbe {
                 tracing::debug!(line = %line, "codex app-server: ignoring a non-JSON line");
                 continue;
             };
-            let Some(id) = msg.get("id").and_then(|v| v.as_i64()) else { continue };
+            let Some(id) = msg.get("id").and_then(serde_json::Value::as_i64) else { continue };
             if let Some(err) = msg.get("error") {
-                let text = err.get("message").and_then(|m| m.as_str()).map(str::to_string).unwrap_or_else(|| err.to_string());
+                let text = err.get("message").and_then(|m| m.as_str()).map_or_else(|| err.to_string(), str::to_string);
                 bail!("codex app-server request {id} failed: {text}");
             }
             if id == 1 {
@@ -221,7 +221,7 @@ mod tests {
         let obs = parse_rate_limits_at(&msg["result"], now()).unwrap();
         assert_eq!(obs.window_used, None, "Pro plans have no 5h window");
         assert_eq!(obs.period_used, Some(0.17));
-        assert_eq!(obs.period_resets_at, Some(epoch(1791234430)));
+        assert_eq!(obs.period_resets_at, Some(epoch(1_791_234_430)));
         assert!(!obs.blocked);
         assert_eq!(obs.observed_at, now());
     }
@@ -231,16 +231,16 @@ mod tests {
         let result = serde_json::json!({
             "ordinaryUsageAllowed": true,
             "rateLimits": {
-                "primary": { "usedPercent": 42.5, "windowDurationMins": 300, "resetsAt": 1790914200 },
-                "secondary": { "usedPercent": 61, "windowDurationMins": 10080, "resetsAt": 1791234430 },
+                "primary": { "usedPercent": 42.5, "windowDurationMins": 300, "resetsAt": 1_790_914_200 },
+                "secondary": { "usedPercent": 61, "windowDurationMins": 10080, "resetsAt": 1_791_234_430 },
                 "rateLimitReachedType": null
             }
         });
         let obs = parse_rate_limits_at(&result, now()).unwrap();
         assert_eq!(obs.window_used, Some(0.425));
-        assert_eq!(obs.window_resets_at, Some(epoch(1790914200)));
+        assert_eq!(obs.window_resets_at, Some(epoch(1_790_914_200)));
         assert_eq!(obs.period_used, Some(0.61));
-        assert_eq!(obs.period_resets_at, Some(epoch(1791234430)));
+        assert_eq!(obs.period_resets_at, Some(epoch(1_791_234_430)));
         assert!(!obs.blocked);
         assert_eq!(obs.cooldown_until(), None);
     }
@@ -250,7 +250,7 @@ mod tests {
         let result = serde_json::json!({
             "ordinaryUsageAllowed": false,
             "rateLimits": {
-                "primary": { "usedPercent": 100, "windowDurationMins": 300, "resetsAt": 1790914200 },
+                "primary": { "usedPercent": 100, "windowDurationMins": 300, "resetsAt": 1_790_914_200 },
                 "secondary": { "usedPercent": 80, "windowDurationMins": 10080, "resetsAt": null },
                 "rateLimitReachedType": "primary"
             }
@@ -259,7 +259,7 @@ mod tests {
         assert!(obs.blocked);
         assert_eq!(obs.window_used, Some(1.0));
         assert_eq!(obs.period_resets_at, None);
-        assert_eq!(obs.cooldown_until(), Some(epoch(1790914200)));
+        assert_eq!(obs.cooldown_until(), Some(epoch(1_790_914_200)));
         // Blocked with no buckets at all still says something.
         let bare = serde_json::json!({ "ordinaryUsageAllowed": false, "rateLimits": { "primary": null } });
         assert!(parse_rate_limits_at(&bare, now()).unwrap().blocked);
@@ -274,7 +274,7 @@ mod tests {
         .unwrap();
         let obs = parse_rate_limits_at(&snapshot, now()).unwrap();
         assert_eq!(obs.period_used, Some(0.17));
-        assert_eq!(obs.period_resets_at, Some(epoch(1791234430)));
+        assert_eq!(obs.period_resets_at, Some(epoch(1_791_234_430)));
         assert_eq!(obs.window_used, None);
         assert!(!obs.blocked);
         // Wrapped in its `token_count` payload.

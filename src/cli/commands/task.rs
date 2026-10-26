@@ -190,7 +190,7 @@ fn control(ctx: &mut Context, task_ref: &TaskRef, make: impl Fn(Task) -> DaemonC
 
 fn tmux_for(ctx: &mut Context) -> Result<Tmux> {
     let cfg = ctx.config_cloned()?;
-    Ok(Tmux::new(cfg.tmux.binary.clone(), cfg.tmux.socket_name.clone()))
+    Ok(Tmux::new(cfg.tmux.binary.clone(), cfg.tmux.socket_name))
 }
 
 fn live_pane(store: &Store, task: &Task) -> Result<(Session, String)> {
@@ -201,10 +201,18 @@ fn live_pane(store: &Store, task: &Task) -> Result<(Session, String)> {
     Ok((session, pane))
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 fn paint(color: bool, s: String, plain: &str) -> String {
     if color { s } else { plain.to_string() }
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 fn level_colored(level: EventLevel, color: bool) -> String {
     let s = level.as_str();
     if !color {
@@ -219,7 +227,7 @@ fn level_colored(level: EventLevel, color: bool) -> String {
 }
 
 fn opt_ts(ts: Option<chrono::DateTime<Utc>>) -> String {
-    ts.map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_else(|| "-".to_string())
+    ts.map_or_else(|| "-".to_string(), |t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
 }
 
 fn execution_location(ctx: &mut Context, task: &Task) -> Result<serde_json::Value> {
@@ -235,6 +243,15 @@ fn execution_location(ctx: &mut Context, task: &Task) -> Result<serde_json::Valu
     })
 }
 
+#[expect(
+    clippy::as_conversions,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
+#[expect(clippy::too_many_lines, reason = "Keep the show workflow and its early exits together in execution order.")]
 fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let store = ctx.store()?.clone();
     let task = find_task(&store, &task_ref.task)?;
@@ -278,7 +295,7 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
             "source_route": source_route,
             "current_routing": current_routing,
             "execution_location": location,
-            "provider": effective_model(&task).map(|m| m.provider()),
+            "provider": effective_model(&task).map(crate::domain::ModelTier::provider),
             "usage": usage,
             "weighted_tokens": usage.weighted(),
             "sessions": session_rows.iter().map(|(s, u, stats)| serde_json::json!({
@@ -303,7 +320,7 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
             "  {:<14} {}",
             if color { k.if_supports_color(Stream::Stdout, |t| t.dimmed()).to_string() } else { k.to_string() },
             v
-        )
+        );
     };
     println!("{} {}", task.key.if_supports_color(Stream::Stdout, |t| t.bold()), task.title);
     kv("id", task.id.to_string());
@@ -330,7 +347,7 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     }
     let model_line = match (&task.model, &task.model_override) {
         (m, Some(o)) => {
-            format!("{} (forced: {})", m.as_ref().map(model_with_provider).unwrap_or("-".into()), model_with_provider(o))
+            format!("{} (forced: {})", m.as_ref().map_or("-".into(), model_with_provider), model_with_provider(o))
         }
         (Some(m), None) => model_with_provider(m),
         (None, None) => "auto".to_string(),
@@ -347,8 +364,7 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
             "GitHub admission",
             task.github_admission
                 .as_ref()
-                .map(|a| a.reason.clone())
-                .unwrap_or_else(|| "unverified; launch blocked until approval is checked".into()),
+                .map_or_else(|| "unverified; launch blocked until approval is checked".into(), |a| a.reason.clone()),
         );
     }
     kv("execution project", task.execution_project.clone());
@@ -480,17 +496,15 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
                 Cell::new(s.attempt),
                 Cell::new(paint(color, output::model_colored(Some(&s.model)), s.model.as_str())),
                 Cell::new(s.state.to_string()),
-                Cell::new(s.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())),
+                Cell::new(s.pid.map_or_else(|| "-".into(), |p| p.to_string())),
                 Cell::new(s.started_at.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string()),
                 Cell::new(
-                    s.ended_at
-                        .map(|t| t.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
-                        .unwrap_or_else(|| "-".into()),
+                    s.ended_at.map_or_else(|| "-".into(), |t| t.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string()),
                 ),
-                Cell::new(s.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "-".into())),
+                Cell::new(s.exit_code.map_or_else(|| "-".into(), |c| c.to_string())),
                 Cell::new(if u.is_zero() { "-".into() } else { human_f64(u.weighted()) }),
-                Cell::new(stats.map(|x| human_bytes(x.0)).unwrap_or_else(|| "-".into())),
-                Cell::new(stats.map(|x| format!("{:.0}%", x.1)).unwrap_or_else(|| "-".into())),
+                Cell::new(stats.map_or_else(|| "-".into(), |x| human_bytes(x.0))),
+                Cell::new(stats.map_or_else(|| "-".into(), |x| format!("{:.0}%", x.1))),
             ]);
         }
         println!("{table}");
@@ -529,12 +543,17 @@ pub fn pr_timeline(events: &[Event]) -> Vec<Event> {
 }
 
 /// `HH:MM:SS LEVEL kind message` with the level coloured.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 pub fn format_event(e: &Event, color: bool) -> String {
     let when = e.timestamp.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S");
     let kind = if color { e.kind.if_supports_color(Stream::Stdout, |t| t.dimmed()).to_string() } else { e.kind.clone() };
     format!("  {when} {:<5} {kind} {}", level_colored(e.level, color), e.message)
 }
 
+#[expect(clippy::too_many_lines, reason = "Keep the explain workflow and its early exits together in execution order.")]
 fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let store = ctx.store()?.clone();
     let task = find_task(&store, &task_ref.task)?;
@@ -560,7 +579,7 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
             "score_reasons": task.score_reasons,
             "model": task.model,
             "model_override": task.model_override,
-            "provider": effective_model(&task).map(|m| m.provider()),
+            "provider": effective_model(&task).map(crate::domain::ModelTier::provider),
             "not_before": task.not_before,
             "deferral": task.deferral,
             "source_deferral": task.source_deferral().ok().flatten(),
@@ -594,10 +613,7 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     if matches!(task.source, crate::domain::TaskSource::GitHub { .. }) {
         println!(
             "  admission    {}",
-            task.github_admission
-                .as_ref()
-                .map(|a| a.reason.as_str())
-                .unwrap_or("unverified; launch blocked until approval is checked")
+            task.github_admission.as_ref().map_or("unverified; launch blocked until approval is checked", |a| a.reason.as_str())
         );
     }
     if task.score_reasons.is_empty() {
@@ -615,7 +631,7 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     } else {
         println!(
             "  model        {} (chosen by the budget policy)",
-            task.model.as_ref().map(model_with_provider).unwrap_or("not chosen yet".into())
+            task.model.as_ref().map_or("not chosen yet".into(), model_with_provider)
         );
     }
     if let Some(nb) = task.not_before {
@@ -718,10 +734,10 @@ fn print_data(data: &serde_json::Value) {
                     serde_json::Value::Array(items) => {
                         println!("    {k}:");
                         for item in items {
-                            println!("      · {}", item.as_str().map(str::to_string).unwrap_or_else(|| item.to_string()));
+                            println!("      · {}", item.as_str().map_or_else(|| item.to_string(), str::to_string));
                         }
                     }
-                    other => println!("    {k}: {}", other.as_str().map(str::to_string).unwrap_or_else(|| other.to_string())),
+                    other => println!("    {k}: {}", other.as_str().map_or_else(|| other.to_string(), str::to_string)),
                 }
             }
         }
@@ -811,6 +827,15 @@ fn prompt(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
 }
 
 /// Handle `powerqueue task ...`.
+#[expect(
+    clippy::as_conversions,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(clippy::too_many_lines, reason = "Keep the run workflow and its early exits together in execution order.")]
 pub fn run(ctx: &mut Context, cmd: TaskCommand) -> Result<i32> {
     ensure_initialised(ctx)?;
     match cmd {
@@ -936,7 +961,7 @@ pub fn run(ctx: &mut Context, cmd: TaskCommand) -> Result<i32> {
             let store = ctx.store()?.clone();
             let mut t = find_task(&store, &task.task)?;
             store.enqueue_command(&DaemonCommand::SetModel { task_id: t.id, model: tier.clone() })?;
-            t.model_override = tier.clone();
+            t.model_override.clone_from(&tier);
             store.update_task(&t)?;
             store.log_event(
                 Some(t.id),
@@ -1079,7 +1104,7 @@ mod tests {
         assert_eq!(timeline.len(), 1);
 
         // Re-arming after a review round keeps the round count.
-        let mut again = back.clone();
+        let mut again = back;
         again.state = TaskState::Running;
         again.review.as_mut().unwrap().rounds = 2;
         hand_off_for_review(&store, &mut again, None, url).unwrap();
@@ -1189,7 +1214,7 @@ mod tests {
             pr_merged,
         };
         let mut t = Task::new("A-1", "a", crate::domain::TaskSource::Manual);
-        assert!(dependency_lines(&t).is_empty());
+        assert_eq!((dependency_lines(&t)).len(), 0);
         t.blocked_by = vec![linked("B-1", "started", false), linked("B-2", "started", true), linked("B-3", "completed", false)];
         t.parent = Some("P-1".into());
         let text = dependency_lines(&t).join("\n");

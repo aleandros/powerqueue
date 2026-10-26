@@ -14,7 +14,10 @@ use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::domain::*;
+use crate::domain::{
+    Criticality, DaemonCommand, Event, EventLevel, HookEvent, ModelTier, ResourceSample, SCHEDULING_PAUSE_KEY, SchedulingPause,
+    Session, SessionState, Task, TaskId, TaskState, TokenUsage, UsageRecord,
+};
 
 const SCHEMA: &str = include_str!("schema.sql");
 /// Current schema version (`PRAGMA user_version`).
@@ -29,11 +32,11 @@ const SCHEMA: &str = include_str!("schema.sql");
 ///   [`crate::domain::ReviewWatch`]).
 /// * v6: `sessions.waiting_since` and `sessions.waited_secs` (time spent
 ///   waiting on a human does not count towards `max_session_secs`).
-/// * v7: tasks.execution_project and execution_repo (stable execution binding).
+/// * v7: `tasks.execution_project` and `execution_repo` (stable execution binding).
 /// * v8: persisted GitHub execution admission (legacy rows start unverified).
 /// * v9: tasks.routing (persisted deterministic routing evidence).
 /// * v10: pinned execution queue and workflow policy.
-/// * v11: explicit local deferral, independent of automatic not_before.
+/// * v11: explicit local deferral, independent of automatic `not_before`.
 /// * v12: explicit and automatic repository assignment provenance.
 pub const SCHEMA_VERSION: i64 = 12;
 
@@ -139,6 +142,7 @@ impl Store {
     /// [`SCHEMA_VERSION`]. Every step is idempotent (checked against the
     /// actual schema, not just `user_version`), so an interrupted migration
     /// is simply finished on the next open.
+    #[expect(clippy::too_many_lines, reason = "Keep the migrate workflow and its early exits together in execution order.")]
     fn migrate(&self) -> Result<()> {
         let conn = self.lock();
         conn.execute_batch(SCHEMA).context("apply schema")?;
@@ -261,7 +265,7 @@ impl Store {
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// `PRAGMA integrity_check`.
@@ -297,8 +301,8 @@ impl Store {
                 task.linear_priority,
                 task.estimate,
                 task.project,
-                task.model_override.as_ref().map(|m| m.alias()),
-                task.model.as_ref().map(|m| m.alias()),
+                task.model_override.as_ref().map(super::domain::ModelTier::alias),
+                task.model.as_ref().map(super::domain::ModelTier::alias),
                 task.worktree_path,
                 task.branch,
                 task.attempts,
@@ -348,14 +352,14 @@ impl Store {
             )
             .context("load task before lifecycle update")?;
         let description =
-            if current.source_deferral().map_err(|e| e.to_string()) != task.source_deferral().map_err(|e| e.to_string()) {
-                &current.description
-            } else {
+            if current.source_deferral().map_err(|e| e.to_string()) == task.source_deferral().map_err(|e| e.to_string()) {
                 &task.description
+            } else {
+                &current.description
             };
         // Assignment changes have their own transactional writers. Preserve newer
         // human/model choices when a lifecycle writer holds an older snapshot.
-        let assignment = if current.project_assignment != task.project_assignment { &current } else { task };
+        let assignment = if current.project_assignment == task.project_assignment { task } else { &current };
         let n = tx.execute(
             "UPDATE tasks SET key=?2, title=?3, description=?4, source=?5, source_kind=?6, linear_issue_id=?7, state=?8,
                 criticality=?9, score=?10, labels=?11, linear_priority=?12, estimate=?13, project=?14, model_override=?15,
@@ -378,8 +382,8 @@ impl Store {
                 task.linear_priority,
                 task.estimate,
                 task.project,
-                task.model_override.as_ref().map(|m| m.alias()),
-                task.model.as_ref().map(|m| m.alias()),
+                task.model_override.as_ref().map(super::domain::ModelTier::alias),
+                task.model.as_ref().map(super::domain::ModelTier::alias),
                 task.worktree_path,
                 task.branch,
                 task.attempts,
@@ -690,7 +694,7 @@ impl Store {
                     before.state.as_str(),
                     before.attempts,
                     starting.state.as_str(),
-                    starting.model.as_ref().map(|m| m.alias()),
+                    starting.model.as_ref().map(super::domain::ModelTier::alias),
                     starting.not_before.as_ref().map(ts),
                     starting.review.as_ref().map(json),
                     ts(&now),
@@ -1100,6 +1104,14 @@ impl Store {
 
     /// Insert a usage record; duplicates (same message id) are ignored.
     /// Returns true if the record was new.
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
     pub fn record_usage(&self, u: &UsageRecord) -> Result<bool> {
         let conn = self.lock();
         let n = conn.execute(
@@ -1132,6 +1144,14 @@ impl Store {
     /// instants; the budget ledger turns this into a cumulative series so it
     /// can sum spend between any two readings without one query per pair.
     /// Rows with an unknown model alias are skipped like in `usage_by_tier`.
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
     pub fn usage_by_minute(&self, since: DateTime<Utc>, until: DateTime<Utc>) -> Result<Vec<(DateTime<Utc>, TierUsage)>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -1167,6 +1187,14 @@ impl Store {
     /// Usage per tier between two instants. Rows whose `tier` is not a
     /// model name any provider claims are skipped with a warning rather than
     /// being attributed to Sonnet.
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
     pub fn usage_by_tier(&self, since: DateTime<Utc>, until: DateTime<Utc>) -> Result<Vec<TierUsage>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -1197,6 +1225,14 @@ impl Store {
         Ok(out)
     }
 
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
     pub fn usage_for_session(&self, session_id: uuid::Uuid) -> Result<TokenUsage> {
         let conn = self.lock();
         let u = conn.query_row(
@@ -1215,6 +1251,14 @@ impl Store {
         Ok(u)
     }
 
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
     pub fn usage_for_task(&self, task_id: TaskId) -> Result<TokenUsage> {
         let conn = self.lock();
         let u = conn.query_row(
@@ -1275,6 +1319,14 @@ impl Store {
 
     // ------------------------------------------------------------- resources
 
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
     pub fn record_resource_sample(&self, s: &ResourceSample) -> Result<()> {
         let conn = self.lock();
         conn.execute(
@@ -1284,14 +1336,26 @@ impl Store {
                 s.session_id.to_string(),
                 s.task_id.to_string(),
                 ts(&s.timestamp),
-                s.cpu_percent as f64,
+                f64::from(s.cpu_percent),
                 s.rss_bytes as i64,
-                s.process_count as i64
+                i64::from(s.process_count)
             ],
         )?;
         Ok(())
     }
 
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
     pub fn latest_resource_sample(&self, session_id: uuid::Uuid) -> Result<Option<ResourceSample>> {
         let conn = self.lock();
         let row = conn
@@ -1321,6 +1385,18 @@ impl Store {
     }
 
     /// Peak RSS and mean CPU over a session's samples.
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
     pub fn resource_stats(&self, session_id: uuid::Uuid) -> Result<Option<(u64, f32, u32)>> {
         let conn = self.lock();
         let row = conn
@@ -1344,6 +1420,10 @@ impl Store {
 
     // ----------------------------------------------------------------- events
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "Keep the established ownership-taking boundary for callers and serialized inputs."
+    )]
     pub fn log_event(
         &self,
         task_id: Option<TaskId>,
@@ -1388,6 +1468,14 @@ impl Store {
         })
     }
 
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
     pub fn events_for_task(&self, task_id: TaskId, limit: usize) -> Result<Vec<Event>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -1422,6 +1510,14 @@ impl Store {
         Ok(rows.next().transpose()?)
     }
 
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
     pub fn recent_events(&self, limit: usize) -> Result<Vec<Event>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -1434,6 +1530,14 @@ impl Store {
     }
 
     /// Events with id greater than `after_id` (for live tailing).
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
     pub fn events_after(&self, after_id: i64, limit: usize) -> Result<Vec<Event>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -1443,6 +1547,14 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
     pub fn count_events_of_kind(&self, kind_prefix: &str, since: DateTime<Utc>) -> Result<u64> {
         let conn = self.lock();
         let n: i64 = conn.query_row(
@@ -1539,6 +1651,14 @@ impl Store {
     }
 
     /// Hook events for a task (consumed or not), newest last.
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
     pub fn hook_events_for_task(&self, task_id: TaskId, limit: usize) -> Result<Vec<PendingHookEvent>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -1579,7 +1699,7 @@ impl Store {
     }
 
     /// Save a result and reconcile automatic assignment atomically against the latest task.
-    /// Returns (saved, assignment_changed); older results are ignored. Storage errors roll back both.
+    /// Returns (saved, `assignment_changed`); older results are ignored. Storage errors roll back both.
     pub fn save_and_apply_analysis(
         &self,
         id: TaskId,
@@ -1700,10 +1820,18 @@ impl Store {
     }
 
     /// `(pid, last heartbeat)` if a daemon has ever run.
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
     pub fn daemon_heartbeat(&self) -> Result<Option<(u32, DateTime<Utc>)>> {
         let v: Option<serde_json::Value> = self.kv_get("daemon.heartbeat")?;
         let Some(v) = v else { return Ok(None) };
-        let pid = v.get("pid").and_then(|p| p.as_u64()).unwrap_or(0) as u32;
+        let pid = v.get("pid").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32;
         let at = v.get("at").and_then(|a| a.as_str()).map(parse_ts).transpose()?.unwrap_or_else(Utc::now);
         Ok(Some((pid, at)))
     }
@@ -1720,6 +1848,14 @@ impl Store {
 
     /// Row counts of every table [`Store::reset`] would empty (`kv` included,
     /// whether or not it will be wiped), without changing anything.
+    #[expect(
+        clippy::as_conversions,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "Preserve the existing SQLite numeric representation and readback semantics for persisted counters and samples."
+    )]
     pub fn reset_counts(&self) -> Result<ResetCounts> {
         let conn = self.lock();
         let count = |table: &str| -> Result<u64> {
@@ -1745,6 +1881,10 @@ impl Store {
     /// calibration, cooldowns, probe results, the daemon heartbeat).
     /// Returns how many rows each table held. The schema and its version are
     /// untouched; a `VACUUM` afterwards is best effort.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Keep the existing reset flag interface during lint adoption; callers already supply named state predicates."
+    )]
     pub fn reset(&self, everything: bool) -> Result<ResetCounts> {
         let counts = self.reset_counts()?;
         {
@@ -1820,6 +1960,7 @@ pub struct JevCached {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{LinkedIssue, ReviewRelaunch, ReviewWatch, TaskSource};
 
     fn linear_task(key: &str) -> Task {
         Task::new(
@@ -1926,7 +2067,7 @@ mod tests {
                 message_id: "msg_gpt".into(),
                 model_id: "gpt-6.1-sol".into(),
                 tier: ModelTier::new("gpt-6.1-sol"),
-                ..rec.clone()
+                ..rec
             })
             .unwrap();
         let by_tier = store.usage_by_tier(now - Duration::hours(1), now + Duration::hours(1)).unwrap();
@@ -1940,7 +2081,7 @@ mod tests {
         s2.exit_code = Some(0);
         store.update_session(&s2).unwrap();
         assert_eq!(store.get_session(s.id).unwrap().unwrap().state, SessionState::Exited);
-        assert!(store.list_live_sessions().unwrap().is_empty());
+        assert_eq!((store.list_live_sessions().unwrap()).len(), 0);
         let summaries = store.task_usage_summaries().unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].usage.total(), 300, "per-task totals count every row, whatever the alias");
@@ -1955,13 +2096,13 @@ mod tests {
         store.enqueue_command(&DaemonCommand::SyncNow).unwrap();
         let cmds = store.drain_commands().unwrap();
         assert_eq!(cmds, vec![DaemonCommand::Pause { task_id: t.id }, DaemonCommand::SyncNow]);
-        assert!(store.drain_commands().unwrap().is_empty());
+        assert_eq!((store.drain_commands().unwrap()).len(), 0);
 
         store.insert_hook_event(t.id, None, HookEvent::Stop, &serde_json::json!({"last_assistant_message": "hi"})).unwrap();
         let ev = store.drain_hook_events().unwrap();
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].event, HookEvent::Stop);
-        assert!(store.drain_hook_events().unwrap().is_empty());
+        assert_eq!((store.drain_hook_events().unwrap()).len(), 0);
         assert_eq!(store.hook_events_for_task(t.id, 10).unwrap().len(), 1);
     }
 
@@ -2015,9 +2156,9 @@ mod tests {
 
         let removed = store.reset(false).unwrap();
         assert_eq!((removed.tasks, removed.events, removed.commands, removed.kv), (1, 1, 1, 0));
-        assert!(store.list_tasks().unwrap().is_empty());
-        assert!(store.recent_events(10).unwrap().is_empty());
-        assert!(store.drain_commands().unwrap().is_empty());
+        assert_eq!((store.list_tasks().unwrap()).len(), 0);
+        assert_eq!((store.recent_events(10).unwrap()).len(), 0);
+        assert_eq!((store.drain_commands().unwrap()).len(), 0);
         assert!(store.kv_get::<serde_json::Value>("budget.calibration.claude").unwrap().is_some(), "kv survives");
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
 
@@ -2231,7 +2372,7 @@ mod tests {
         watch.rounds = 2;
         watch.relaunch =
             Some(ReviewRelaunch { pr_number: 7, reason: "conflict".into(), detail: String::new(), requested_at: Utc::now() });
-        t.review = Some(watch.clone());
+        t.review = Some(watch);
         store.insert_task(&t).unwrap();
         let back = store.get_task(t.id).unwrap().unwrap();
         assert_eq!(back.state, TaskState::InReview);

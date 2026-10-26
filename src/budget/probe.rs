@@ -103,7 +103,7 @@ pub fn thin_samples(samples: &[ObservationSample], now: DateTime<Utc>) -> Vec<Ob
         }
         let spacing = if now - s.at <= SAMPLE_RECENT { SAMPLE_SPACING_RECENT } else { SAMPLE_SPACING_OLD };
         match kept.last() {
-            Some(newer) if newer.at - s.at < spacing => continue,
+            Some(newer) if newer.at - s.at < spacing => {}
             _ => kept.push(*s),
         }
     }
@@ -234,17 +234,12 @@ mod tests {
         let h = append_observation(Vec::new(), &base).expect("first reading stored");
         assert_eq!(h, vec![ObservationSample::of(&base)]);
         // Same reading 20s later: not stored. Same reading 2 min later: stored.
-        assert!(
-            append_observation(h.clone(), &ObservedUsage { observed_at: t0 + Duration::seconds(20), ..base.clone() }).is_none()
-        );
-        let h = append_observation(h, &ObservedUsage { observed_at: t0 + Duration::minutes(2), ..base.clone() }).unwrap();
+        assert!(append_observation(h.clone(), &ObservedUsage { observed_at: t0 + Duration::seconds(20), ..base }).is_none());
+        let h = append_observation(h, &ObservedUsage { observed_at: t0 + Duration::minutes(2), ..base }).unwrap();
         assert_eq!(h.len(), 2);
         // A changed reading 10s later replaces the one just before it (one per minute is kept).
-        let changed = ObservedUsage {
-            period_used: Some(0.31),
-            observed_at: t0 + Duration::minutes(2) + Duration::seconds(10),
-            ..base.clone()
-        };
+        let changed =
+            ObservedUsage { period_used: Some(0.31), observed_at: t0 + Duration::minutes(2) + Duration::seconds(10), ..base };
         let h = append_observation(h, &changed).unwrap();
         assert_eq!(h.len(), 2);
         assert_eq!(h.last().map(|s| s.period_used), Some(Some(0.31)));
@@ -262,7 +257,7 @@ mod tests {
         let t0 = at("2026-10-01T12:00:00Z");
         let legacy = ObservationSample { at: t0, period_used: Some(0.43), window_used: None };
         assert_eq!(fold_legacy_calibration(Vec::new(), Some(legacy)), vec![legacy]);
-        assert!(fold_legacy_calibration(Vec::new(), None).is_empty());
+        assert_eq!((fold_legacy_calibration(Vec::new(), None)).len(), 0);
         let later = sample(t0 + Duration::hours(1), 0.5);
         let h = fold_legacy_calibration(vec![later], Some(legacy));
         assert_eq!(h, vec![legacy, later], "sorted, oldest first");
@@ -289,7 +284,7 @@ mod tests {
         assert!((118..=121).contains(&recent), "about one per minute over 2h, got {recent}");
         assert!((5..=7).contains(&old), "about one per 10 min over the older hour, got {old}");
         assert!(thinned.windows(2).all(|w| w[1].at - w[0].at >= SAMPLE_SPACING_RECENT));
-        assert!(thin_samples(&[], now).is_empty());
+        assert_eq!((thin_samples(&[], now)).len(), 0);
     }
 
     #[test]
@@ -440,7 +435,7 @@ mod properties {
                     if samples.last().is_none_or(|last| last.at <= sample.at) {
                         prop_assert_eq!(stored.last(), Some(&sample), "the newest reading is kept");
                     }
-                    let mut all = samples.clone();
+                    let mut all = samples;
                     all.push(sample);
                     all.sort_by_key(|s| s.at);
                     prop_assert_eq!(&stored, &thin_samples(&all, sample.at));

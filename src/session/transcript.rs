@@ -76,7 +76,7 @@ pub fn claude_home(cfg: &crate::config::Config) -> PathBuf {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
         return PathBuf::from(dir);
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
     home.join(".claude")
 }
 
@@ -120,7 +120,7 @@ impl TranscriptReader {
         Self {
             path,
             offset: 0,
-            seen: Default::default(),
+            seen: std::collections::HashSet::default(),
             session_id,
             task_id,
             last_text: None,
@@ -138,6 +138,10 @@ impl TranscriptReader {
     /// Only complete lines (terminated by `\n`) are consumed; a partial
     /// trailing line is left for the next call. If the file shrank below the
     /// remembered offset (truncated or replaced) reading restarts from zero.
+    #[expect(
+        clippy::as_conversions,
+        reason = "Collection and read lengths fit the platform counter type on supported 32-bit and 64-bit targets."
+    )]
     pub fn read_new(&mut self) -> Result<Vec<UsageRecord>> {
         let file = match std::fs::File::open(&self.path) {
             Ok(f) => f,
@@ -200,7 +204,7 @@ impl TranscriptReader {
         if let Some(ts) = v.get("timestamp").or_else(|| v.get("created_at")).and_then(|t| t.as_str()).and_then(parse_timestamp) {
             self.last_line_at = Some(ts);
             if v.get("type").and_then(|t| t.as_str()) == Some("assistant")
-                && v.get("isSidechain").and_then(|v| v.as_bool()) != Some(true)
+                && v.get("isSidechain").and_then(serde_json::Value::as_bool) != Some(true)
             {
                 self.last_progress_at = Some(self.last_progress_at.map_or(ts, |previous| previous.max(ts)));
             }
@@ -214,7 +218,7 @@ impl TranscriptReader {
 
     /// Current file size, or 0 when missing (activity signal).
     pub fn file_len(&self) -> u64 {
-        std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
+        std::fs::metadata(&self.path).map_or(0, |m| m.len())
     }
 }
 
@@ -232,7 +236,7 @@ pub fn parse_line(line: &str, session_id: uuid::Uuid, task_id: TaskId) -> Option
     let message = v.get("message")?;
     let message_id = message.get("id")?.as_str()?.to_string();
     let usage = message.get("usage")?.as_object()?;
-    let field = |name: &str| usage.get(name).and_then(|n| n.as_u64()).unwrap_or(0);
+    let field = |name: &str| usage.get(name).and_then(serde_json::Value::as_u64).unwrap_or(0);
     let model_id = message.get("model").and_then(|m| m.as_str()).unwrap_or_default().to_string();
     let timestamp = v.get("timestamp").and_then(|t| t.as_str()).and_then(parse_timestamp).unwrap_or_else(Utc::now);
     Some(UsageRecord {
@@ -356,7 +360,7 @@ mod tests {
         assert_eq!(reader.offset, std::fs::metadata(&path).unwrap().len());
 
         // Nothing new: nothing returned.
-        assert!(reader.read_new().unwrap().is_empty());
+        assert_eq!((reader.read_new().unwrap()).len(), 0);
 
         // A repeated message id later in the file is still ignored.
         let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -393,6 +397,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
     fn partial_trailing_line_waits_for_completion() {
         let (sid, tid) = ids();
         let dir = tempfile::tempdir().unwrap();
@@ -402,7 +407,7 @@ mod tests {
         std::fs::write(&path, head).unwrap();
 
         let mut reader = TranscriptReader::new(path.clone(), sid, tid);
-        assert!(reader.read_new().unwrap().is_empty());
+        assert_eq!((reader.read_new().unwrap()).len(), 0);
         assert_eq!(reader.offset, 0);
 
         let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -420,7 +425,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing.jsonl");
         let mut reader = TranscriptReader::new(path.clone(), sid, tid);
-        assert!(reader.read_new().unwrap().is_empty());
+        assert_eq!((reader.read_new().unwrap()).len(), 0);
         assert_eq!(reader.file_len(), 0);
 
         let mut f = std::fs::File::create(&path).unwrap();

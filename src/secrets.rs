@@ -95,6 +95,7 @@ pub trait SecretBackend: Send + Sync {
 }
 
 /// OS keychain backend.
+#[derive(Debug)]
 pub struct KeychainBackend {
     service: String,
 }
@@ -108,8 +109,7 @@ impl KeychainBackend {
     pub fn available() -> bool {
         match keyring::Entry::new(APP_NAME, "__probe__") {
             Ok(entry) => match entry.get_password() {
-                Ok(_) => true,
-                Err(keyring::Error::NoEntry) => true,
+                Ok(_) | Err(keyring::Error::NoEntry) => true,
                 Err(_) => false,
             },
             Err(_) => false,
@@ -158,6 +158,7 @@ impl SecretBackend for KeychainBackend {
 }
 
 /// Owner-only TOML file backend.
+#[derive(Debug)]
 pub struct FileBackend {
     path: PathBuf,
 }
@@ -229,7 +230,7 @@ impl Secrets {
     /// Choose the best backend for this machine. `POWERQUEUE_SECRETS=file`
     /// forces the file backend (useful in CI and tests).
     pub fn auto(paths: &Paths) -> Self {
-        let forced_file = std::env::var("POWERQUEUE_SECRETS").map(|v| v == "file").unwrap_or(false);
+        let forced_file = std::env::var("POWERQUEUE_SECRETS").is_ok_and(|v| v == "file");
         if !forced_file && KeychainBackend::available() {
             Self { backend: Box::new(KeychainBackend::new()) }
         } else {
@@ -314,18 +315,32 @@ mod tests {
 
     #[test]
     fn env_overrides_backend() {
+        const CHILD: &str = "POWERQUEUE_TEST_SECRET_ORIGIN";
+        let Ok(expected) = std::env::var(CHILD) else {
+            // Each child gets its environment before startup; never mutate the
+            // process environment while the parallel test harness is running.
+            for origin in ["environment", "file"] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child.args(["--exact", "secrets::tests::env_overrides_backend"]);
+                child.env(CHILD, origin).env_remove("JEV_API_KEY");
+                if origin == "environment" {
+                    child.env("JEV_API_KEY", "from-env");
+                }
+                assert!(child.status().unwrap().success(), "secret origin: {origin}");
+            }
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let secrets = Secrets::with_backend(Box::new(FileBackend::new(dir.path().join("s.toml"))));
         secrets.set(SecretKind::JevApiKey, "stored").unwrap();
-        // SAFETY: tests in this module run single-threaded per process env semantics; we restore after.
-        unsafe { std::env::set_var("JEV_API_KEY", "from-env") };
-        let (v, origin) = secrets.get_with_origin(SecretKind::JevApiKey).unwrap().unwrap();
-        unsafe { std::env::remove_var("JEV_API_KEY") };
-        assert_eq!(v, "from-env");
-        assert_eq!(origin, SecretOrigin::Environment);
-        let (v, origin) = secrets.get_with_origin(SecretKind::JevApiKey).unwrap().unwrap();
-        assert_eq!(v, "stored");
-        assert_eq!(origin, SecretOrigin::File);
+        let (value, origin) = secrets.get_with_origin(SecretKind::JevApiKey).unwrap().unwrap();
+        if expected == "environment" {
+            assert_eq!(value, "from-env");
+            assert_eq!(origin, SecretOrigin::Environment);
+        } else {
+            assert_eq!(value, "stored");
+            assert_eq!(origin, SecretOrigin::File);
+        }
     }
 
     #[test]

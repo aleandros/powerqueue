@@ -1,5 +1,7 @@
 //! `powerqueue doctor` — render diagnostics grouped by category.
 
+use std::fmt::Write as _;
+
 use anyhow::Result;
 use owo_colors::{OwoColorize, Stream, Style};
 
@@ -18,6 +20,10 @@ pub fn symbol(status: Status) -> &'static str {
     }
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 fn symbol_colored(status: Status, color: bool) -> String {
     let s = symbol(status);
     if !color {
@@ -59,6 +65,10 @@ pub fn summarize(results: &[CheckResult]) -> Summary {
 }
 
 /// Render the report as text.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 pub fn render(results: &[CheckResult], color: bool) -> String {
     let mut out = String::new();
     for cat in CATEGORIES {
@@ -88,7 +98,7 @@ pub fn render(results: &[CheckResult], color: bool) -> String {
             } else {
                 String::new()
             };
-            out.push_str(&format!("  {} {name} {detail}{fixed}\n", symbol_colored(r.status, color)));
+            let _ = writeln!(out, "  {} {name} {detail}{fixed}", symbol_colored(r.status, color));
             if let Some(h) = &r.fix_hint
                 && !r.fixed
                 && r.status != Status::Ok
@@ -130,6 +140,10 @@ pub fn render(results: &[CheckResult], color: bool) -> String {
 }
 
 /// Handle `powerqueue doctor`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Command dispatch transfers ownership of parsed arguments to the selected handler."
+)]
 pub fn run(ctx: &mut Context, args: DoctorArgs) -> Result<i32> {
     ensure_initialised(ctx)?;
     let cfg = ctx.config_cloned()?;

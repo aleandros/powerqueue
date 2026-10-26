@@ -79,7 +79,7 @@ pub fn evaluate(
             ApprovalEvent::LabeledEvent { label, .. } | ApprovalEvent::UnlabeledEvent { label } => {
                 label.name.eq_ignore_ascii_case(required)
             }
-            _ => false,
+            ApprovalEvent::RenamedTitleEvent { .. } => false,
         });
         let Some(ApprovalEvent::LabeledEvent { id, at, actor, .. }) = effective else {
             return GitHubAdmission::denied(format!(

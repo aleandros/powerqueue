@@ -33,6 +33,10 @@ pub struct PendingCleanup {
 
 impl PendingCleanup {
     /// Capture the execution identity without changing task or session state.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Keep the existing new flag interface during lint adoption; callers already supply named state predicates."
+    )]
     pub fn new(task: &Task, session: Option<uuid::Uuid>, succeeded: bool, review: bool) -> Self {
         Self {
             succeeded,
@@ -84,6 +88,10 @@ pub fn pick_next(tasks: &[Task], now: DateTime<Utc>) -> Option<&Task> {
 
 /// What [`cleanup_task`] will do, decided from config and the repository facts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "These are independent configuration or observed-state flags, not mutually exclusive states."
+)]
 pub struct CleanupPlan {
     /// Push the branch to the remote first.
     pub push: bool,
@@ -105,6 +113,10 @@ pub struct CleanupPlan {
 /// * `pushed_ok`: the push attempt succeeded (ignored when no push was planned).
 ///
 /// The worktree is never removed while it holds unpushed commits.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing cleanup_plan flag interface during lint adoption; callers already supply named state predicates."
+)]
 pub fn cleanup_plan(cfg: &CleanupConfig, succeeded: bool, has_remote: bool, unpushed: u32, pushed_ok: bool) -> CleanupPlan {
     let push = cfg.push_branch && has_remote;
     let (remove_worktree, keep_reason) = if !succeeded && cfg.keep_failed {
@@ -142,6 +154,11 @@ pub fn cleanup_plan(cfg: &CleanupConfig, succeeded: bool, has_remote: bool, unpu
 /// the caller saves the task. Individual git/tmux failures are logged as
 /// `cleanup.*` events and do not abort the remaining steps; only a store
 /// failure is returned as an error.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing cleanup_task flag interface during lint adoption; callers already supply named state predicates."
+)]
+#[expect(clippy::too_many_lines, reason = "Keep the cleanup_task workflow and its early exits together in execution order.")]
 pub fn cleanup_task(
     cfg: &Config,
     store: &Store,
@@ -212,7 +229,7 @@ pub fn cleanup_task(
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    tracing::warn!(task = %task.key, error = %format!("{e:#}"), "cannot check whether the worktree is dirty")
+                    tracing::warn!(task = %task.key, error = %format!("{e:#}"), "cannot check whether the worktree is dirty");
                 }
             }
         }
@@ -384,6 +401,10 @@ fn base_branch(cfg: &Config, repo: &Repo) -> Option<String> {
 }
 
 /// Environment for user cleanup commands.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing cleanup_env flag interface during lint adoption; callers already supply named state predicates."
+)]
 fn cleanup_env(task: &Task, succeeded: bool) -> Vec<(String, String)> {
     vec![
         ("POWERQUEUE_TASK_ID".to_string(), task.id.to_string()),
@@ -582,7 +603,7 @@ mod properties {
             newer = task.clone();
             newer.execution_project.push_str("-other");
             prop_assert!(!request.matches(&newer, None));
-            newer = task.clone();
+            newer = task;
             newer.worktree_path = Some(format!("{}/new", newer.worktree_path.unwrap_or_default()));
             prop_assert!(!request.matches(&newer, None));
         }

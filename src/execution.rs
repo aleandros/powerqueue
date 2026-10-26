@@ -249,7 +249,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::domain::{TaskSource, TaskState};
 
-    pub fn config() -> Config {
+    pub(crate) fn config() -> Config {
         Config::from_toml(
             r#"
 [repo]
@@ -271,7 +271,7 @@ comment_prefix = "[interno]"
         .unwrap()
     }
 
-    pub fn it_task() -> Task {
+    pub(crate) fn it_task() -> Task {
         Task::new(
             "IT-1",
             "Investigate",
@@ -413,6 +413,7 @@ mod properties {
         }
 
         #[test]
+        #[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
         fn queues_never_borrow_capacity((coding_cap, triage_cap, coding_live, triage_live) in crate::strategies::queue_capacity_case()) {
             let mut cfg = super::tests::config();
             cfg.queues.get_mut("default").unwrap().max_concurrent = coding_cap;

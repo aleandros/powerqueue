@@ -7,6 +7,8 @@
 //! [`container_comment`]. The parent does not have to be a powerqueue task:
 //! it is usually `In Progress` while its children are worked on.
 
+use std::fmt::Write as _;
+
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
@@ -82,9 +84,9 @@ pub fn container_comment(children: &[LinkedIssue], state: Option<&str>) -> Strin
     for c in children {
         let outcome = if c.is_completed() { "completada" } else { "cancelada" };
         if c.title.trim().is_empty() {
-            out.push_str(&format!("- {} ({outcome})\n", c.key));
+            let _ = writeln!(out, "- {} ({outcome})", c.key);
         } else {
-            out.push_str(&format!("- {} — {} ({outcome})\n", c.key, c.title.trim()));
+            let _ = writeln!(out, "- {} — {} ({outcome})", c.key, c.title.trim());
         }
     }
     out

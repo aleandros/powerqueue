@@ -1,4 +1,4 @@
-//! Client for Jev, TypeSafe's "System One" decision model.
+//! Client for Jev, `TypeSafe`'s "System One" decision model.
 //!
 //! Jev answers fixed-form questions with probabilities instead of prose, which
 //! makes it a good fit for turning a ticket into an ordered urgency level.
@@ -46,6 +46,14 @@ pub struct JevScore {
 
 impl JevScore {
     /// Score normalised to 0..=1 across the rubric.
+    #[expect(
+        clippy::as_conversions,
+        reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+    )]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+    )]
     pub fn normalized(&self) -> f64 {
         let n = self.probabilities.len().max(2) as f64;
         (self.score / (n - 1.0)).clamp(0.0, 1.0)
@@ -216,6 +224,22 @@ pub fn task_state(task: &Task) -> serde_json::Value {
 
 /// Turn a raw response into a [`JevScore`], tolerating string-indexed maps
 /// and unknown fields.
+#[expect(
+    clippy::as_conversions,
+    reason = "Budget and score calculations intentionally round or clamp floating-point estimates into their output units."
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Budget and score calculations intentionally round or clamp floating-point estimates into their output units."
+)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "Budget and score calculations intentionally round or clamp floating-point estimates into their output units."
+)]
 fn parse_score(raw: serde_json::Value, levels: &[String]) -> Result<JevScore> {
     let mut parsed: RawResponse = serde_json::from_value(raw.clone()).context("parse Jev response")?;
     let answer = match parsed.answers.remove(QUESTION_KEY) {
@@ -247,14 +271,14 @@ fn parse_score(raw: serde_json::Value, levels: &[String]) -> Result<JevScore> {
         .cloned()
         .or_else(|| levels.get(level_index).cloned())
         .unwrap_or_else(|| format!("level {level_index}"));
-    let confidence = answer.confidence.unwrap_or_else(|| probabilities.iter().cloned().fold(0.0, f64::max));
+    let confidence = answer.confidence.unwrap_or_else(|| probabilities.iter().copied().fold(0.0, f64::max));
     Ok(JevScore {
         score,
         level_index,
         level,
         confidence,
         probabilities,
-        input_tokens: parsed.usage.map(|u| u.input_tokens).unwrap_or(0),
+        input_tokens: parsed.usage.map_or(0, |u| u.input_tokens),
         raw,
     })
 }
@@ -300,7 +324,7 @@ mod tests {
 
     #[test]
     fn parses_sample_response() {
-        let levels: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+        let levels: Vec<String> = ["a", "b", "c", "d"].iter().map(std::string::ToString::to_string).collect();
         let s = parse_score(sample(), &levels).unwrap();
         assert_eq!(s.score, 1.43);
         assert_eq!(s.level_index, 1);

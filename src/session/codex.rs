@@ -1,4 +1,4 @@
-//! OpenAI Codex CLI (`codex`).
+//! `OpenAI` Codex CLI (`codex`).
 //!
 //! Verified against codex-cli 0.159.2 (see
 //! `docs/reference/providers-research.md`, appendix):
@@ -16,6 +16,8 @@
 //!   comes from the latest `turn_context`.
 //! * Resume: `codex resume <thread id> ... "<prompt>"` (the rollout keeps
 //!   growing in the same file).
+
+use std::fmt::Write as _;
 
 use std::path::{Path, PathBuf};
 
@@ -57,7 +59,7 @@ const MAX_ERROR_MESSAGE_CHARS: usize = 400;
 /// window starts the CLI before the session row records its start time).
 const DISCOVERY_SLACK: Duration = Duration::seconds(10);
 
-/// OpenAI Codex CLI.
+/// `OpenAI` Codex CLI.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CodexCli;
 
@@ -88,7 +90,9 @@ pub fn toml_string(s: &str) -> String {
             '\t' => out.push_str("\\t"),
             '\u{8}' => out.push_str("\\b"),
             '\u{c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c if (u32::from(c)) < 0x20 || u32::from(c) == 0x7f => {
+                let _ = write!(out, "\\u{:04X}", u32::from(c));
+            }
             c => out.push(c),
         }
     }
@@ -105,7 +109,7 @@ pub fn approval_flags(mode: &str) -> Result<Vec<String>> {
         "on-request" => &["-a", "on-request", "-s", "workspace-write"],
         other => bail!("codex.approval `{other}` is not one of {}", CODEX_APPROVAL_MODES.join("|")),
     };
-    Ok(flags.iter().map(|s| s.to_string()).collect())
+    Ok(flags.iter().map(std::string::ToString::to_string).collect())
 }
 
 /// The `notify=[...]` override that routes turn-complete notifications to
@@ -207,13 +211,13 @@ pub fn parse_rollout_usage(line: &str, session_id: uuid::Uuid, task_id: TaskId, 
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     let payload = event_payload(&v, "token_count")?;
     let usage = payload.get("info")?.get("last_token_usage")?.as_object()?;
-    let field = |name: &str| usage.get(name).and_then(|n| n.as_u64()).unwrap_or(0);
+    let field = |name: &str| usage.get(name).and_then(serde_json::Value::as_u64).unwrap_or(0);
     let cached = field("cached_input_tokens");
     let timestamp_text = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or_default();
     let timestamp = parse_timestamp(timestamp_text).unwrap_or_else(Utc::now);
     // The thread id maps 1:1 to the powerqueue session id (a resume reuses
     // both). The timestamp guards against ordinals restarting on resume.
-    let ordinal = v.get("ordinal").and_then(|o| o.as_u64()).map(|o| o.to_string()).unwrap_or_default();
+    let ordinal = v.get("ordinal").and_then(serde_json::Value::as_u64).map(|o| o.to_string()).unwrap_or_default();
     Some(UsageRecord {
         session_id,
         task_id,
@@ -235,6 +239,10 @@ pub fn parse_rollout_usage(line: &str, session_id: uuid::Uuid, task_id: TaskId, 
 /// rollout path)` of the *earliest* session started since then: the main
 /// thread is created first, so later rollouts in the same directory (a
 /// following attempt, sub-agents) never shadow it.
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "The producer protocol defines these filenames with case-sensitive suffixes."
+)]
 pub fn find_rollout(sessions_dir: &Path, worktree: &Path, started_after: DateTime<Utc>) -> Result<Option<(String, PathBuf)>> {
     let not_before = started_after - DISCOVERY_SLACK;
     // Day directories use the local date: look one day further back.
@@ -244,10 +252,7 @@ pub fn find_rollout(sessions_dir: &Path, worktree: &Path, started_after: DateTim
         if day.0 < first_day {
             continue;
         }
-        let entries = match std::fs::read_dir(&day.1) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let Ok(entries) = std::fs::read_dir(&day.1) else { continue };
         for entry in entries.flatten() {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
@@ -274,6 +279,14 @@ pub fn find_rollout(sessions_dir: &Path, worktree: &Path, started_after: DateTim
 }
 
 /// `(date, dir)` for every `YYYY/MM/DD` directory under `sessions_dir`.
+#[expect(
+    clippy::as_conversions,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
 fn day_dirs(sessions_dir: &Path) -> Result<Vec<(chrono::NaiveDate, PathBuf)>> {
     let mut out = Vec::new();
     let read = |p: &Path| -> Vec<(u32, PathBuf)> {
@@ -559,7 +572,7 @@ mod tests {
             self_bin: Path::new("/bin/powerqueue"),
         };
         let launch = agent_for(Provider::Codex).prepare(&ctx).unwrap();
-        assert!(launch.files.is_empty());
+        assert_eq!((launch.files).len(), 0);
         assert_eq!(launch.transcript_path, None);
         assert!(!launch.poll_transcript_for_completion);
         assert!(launch.env.iter().any(|(k, v)| k == "OPENAI_FOO" && v == "1"));
@@ -644,7 +657,7 @@ mod tests {
         assert_eq!(rollout_rate_limits(TOKENS).unwrap()["limit_id"], "codex");
         assert!(rollout_rate_limits(TURN).is_none());
         assert_eq!(st.take_pending_message().as_deref(), Some("OK"));
-        assert!(st.take_rate_limit_errors().is_empty());
+        assert_eq!((st.take_rate_limit_errors()).len(), 0);
 
         let err = r#"{"timestamp":"2026-10-02T03:25:00Z","type":"event_msg","payload":{"type":"error","message":"You’ve hit your usage limit. Try again at 9:00 PM."}}"#;
         let other = r#"{"type":"event_msg","payload":{"type":"error","message":"stream disconnected"}}"#;

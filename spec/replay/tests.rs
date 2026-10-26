@@ -460,6 +460,8 @@ fn ordinary_duplicate_creation_is_retained_for_quint_to_reject() {
 }
 
 #[test]
+#[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+#[expect(clippy::cast_possible_wrap, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
 fn observational_events_stutter_but_permission_prompt_cuts_off() {
     let mut rows = launched();
     let kinds: Vec<_> = STUTTERS
@@ -566,7 +568,7 @@ fn task_indices_follow_first_event_and_output_is_anonymized() {
     assert_eq!(observations.iter().map(|o| o.id).collect::<Vec<_>>(), [0, 0, 0, 1, 1, 1]);
     assert_eq!(report.tasks, 2);
     assert_eq!(report.actions, BTreeMap::from([("Create".into(), 2), ("Start".into(), 2), ("Launch".into(), 2)]));
-    let artifacts = render(&observations) + &serde_json::to_string(&report).unwrap();
+    let artifacts = format!("{}{}", render(&observations), serde_json::to_string(&report).unwrap());
     for private in ["private ticket", "/private/path", "do not export", "00000000-0000-0000-0000-000000000001"] {
         assert!(!artifacts.contains(private));
     }
@@ -608,6 +610,10 @@ fn rejected_observation_uses_last_valid_itf_index() {
 
 // These tests intentionally fail if Quint is missing when explicitly requested.
 // The ordinary Rust gate exercises projection without installing Node/Quint.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Test helpers take boolean inputs to exercise both sides of the production transition."
+)]
 fn check_trace(rows: Vec<Event>, success: bool) {
     let (observations, _) = project(rows).unwrap();
     let destination = Path::new(SPEC).join(".generated");
@@ -620,7 +626,7 @@ fn check_trace(rows: Vec<Event>, success: bool) {
         .arg("--max-samples=1")
         .output()
         .expect("install Quint with npm ci --prefix spec --ignore-scripts");
-    let output = String::from_utf8_lossy(&result.stdout).into_owned() + &String::from_utf8_lossy(&result.stderr);
+    let output = format!("{}{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
     assert_eq!(result.status.success(), success, "{output}");
     if !success {
         assert!(output.contains("Assertion failed"), "{output}");
@@ -720,6 +726,10 @@ fn github_created() -> Event {
     payload(1, "task.created", json!({"source":"github"}))
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Test helpers take boolean inputs to exercise both sides of the production transition."
+)]
 fn admission(index: i64, approved: bool) -> Event {
     payload(index, if approved { "github.admitted" } else { "github.revoked" }, json!({"admission":{"approved":approved}}))
 }
@@ -808,6 +818,10 @@ fn quint_accepts_reapproval_and_preserves_active_work_on_revocation() {
     );
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Test helpers take boolean inputs to exercise both sides of the production transition."
+)]
 fn routing(index: i64, permitted: bool) -> Event {
     payload(index, if permitted { "routing.selected" } else { "routing.blocked" }, json!({"routing":{"permitted":permitted}}))
 }
@@ -847,6 +861,8 @@ fn routing_events_are_explicit_and_decisions_are_validated() {
 }
 
 #[test]
+#[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+#[expect(clippy::cast_possible_wrap, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
 fn production_routing_effects_are_projected_without_discarding_holds() {
     use powerqueue::{
         config::Config,
@@ -874,6 +890,8 @@ fn production_routing_effects_are_projected_without_discarding_holds() {
 
 #[test]
 #[ignore = "requires Quint"]
+#[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+#[expect(clippy::cast_possible_wrap, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
 fn quint_keeps_routing_and_source_approval_independent() {
     // Neither a selected route nor fresh approval may repair the other prerequisite.
     for rows in [

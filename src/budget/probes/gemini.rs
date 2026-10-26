@@ -96,9 +96,10 @@ pub fn parse_usage(value: &serde_json::Value, now: DateTime<Utc>) -> Option<Obse
             PERIOD_BUCKET => false,
             _ => continue,
         };
-        let remaining = bucket.get("remaining_fraction").or_else(|| bucket.get("remainingFraction")).and_then(|v| v.as_f64());
+        let remaining =
+            bucket.get("remaining_fraction").or_else(|| bucket.get("remainingFraction")).and_then(serde_json::Value::as_f64);
         let used = remaining.map(|r| (1.0 - r).clamp(0.0, 1.0));
-        let disabled = bucket.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
+        let disabled = bucket.get("disabled").and_then(serde_json::Value::as_bool).unwrap_or(false);
         let resets = ["reset_time", "resets_at", "resetTime", "reset_at"].iter().find_map(|k| {
             let v = bucket.get(*k)?;
             epoch_secs(v).or_else(|| v.as_str().and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|d| d.with_timezone(&Utc)))
@@ -171,12 +172,12 @@ mod tests {
     fn disabled_bucket_blocks() {
         let mut v = sample();
         v["command"]["data"]["groups"][0]["buckets"][0] =
-            serde_json::json!({ "id": "gemini-5h", "disabled": true, "reset_time": 1790914200 });
+            serde_json::json!({ "id": "gemini-5h", "disabled": true, "reset_time": 1_790_914_200 });
         let obs = parse_usage(&v, now()).unwrap();
         assert!(obs.blocked);
         assert_eq!(obs.window_used, Some(1.0));
-        assert_eq!(obs.window_resets_at, DateTime::from_timestamp(1790914200, 0));
-        assert_eq!(obs.cooldown_until(), DateTime::from_timestamp(1790914200, 0));
+        assert_eq!(obs.window_resets_at, DateTime::from_timestamp(1_790_914_200, 0));
+        assert_eq!(obs.cooldown_until(), DateTime::from_timestamp(1_790_914_200, 0));
     }
 
     #[test]

@@ -220,7 +220,7 @@ fn hook_from_other_providers_is_normalised() {
         .write_stdin("{}")
         .assert()
         .success();
-    assert!(store.drain_hook_events().unwrap().is_empty());
+    assert_eq!((store.drain_hook_events().unwrap()).len(), 0);
 }
 
 #[test]

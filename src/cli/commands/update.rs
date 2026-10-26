@@ -264,6 +264,14 @@ pub fn verify_sha256(data: &[u8], sha_file: &str, asset_name: &str) -> Result<()
 
 /// Pull the `powerqueue` regular file out of a `.tar.gz`. Fails when the
 /// archive is not gzip/tar or has no such entry.
+#[expect(
+    clippy::as_conversions,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
 pub fn extract_binary(tarball: &[u8]) -> Result<Vec<u8>> {
     let decoder = flate2::read::GzDecoder::new(tarball);
     let mut archive = tar::Archive::new(decoder);
@@ -283,6 +291,7 @@ pub fn extract_binary(tarball: &[u8]) -> Result<Vec<u8>> {
 /// The staging file beside the target binary. Opened *before* the download
 /// so an unwritable directory fails fast; removed on drop unless `commit`
 /// renamed it over the target.
+#[derive(Debug)]
 pub struct Staging {
     target: PathBuf,
     path: PathBuf,
@@ -421,11 +430,19 @@ fn under_cargo_bin(path: &Path) -> bool {
     if let Some(home) = std::env::var_os("HOME") {
         candidates.push(PathBuf::from(home).join(".cargo").join("bin"));
     }
-    candidates.iter().any(|c| c.canonicalize().map(|c| path.starts_with(c)).unwrap_or(false))
+    candidates.iter().any(|c| c.canonicalize().is_ok_and(|c| path.starts_with(c)))
 }
 
 /// Whether a daemon is heartbeating, when a database exists. Never fails:
 /// any problem reads as "unknown" (`None`).
+#[expect(
+    clippy::as_conversions,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
 fn daemon_running(ctx: &mut Context) -> Option<bool> {
     if !ctx.paths.database().exists() {
         return Some(false);
@@ -445,6 +462,11 @@ fn bold(s: &str) -> String {
 }
 
 /// Handle `powerqueue update`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Command dispatch transfers ownership of parsed arguments to the selected handler."
+)]
+#[expect(clippy::too_many_lines, reason = "Keep the run workflow and its early exits together in execution order.")]
 pub fn run(ctx: &mut Context, args: UpdateArgs) -> Result<i32> {
     let current = Version::parse(crate::VERSION).context("parse the compiled-in version")?;
     let target_triple = detect_target()?;
@@ -622,6 +644,7 @@ mod tests {
         assert!(verify_sha256(data, "deadbeef  a", "a").is_err());
     }
 
+    #[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
     fn tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         let mut ar = tar::Builder::new(enc);

@@ -62,6 +62,14 @@ impl Snapshot {
 
     /// Read everything from the store. The ledger is optional: when it cannot
     /// be computed the budget panel says so instead of failing the frame.
+    #[expect(
+        clippy::as_conversions,
+        reason = "Terminal dimensions and rendered collection lengths use the existing bounded display representation."
+    )]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Terminal dimensions and rendered collection lengths use the existing bounded display representation."
+    )]
     pub fn load(store: &Store, cfg: &Config, now: DateTime<Utc>) -> Result<Snapshot> {
         let tasks = store.list_tasks()?;
         let sessions = store.list_sessions()?;
@@ -192,7 +200,11 @@ pub fn provider_cooldowns(
         .iter()
         .filter_map(|(p, ledger)| {
             let marks = limits.provider_blocked_until(&cfg.budget, p, now);
-            let observed = ledger.observed.as_ref().and_then(|o| o.cooldown_until()).filter(|u| *u > now);
+            let observed = ledger
+                .observed
+                .as_ref()
+                .and_then(super::super::budget::probe::ObservedUsage::cooldown_until)
+                .filter(|u| *u > now);
             let until = match (marks, observed) {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 (a, b) => a.or(b),
@@ -224,6 +236,10 @@ pub struct RowData {
 
 /// Rows for the table: live tasks first, then by score; terminal tasks are
 /// hidden when `hide_terminal`.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing rows_for flag interface during lint adoption; callers already supply named state predicates."
+)]
 pub fn rows_for(snapshot: &Snapshot, hide_terminal: bool, now: DateTime<Utc>) -> Vec<RowData> {
     let mut tasks: Vec<Task> = snapshot.tasks.iter().filter(|t| !hide_terminal || !t.state.is_terminal()).cloned().collect();
     crate::cli::commands::status::sort_for_display(&mut tasks);
@@ -240,14 +256,14 @@ pub fn rows_for(snapshot: &Snapshot, hide_terminal: bool, now: DateTime<Utc>) ->
                 task_id: t.id,
                 key: t.key.clone(),
                 execution_project: t.execution_project.clone(),
-                queue: t.execution.as_ref().map(|e| e.queue.clone()).unwrap_or_else(|| "default".into()),
+                queue: t.execution.as_ref().map_or_else(|| "default".into(), |e| e.queue.clone()),
                 state: t.state,
                 deferred: !t.deferral_allows(now),
                 criticality: t.criticality,
                 model: t.model.clone().or(t.model_override.clone()),
-                tokens: snapshot.weighted_tokens.get(&t.id).map(|w| human_f64(*w)).unwrap_or_else(|| "-".into()),
-                cpu: sample.map(|s| format!("{:.0}%", s.cpu_percent)).unwrap_or_else(|| "-".into()),
-                rss: sample.map(|s| human_bytes(s.rss_bytes)).unwrap_or_else(|| "-".into()),
+                tokens: snapshot.weighted_tokens.get(&t.id).map_or_else(|| "-".into(), |w| human_f64(*w)),
+                cpu: sample.map_or_else(|| "-".into(), |s| format!("{:.0}%", s.cpu_percent)),
+                rss: sample.map_or_else(|| "-".into(), |s| human_bytes(s.rss_bytes)),
                 age,
                 waiting: crate::cli::commands::status::waiting_on(&t),
                 title: t.title.clone(),
@@ -351,14 +367,14 @@ impl DashboardApp {
 
     /// Translate a key press into state changes and an optional [`Action`].
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d')) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'd')) {
             return Some(Action::Quit);
         }
         if let Some(picker) = self.project_picker.as_mut() {
             match key.code {
                 KeyCode::Esc => self.project_picker = None,
                 KeyCode::Down | KeyCode::Char('j') => {
-                    picker.selected = (picker.selected + 1).min(picker.projects.len().saturating_sub(1))
+                    picker.selected = (picker.selected + 1).min(picker.projects.len().saturating_sub(1));
                 }
                 KeyCode::Up | KeyCode::Char('k') => picker.selected = picker.selected.saturating_sub(1),
                 KeyCode::Enter => {
@@ -442,7 +458,7 @@ impl DashboardApp {
                 self.clamp_selection();
                 Some(Action::ToggleTerminal)
             }
-            KeyCode::Char('?') | KeyCode::Char('h') => {
+            KeyCode::Char('?' | 'h') => {
                 self.show_help = true;
                 Some(Action::Help)
             }
@@ -613,7 +629,7 @@ mod tests {
         let s = snapshot();
         let json = serde_json::to_value(&s).expect("snapshot is JSON-serialisable");
         assert_eq!(json["max_concurrent"], 2);
-        assert_eq!(json["tasks"].as_array().map(|t| t.len()), Some(4));
+        assert_eq!(json["tasks"].as_array().map(std::vec::Vec::len), Some(4));
         let tokens = json["weighted_tokens"].as_object().expect("map with string keys");
         assert_eq!(tokens.len(), 1);
     }
@@ -623,8 +639,8 @@ mod tests {
         let s = snapshot();
         assert_eq!(s.slots_used(), 1);
         assert!(s.latest_session(s.tasks[0].id).is_none());
-        assert!(s.events_for(s.tasks[0].id, 10).is_empty());
-        assert!(s.ordered_ledgers().is_empty());
+        assert_eq!((s.events_for(s.tasks[0].id, 10)).len(), 0);
+        assert_eq!((s.ordered_ledgers()).len(), 0);
     }
 
     #[test]
@@ -646,7 +662,7 @@ mod tests {
         assert_eq!(s.next_model, Some(ModelTier::sonnet()));
         let json = serde_json::to_value(&s).unwrap();
         assert!(json["ledgers"]["by_provider"]["codex"].is_object());
-        assert!(json["ledger"]["provider"] == "claude");
+        assert_eq!(json["ledger"]["provider"], "claude");
         assert_eq!(json["next_model"], "sonnet");
 
         // A rate-limited provider shows a cooldown and `next` moves to the other one.
@@ -656,6 +672,6 @@ mod tests {
         let s = Snapshot::load(&store, &cfg, now).unwrap();
         assert_eq!(s.cooldowns.get(&Provider::Claude), Some(&(now + Duration::minutes(30))));
         assert!(!s.cooldowns.contains_key(&Provider::Codex));
-        assert_eq!(s.next_model.as_ref().map(|m| m.provider()), Some(Provider::Codex), "{:?}", s.next_model);
+        assert_eq!(s.next_model.as_ref().map(crate::domain::ModelTier::provider), Some(Provider::Codex), "{:?}", s.next_model);
     }
 }

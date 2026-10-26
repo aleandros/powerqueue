@@ -149,7 +149,12 @@ fn seconds(time: DateTime<Utc>, origin: DateTime<Utc>) -> i64 {
 }
 
 fn positive(event: &Event, key: &str) -> Result<i64> {
-    event.data.get(key).and_then(|v| v.as_i64()).filter(|v| *v >= 1).with_context(|| format!("event {}: invalid {key}", event.id))
+    event
+        .data
+        .get(key)
+        .and_then(serde_json::Value::as_i64)
+        .filter(|v| *v >= 1)
+        .with_context(|| format!("event {}: invalid {key}", event.id))
 }
 
 fn deadline(event: &Event, key: &str, origin: DateTime<Utc>) -> Result<i64> {
@@ -170,15 +175,16 @@ fn ends_prefix(event: &Event) -> bool {
     OUT_OF_SCOPE.contains(&kind)
         || (kind == "task.blocked"
             && (event.data.get("previous_state").is_none()
-                || event.data.get("container").and_then(|v| v.as_bool()) == Some(true)))
+                || event.data.get("container").and_then(serde_json::Value::as_bool) == Some(true)))
         || (kind == "task.completed" && event.data.get("children").is_some())
-        || (kind == "task.in_review" && event.data.get("adopted").and_then(|v| v.as_bool()) == Some(true))
+        || (kind == "task.in_review" && event.data.get("adopted").and_then(serde_json::Value::as_bool) == Some(true))
         || (["review.", "relay.", "inbox."].iter().any(|p| kind.starts_with(p))
             && !STUTTERS.contains(&kind)
             && !REVIEW_ACTIONS.contains(&kind))
 }
 
 /// Project complete task prefixes; refuse malformed data and vacuous schedules.
+#[expect(clippy::too_many_lines, reason = "Keep the project workflow and its early exits together in execution order.")]
 fn project(mut events: Vec<Event>) -> Result<(Vec<Observation>, Coverage)> {
     ensure!(!events.is_empty(), "expected a nonempty JSON array from logs --events --json");
     events.sort_by_key(|e| e.id);
@@ -228,7 +234,7 @@ fn project(mut events: Vec<Event>) -> Result<(Vec<Observation>, Coverage)> {
         }
         let kind = event.kind.as_str();
         let data = &event.data;
-        let empty = data.as_object().is_some_and(|o| o.is_empty());
+        let empty = data.as_object().is_some_and(serde_json::Map::is_empty);
         let time = seconds(event.timestamp, origin);
         ensure!(time >= last_time, "event {}: clock moved backwards", event.id);
         last_time = time;
@@ -257,7 +263,7 @@ fn project(mut events: Vec<Event>) -> Result<(Vec<Observation>, Coverage)> {
             "github.admitted" | "github.revoked" | "github.admission_blocked" => {
                 let approved = data
                     .pointer("/admission/approved")
-                    .and_then(|v| v.as_bool())
+                    .and_then(serde_json::Value::as_bool)
                     .with_context(|| format!("event {}: missing approval decision", event.id))?;
                 ensure!(approved == (kind == "github.admitted"), "event {}: inconsistent approval decision", event.id);
                 if approved { Op::Approve } else { Op::Revoke }
@@ -265,7 +271,7 @@ fn project(mut events: Vec<Event>) -> Result<(Vec<Observation>, Coverage)> {
             "routing.selected" | "routing.blocked" => {
                 let permitted = data
                     .pointer("/routing/permitted")
-                    .and_then(|v| v.as_bool())
+                    .and_then(serde_json::Value::as_bool)
                     .with_context(|| format!("event {}: missing routing decision", event.id))?;
                 ensure!(permitted == (kind == "routing.selected"), "event {}: inconsistent routing decision", event.id);
                 if permitted { Op::RouteAllow } else { Op::RouteBlock }
@@ -292,7 +298,7 @@ fn project(mut events: Vec<Event>) -> Result<(Vec<Observation>, Coverage)> {
                     _ => bail!("event {}: invalid dependency block payload", event.id),
                 };
                 ensure!(
-                    data.get("container").and_then(|v| v.as_bool()) == Some(false)
+                    data.get("container").and_then(serde_json::Value::as_bool) == Some(false)
                         && data.get("waiting_on").and_then(|v| v.as_array()).is_some(),
                     "event {}: invalid dependency block payload",
                     event.id
@@ -406,6 +412,10 @@ fn rejected_observation(trace: &Path, observations: &[Observation]) -> Option<St
     serde_json::to_string(observations.get(position)?).ok()
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "The test or replay driver consumes each input operation before advancing to the next one."
+)]
 fn run(args: Args) -> Result<()> {
     let input = fs::read(&args.events).with_context(|| format!("read {}", args.events.display()))?;
     let events: Vec<Event> =
@@ -415,7 +425,7 @@ fn run(args: Args) -> Result<()> {
     fs::create_dir_all(&destination).with_context(|| format!("create {}", destination.display()))?;
     let path = destination.join(format!("{}.qnt", args.name));
     fs::write(&path, render(&observations)).with_context(|| format!("write {}", path.display()))?;
-    let report = serde_json::to_string_pretty(&coverage)? + "\n";
+    let report = format!("{}\n", serde_json::to_string_pretty(&coverage)?);
     let coverage_path = destination.join(format!("{}.coverage.json", args.name));
     fs::write(&coverage_path, &report).with_context(|| format!("write {}", coverage_path.display()))?;
     print!("{report}");

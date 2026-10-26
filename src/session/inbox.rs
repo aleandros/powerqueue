@@ -139,6 +139,8 @@ pub fn parse_message(text: &str) -> Result<InboxMessage> {
 
 /// Render a message the way the shim does (tests and tools that want to
 /// talk to the daemon without the shell script).
+/// # Panics
+/// Panics if an inbox header cannot be serialized to JSON.
 pub fn render_message(header: &InboxHeader, body: &str) -> String {
     let mut s = serde_json::to_string(header).expect("inbox header serialises");
     s.push('\n');
@@ -187,6 +189,10 @@ fn next_sequence(inbox: &Path) -> Result<u64> {
 /// the next launch (a Stop hook that arrived after `task complete` would
 /// otherwise complete a retried task before it starts). Returns how many
 /// files were removed; a missing inbox is fine.
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "The producer protocol defines these filenames with case-sensitive suffixes."
+)]
 pub fn purge(inbox: &Path) -> Result<usize> {
     let entries = match std::fs::read_dir(inbox) {
         Ok(e) => e,
@@ -194,7 +200,7 @@ pub fn purge(inbox: &Path) -> Result<usize> {
         Err(e) => return Err(e).with_context(|| format!("cannot read {}", inbox.display())),
     };
     let mut removed = 0;
-    for entry in entries.filter_map(|e| e.ok()) {
+    for entry in entries.filter_map(std::result::Result::ok) {
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -234,7 +240,7 @@ pub fn drain(inbox: &Path) -> Result<Vec<(PathBuf, Result<InboxMessage>)>> {
         Err(e) => return Err(e).with_context(|| format!("cannot read {}", inbox.display())),
     };
     let mut files: Vec<PathBuf> = entries
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.path())
         .filter(|p| {
             p.is_file()
@@ -270,10 +276,10 @@ pub fn reject(path: &Path) -> Result<PathBuf> {
 pub fn rejected_counts(tasks_dir: &Path) -> Vec<(String, usize)> {
     let Ok(entries) = std::fs::read_dir(tasks_dir) else { return Vec::new() };
     let mut out = Vec::new();
-    for entry in entries.filter_map(|e| e.ok()) {
+    for entry in entries.filter_map(std::result::Result::ok) {
         let dir = entry.path().join(INBOX_RELATIVE).join(REJECTED_RELATIVE);
         let Ok(files) = std::fs::read_dir(&dir) else { continue };
-        let n = files.filter_map(|f| f.ok()).filter(|f| f.path().is_file()).count();
+        let n = files.filter_map(std::result::Result::ok).filter(|f| f.path().is_file()).count();
         if n > 0 {
             out.push((entry.file_name().to_string_lossy().to_string(), n));
         }
@@ -286,6 +292,7 @@ pub fn rejected_counts(tasks_dir: &Path) -> Vec<(String, usize)> {
 /// an absolute path (`POWERQUEUE_INBOX` overrides it), so the script works
 /// wherever it is invoked from, as long as the task directory is visible at
 /// the same path.
+#[expect(clippy::too_many_lines, reason = "Keep the shim_script workflow and its early exits together in execution order.")]
 pub fn shim_script(task_key: &str, inbox: &Path) -> String {
     let inbox_q = shell_quote(&inbox.to_string_lossy());
     let key_q = shell_quote(task_key);
@@ -509,7 +516,7 @@ mod tests {
         std::fs::write(tasks.path().join("t1/inbox/rejected/x.msg"), "x").unwrap();
         std::fs::create_dir_all(tasks.path().join("t2/inbox")).unwrap();
         assert_eq!(rejected_counts(tasks.path()), vec![("t1".to_string(), 1)]);
-        assert!(rejected_counts(Path::new("/definitely/missing")).is_empty());
+        assert_eq!((rejected_counts(Path::new("/definitely/missing"))).len(), 0);
     }
 
     #[test]
@@ -518,7 +525,7 @@ mod tests {
         let inbox = inbox_dir(dir.path());
         let header = InboxHeader::Block { task: "ENG-2".into(), session: Some(uuid::Uuid::nil().to_string()) };
         let path = write_message(&inbox, &header, "need creds").unwrap();
-        assert!(path.extension().unwrap() == "msg");
+        assert_eq!(path.extension().unwrap(), "msg");
         let drained = drain(&inbox).unwrap();
         assert_eq!(drained.len(), 1);
         let msg = drained[0].1.as_ref().unwrap();

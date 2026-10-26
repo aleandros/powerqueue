@@ -17,6 +17,7 @@ const TAG: &str = "v9.9.9";
 const GOOD_SCRIPT: &str = "#!/bin/sh\necho powerqueue 9.9.9\n";
 const ORIGINAL_SCRIPT: &str = "#!/bin/sh\necho powerqueue 0.0.1\n";
 
+#[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
 fn tarball(binary: &[u8]) -> Vec<u8> {
     let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut ar = tar::Builder::new(enc);
@@ -39,7 +40,7 @@ fn sha_line(data: &[u8], name: &str) -> String {
 async fn serve(server: &MockServer, binary: &[u8], sha_override: Option<&str>) {
     let asset = format!("powerqueue-{TARGET}.tar.gz");
     let tb = tarball(binary);
-    let sha = sha_override.map(str::to_string).unwrap_or_else(|| sha_line(&tb, &asset));
+    let sha = sha_override.map_or_else(|| sha_line(&tb, &asset), str::to_string);
     let base = server.uri();
     Mock::given(method("GET"))
         .and(path("/releases/latest"))

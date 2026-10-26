@@ -173,6 +173,10 @@ pub struct PauseArgs {
 }
 
 #[derive(Debug, Args, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "These are independent configuration or observed-state flags, not mutually exclusive states."
+)]
 pub struct InitArgs {
     /// Repository path (default: current directory).
     #[arg(long, value_name = "PATH")]
@@ -401,6 +405,10 @@ pub struct CheckArgs {
 }
 
 #[derive(Debug, Args, Default, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "These are independent configuration or observed-state flags, not mutually exclusive states."
+)]
 pub struct SimulateArgs {
     /// Restrict the simulation to an execution project.
     #[arg(long)]
@@ -522,6 +530,10 @@ pub enum ServiceCommand {
 }
 
 #[derive(Debug, Args, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "These are independent configuration or observed-state flags, not mutually exclusive states."
+)]
 pub struct ServiceInstallArgs {
     /// Print the generated file and change nothing.
     #[arg(long)]
@@ -658,6 +670,10 @@ impl std::fmt::Display for TuneScope {
 }
 
 #[derive(Debug, Args, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "These are independent configuration or observed-state flags, not mutually exclusive states."
+)]
 pub struct TuneArgs {
     /// Select an execution project (otherwise use the machine policy).
     #[arg(long)]
@@ -707,6 +723,10 @@ pub enum SecretsCommand {
 }
 
 #[derive(Debug, Args, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "These are independent configuration or observed-state flags, not mutually exclusive states."
+)]
 pub struct ResetArgs {
     /// Do not ask for confirmation (required when stdin is not a terminal).
     #[arg(short, long)]

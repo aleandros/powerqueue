@@ -3,6 +3,8 @@
 //! later). The mechanics live in [`crate::tune`]; this file is the flow and
 //! the output.
 
+use std::fmt::Write as _;
+
 use std::io::IsTerminal as _;
 use std::path::Path;
 use std::time::Duration;
@@ -42,6 +44,19 @@ pub fn run(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
 }
 
 /// Produce a new proposal.
+#[expect(
+    clippy::as_conversions,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Command dispatch transfers ownership of parsed arguments to the selected handler."
+)]
+#[expect(clippy::too_many_lines, reason = "Keep the tune workflow and its early exits together in execution order.")]
 fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
     let instruction = read_instruction(args.instruction.as_deref())?;
     let cfg = ctx.config()?.clone();
@@ -60,7 +75,9 @@ fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
         bail!("`{model}` is not a Claude model; `powerqueue tune` runs on Claude Code");
     }
     let binary = cfg.claude.binary.clone();
-    if let Some(t) = crate::session::BinaryTemplate::parse(&binary).ok().filter(|t| t.is_per_task()) {
+    if let Some(t) =
+        crate::session::BinaryTemplate::parse(&binary).ok().filter(crate::session::binary::BinaryTemplate::is_per_task)
+    {
         bail!(
             "claude.binary is a per-task command (`{binary}`, placeholders {}) and `powerqueue tune` runs Claude Code on this host; \
              set claude.binary to a plain command while tuning",
@@ -121,15 +138,16 @@ fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
         draft.set_status(DraftStatus::Failed, vec![format!("{e:#}")])?;
         return Err(e);
     }
-    context_md.push_str(&format!(
+    let _ = write!(
+        context_md,
         "\n## Policy target\n\nProject: {}\nSource: {}\nIntent: {}\nStatus: {}\n",
         args.project.as_deref().unwrap_or("machine"),
         selected.rules_source(&paths),
         draft.meta.intent_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
         draft.meta.intent_status
-    ));
+    );
     if let Some(text) = &draft.meta.intent_text {
-        context_md.push_str(&format!("\n## Free-form intent (read-only PRIORITY.md)\n\n{text}\n"));
+        let _ = write!(context_md, "\n## Free-form intent (read-only PRIORITY.md)\n\n{text}\n");
     }
     draft.write_file(CONTEXT_FILE, &context_md)?;
     let mut prompt = build_prompt(&instruction, args.scope, &context_md, repo_overrides.as_deref());
@@ -300,6 +318,10 @@ fn apply_existing(ctx: &mut Context, args: &TuneArgs, which: &str) -> Result<i32
 }
 
 /// Show the proposal and apply it according to `--yes` / `--dry-run` / the terminal.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 fn review_and_apply(
     ctx: &mut Context,
     cfg: &Config,
@@ -346,9 +368,8 @@ fn review_and_apply(
     }
 
     let apply_now = match decision {
-        Decision::DryRun => false,
         Decision::Apply => true,
-        Decision::Proposed => false,
+        Decision::DryRun | Decision::Proposed => false,
         Decision::Ask => {
             let theme: Box<dyn Theme> = if ctx.color { Box::new(ColorfulTheme::default()) } else { Box::new(SimpleTheme) };
             let names: Vec<&str> = file_changes.iter().filter(|c| c.changed).map(|c| c.name.as_str()).collect();
@@ -535,6 +556,14 @@ fn names_of(changes: &[FileChange]) -> String {
     changes.iter().filter(|c| c.changed).map(|c| c.name.as_str()).collect::<Vec<_>>().join(" and ")
 }
 
+#[expect(
+    clippy::as_conversions,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
 fn print_summary(draft: &Draft) {
     let Some(summary) = draft.meta.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
         return;
@@ -593,6 +622,10 @@ fn print_diffs(changes: &[FileChange]) {
     }
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 fn print_json(draft: &Draft, changes: &[FileChange], sim: Option<&Simulation>, applied: bool) -> Result<()> {
     println!(
         "{}",
@@ -629,6 +662,11 @@ fn prune(ctx: &mut Context, cfg: &Config) {
 
 /// `CONTEXT.md`: the current queue (simulated with the live rules), the
 /// open tasks with every field the rules can match, and the budget state.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
+#[expect(clippy::too_many_lines, reason = "Keep the context_markdown workflow and its early exits together in execution order.")]
 pub fn context_markdown(
     cfg: &Config,
     live_priority: &Path,
@@ -676,8 +714,8 @@ pub fn context_markdown(
                 t.criticality,
                 t.score,
                 if t.labels.is_empty() { "–".to_string() } else { t.labels.join(", ") },
-                t.linear_priority.map(|p| p.to_string()).unwrap_or_else(|| "–".into()),
-                t.estimate.map(|e| format!("{e}")).unwrap_or_else(|| "–".into()),
+                t.linear_priority.map_or_else(|| "–".into(), |p| p.to_string()),
+                t.estimate.map_or_else(|| "–".into(), |e| format!("{e}")),
                 t.project.as_deref().unwrap_or("–"),
                 match (&t.cycle, t.cycle_number) {
                     (Some(c), Some(n)) => format!("{c} #{n}"),
@@ -744,7 +782,7 @@ pub fn context_markdown(
         }
         let _ = writeln!(md, ")");
         for tier in &ledger.tiers {
-            let share = pb.models.get(&tier.tier).map(|m| m.share).unwrap_or(0.0);
+            let share = pb.models.get(&tier.tier).map_or(0.0, |m| m.share);
             let _ = writeln!(
                 md,
                 "  - {}: share {:.0}%, {:.0}% of its share spent, {} message(s) this period",

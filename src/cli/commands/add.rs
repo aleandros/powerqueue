@@ -37,7 +37,7 @@ pub fn build_task(req: &NewTask) -> Result<Task> {
         None => format!("manual-{}", task.id.short()),
     };
     if let Some(project) = &req.execution_project {
-        task.execution_project = project.clone();
+        task.execution_project.clone_from(project);
         if !project.is_empty() {
             task.project_assignment = Some(crate::routing::ProjectAssignment::Explicit { project: project.clone() });
         }
@@ -45,7 +45,7 @@ pub fn build_task(req: &NewTask) -> Result<Task> {
     task.description = req.description.trim().to_string();
     task.criticality = req.criticality.unwrap_or(Criticality::Normal);
     task.score = task.criticality.base_score();
-    task.model_override = req.model_override.clone();
+    task.model_override.clone_from(&req.model_override);
     task.labels = req.labels.iter().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
     if req.paused {
         task.state = TaskState::Paused;

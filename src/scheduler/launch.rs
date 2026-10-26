@@ -99,12 +99,13 @@ impl LaunchPlanner {
             candidates,
             considered: HashSet::new(),
             slots,
-            queues: Default::default(),
-            failures: Default::default(),
+            queues: crate::execution::QueueSlots::default(),
+            failures: crate::scheduler::launch_failures::LaunchFailures::default(),
         }
     }
 
     /// Configure independent queue capacity for this scheduling pass.
+    #[must_use]
     pub fn with_queues(mut self, cfg: &Config, live: &[Task]) -> Self {
         self.queues = crate::execution::QueueSlots::new(cfg, &self.candidates, live);
         self
@@ -113,6 +114,7 @@ impl LaunchPlanner {
     /// Reserve slots, queue capacity and predicted cost for setup attempts
     /// carried over from earlier ticks. Their tasks cannot be selected again.
     /// Call after `with_queues` when dedicated queues are enabled.
+    #[must_use]
     pub fn with_pending(mut self, budget: &BudgetConfig, pending: &[Candidate]) -> Self {
         for candidate in pending {
             self.considered.insert(candidate.task.id);
@@ -295,6 +297,10 @@ pub struct Start {
 /// answer is about to be resumed, which un-parks a review watch (`task
 /// retry` of a task parked with its rounds used up). `root` is the worktree
 /// root directory. Returns `None` without mutation when source approval is missing.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing on_starting flag interface during lint adoption; callers already supply named state predicates."
+)]
 pub fn on_starting(
     task: &mut Task,
     model: &ModelTier,
@@ -323,8 +329,7 @@ pub fn on_starting(
         .worktree_path
         .clone()
         .or_else(|| task.review.as_ref().and_then(|r| r.worktree_path.clone()))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| worktree_dir(root, task));
+        .map_or_else(|| worktree_dir(root, task), PathBuf::from);
     let effects = vec![Effect::log(
         EventLevel::Info,
         "task.starting",
@@ -423,6 +428,10 @@ pub fn on_abandoned_start(
 /// its provider resumes from. A session that died before its first prompt
 /// has nothing to resume: `--resume` would fail on every remaining attempt
 /// ("No conversation found with session ID"), so it starts over instead.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing resume_plan flag interface during lint adoption; callers already supply named state predicates."
+)]
 pub fn resume_plan(
     previous: Option<&Session>,
     model: &ModelTier,
@@ -460,6 +469,10 @@ pub struct ResumePrompt {
 /// review prompt and/or the relayed answer. Started over (other provider,
 /// no transcript): the full task prompt, with them as what to do first;
 /// without either, the last error as before.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing resume_prompt flag interface during lint adoption; callers already supply named state predicates."
+)]
 pub fn resume_prompt(
     review_prompt: Option<&str>,
     answer: Option<&str>,
@@ -573,10 +586,10 @@ pub fn on_launched(task: &mut Task, session: &Session, launched: &Launched<'_>, 
 /// `launch.superseded`.
 pub fn on_launch_superseded(fresh: &mut Task, claimed: &Task, session: &Session) -> Vec<Effect> {
     fresh.attempts = claimed.attempts;
-    fresh.branch = claimed.branch.clone();
-    fresh.worktree_path = claimed.worktree_path.clone();
-    fresh.model = claimed.model.clone();
-    fresh.execution = claimed.execution.clone();
+    fresh.branch.clone_from(&claimed.branch);
+    fresh.worktree_path.clone_from(&claimed.worktree_path);
+    fresh.model.clone_from(&claimed.model);
+    fresh.execution.clone_from(&claimed.execution);
     vec![Effect::log(
         EventLevel::Warn,
         "launch.superseded",
@@ -808,11 +821,16 @@ mod tests {
         let mut f = Fixed::new();
         let mut p = planner(vec![task("a", TaskState::Queued, 2.0), task("b", TaskState::Queued, 1.0)], 2);
         let first = p.next(f.ctx(), now()).expect("a candidate");
-        let model = first.decision.model.clone().expect("a model");
+        let model = first.decision.model.expect("a model");
         // A failed start marks the provider; the next candidate must not get it.
         f.limits.mark_provider(&f.cfg.budget, model.provider(), now() + Duration::minutes(10));
         let second = p.next(f.ctx(), now()).expect("a second candidate");
-        assert_ne!(second.decision.model.as_ref().map(|m| m.provider()), Some(model.provider()), "{:?}", second.decision);
+        assert_ne!(
+            second.decision.model.as_ref().map(crate::domain::ModelTier::provider),
+            Some(model.provider()),
+            "{:?}",
+            second.decision
+        );
     }
 
     #[test]
@@ -881,7 +899,7 @@ mod tests {
         let unknown = crashed(codex.clone(), None);
         let (id, resume, _) = resume_plan(Some(&unknown), &codex, true, false);
         assert!(!resume && id != unknown.id, "no discovered id: start fresh");
-        let mut exited = found.clone();
+        let mut exited = found;
         exited.state = SessionState::Exited;
         assert!(!resume_plan(Some(&exited), &codex, true, false).1);
         assert!(!resume_plan(None, &codex, true, false).1);
@@ -1086,9 +1104,7 @@ mod properties {
                 && !sessions.iter().any(|s| s.state.is_live())
                 && activity == StartActivity::Abandoned;
             let effects = on_abandoned_start(&mut task, &sessions, activity, &cfg, origin());
-            if !eligible {
-                prop_assert_eq!(&task, &before);
-            } else {
+            if eligible {
                 prop_assert!(matches!(task.state, TaskState::Crashed | TaskState::Failed));
                 prop_assert_eq!(task.attempts, before.attempts);
                 prop_assert_eq!(&task.execution_project, &before.execution_project);
@@ -1099,6 +1115,8 @@ mod properties {
                 let after = task.clone();
                 prop_assert!(on_abandoned_start(&mut task, &sessions, activity, &cfg, origin()).is_empty());
                 prop_assert_eq!(task, after);
+            } else {
+                prop_assert_eq!(&task, &before);
             }
         }
 
@@ -1153,7 +1171,7 @@ mod properties {
                 branch: claimed.branch.clone(),
                 worktree_path: claimed.worktree_path.clone(),
                 model: claimed.model.clone(),
-                ..fresh.clone()
+                ..fresh
             };
             prop_assert_eq!(&t, &expected);
         }
@@ -1234,9 +1252,9 @@ mod properties {
             let mut p = LaunchPlanner::new(Estimator::from_summaries(&[]), ledgers.clone(), tasks.clone(), slots);
             let mut handed: Vec<TaskId> = Vec::new();
             let mut starts = 0u32;
-            let mut before = ledgers.clone();
+            let mut before = ledgers;
             let mut expected_order: Vec<TaskId> = Vec::new();
-            let mut remaining = tasks.clone();
+            let mut remaining = tasks;
             while let Some(c) = p.next(f.ctx(), now) {
                 prop_assert!(starts < slots, "handed out after the slots were used");
                 prop_assert!(!handed.contains(&c.task.id), "handed out twice");
@@ -1310,10 +1328,10 @@ mod properties {
             ];
             let mut p = LaunchPlanner::new(Estimator::from_summaries(&[]), ledgers, tasks, 2);
             let first = p.next(f.ctx(), now).expect("a candidate");
-            let blocked = first.decision.model.as_ref().map_or(provider, |m| m.provider());
+            let blocked = first.decision.model.as_ref().map_or(provider, crate::domain::ModelTier::provider);
             f.limits.mark_provider(&f.cfg.budget, blocked, now + Duration::minutes(10));
             let second = p.next(f.ctx(), now).expect("a second candidate");
-            prop_assert_ne!(second.decision.model.as_ref().map(|m| m.provider()), Some(blocked), "{:?}", second.decision.reasons);
+            prop_assert_ne!(second.decision.model.as_ref().map(crate::domain::ModelTier::provider), Some(blocked), "{:?}", second.decision.reasons);
         }
 
         /// A session is resumed only with a transcript, on the same provider,
@@ -1370,7 +1388,7 @@ mod properties {
                 prop_assert_eq!(p.previous_error, last_error);
             }
             if let (Some(r), Some(a)) = (&review_prompt, &answer) {
-                prop_assert_eq!(p.resume_prompt.clone(), Some(format!("{r}\n\n{a}")));
+                prop_assert_eq!(p.resume_prompt, Some(format!("{r}\n\n{a}")));
             }
         }
 

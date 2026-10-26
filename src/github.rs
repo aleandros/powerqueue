@@ -158,7 +158,7 @@ impl PrStatus {
 }
 
 /// GraphQL query run by [`Gh::pr_status`].
-pub const PR_STATUS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
+pub const PR_STATUS_QUERY: &str = r"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       number state mergeable mergeStateStatus headRefOid isInMergeQueue
@@ -175,7 +175,7 @@ pub const PR_STATUS_QUERY: &str = r#"query($owner: String!, $name: String!, $num
       } } } } } }
     }
   }
-}"#;
+}";
 
 /// Parse the JSON `gh api graphql` printed for [`PR_STATUS_QUERY`]. Fails
 /// on GraphQL errors or a missing pull request, naming what was wrong.

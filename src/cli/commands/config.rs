@@ -96,6 +96,8 @@ pub fn parse_toml_value(raw: &str) -> toml_edit::Value {
 /// contents. Fails when the document does not parse, when the result is not a
 /// valid [`Config`] (unknown key, wrong type) or when [`Config::validate`]
 /// reports problems.
+/// # Panics
+/// Panics if the internal key parser returns an empty path after validation.
 pub fn set_in_toml(text: &str, key: &str, raw: &str) -> Result<String> {
     let (key, _) = effective_key(key);
     let key = key.as_str();
@@ -122,6 +124,8 @@ pub fn set_in_toml(text: &str, key: &str, raw: &str) -> Result<String> {
 /// Remove `key` from `text` so its default applies again. Returns the new
 /// contents and whether the key was present. Fails like [`set_in_toml`] when
 /// the result is invalid (for example after removing `repo.path`).
+/// # Panics
+/// Panics if the internal key parser returns an empty path after validation.
 pub fn unset_in_toml(text: &str, key: &str) -> Result<(String, bool)> {
     let (key, _) = effective_key(key);
     let key = key.as_str();
@@ -335,6 +339,7 @@ pub fn open_in_editor(file: &Path) -> Result<()> {
 }
 
 /// Handle `powerqueue config ...`.
+#[expect(clippy::too_many_lines, reason = "Keep the run workflow and its early exits together in execution order.")]
 pub fn run(ctx: &mut Context, cmd: ConfigCommand) -> Result<i32> {
     match cmd {
         ConfigCommand::Path => {
@@ -514,29 +519,26 @@ pub fn run(ctx: &mut Context, cmd: ConfigCommand) -> Result<i32> {
             }
         }
         ConfigCommand::Validate { file } => {
-            let (cfg, shown) = match file {
-                Some(file) => {
-                    if !file.exists() {
-                        bail!("{} does not exist", file.display());
-                    }
-                    let text = std::fs::read_to_string(&file).with_context(|| format!("cannot read {}", file.display()))?;
-                    match Config::from_toml(&text) {
-                        Ok(cfg) => (cfg, file),
-                        Err(e) => {
-                            let problem = format!("{}: {e:#}", file.display());
-                            if ctx.json {
-                                println!("{}", serde_json::json!({ "ok": false, "problems": [problem] }));
-                            } else {
-                                print_problems(std::slice::from_ref(&problem));
-                            }
-                            return Ok(1);
+            let (cfg, shown) = if let Some(file) = file {
+                if !file.exists() {
+                    bail!("{} does not exist", file.display());
+                }
+                let text = std::fs::read_to_string(&file).with_context(|| format!("cannot read {}", file.display()))?;
+                match Config::from_toml(&text) {
+                    Ok(cfg) => (cfg, file),
+                    Err(e) => {
+                        let problem = format!("{}: {e:#}", file.display());
+                        if ctx.json {
+                            println!("{}", serde_json::json!({ "ok": false, "problems": [problem] }));
+                        } else {
+                            print_problems(std::slice::from_ref(&problem));
                         }
+                        return Ok(1);
                     }
                 }
-                None => {
-                    super::status::ensure_initialised(ctx)?;
-                    (Config::load(&ctx.paths)?, ctx.paths.config_file())
-                }
+            } else {
+                super::status::ensure_initialised(ctx)?;
+                (Config::load(&ctx.paths)?, ctx.paths.config_file())
             };
             let (merged, problems) = validation_problems(&cfg);
             if ctx.json {
@@ -564,7 +566,7 @@ pub fn run(ctx: &mut Context, cmd: ConfigCommand) -> Result<i32> {
             } else {
                 print_problems(&problems);
             }
-            Ok(if problems.is_empty() { 0 } else { 1 })
+            Ok(i32::from(!problems.is_empty()))
         }
     }
 }
@@ -680,7 +682,7 @@ mod tests {
     #[test]
     fn editor_fallback_is_vi() {
         let cmd = editor_command();
-        assert!(!cmd.is_empty());
+        assert_ne!((cmd).len(), 0);
     }
 
     const BASE: &str =

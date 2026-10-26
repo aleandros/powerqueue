@@ -310,7 +310,7 @@ fn task_op() -> impl Strategy<Value = Op> {
         1 => (vec(linked_issue(), 0..3), vec(linked_issue(), 0..2))
             .prop_map(|(blocked_by, children)| Op::Links { blocked_by, children }),
         3 => (criticality(), 0u32..2000, prop::bool::weighted(0.2))
-            .prop_map(|(criticality, score, skip)| Op::Evaluate { criticality, score: score as f64, skip }),
+            .prop_map(|(criticality, score, skip)| Op::Evaluate { criticality, score: f64::from(score), skip }),
         2 => Just(Op::AnswerQueued),
         1 => Just(Op::ContainerClosed),
     ]
@@ -359,6 +359,7 @@ impl TaskWorld {
 
     /// Run one op; `None` when its precondition does not hold (skipped).
     /// `Tick` is the world's business and is never applied here.
+    #[expect(clippy::too_many_lines, reason = "Keep the apply workflow and its early exits together in execution order.")]
     fn apply(&mut self, cfg: &Config, now: DateTime<Utc>, op: &Op) -> Option<Vec<Effect>> {
         let live = self.session_live();
         // This general-purpose world treats preparation as one atomic launch.
@@ -583,6 +584,11 @@ impl TaskWorld {
     /// a session that went stale or ran out of time whose pane shows the
     /// agent waiting for a usage reset, the cooldown the daemon starts
     /// (`cooldown_secs` from now, at least a minute). `None` otherwise.
+    #[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Fixture counts and timestamps are bounded to small values by the test inputs."
+    )]
     fn provider_cooldown(
         &self,
         cfg: &Config,
@@ -629,6 +635,7 @@ fn fresh_task() -> impl Strategy<Value = Task> {
         .prop_flat_map(with_source_admission)
 }
 
+#[expect(clippy::too_many_lines, reason = "Keep the check workflow and its early exits together in execution order.")]
 fn check(
     step: usize,
     op: &Op,
@@ -1042,12 +1049,22 @@ impl DaemonWorld {
         }
     }
 
+    #[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Fixture counts and timestamps are bounded to small values by the test inputs."
+    )]
     fn live_count(&self) -> u32 {
         self.tasks.iter().filter(|t| t.session_live()).count() as u32
     }
 
     // Independent capacity oracle: count actual live session rows rather than
     // consulting QueueSlots or the planner's remaining-slot bookkeeping.
+    #[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Fixture counts and timestamps are bounded to small values by the test inputs."
+    )]
     fn queue_room(&self, task: &Task) -> bool {
         let queue = task.execution.as_ref().map_or("default", |e| e.queue.as_str());
         if self.cfg.queues.is_empty() {
@@ -1091,7 +1108,7 @@ impl DaemonWorld {
             match e {
                 Effect::RateLimit { tier, until } => self.rate_limits.mark(tier.clone(), *until),
                 Effect::RateLimitProvider { provider, until } => {
-                    self.rate_limits.mark_provider(&self.cfg.budget, *provider, *until)
+                    self.rate_limits.mark_provider(&self.cfg.budget, *provider, *until);
                 }
                 _ => {}
             }
@@ -1125,6 +1142,7 @@ impl DaemonWorld {
     }
 
     /// `launch_tasks`, with the per-task steps and the pass invariants checked.
+    #[expect(clippy::too_many_lines, reason = "Keep the launch_pass workflow and its early exits together in execution order.")]
     fn launch_pass(&mut self, step: usize, outcomes: &[LaunchOutcome]) -> Result<Pass, TestCaseError> {
         let now = self.now;
         let mut pass = Pass::default();
@@ -1505,7 +1523,7 @@ fn daemon_world() -> impl Strategy<Value = DaemonWorld> {
                 rate_limits,
                 estimator: Estimator::from_summaries(&[]),
                 scheduling_paused: false,
-                launch_failures: Default::default(),
+                launch_failures: crate::scheduler::launch_failures::LaunchFailures::default(),
             };
             for task in &world.tasks {
                 world.budget_store.insert_task(&task.task).unwrap();

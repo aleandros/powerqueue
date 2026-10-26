@@ -26,6 +26,10 @@ pub enum Verbosity {
 }
 
 impl Verbosity {
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Keep the existing from_flags flag interface during lint adoption; callers already supply named state predicates."
+    )]
     pub fn from_flags(verbose: u8, quiet: bool) -> Self {
         if quiet {
             Verbosity::Quiet
@@ -37,7 +41,7 @@ impl Verbosity {
             }
         }
     }
-    fn stderr_filter(&self) -> &'static str {
+    fn stderr_filter(self) -> &'static str {
         match self {
             Verbosity::Quiet => "error",
             Verbosity::Normal => "warn,powerqueue=info",
@@ -48,6 +52,10 @@ impl Verbosity {
 }
 
 /// Initialise global tracing. `stderr` may be disabled for TUI commands.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing init flag interface during lint adoption; callers already supply named state predicates."
+)]
 pub fn init(paths: &Paths, cfg: &LoggingConfig, verbosity: Verbosity, stderr: bool) -> Result<WorkerGuard> {
     std::fs::create_dir_all(paths.logs_dir())?;
     prune_old_logs(&paths.logs_dir(), cfg.keep_days);
@@ -108,7 +116,7 @@ pub fn log_files(dir: &Path) -> Vec<std::path::PathBuf> {
         .map(|rd| {
             rd.flatten()
                 .map(|e| e.path())
-                .filter(|p| p.file_name().map(|n| n.to_string_lossy().starts_with("powerqueue.log")).unwrap_or(false))
+                .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("powerqueue.log")))
                 .collect()
         })
         .unwrap_or_default();

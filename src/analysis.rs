@@ -257,13 +257,11 @@ impl AnalysisRecord {
             "stale — rerun analysis"
         } else if self.proposal.as_ref().and_then(|p| p.project.as_ref()).is_none() {
             "unresolved — human resolution required"
+        } else if matches!(&task.project_assignment, Some(crate::routing::ProjectAssignment::Automatic { fingerprint, .. }) if *fingerprint == self.fingerprint)
+        {
+            "repository assigned — source approval still applies"
         } else {
-            if matches!(&task.project_assignment, Some(crate::routing::ProjectAssignment::Automatic { fingerprint, .. }) if *fingerprint == self.fingerprint)
-            {
-                "repository assigned — source approval still applies"
-            } else {
-                "recommendation — source approval still applies"
-            }
+            "recommendation — source approval still applies"
         }
     }
 }
@@ -328,12 +326,12 @@ mod properties {
     fn configuration_and_input_are_bounded_and_opt_in() {
         let mut cfg = Config::default();
         assert!(!cfg.analysis.enabled);
-        assert!(cfg.analysis_problems().is_empty());
+        assert_eq!((cfg.analysis_problems()).len(), 0);
         cfg.analysis.enabled = true;
-        assert!(!cfg.analysis_problems().is_empty());
+        assert_ne!((cfg.analysis_problems()).len(), 0);
         cfg.repo.path = "/repo".into();
         cfg.analysis.projects.insert("default".into(), "API".into());
-        assert!(cfg.analysis_problems().is_empty());
+        assert_eq!((cfg.analysis_problems()).len(), 0);
         for endpoint in ["http://remote.example/v1", "https://key@host/v1", "https://host/v1?key=secret", "file:///tmp/model"] {
             cfg.priority.jev.endpoint = endpoint.into();
             assert!(!cfg.analysis_problems().is_empty(), "{endpoint}");
@@ -359,11 +357,11 @@ mod properties {
         cfg.projects.insert("web".into(), web);
         cfg.analysis.enabled = true;
         cfg.analysis.projects = [("default".into(), "API".into()), ("web".into(), "UI".into())].into();
-        assert!(cfg.analysis_problems().is_empty());
+        assert_eq!((cfg.analysis_problems()).len(), 0);
         for id in ["default", "web"] {
             let project = cfg.for_project(id, &paths).unwrap();
             assert!(!project.analysis.enabled);
-            assert!(project.analysis_problems().is_empty());
+            assert_eq!((project.analysis_problems()).len(), 0);
         }
     }
 }

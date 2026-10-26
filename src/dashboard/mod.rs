@@ -105,6 +105,10 @@ impl TerminalEnv {
 }
 
 /// Decide whether the live TUI may start. `term` is `$TERM`.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing precheck flag interface during lint adoption; callers already supply named state predicates."
+)]
 pub fn precheck(stdin_tty: bool, stdout_tty: bool, term: Option<&str>) -> Result<(), TerminalError> {
     if !stdin_tty || !stdout_tty {
         return Err(TerminalError::NotATty);
@@ -200,10 +204,10 @@ pub fn render_once_app(app: &DashboardApp, width: u16, height: u16) -> String {
 
 /// Rows of a buffer as text, trailing whitespace removed.
 pub fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
-    let width = buffer.area.width as usize;
+    let width = usize::from(buffer.area.width);
     let mut out = String::new();
     for row in buffer.content().chunks(width.max(1)) {
-        let line: String = row.iter().map(|c| c.symbol()).collect();
+        let line: String = row.iter().map(ratatui::buffer::Cell::symbol).collect();
         out.push_str(line.trim_end());
         out.push('\n');
     }
@@ -226,7 +230,11 @@ fn event_loop(
                     if let Some(action) = app.handle_key(key) {
                         match apply(action, app, cfg, paths, store, terminal)? {
                             Flow::Quit => return Ok(()),
-                            Flow::Continue => last_refresh = Instant::now() - REFRESH_EVERY,
+                            Flow::Continue => {
+                                last_refresh = Instant::now()
+                                    .checked_sub(REFRESH_EVERY)
+                                    .expect("monotonic clock supports the refresh interval");
+                            }
                         }
                     }
                 }
@@ -252,6 +260,10 @@ fn event_loop(
     }
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Keep the established ownership-taking boundary for callers and serialized inputs."
+)]
 fn control(app: &mut DashboardApp, store: &Store, cmd: DaemonCommand, verb: &str) -> Result<()> {
     let task_id = match &cmd {
         DaemonCommand::Pause { task_id }
@@ -435,6 +447,6 @@ mod tests {
         let unicode = render_once(snapshot, Options { ascii: false, ..Default::default() }, 100, 24);
         assert!(unicode.contains('┌'), "{unicode}");
         // Degenerate sizes are clamped, not panicking.
-        assert!(!render_once(Snapshot::default(), Options::default(), 0, 0).is_empty());
+        assert_ne!(render_once(Snapshot::default(), Options::default(), 0, 0), "");
     }
 }

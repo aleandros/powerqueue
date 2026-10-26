@@ -82,6 +82,10 @@ pub struct Predicate {
     pub value: Value,
 }
 
+#[expect(
+    clippy::naive_bytecount,
+    reason = "Counting newlines in a small policy document does not justify an extra optimized-bytecount dependency."
+)]
 fn line(text: &str, offset: usize) -> usize {
     text.as_bytes()[..offset.min(text.len())].iter().filter(|c| **c == b'\n').count() + 1
 }

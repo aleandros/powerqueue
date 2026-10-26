@@ -50,6 +50,10 @@ fn cwd() -> PathBuf {
 }
 
 /// Poll until `pred` holds, failing with the last observation on timeout.
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn wait_for_pane(tmux: &Tmux, session: &str, pane_id: &str, pred: impl Fn(&PaneInfo) -> bool) -> Option<PaneInfo> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -59,14 +63,16 @@ fn wait_for_pane(tmux: &Tmux, session: &str, pane_id: &str, pred: impl Fn(&PaneI
         {
             return pane;
         }
-        if Instant::now() > deadline {
-            panic!("timed out waiting for pane {pane_id} in {session}; last observation: {pane:?}");
-        }
+        assert!(Instant::now() <= deadline, "timed out waiting for pane {pane_id} in {session}; last observation: {pane:?}");
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
 /// Poll until the pane's screen contains `needle`.
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn wait_for_output(tmux: &Tmux, pane_id: &str, needle: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -133,7 +139,7 @@ fn ensure_session_is_idempotent() {
     let Some(srv) = Server::start() else { return };
     let t = &srv.tmux;
     assert!(!t.has_session("pq").unwrap());
-    assert_eq!(t.list_panes("pq").unwrap(), Vec::<PaneInfo>::new());
+    assert_eq!((t.list_panes("pq").unwrap()).len(), 0);
     t.ensure_session("pq", &cwd()).unwrap();
     assert!(t.has_session("pq").unwrap());
     t.ensure_session("pq", &cwd()).unwrap();

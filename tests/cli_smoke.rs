@@ -19,6 +19,10 @@ fn pq(home: &Path) -> Command {
     cmd
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn write_minimal_config(home: &Path, repo: &Path) {
     let config_dir = home.join("config");
     std::fs::create_dir_all(&config_dir).unwrap();

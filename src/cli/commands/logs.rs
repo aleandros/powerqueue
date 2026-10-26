@@ -1,5 +1,7 @@
 //! `powerqueue logs` — read the daemon log (or the event timeline).
 
+use std::fmt::Write as _;
+
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -63,15 +65,14 @@ pub fn parse_json_line(line: &str) -> Option<LogLine> {
     let obj = v.as_object()?;
     let timestamp = obj.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
     let time = chrono::DateTime::parse_from_rfc3339(timestamp)
-        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
-        .unwrap_or_else(|_| timestamp.chars().take(8).collect());
+        .map_or_else(|_| timestamp.chars().take(8).collect(), |t| t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string());
     let level = obj.get("level").and_then(|l| l.as_str()).and_then(Level::parse);
     let target = obj.get("target").and_then(|t| t.as_str()).unwrap_or("").to_string();
     let mut message = String::new();
     let mut fields = Vec::new();
     if let Some(f) = obj.get("fields").and_then(|f| f.as_object()) {
         for (k, val) in f {
-            let text = val.as_str().map(str::to_string).unwrap_or_else(|| val.to_string());
+            let text = val.as_str().map_or_else(|| val.to_string(), str::to_string);
             if k == "message" {
                 message = text;
             } else {
@@ -89,14 +90,18 @@ pub fn format_json_line(line: &str) -> Option<String> {
     Some(render(&parsed, false))
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 fn render(l: &LogLine, color: bool) -> String {
-    let level = l.level.map(|lv| lv.as_str()).unwrap_or("-");
+    let level = l.level.map_or("-", Level::as_str);
     let level_text = if color {
         match l.level {
             Some(Level::Error) => level.if_supports_color(Stream::Stdout, |t| t.style(Style::new().red().bold())).to_string(),
             Some(Level::Warn) => level.if_supports_color(Stream::Stdout, |t| t.yellow()).to_string(),
             Some(Level::Info) => level.if_supports_color(Stream::Stdout, |t| t.green()).to_string(),
-            Some(Level::Debug) | Some(Level::Trace) => level.if_supports_color(Stream::Stdout, |t| t.dimmed()).to_string(),
+            Some(Level::Debug | Level::Trace) => level.if_supports_color(Stream::Stdout, |t| t.dimmed()).to_string(),
             None => level.to_string(),
         }
     } else {
@@ -111,7 +116,7 @@ fn render(l: &LogLine, color: bool) -> String {
     );
     for (k, v) in &l.fields {
         out.push(' ');
-        out.push_str(&format!("{k}={v}"));
+        let _ = write!(out, "{k}={v}");
     }
     out.trim_end().to_string()
 }
@@ -138,6 +143,10 @@ pub struct LineFilter {
 
 impl LineFilter {
     /// Apply the filter and render the line (coloured when `color`). `None` = hidden.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+    )]
     pub fn render(&self, raw: &str, color: bool) -> Option<String> {
         if raw.trim().is_empty() {
             return None;
@@ -148,28 +157,29 @@ impl LineFilter {
                 return None;
             }
         }
-        match parse_json_line(raw) {
-            Some(parsed) => {
-                if let Some(min) = self.min_level
-                    && parsed.level.map(|l| l < min).unwrap_or(false)
-                {
-                    return None;
-                }
-                Some(render(&parsed, color))
+        if let Some(parsed) = parse_json_line(raw) {
+            if let Some(min) = self.min_level
+                && parsed.level.is_some_and(|l| l < min)
+            {
+                return None;
             }
-            None => {
-                if let Some(min) = self.min_level
-                    && text_line_level(raw).map(|l| l < min).unwrap_or(false)
-                {
-                    return None;
-                }
-                Some(raw.trim_end().to_string())
+            Some(render(&parsed, color))
+        } else {
+            if let Some(min) = self.min_level
+                && text_line_level(raw).is_some_and(|l| l < min)
+            {
+                return None;
             }
+            Some(raw.trim_end().to_string())
         }
     }
 }
 
 /// Last `n` matching lines across files (newest file first in `files`).
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 pub fn tail_lines(files: &[PathBuf], n: usize, filter: &LineFilter, color: bool) -> Result<Vec<String>> {
     let mut out: VecDeque<String> = VecDeque::with_capacity(n);
     for file in files {
@@ -199,10 +209,18 @@ fn newest(dir: &Path) -> Option<PathBuf> {
 
 /// Poll the newest log file every 500 ms and print new lines, switching to a
 /// new daily file when one appears. Runs until the process is interrupted.
+#[expect(
+    clippy::as_conversions,
+    reason = "Collection and read lengths fit the platform counter type on supported 32-bit and 64-bit targets."
+)]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 fn follow(dir: &Path, filter: &LineFilter, color: bool) -> Result<()> {
     let mut current: Option<PathBuf> = newest(dir);
     let mut offset: u64 = match &current {
-        Some(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+        Some(p) => std::fs::metadata(p).map_or(0, |m| m.len()),
         None => 0,
     };
     loop {
@@ -214,7 +232,7 @@ fn follow(dir: &Path, filter: &LineFilter, color: bool) -> Result<()> {
         if let Some(path) = &current
             && let Ok(mut f) = std::fs::File::open(path)
         {
-            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+            let len = f.metadata().map_or(0, |m| m.len());
             if len < offset {
                 offset = 0; // truncated / rotated in place
             }
@@ -242,6 +260,7 @@ fn follow(dir: &Path, filter: &LineFilter, color: bool) -> Result<()> {
     }
 }
 
+#[expect(clippy::unnecessary_wraps, reason = "Keep the fallible helper interface shared by the surrounding I/O workflow.")]
 fn task_needles(ctx: &mut Context, needle: &str) -> Result<Vec<String>> {
     let mut needles = vec![needle.to_string()];
     if let Ok(store) = ctx.store()
@@ -257,6 +276,10 @@ fn task_needles(ctx: &mut Context, needle: &str) -> Result<Vec<String>> {
 }
 
 /// Handle `powerqueue logs`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Command dispatch transfers ownership of parsed arguments to the selected handler."
+)]
 pub fn run(ctx: &mut Context, args: LogsArgs) -> Result<i32> {
     ensure_initialised(ctx)?;
     let color = ctx.color;
@@ -295,7 +318,7 @@ pub fn run(ctx: &mut Context, args: LogsArgs) -> Result<i32> {
             println!("{}", "no events".if_supports_color(Stream::Stdout, |t| t.dimmed()));
         }
         for e in &events {
-            let task = e.task_id.map(|t| t.short()).unwrap_or_else(|| "-".to_string());
+            let task = e.task_id.map_or_else(|| "-".to_string(), |t| t.short());
             println!(
                 "{} {}",
                 super::task::format_event(e, color),
@@ -307,7 +330,7 @@ pub fn run(ctx: &mut Context, args: LogsArgs) -> Result<i32> {
             );
         }
         if args.follow {
-            let mut last_id = events.last().map(|e| e.id).unwrap_or(0);
+            let mut last_id = events.last().map_or(0, |e| e.id);
             loop {
                 std::thread::sleep(Duration::from_millis(500));
                 for e in store.events_after(last_id, 200)? {

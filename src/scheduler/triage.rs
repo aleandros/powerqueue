@@ -75,7 +75,8 @@ pub fn delivery_key(id: TaskId) -> String {
 pub fn report_body(task: &Task, base: Option<&str>) -> String {
     let policy = task.execution.as_ref().and_then(|e| e.policy.as_ref());
     let prefix = policy.map(|p| p.comment_prefix.as_str()).unwrap_or_default();
-    let label = task.execution.as_ref().and_then(|e| e.outcome).map(|o| o.label()).unwrap_or("unspecified");
+    let label =
+        task.execution.as_ref().and_then(|e| e.outcome).map_or("unspecified", super::super::execution::TriageOutcome::label);
     super::relay::tag_own(&format!(
         "{}## Automated triage\n\n**Recommendation:** `{label}` (not implementation approval)\n\n**Code inspected:** `{}`\n\n{}",
         if prefix.is_empty() { String::new() } else { format!("{prefix}\n\n") },

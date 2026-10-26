@@ -63,12 +63,12 @@ fn update_issue(task: &mut Task, issue: &GitHubIssue) -> bool {
     let description = issue.body.clone().unwrap_or_default();
     let labels: Vec<_> = issue.labels.iter().map(|l| l.name.clone()).collect();
     let mut changed = task.title != issue.title || task.description != description || task.labels != labels;
-    task.title = issue.title.clone();
+    task.title.clone_from(&issue.title);
     task.description = description;
     task.labels = labels;
     if let TaskSource::GitHub { url, .. } = &mut task.source {
         changed |= *url != issue.html_url;
-        *url = issue.html_url.clone();
+        url.clone_from(&issue.html_url);
     }
     changed
 }
@@ -86,6 +86,10 @@ pub async fn plan_sync_routed(store: &Store, cfg: &GitHubConfig, client: &GitHub
     plan_sync_inner(store, cfg, client, Some(routing)).await
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing reconcile flag interface during lint adoption; callers already supply named state predicates."
+)]
 fn reconcile(
     task: &mut Task,
     admission: crate::domain::GitHubAdmission,
@@ -297,6 +301,10 @@ fn record_problem(store: &Store, problem: &SyncProblem) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing apply_decisions flag interface during lint adoption; callers already supply named state predicates."
+)]
 fn apply_decisions(
     task: &mut Task,
     admission: Option<crate::domain::GitHubAdmission>,

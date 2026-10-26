@@ -81,6 +81,10 @@ pub fn sort_for_display(tasks: &mut [Task]) {
 }
 
 /// Load the rows `status` shows. Terminal tasks are hidden unless `all`.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 pub fn load_rows(store: &Store, all: bool) -> Result<Vec<StatusRow>> {
     let mut tasks = if all { store.list_tasks()? } else { store.list_open_tasks()? };
     sort_for_display(&mut tasks);
@@ -92,7 +96,7 @@ pub fn load_rows(store: &Store, all: bool) -> Result<Vec<StatusRow>> {
             Some(s) if s.state.is_live() => store.latest_resource_sample(s.id)?,
             _ => None,
         };
-        let provider = super::task::effective_model(&task).map(|m| m.provider());
+        let provider = super::task::effective_model(&task).map(crate::domain::ModelTier::provider);
         let source_deferral = task.source_deferral();
         let deferral_allows = task.deferral_allows(Utc::now());
         let deferral_error = source_deferral.as_ref().err().map(ToString::to_string);
@@ -156,7 +160,7 @@ fn waiting_on_without_deferral(task: &Task) -> String {
     let keys = task.waiting_on();
     let pr = || {
         let url = task.pr_url.as_deref().unwrap_or_default();
-        url.parse::<crate::github::PrRef>().map(|p| format!("PR #{}", p.number)).unwrap_or_else(|_| url.to_string())
+        url.parse::<crate::github::PrRef>().map_or_else(|_| url.to_string(), |p| format!("PR #{}", p.number))
     };
     if task.state == TaskState::InReview {
         if task.review.as_ref().is_some_and(|r| r.waiting_manual_merge) {
@@ -202,13 +206,26 @@ fn counts_line(c: &QueueCounts) -> String {
 /// otherwise a generous fixed width so piped output is not truncated.
 fn terminal_width() -> usize {
     if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-        crossterm::terminal::size().map(|(w, _)| w as usize).ok().filter(|w| *w >= 40).unwrap_or(120)
+        crossterm::terminal::size().map(|(w, _)| usize::from(w)).ok().filter(|w| *w >= 40).unwrap_or(120)
     } else {
         160
     }
 }
 
 /// Handle `powerqueue status`.
+#[expect(
+    clippy::as_conversions,
+    reason = "Terminal dimensions and rendered collection lengths use the existing bounded display representation."
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Terminal dimensions and rendered collection lengths use the existing bounded display representation."
+)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Command dispatch transfers ownership of parsed arguments to the selected handler."
+)]
+#[expect(clippy::too_many_lines, reason = "Keep the run workflow and its early exits together in execution order.")]
 pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
     ensure_initialised(ctx)?;
     let cfg = ctx.config_cloned()?;
@@ -316,7 +333,7 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
         let model_text = if color {
             output::model_colored_with_provider(model)
         } else {
-            model.map(output::model_with_provider).unwrap_or("-".into())
+            model.map_or("-".into(), output::model_with_provider)
         };
         let model_text = if t.model_override.is_some() { format!("{model_text}*") } else { model_text };
         let attempts = match t.max_attempts {
@@ -327,7 +344,7 @@ pub fn run(ctx: &mut Context, args: StatusArgs) -> Result<i32> {
         let mut cells = vec![
             Cell::new(&t.key),
             Cell::new(&t.execution_project),
-            Cell::new(cfg.execution_for(t).map(|e| e.queue).unwrap_or_else(|_| "invalid".into())),
+            Cell::new(cfg.execution_for(t).map_or_else(|_| "invalid".into(), |e| e.queue)),
             Cell::new(state),
             Cell::new(crit),
             Cell::new(model_text),

@@ -17,6 +17,12 @@ use crate::dashboard::{self, Options, Snapshot, TerminalEnv};
 /// Exit code when the dashboard cannot use the terminal it was started from.
 pub const EXIT_NO_TTY: i32 = 2;
 
+/// # Panics
+/// Panics if snapshot serialization stops representing tasks as a JSON array.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Command dispatch transfers ownership of parsed arguments to the selected handler."
+)]
 pub fn run(ctx: &mut Context, args: DashboardArgs) -> Result<i32> {
     ensure_initialised(ctx)?;
     let cfg = ctx.config_cloned()?;

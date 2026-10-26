@@ -200,7 +200,7 @@ mod tests {
             // Dropping these also releases workers if a probe above panics.
             drop(releases);
             assert!(threads >= 16, "fixture must expose Linux threads");
-            assert_eq!(sample.process_count as usize, seen.len());
+            assert_eq!(usize::try_from(sample.process_count).unwrap(), seen.len());
             assert_eq!(sample.rss_bytes, rss);
             assert!((sample.cpu_percent - cpu).abs() < 0.001);
         });

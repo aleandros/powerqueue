@@ -32,10 +32,21 @@ impl World {
         Self { daemon, bindings }
     }
 
+    #[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Fixture counts and timestamps are bounded to small values by the test inputs."
+    )]
     fn count(&self, queue: &str) -> u32 {
         self.daemon.tasks.iter().filter(|t| t.session_live() && t.task.execution.as_ref().unwrap().queue == queue).count() as u32
     }
 
+    #[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Fixture counts and timestamps are bounded to small values by the test inputs."
+    )]
+    #[expect(clippy::too_many_lines, reason = "Keep the apply workflow and its early exits together in execution order.")]
     fn apply(&mut self, step: usize, op: &TriageModelOp) -> Result<(), TestCaseError> {
         let d = &mut self.daemon;
         d.now += Duration::seconds(1);
@@ -198,6 +209,7 @@ proptest! {
     }
 
     #[test]
+    #[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
     fn dedicated_limits_drain_by_attrition_and_failures_do_not_borrow_slots(high in 2u32..=3) {
         let mut world = World::new(high, high);
         world.apply(0, &TriageModelOp::Launch(true))?;

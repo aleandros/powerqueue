@@ -35,6 +35,16 @@ impl World {
             .count()
     }
 
+    #[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Fixture counts and timestamps are bounded to small values by the test inputs."
+    )]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "The test or replay driver consumes each input operation before advancing to the next one."
+    )]
+    #[expect(clippy::too_many_lines, reason = "Keep the apply workflow and its early exits together in execution order.")]
     fn apply(&mut self, op: SetupModelOp) -> Result<(), TestCaseError> {
         use SetupModelOp::*;
         self.daemon.now += Duration::seconds(60);

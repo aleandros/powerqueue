@@ -44,17 +44,18 @@ struct Env {
 
 impl Env {
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("create service fixture directory");
         let bin = dir.path().join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&bin).expect("create fake service manager directory");
         for (name, body) in [("systemctl", FAKE_SYSTEMCTL), ("loginctl", FAKE_LOGINCTL), ("journalctl", FAKE_JOURNALCTL)] {
             let p = bin.join(name);
-            std::fs::write(&p, body).unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(&p, body).expect("write fake service manager script");
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("make fake service manager executable");
         }
         let config = dir.path().join("pq/config");
-        std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(config.join("config.toml"), format!("[repo]\npath = \"{}\"\n", dir.path().display())).unwrap();
+        std::fs::create_dir_all(&config).expect("create service fixture configuration directory");
+        std::fs::write(config.join("config.toml"), format!("[repo]\npath = \"{}\"\n", dir.path().display()))
+            .expect("write service fixture configuration");
         Self { dir }
     }
 
@@ -91,7 +92,7 @@ impl Env {
 }
 
 fn read(p: &Path) -> String {
-    std::fs::read_to_string(p).unwrap()
+    std::fs::read_to_string(p).expect("read expected service fixture file")
 }
 
 #[test]

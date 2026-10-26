@@ -94,6 +94,14 @@ POWERQUEUE_AGY_HOME = "{agy_home}"
     }
 
     /// The general form; see [`Opts`].
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "The test or replay driver consumes each input operation before advancing to the next one."
+    )]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+    )]
     fn with_opts(opts: Opts<'_>, provider_config: impl Fn(&Path) -> String) -> Option<Self> {
         for tool in ["tmux", "git", "python3"] {
             if which::which(tool).is_err() {
@@ -180,12 +188,20 @@ push_branch = false
         c
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+    )]
     fn run_ok(&self, args: &[&str]) -> String {
         let out = self.cmd().args(args).output().unwrap();
         assert!(out.status.success(), "powerqueue {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8_lossy(&out.stdout).to_string()
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+    )]
     fn start_daemon(&mut self) {
         let log = std::fs::File::create(self.root.path().join("daemon.log")).unwrap();
         let child = self.cmd().arg("run").stdout(Stdio::from(log.try_clone().unwrap())).stderr(Stdio::from(log)).spawn().unwrap();
@@ -258,7 +274,7 @@ impl Drop for Env {
 }
 
 fn has_event(show: &serde_json::Value, kind: &str) -> bool {
-    show["events"].as_array().map(|evs| evs.iter().any(|e| e["kind"] == kind)).unwrap_or(false)
+    show["events"].as_array().is_some_and(|evs| evs.iter().any(|e| e["kind"] == kind))
 }
 
 /// A task can be completed by either signal, whichever the daemon sees
@@ -273,6 +289,10 @@ fn output_tokens(show: &serde_json::Value) -> u64 {
     show["usage"]["output_tokens"].as_u64().unwrap_or(0)
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn git(repo: &Path, args: &[&str]) {
     let out = Command::new("git").args(args).current_dir(repo).output().unwrap();
     assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
@@ -381,6 +401,10 @@ static CONTAINER_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Name of the image the container tests use; built from the fixtures when
 /// `POWERQUEUE_E2E_DOCKER` is set and `docker` works, else `None` (skip).
 /// The returned guard serialises the container tests.
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn docker_image() -> Option<(String, std::sync::MutexGuard<'static, ()>)> {
     if std::env::var_os("POWERQUEUE_E2E_DOCKER").is_none() {
         eprintln!("skipping container test: set POWERQUEUE_E2E_DOCKER=1 to run it");
@@ -408,7 +432,7 @@ fn docker_image() -> Option<(String, std::sync::MutexGuard<'static, ()>)> {
     .unwrap();
     let out = Command::new("docker").args(["build", "-q", "-t", &image]).arg(ctx.path()).output().unwrap();
     assert!(out.status.success(), "docker build failed: {}", String::from_utf8_lossy(&out.stderr));
-    let guard = CONTAINER_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let guard = CONTAINER_TESTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     Some((image, guard))
 }
 
@@ -432,6 +456,10 @@ fn container_setup_and_cleanup(image: &str) -> (String, String) {
 struct ContainerGuard(String);
 
 impl ContainerGuard {
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+    )]
     fn running(&self) -> bool {
         let out = Command::new("docker").args(["ps", "-q", "--filter", &format!("name=^{}$", self.0)]).output().unwrap();
         !String::from_utf8_lossy(&out.stdout).trim().is_empty()
@@ -694,6 +722,14 @@ fn execution_project_crash_resumes_in_the_same_checkout() {
     crash_resume_in_project(true);
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Test helpers take boolean inputs to exercise both sides of the production transition."
+)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn crash_resume_in_project(multi: bool) {
     let Some(mut env) = Env::new("crash-once", "") else { return };
     if multi {
@@ -886,6 +922,10 @@ fn gh_pr(number: u64, state: &str, mergeable: &str) -> String {
 }
 
 /// Publish a complete response atomically while the fake gh may be reading it.
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn write_pr_response(path: &Path, response: &str) {
     let temp = tempfile::NamedTempFile::new_in(path.parent().unwrap()).unwrap();
     std::fs::write(temp.path(), response).unwrap();
@@ -924,6 +964,14 @@ fn execution_project_review_resumes_and_deletes_only_its_own_branch() {
     review_in_project(true);
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Test helpers take boolean inputs to exercise both sides of the production transition."
+)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn review_in_project(multi: bool) {
     let gh = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-gh.sh");
     let extra = format!("max_concurrent = 1\npr_poll_secs = 1\ngh_binary = \"{}\"", gh.display());
@@ -1023,6 +1071,10 @@ struct GitHubFixtureState {
 }
 
 impl wiremock::Respond for GitHubFixture {
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+    )]
     fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
         use serde_json::json;
         use wiremock::ResponseTemplate;
@@ -1108,6 +1160,18 @@ impl wiremock::Respond for GitHubFixture {
     }
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Test helpers take boolean inputs to exercise both sides of the production transition."
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the github_lifecycle_e2e workflow and its early exits together in execution order."
+)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 async fn github_lifecycle_e2e(close_on_complete: bool, with_review: bool) {
     use serde_json::json;
     use wiremock::{Mock, MockServer};
@@ -1252,6 +1316,10 @@ async fn github_issue_waits_for_pr_merge_before_closing() {
 
 /// Register a second checkout with the same basename as the legacy checkout.
 /// Repository-local overrides must not enlarge the machine's slot limit.
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn register_execution_project(env: &Env) -> PathBuf {
     let repo = env.root.path().join("second/repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -1458,6 +1526,10 @@ fn execution_projects_push_and_clean_up_only_their_own_repositories() {
 /// Three real checkouts with independent mocked GitHub APIs and identical issue
 /// and PR numbers. No credentials, remotes or agent services leave the tempdir.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the three_project_github_queue_routes_approved_work_through_review_and_cleanup workflow and its early exits together in execution order."
+)]
 async fn three_project_github_queue_routes_approved_work_through_review_and_cleanup() {
     use powerqueue::config::Config;
     use serde_json::json;
@@ -1746,6 +1818,14 @@ fn deferred_task_keeps_queue_visibility_and_launches_only_after_expiry() {
 
 /// Hold one setup until the test releases it. A removed temp root also releases
 /// the shell, so failed assertions cannot leave a long-lived fixture process.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Test helpers take boolean inputs to exercise both sides of the production transition."
+)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn gate_setup(env: &Env, key: &str, failure: bool) -> PathBuf {
     let release = env.root.path().join("release-setup");
     let entered = env.root.path().join("entered-setup");
@@ -1758,6 +1838,10 @@ fn gate_setup(env: &Env, key: &str, failure: bool) -> PathBuf {
 }
 
 #[test]
+#[expect(
+    clippy::similar_names,
+    reason = "The names distinguish related domain values and match the surrounding workflow terminology."
+)]
 fn background_setup_keeps_heartbeat_and_other_queue_flowing() {
     let Some(mut env) = Env::with_provider("complete", "max_concurrent = 3\npr_poll_secs = 0", |_| {
         "[queues.default]\nmax_concurrent = 1\n[queues.fast]\nmax_concurrent = 1\nall = [{field = \"label\", op = \"eq\", value = \"fast\"}]\n".into()
@@ -1787,6 +1871,10 @@ fn background_setup_keeps_heartbeat_and_other_queue_flowing() {
 }
 
 #[test]
+#[expect(
+    clippy::similar_names,
+    reason = "The names distinguish related domain values and match the surrounding workflow terminology."
+)]
 fn background_setup_cancel_defers_cleanup_and_discards_failure() {
     let Some(mut env) = Env::with_opts(
         Opts {
@@ -1822,6 +1910,10 @@ fn background_setup_cancel_defers_cleanup_and_discards_failure() {
 }
 
 #[test]
+#[expect(
+    clippy::similar_names,
+    reason = "The names distinguish related domain values and match the surrounding workflow terminology."
+)]
 fn background_setup_once_drains_admitted_work_without_admitting_another_task() {
     let Some(mut env) = Env::new("idle", "max_concurrent = 1\npr_poll_secs = 0") else { return };
     let slow = add_task(&env, "One-shot setup", &[]);
@@ -1851,6 +1943,10 @@ fn background_setup_once_drains_admitted_work_without_admitting_another_task() {
 }
 
 #[test]
+#[expect(
+    clippy::similar_names,
+    reason = "The names distinguish related domain values and match the surrounding workflow terminology."
+)]
 fn background_setup_scheduling_pause_holds_completed_setup() {
     let Some(mut env) = Env::new("complete", "max_concurrent = 1\npr_poll_secs = 0") else { return };
     let slow = add_task(&env, "Pause scheduling during setup", &[]);

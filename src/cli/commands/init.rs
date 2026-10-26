@@ -111,17 +111,17 @@ impl Answers {
     /// Write the answers into `cfg`, leaving every other key untouched.
     pub fn apply_to(&self, cfg: &mut Config) {
         cfg.repo.path = self.repo_path.display().to_string();
-        cfg.repo.default_branch = self.default_branch.clone();
+        cfg.repo.default_branch.clone_from(&self.default_branch);
         cfg.linear.enabled = self.linear_enabled;
-        cfg.linear.team_keys = self.team_keys.clone();
+        cfg.linear.team_keys.clone_from(&self.team_keys);
         if !self.queued_states.is_empty() {
-            cfg.linear.queued_states = self.queued_states.clone();
+            cfg.linear.queued_states.clone_from(&self.queued_states);
         }
-        cfg.linear.in_progress_state = self.in_progress_state.clone();
-        cfg.linear.done_state = self.done_state.clone();
+        cfg.linear.in_progress_state.clone_from(&self.in_progress_state);
+        cfg.linear.done_state.clone_from(&self.done_state);
         cfg.priority.jev.enabled = self.jev_enabled;
         cfg.scheduler.max_concurrent = self.max_concurrent;
-        cfg.claude.permission_mode = self.permission_mode.clone();
+        cfg.claude.permission_mode.clone_from(&self.permission_mode);
         cfg.budget.providers.claude.period_weighted_tokens = self.period_weighted_tokens;
         cfg.budget.providers.claude.period_anchor =
             self.period_anchor.map(|a| a.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
@@ -235,8 +235,8 @@ fn parse_time(s: &str) -> Option<NaiveTime> {
     };
     let mut parts = body.split(':');
     let hour: u32 = parts.next()?.trim().parse().ok()?;
-    let minute: u32 = parts.next().map(|m| m.trim().parse().ok()).unwrap_or(Some(0))?;
-    let second: u32 = parts.next().map(|m| m.trim().parse().ok()).unwrap_or(Some(0))?;
+    let minute: u32 = parts.next().map_or(Some(0), |m| m.trim().parse().ok())?;
+    let second: u32 = parts.next().map_or(Some(0), |m| m.trim().parse().ok())?;
     if parts.next().is_some() {
         return None;
     }
@@ -250,12 +250,16 @@ fn parse_time(s: &str) -> Option<NaiveTime> {
 }
 
 /// Items required by `--non-interactive` that were not provided (or invalid).
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 pub fn missing_for_non_interactive(args: &InitArgs, repo_is_git: bool) -> Vec<String> {
     let mut missing = Vec::new();
     if !repo_is_git {
         missing.push("a git repository (--repo PATH or run inside one)".to_string());
     }
-    if !args.no_linear && args.linear_key.as_deref().map(str::trim).filter(|k| !k.is_empty()).is_none() {
+    if !args.no_linear && args.linear_key.as_deref().map(str::trim).as_ref().is_none_or(|k| k.is_empty()) {
         missing.push("Linear API key (--linear-key, LINEAR_API_KEY, or --no-linear)".to_string());
     }
     if let Some(mode) = &args.permission_mode
@@ -318,6 +322,10 @@ struct Ui {
 }
 
 impl Ui {
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+    )]
     fn new(color: bool) -> Self {
         let theme: Box<dyn Theme> = if color { Box::new(ColorfulTheme::default()) } else { Box::new(SimpleTheme) };
         Self { theme, color }
@@ -362,6 +370,10 @@ impl Ui {
             }
         );
     }
+    #[expect(
+        clippy::unused_self,
+        reason = "Keep this helper on its context so callers use the same interface as adjacent context-dependent operations."
+    )]
     fn spinner(&self, msg: &str) -> ProgressBar {
         let pb = ProgressBar::new_spinner().with_message(msg.to_string());
         pb.enable_steady_tick(Duration::from_millis(80));
@@ -381,6 +393,10 @@ fn detect_repo(args_repo: Option<&Path>) -> Result<PathBuf> {
 /// default and the user may also set an explicit default branch; otherwise
 /// the branch is left to detection. Returns the path and the explicit
 /// `repo.default_branch` value (`None` = detect).
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 fn repo_step(ui: &Ui, args: &InitArgs, interactive: bool, current: Option<&RepoConfig>) -> Result<(PathBuf, Option<String>)> {
     ui.section("Repository");
     let mut path = match (args.repo.as_deref(), current) {
@@ -426,6 +442,10 @@ fn repo_step(ui: &Ui, args: &InitArgs, interactive: bool, current: Option<&RepoC
     }
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 fn linear_step(
     ctx: &mut Context,
     ui: &Ui,
@@ -446,26 +466,25 @@ fn linear_step(
         bail!("Linear API key missing (--linear-key or LINEAR_API_KEY)");
     }
     loop {
-        let key = match candidate.take() {
-            Some(k) => k,
-            None => {
-                let typed = Password::with_theme(ui.theme())
-                    .with_prompt("Linear API key (https://linear.app/settings/account/security; empty to skip Linear)")
-                    .allow_empty_password(true)
+        let key = if let Some(k) = candidate.take() {
+            k
+        } else {
+            let typed = Password::with_theme(ui.theme())
+                .with_prompt("Linear API key (https://linear.app/settings/account/security; empty to skip Linear)")
+                .allow_empty_password(true)
+                .interact()?;
+            if typed.trim().is_empty() {
+                let skip = Confirm::with_theme(ui.theme())
+                    .with_prompt("Skip Linear and use manual tasks only?")
+                    .default(false)
                     .interact()?;
-                if typed.trim().is_empty() {
-                    let skip = Confirm::with_theme(ui.theme())
-                        .with_prompt("Skip Linear and use manual tasks only?")
-                        .default(false)
-                        .interact()?;
-                    if skip {
-                        ui.warn("Linear disabled; add work with `powerqueue add`");
-                        return Ok(None);
-                    }
-                    continue;
+                if skip {
+                    ui.warn("Linear disabled; add work with `powerqueue add`");
+                    return Ok(None);
                 }
-                typed.trim().to_string()
+                continue;
             }
+            typed.trim().to_string()
         };
         let client = LinearClient::new(endpoint.clone(), key.clone())?;
         let pb = ui.spinner("checking the Linear API key…");
@@ -503,6 +522,10 @@ fn linear_step(
 /// Choose teams and workflow states. `--team` wins; otherwise the teams and
 /// states already in `answers` (the current config when reconfiguring) are
 /// the defaults, and a fresh install falls back to [`pick_default_states`].
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 fn teams_step(
     ui: &Ui,
     client: &LinearClient,
@@ -531,7 +554,7 @@ fn teams_step(
     let preselected: Vec<bool> = teams.iter().map(|t| wanted.iter().any(|k| k.eq_ignore_ascii_case(&t.key))).collect();
     let chosen: Vec<usize> = if interactive {
         let labels: Vec<String> = teams.iter().map(|t| format!("{} — {}", t.key, t.name)).collect();
-        let defaults = if preselected.iter().any(|p| *p) { preselected.clone() } else { vec![teams.len() == 1; teams.len()] };
+        let defaults = if preselected.iter().any(|p| *p) { preselected } else { vec![teams.len() == 1; teams.len()] };
         MultiSelect::with_theme(ui.theme())
             .with_prompt("Teams to pull issues from (space to toggle, enter to confirm)")
             .items(&labels)
@@ -593,7 +616,7 @@ fn teams_step(
     }
     let mut options: Vec<String> = vec!["(do not change the state)".to_string()];
     options.extend(labels.iter().cloned());
-    let idx_of = |name: Option<&String>| name.and_then(|n| states.iter().position(|s| &s.name == n)).map(|i| i + 1).unwrap_or(0);
+    let idx_of = |name: Option<&String>| name.and_then(|n| states.iter().position(|s| &s.name == n)).map_or(0, |i| i + 1);
     let ip = Select::with_theme(ui.theme())
         .with_prompt("State to set when a session starts")
         .items(&options)
@@ -621,7 +644,7 @@ fn tools_step(ui: &Ui, claude_binary: &str, tmux_binary: &str) {
     }
     match claude_auth_status(claude_binary) {
         Ok(auth) if auth.logged_in => {
-            ui.ok(&format!("claude is logged in{}", auth.method.as_deref().map(|m| format!(" ({m})")).unwrap_or_default()))
+            ui.ok(&format!("claude is logged in{}", auth.method.as_deref().map(|m| format!(" ({m})")).unwrap_or_default()));
         }
         Ok(auth) => ui.warn(&format!("claude is not logged in ({}); run `{claude_binary} auth login`", auth.detail)),
         Err(e) => ui.fail(&format!("`{claude_binary} auth status` failed: {e:#}")),
@@ -639,6 +662,10 @@ pub fn provider_prompt(p: Provider, binary: &str) -> String {
 /// `answers.providers` (the current config when reconfiguring) are the
 /// defaults; a `--provider` flag always enables. An enabled provider that is
 /// not logged in gets a warning, not an error: `doctor` checks it again.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 fn providers_step(ui: &Ui, args: &InitArgs, interactive: bool, answers: &mut Answers) -> Result<()> {
     ui.section("Other providers (optional)");
     let defaults = Config::default();
@@ -689,6 +716,10 @@ fn providers_step(ui: &Ui, args: &InitArgs, interactive: bool, answers: &mut Ans
     Ok(())
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 fn jev_step(ctx: &mut Context, ui: &Ui, args: &InitArgs, interactive: bool, rt: &tokio::runtime::Runtime) -> Result<bool> {
     ui.section("Jev (optional ticket scoring by TypeSafe)");
     let mut candidate = args.jev_key.clone().map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
@@ -744,11 +775,15 @@ fn jev_step(ctx: &mut Context, ui: &Ui, args: &InitArgs, interactive: bool, rt: 
 /// Concurrency, permission mode, weekly budget and reset anchor. The values
 /// already in `answers` are the defaults; `--permission-mode` overrides the
 /// mode in both interactive and non-interactive runs.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 fn tuning_step(ui: &Ui, args: &InitArgs, interactive: bool, answers: &mut Answers) -> Result<()> {
     ui.section("Scheduling and budget");
     if let Some(mode) = &args.permission_mode {
         check_permission_mode(mode)?;
-        answers.permission_mode = mode.clone();
+        answers.permission_mode.clone_from(mode);
     }
     if !interactive {
         ui.ok(&format!(
@@ -764,18 +799,17 @@ fn tuning_step(ui: &Ui, args: &InitArgs, interactive: bool, answers: &mut Answer
         .interact_text()?;
     let mut modes: Vec<String> = PERMISSION_MODES.iter().map(|(m, _)| m.to_string()).collect();
     let mut labels: Vec<String> = PERMISSION_MODES.iter().map(|(m, d)| format!("{m} — {d}")).collect();
-    let selected = match modes.iter().position(|m| *m == answers.permission_mode) {
-        Some(i) => i,
-        None => {
-            // A mode set by hand (e.g. `manual`) stays selectable.
-            labels.push(format!("{} — keep the current value", answers.permission_mode));
-            modes.push(answers.permission_mode.clone());
-            modes.len() - 1
-        }
+    let selected = if let Some(i) = modes.iter().position(|m| *m == answers.permission_mode) {
+        i
+    } else {
+        // A mode set by hand (e.g. `manual`) stays selectable.
+        labels.push(format!("{} — keep the current value", answers.permission_mode));
+        modes.push(answers.permission_mode.clone());
+        modes.len() - 1
     };
     let mode =
         Select::with_theme(ui.theme()).with_prompt("Permission mode for sessions").items(&labels).default(selected).interact()?;
-    answers.permission_mode = modes[mode].clone();
+    answers.permission_mode.clone_from(&modes[mode]);
     answers.period_weighted_tokens = Input::with_theme(ui.theme())
         .with_prompt("Weekly budget in weighted tokens (see docs/budget.md)")
         .default(answers.period_weighted_tokens)
@@ -805,6 +839,10 @@ fn tuning_step(ui: &Ui, args: &InitArgs, interactive: bool, answers: &mut Answer
     Ok(())
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 fn keys_only(ctx: &mut Context, ui: &Ui, args: &InitArgs, interactive: bool) -> Result<i32> {
     let rt = super::runtime()?;
     let linear = linear_step(ctx, ui, args, interactive, &rt)?;
@@ -857,6 +895,10 @@ fn stored_linear_client(
 /// defaults and write only those keys back. Keys, priority.toml and every
 /// other section are left alone. Non-interactive runs apply the flags given
 /// and keep everything else.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 fn reconfigure(ctx: &mut Context, ui: &Ui, args: &InitArgs, interactive: bool) -> Result<i32> {
     let mut cfg = Config::load(&ctx.paths)
         .with_context(|| "cannot load the existing configuration; fix it with `powerqueue config edit` or start over")?;
@@ -877,9 +919,7 @@ fn reconfigure(ctx: &mut Context, ui: &Ui, args: &InitArgs, interactive: bool) -
     } else {
         answers.linear_enabled || args.linear_key.is_some()
     };
-    if !answers.linear_enabled {
-        println!("  disabled; manual tasks only");
-    } else {
+    if answers.linear_enabled {
         // Interactively, every `None` below comes from linear_step, i.e. the
         // user chose to skip Linear; non-interactively it means "no usable key,
         // keep the current team/state settings".
@@ -908,13 +948,14 @@ fn reconfigure(ctx: &mut Context, ui: &Ui, args: &InitArgs, interactive: bool) -
             Some(client) if interactive || !args.team.is_empty() => {
                 teams_step(ui, &client, args, interactive, &mut answers, &rt)?;
             }
-            Some(_) => {}
             None if interactive => {
                 ui.warn("Linear disabled; add work with `powerqueue add`");
                 answers.linear_enabled = false;
             }
-            None => {}
+            Some(_) | None => {}
         }
+    } else {
+        println!("  disabled; manual tasks only");
     }
 
     tuning_step(ui, args, interactive, &mut answers)?;
@@ -945,10 +986,15 @@ fn reconfigure(ctx: &mut Context, ui: &Ui, args: &InitArgs, interactive: bool) -
 
 /// `claude, codex` for the summaries.
 fn providers_summary(answers: &Answers) -> String {
-    answers.enabled_providers().iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+    answers.enabled_providers().iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(", ")
 }
 
 /// Handle `powerqueue init`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Command dispatch transfers ownership of parsed arguments to the selected handler."
+)]
+#[expect(clippy::too_many_lines, reason = "Keep the run workflow and its early exits together in execution order.")]
 pub fn run(ctx: &mut Context, args: InitArgs) -> Result<i32> {
     let interactive = !args.non_interactive && std::io::stdin().is_terminal();
     let ui = Ui::new(ctx.color);
@@ -1155,7 +1201,7 @@ mod tests {
         assert_eq!(cfg.scheduler.max_concurrent, 3);
         assert_eq!(cfg.claude.permission_mode, "bypassPermissions");
         assert_eq!(cfg.budget.providers.claude.period_anchor.as_deref(), Some("2026-03-02T09:00:00Z"));
-        assert!(cfg.validate().is_empty());
+        assert_eq!((cfg.validate()).len(), 0);
         assert!(!cfg.budget.providers.codex.enabled);
 
         let answers = Answers { repo_path: PathBuf::from("/tmp/repo"), providers: vec![Provider::Codex], ..Answers::default() };
@@ -1174,15 +1220,15 @@ mod tests {
         let missing = missing_for_non_interactive(&args, false);
         assert_eq!(missing.len(), 2);
         let args = InitArgs { linear_key: Some("lin_x".into()), ..InitArgs::default() };
-        assert!(missing_for_non_interactive(&args, true).is_empty());
+        assert_eq!((missing_for_non_interactive(&args, true)).len(), 0);
         let args = InitArgs { no_linear: true, ..InitArgs::default() };
-        assert!(missing_for_non_interactive(&args, true).is_empty());
+        assert_eq!((missing_for_non_interactive(&args, true)).len(), 0);
         let args = InitArgs { no_linear: true, permission_mode: Some("bogus".into()), ..InitArgs::default() };
         let missing = missing_for_non_interactive(&args, true);
         assert_eq!(missing.len(), 1);
         assert!(missing[0].contains("bogus"), "{missing:?}");
         let args = InitArgs { no_linear: true, permission_mode: Some("auto".into()), ..InitArgs::default() };
-        assert!(missing_for_non_interactive(&args, true).is_empty());
+        assert_eq!((missing_for_non_interactive(&args, true)).len(), 0);
     }
 
     #[test]
@@ -1192,7 +1238,7 @@ mod tests {
         for (mode, description) in PERMISSION_MODES {
             cfg.claude.permission_mode = mode.to_string();
             assert!(cfg.validate().is_empty(), "{mode} must be accepted by Config::validate");
-            assert!(!description.is_empty());
+            assert_ne!(description, "");
             check_permission_mode(mode).unwrap();
         }
         assert_eq!(PERMISSION_MODES[0].0, "acceptEdits");

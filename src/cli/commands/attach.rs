@@ -9,10 +9,14 @@ use anyhow::{Result, anyhow, bail};
 use crate::cli::{AttachArgs, Context};
 use crate::tmux::{Tmux, shell_quote};
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Command dispatch transfers ownership of parsed arguments to the selected handler."
+)]
 pub fn run(ctx: &mut Context, args: AttachArgs) -> Result<i32> {
     let cfg = ctx.config_cloned()?;
     let tmux = Tmux::new(cfg.tmux.binary.clone(), cfg.tmux.socket_name.clone());
-    let session_name = cfg.tmux.session_name.clone();
+    let session_name = cfg.tmux.session_name;
 
     let window = match args.task.as_deref() {
         Some(needle) => Some(resolve_window(ctx, needle)?),

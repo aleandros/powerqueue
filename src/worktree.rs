@@ -5,6 +5,8 @@
 //! credential helpers). Every error names the command line and carries
 //! git's stderr.
 
+use std::fmt::Write as _;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -133,8 +135,7 @@ impl Repo {
         self.path.is_dir()
             && self
                 .git_output(None, &["rev-parse", "--is-inside-work-tree"])
-                .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
-                .unwrap_or(false)
+                .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
     }
 
     /// `origin/HEAD` target, else `main`/`master` if they exist, else current branch.
@@ -259,8 +260,7 @@ impl Repo {
         let local = self.try_rev_sha(base)?;
         let use_remote = match (&remote, &local, prefer) {
             (None, _, _) => false,
-            (Some(_), None, _) => true,
-            (Some(_), Some(_), BasePreference::Remote) => true,
+            (Some(_), None, _) | (Some(_), Some(_), BasePreference::Remote) => true,
             (Some(r), Some(l), _) => self.is_ancestor(l, r)?,
         };
         match (use_remote, remote, local) {
@@ -294,22 +294,19 @@ impl Repo {
         if let Some(busy) = self.operation_in_progress(&worktrees, base)? {
             return Ok(FastForward::Skipped(busy));
         }
-        match worktrees.iter().find(|w| w.branch.as_deref() == Some(base)) {
-            Some(wt) => {
-                let status = self.git(Some(&wt.path), &["status", "--porcelain", "--untracked-files=no"])?;
-                if status.lines().any(|l| !l.trim().is_empty()) {
-                    return Ok(FastForward::Skipped(format!(
-                        "`{base}` is checked out in {} with uncommitted changes",
-                        wt.path.display()
-                    )));
-                }
-                // No post-merge hooks (npm install & co.) in the user's checkout.
-                self.git(Some(&wt.path), &["-c", "core.hooksPath=/dev/null", "merge", "--ff-only", "--quiet", &to])?;
+        if let Some(wt) = worktrees.iter().find(|w| w.branch.as_deref() == Some(base)) {
+            let status = self.git(Some(&wt.path), &["status", "--porcelain", "--untracked-files=no"])?;
+            if status.lines().any(|l| !l.trim().is_empty()) {
+                return Ok(FastForward::Skipped(format!(
+                    "`{base}` is checked out in {} with uncommitted changes",
+                    wt.path.display()
+                )));
             }
-            None => {
-                let r = format!("refs/heads/{base}");
-                self.git(None, &["update-ref", "-m", "powerqueue: fast-forward", &r, &to, &from])?;
-            }
+            // No post-merge hooks (npm install & co.) in the user's checkout.
+            self.git(Some(&wt.path), &["-c", "core.hooksPath=/dev/null", "merge", "--ff-only", "--quiet", &to])?;
+        } else {
+            let r = format!("refs/heads/{base}");
+            self.git(None, &["update-ref", "-m", "powerqueue: fast-forward", &r, &to, &from])?;
         }
         tracing::info!(repo = %self.path.display(), base, from, to, "fast-forwarded base branch");
         Ok(FastForward::Updated { from, to })
@@ -318,6 +315,7 @@ impl Repo {
     /// A rebase or bisect of `branch` running in any of `worktrees` (which
     /// leaves the branch detached, so it is not on a worktree's `branch`
     /// line), described for a skip reason.
+    #[expect(clippy::unnecessary_wraps, reason = "Keep the fallible helper interface shared by the surrounding I/O workflow.")]
     fn operation_in_progress(&self, worktrees: &[WorktreeEntry], branch: &str) -> Result<Option<String>> {
         let full = format!("refs/heads/{branch}");
         for wt in worktrees.iter().filter(|w| !w.bare && w.path.is_dir()) {
@@ -367,7 +365,7 @@ impl Repo {
                 other => bail!(
                     "{} is already a worktree on {} (wanted branch {branch}); remove it or pick another path",
                     path.display(),
-                    other.map(|b| format!("branch `{b}`")).unwrap_or_else(|| "a detached HEAD".to_string())
+                    other.map_or_else(|| "a detached HEAD".to_string(), |b| format!("branch `{b}`"))
                 ),
             }
         }
@@ -375,21 +373,22 @@ impl Repo {
             std::fs::create_dir_all(parent).with_context(|| format!("cannot create {}", parent.display()))?;
         }
         let path_s = path.to_string_lossy();
-        match new_from {
-            Some(start) => {
-                self.git(None, &["worktree", "add", "--no-track", "-b", branch, &path_s, start])?;
-                tracing::info!(path = %path.display(), branch, start, "created worktree on a new branch");
-            }
-            None => {
-                self.git(None, &["worktree", "add", &path_s, branch])?;
-                tracing::info!(path = %path.display(), branch, "created worktree");
-            }
+        if let Some(start) = new_from {
+            self.git(None, &["worktree", "add", "--no-track", "-b", branch, &path_s, start])?;
+            tracing::info!(path = %path.display(), branch, start, "created worktree on a new branch");
+        } else {
+            self.git(None, &["worktree", "add", &path_s, branch])?;
+            tracing::info!(path = %path.display(), branch, "created worktree");
         }
         Ok(())
     }
 
     /// `git worktree remove [--force] <path>` followed by a prune. Removing a
     /// path that is no longer registered is not an error.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Keep the existing remove_worktree flag interface during lint adoption; callers already supply named state predicates."
+    )]
     pub fn remove_worktree(&self, path: &Path, force: bool) -> Result<()> {
         let wanted = normalize(path);
         let registered = self.list_worktrees()?.iter().any(|w| normalize(&w.path) == wanted);
@@ -415,6 +414,10 @@ impl Repo {
     }
 
     /// Delete a local branch (`-d`, or `-D` with `force`).
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Keep the existing delete_branch flag interface during lint adoption; callers already supply named state predicates."
+    )]
     pub fn delete_branch(&self, branch: &str, force: bool) -> Result<()> {
         let flag = if force { "-D" } else { "-d" };
         self.git(None, &["branch", flag, branch])?;
@@ -638,7 +641,7 @@ fn run_commands_inner(
         let out = command
             .output()
             .with_context(|| format!("cannot run `sh -c {}` in {}", crate::tmux::shell_quote(cmd), cwd.display()))?;
-        combined.push_str(&format!("$ {cmd}\n"));
+        let _ = writeln!(combined, "$ {cmd}");
         combined.push_str(&String::from_utf8_lossy(&out.stdout));
         combined.push_str(&String::from_utf8_lossy(&out.stderr));
         if !combined.ends_with('\n') {
@@ -671,7 +674,7 @@ mod tests {
         assert!(list[2].prunable);
         assert_eq!(list[2].branch, None);
         assert!(list[3].bare);
-        assert!(parse_worktree_list("").is_empty());
+        assert_eq!((parse_worktree_list("")).len(), 0);
     }
 
     #[test]

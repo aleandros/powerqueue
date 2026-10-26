@@ -27,7 +27,7 @@ impl AgentCli for ClaudeCli {
         let settings_path = ctx.task_dir.join("settings.json");
         let mut settings = hook_settings(ctx.self_bin, ctx.task.id, ctx.session_id, &ctx.cfg.claude);
         settings["statusLine"] = crate::budget::probes::claude::status_line_setting(ctx.self_bin, ctx.task.id, ctx.session_id);
-        let settings_text = serde_json::to_string_pretty(&settings).context("serialise settings.json")? + "\n";
+        let settings_text = format!("{}\n", serde_json::to_string_pretty(&settings).context("serialise settings.json")?);
         let argv = Launcher::claude_command(ctx, &settings_path)?;
         // Claude Code encodes its *physical* cwd, so resolve symlinks (e.g. /tmp → /private/tmp).
         let physical = std::fs::canonicalize(ctx.worktree).unwrap_or_else(|_| ctx.worktree.to_path_buf());
@@ -54,14 +54,14 @@ impl AgentCli for ClaudeCli {
         }
         let file = crate::session::trust::claude_json_path(cfg);
         let targets = crate::session::trust::trust_targets(repo, worktree);
-        let refs: Vec<&Path> = targets.iter().map(|p| p.as_path()).collect();
+        let refs: Vec<&Path> = targets.iter().map(std::path::PathBuf::as_path).collect();
         match crate::session::trust::ensure_trusted(&file, &refs) {
             Ok(newly) if !newly.is_empty() => {
-                tracing::info!(file = %file.display(), paths = ?newly, "marked workspace as trusted for Claude Code")
+                tracing::info!(file = %file.display(), paths = ?newly, "marked workspace as trusted for Claude Code");
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "could not pre-trust workspace; the session may wait on the trust dialog")
+                tracing::warn!(error = %format!("{e:#}"), "could not pre-trust workspace; the session may wait on the trust dialog");
             }
         }
         Ok(())

@@ -3,6 +3,8 @@
 //! Runtime parsing is the strict TOML schema in `policy`; `parse_legacy` is
 //! crate-private and called only by explicit migration and legacy regression tests.
 
+use std::fmt::Write as _;
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -273,6 +275,7 @@ impl PriorityRules {
 
     /// Parse the Markdown document. Fatal errors (unparseable rules) are
     /// returned; recoverable issues land in `warnings`.
+    #[expect(clippy::too_many_lines, reason = "Keep the parse_legacy workflow and its early exits together in execution order.")]
     pub(crate) fn parse_legacy(markdown: &str) -> Result<Self, Vec<RuleError>> {
         let mut rules = PriorityRules::default();
         let mut errors: Vec<RuleError> = Vec::new();
@@ -394,6 +397,14 @@ impl PriorityRules {
     /// criticality is tried Critical → High → Normal → Low. All matching
     /// scoring deltas add. Models come from the task override, first matching
     /// conditional preference, or effective criticality's model list.
+    #[expect(
+        clippy::as_conversions,
+        reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+    )]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+    )]
     pub fn evaluate(
         &self,
         task: &Task,
@@ -425,7 +436,7 @@ impl PriorityRules {
                         reasons.push(format!("{} override for {}", fmt_delta(*d), task.key));
                     }
                     Override::Model(m) => {
-                        models = m.clone();
+                        models.clone_from(m);
                         model_source = Some("overrides".to_string());
                         reasons.push(format!("model {} from overrides", fmt_models(m)));
                     }
@@ -435,7 +446,7 @@ impl PriorityRules {
 
         if criticality.is_none() {
             'sections: for c in Criticality::ALL {
-                for rule in self.sections.get(&c).map(Vec::as_slice).unwrap_or(&[]) {
+                for rule in self.sections.get(&c).map_or(&[][..], Vec::as_slice) {
                     if rule.conditions.iter().all(|cond| condition_matches(cond, task)) {
                         criticality = Some(c);
                         reasons.push(format!("{c}: matched rule at line {} ({})", rule.line, fmt_conditions(&rule.conditions)));
@@ -483,7 +494,7 @@ impl PriorityRules {
         if models.is_empty()
             && let Some(rule) = self.model_rules.iter().find(|r| r.conditions.iter().all(|cond| condition_matches(cond, task)))
         {
-            models = rule.models.clone();
+            models.clone_from(&rule.models);
             let source = format!("if {}", fmt_conditions(&rule.conditions));
             reasons.push(format!("model {} from models line {} ({source})", fmt_models(&models), rule.line));
             model_source = Some(source);
@@ -492,7 +503,7 @@ impl PriorityRules {
         if models.is_empty()
             && let Some(m) = self.models.get(&criticality)
         {
-            models = m.clone();
+            models.clone_from(m);
             model_source = Some(format!("{criticality} row"));
             reasons.push(format!("model {} from models", fmt_models(m)));
         }
@@ -503,7 +514,7 @@ impl PriorityRules {
     /// Models the rules prefer for a criticality, most wanted first; empty
     /// when `models` says nothing about it.
     pub fn model_for(&self, criticality: Criticality) -> &[ModelTier] {
-        self.models.get(&criticality).map(Vec::as_slice).unwrap_or(&[])
+        self.models.get(&criticality).map_or(&[][..], Vec::as_slice)
     }
 
     /// Number of rules under the criticality sections.
@@ -515,39 +526,43 @@ impl PriorityRules {
     pub fn describe(&self) -> String {
         let mut out = String::new();
         for c in Criticality::ALL {
-            let rules = self.sections.get(&c).map(Vec::as_slice).unwrap_or(&[]);
-            out.push_str(&format!("{} ({} rule{})\n", capitalize(c.as_str()), rules.len(), plural(rules.len())));
+            let rules = self.sections.get(&c).map_or(&[][..], Vec::as_slice);
+            let _ = writeln!(out, "{} ({} rule{})", capitalize(c.as_str()), rules.len(), plural(rules.len()));
             for r in rules {
-                out.push_str(&format!("  line {:>3}: {}\n", r.line, fmt_conditions(&r.conditions)));
+                let _ = writeln!(out, "  line {:>3}: {}", r.line, fmt_conditions(&r.conditions));
             }
         }
-        out.push_str(&format!("Default: {}\n", self.default_criticality));
-        out.push_str(&format!("Scoring ({} rule{})\n", self.scoring.len(), plural(self.scoring.len())));
+        let _ = writeln!(out, "Default: {}", self.default_criticality);
+        let _ = writeln!(out, "Scoring ({} rule{})", self.scoring.len(), plural(self.scoring.len()));
         for s in &self.scoring {
-            out.push_str(&format!("  line {:>3}: {} if {}\n", s.line, fmt_delta(s.delta), fmt_conditions(&s.conditions)));
+            let _ = writeln!(out, "  line {:>3}: {} if {}", s.line, fmt_delta(s.delta), fmt_conditions(&s.conditions));
         }
-        out.push_str(&format!("Overrides ({})\n", self.overrides.len()));
+        let _ = writeln!(out, "Overrides ({})", self.overrides.len());
         for (key, ovs) in &self.overrides {
-            let list: Vec<String> = ovs.iter().map(|o| o.to_string()).collect();
-            out.push_str(&format!("  {}: {}\n", key.to_ascii_uppercase(), list.join(", ")));
+            let list: Vec<String> = ovs.iter().map(std::string::ToString::to_string).collect();
+            let _ = writeln!(out, "  {}: {}", key.to_ascii_uppercase(), list.join(", "));
         }
         out.push_str("Models\n");
         for r in &self.model_rules {
-            out.push_str(&format!("  line {:>3}: {r}\n", r.line));
+            let _ = writeln!(out, "  line {:>3}: {r}", r.line);
         }
         for c in Criticality::ALL {
             match self.models.get(&c) {
-                Some(m) => out.push_str(&format!("  {c}: {}\n", fmt_models(m))),
-                None => out.push_str(&format!("  {c}: (budget policy decides)\n")),
+                Some(m) => {
+                    let _ = writeln!(out, "  {c}: {}", fmt_models(m));
+                }
+                None => {
+                    let _ = writeln!(out, "  {c}: (budget policy decides)");
+                }
             }
         }
-        out.push_str(&format!("Jev: {}\n", if self.jev.enabled { "enabled" } else { "disabled" }));
-        out.push_str(&format!("  question: {}\n", self.jev.question));
-        out.push_str(&format!("  levels: {}\n", self.jev.levels.join(" | ")));
+        let _ = writeln!(out, "Jev: {}", if self.jev.enabled { "enabled" } else { "disabled" });
+        let _ = writeln!(out, "  question: {}", self.jev.question);
+        let _ = writeln!(out, "  levels: {}", self.jev.levels.join(" | "));
         if !self.warnings.is_empty() {
-            out.push_str(&format!("Warnings ({})\n", self.warnings.len()));
+            let _ = writeln!(out, "Warnings ({})", self.warnings.len());
             for w in &self.warnings {
-                out.push_str(&format!("  line {:>3}: {}\n", w.line, w.message));
+                let _ = writeln!(out, "  line {:>3}: {}", w.line, w.message);
             }
         }
         out
@@ -572,14 +587,18 @@ pub fn condition_matches(cond: &Condition, task: &Task) -> bool {
                         || l.rsplit_once(crate::domain::LABEL_PARENT_SEPARATOR).is_some_and(|(_, child)| re.is_match(child))
                 });
             }
-            field_text(field, task).map(|t| re.is_match(&t)).unwrap_or(false)
+            field_text(field, task).is_some_and(|t| re.is_match(&t))
         }
-        Condition::GreaterThan { field, value } => field_number(field, task).map(|n| n > *value).unwrap_or(false),
-        Condition::LessThan { field, value } => field_number(field, task).map(|n| n < *value).unwrap_or(false),
+        Condition::GreaterThan { field, value } => field_number(field, task).is_some_and(|n| n > *value),
+        Condition::LessThan { field, value } => field_number(field, task).is_some_and(|n| n < *value),
     }
 }
 
 /// `Some(true/false)` if the field is present; `None` if it is missing on this task.
+#[expect(
+    clippy::float_cmp,
+    reason = "These values are exact discrete priorities or fixture constants; approximate equality would weaken the contract."
+)]
 fn field_equals(field: &str, value: &str, task: &Task) -> Option<bool> {
     match field {
         "label" => Some(task.labels.iter().any(|l| crate::domain::label_matches(l, value))),
@@ -673,18 +692,13 @@ fn strip_comments(line: &str, in_comment: &mut bool) -> String {
                 }
                 None => return out,
             }
+        } else if let Some(start) = rest.find("<!--") {
+            out.push_str(&rest[..start]);
+            *in_comment = true;
+            rest = &rest[start + 4..];
         } else {
-            match rest.find("<!--") {
-                Some(start) => {
-                    out.push_str(&rest[..start]);
-                    *in_comment = true;
-                    rest = &rest[start + 4..];
-                }
-                None => {
-                    out.push_str(rest);
-                    return out;
-                }
-            }
+            out.push_str(rest);
+            return out;
         }
     }
 }
@@ -862,7 +876,7 @@ fn parse_override(text: &str, line: usize, warnings: &mut Vec<RuleError>) -> Res
         let n: f64 = delta.trim().parse().map_err(|_| RuleError::new(line, format!("bad score delta `{value}` for {key}")))?;
         Override::Score(if value.starts_with('-') { -n } else { n })
     } else if let Some(rest) = lower.strip_prefix("model") {
-        let list = rest.trim_start().strip_prefix(['=', ':']).map(str::trim).unwrap_or("");
+        let list = rest.trim_start().strip_prefix(['=', ':']).map_or("", str::trim);
         let models = parse_model_list(list, line, &format!("{key}: model"), warnings)?;
         Override::Model(models)
     } else {
@@ -1005,19 +1019,27 @@ fn unquote(s: &str) -> String {
 /// The `regex` crate's errors span several lines (pattern, caret, `error: ...`);
 /// keep the last informative one.
 fn regex_reason(s: &str) -> &str {
-    s.lines().rev().map(str::trim).find(|l| !l.is_empty()).map(|l| l.strip_prefix("error: ").unwrap_or(l)).unwrap_or(s)
+    s.lines().rev().map(str::trim).find(|l| !l.is_empty()).map_or(s, |l| l.strip_prefix("error: ").unwrap_or(l))
 }
 
 /// `fable | gpt-6.1-sol`: a preference list as written in the file.
 pub fn fmt_models(models: &[ModelTier]) -> String {
-    models.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(" | ")
+    models.iter().map(super::super::domain::ModelTier::as_str).collect::<Vec<_>>().join(" | ")
 }
 
 /// `label: a and priority: high`: conditions as written in the file.
 pub fn fmt_conditions(conds: &[Condition]) -> String {
-    conds.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(" and ")
+    conds.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(" and ")
 }
 
+#[expect(
+    clippy::as_conversions,
+    reason = "Budget and score calculations intentionally round or clamp floating-point estimates into their output units."
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Budget and score calculations intentionally round or clamp floating-point estimates into their output units."
+)]
 fn fmt_num(n: f64) -> String {
     let rounded = n.round();
     if (n - rounded).abs() < 1e-6 && n.abs() < 1e15 { format!("{}", rounded as i64) } else { format!("{n:.2}") }
@@ -1030,7 +1052,7 @@ fn fmt_delta(n: f64) -> String {
 fn capitalize(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
         None => String::new(),
     }
 }
@@ -1232,7 +1254,7 @@ mod tests {
         assert_eq!(eval(&rules, &t).model, Some(ModelTier::sonnet()));
         let no_models = parse_ok("## High\n- priority: high\n");
         assert_eq!(eval(&no_models, &t).model, None);
-        assert!(rules.model_for(Criticality::Low).is_empty());
+        assert_eq!(rules.model_for(Criticality::Low), []);
     }
 
     #[test]
@@ -1243,7 +1265,7 @@ mod tests {
         assert!(rules.warnings.is_empty(), "{:?}", rules.warnings);
         assert_eq!(rules.models[&Criticality::Critical], vec![ModelTier::fable(), ModelTier::new("gpt-6.1-sol")]);
         assert_eq!(rules.model_for(Criticality::High), &[ModelTier::opus(), ModelTier::new("gemini-3-pro"), ModelTier::haiku()]);
-        assert!(rules.model_for(Criticality::Low).is_empty());
+        assert_eq!(rules.model_for(Criticality::Low), []);
         let mut t = linear_task("ENG-1");
         t.labels = vec!["incident".into()];
         let e = eval(&rules, &t);
@@ -1357,7 +1379,7 @@ mod tests {
         assert_eq!(e.model_source.as_deref(), Some("overrides"));
 
         let e = eval(&parse_ok("## High\n- priority: high\n"), &t);
-        assert!(e.models.is_empty());
+        assert_eq!((e.models).len(), 0);
         assert_eq!(e.model_source, None);
     }
 

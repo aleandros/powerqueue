@@ -47,13 +47,13 @@ impl Config {
         cfg.projects.clear();
         // Advisory analysis is machine-level. A narrowed execution config no
         // longer has the registry needed to validate its candidate descriptions.
-        cfg.analysis = Default::default();
+        cfg.analysis = crate::analysis::AnalysisConfig::default();
         cfg.overrides = AppliedOverrides::default();
         if let Some(project) = self.projects.get(id) {
             cfg.repo = project.repo.clone();
             if let Some(prompt) = &project.prompt {
                 cfg.prompt = prompt.clone();
-                cfg.prompt.base_dir = self.prompt.base_dir.clone();
+                cfg.prompt.base_dir.clone_from(&self.prompt.base_dir);
             }
             if let Some(cleanup) = &project.cleanup {
                 cfg.cleanup = cleanup.clone();
@@ -65,8 +65,7 @@ impl Config {
                 .repo
                 .worktree_root
                 .as_ref()
-                .map(|p| crate::paths::expand_tilde(p))
-                .unwrap_or_else(|| paths.data_dir.join("worktrees/projects"));
+                .map_or_else(|| paths.data_dir.join("worktrees/projects"), |p| crate::paths::expand_tilde(p));
             cfg.repo.worktree_root = Some(root.join(id).to_string_lossy().into_owned());
         } else if id != "default" || self.repo.path.trim().is_empty() {
             bail!("unknown execution project `{id}`; register it in config.toml");

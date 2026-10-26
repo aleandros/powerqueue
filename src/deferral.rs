@@ -81,7 +81,7 @@ impl Task {
                 "{origin} {} until {}{}{}",
                 if d.until > now { "deferred" } else { "expired" },
                 d.until.to_rfc3339(),
-                d.reason.as_ref().map(|_| ": ").unwrap_or(""),
+                d.reason.as_ref().map_or("", |_| ": "),
                 d.reason.as_deref().unwrap_or("")
             )
         };

@@ -9,6 +9,10 @@ use crate::domain::{Criticality, ModelTier, Provider, TaskState};
 static COLOR: AtomicBool = AtomicBool::new(true);
 
 /// Enable or disable ANSI colours for every helper in this module.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Boolean parameters mirror independent CLI flags passed through command dispatch."
+)]
 pub fn set_color(enabled: bool) {
     COLOR.store(enabled, Ordering::Relaxed);
     owo_colors::set_override(enabled);
@@ -73,6 +77,14 @@ pub fn print_error(err: &anyhow::Error) {
 }
 
 /// `1.2M`, `340k`, `12`.
+#[expect(
+    clippy::as_conversions,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
 pub fn human_tokens(n: u64) -> String {
     human_f64(n as f64)
 }
@@ -90,6 +102,14 @@ pub fn human_f64(n: f64) -> String {
 }
 
 /// `1.3 GB`, `512 MB`.
+#[expect(
+    clippy::as_conversions,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
+)]
 pub fn human_bytes(b: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = b as f64;
@@ -158,7 +178,7 @@ pub fn criticality_colored(c: Criticality) -> String {
 /// models are green and Gemini models yellow.
 pub fn model_colored(m: Option<&ModelTier>) -> String {
     if !color_enabled() {
-        return m.map(|m| m.as_str().to_string()).unwrap_or_else(|| "-".to_string());
+        return m.map_or_else(|| "-".to_string(), |m| m.as_str().to_string());
     }
     let Some(m) = m else { return "-".dimmed().to_string() };
     let name = m.as_str();

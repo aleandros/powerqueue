@@ -207,6 +207,10 @@ impl Tmux {
     /// session-scoped `after-new-window` hook that turns the option on as
     /// part of the `new-window` command itself, then pin the per-window value
     /// explicitly (which is also how windows opt *out* once the hook exists).
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Keep the existing new_window flag interface during lint adoption; callers already supply named state predicates."
+    )]
     pub fn new_window(
         &self,
         session: &str,
@@ -331,6 +335,10 @@ impl Tmux {
     }
 
     /// [`Tmux::attach_args`] with the "inside tmux" decision made explicit (testable).
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Keep the existing attach_args_for flag interface during lint adoption; callers already supply named state predicates."
+    )]
     pub fn attach_args_for(inside_tmux: bool, session: &str, window_id: Option<&str>) -> Vec<String> {
         if inside_tmux {
             let target = match window_id {
@@ -384,7 +392,7 @@ impl Tmux {
     /// True if the current process runs inside a client of *this* tmux server
     /// (same socket as `-L socket_name`), so `switch-client` can reach it.
     pub fn inside_this_server(&self) -> bool {
-        std::env::var("TMUX").map(|v| Self::tmux_env_matches_socket(&v, self.socket_name.as_deref())).unwrap_or(false)
+        std::env::var("TMUX").is_ok_and(|v| Self::tmux_env_matches_socket(&v, self.socket_name.as_deref()))
     }
 
     /// Whether a `$TMUX` value (`socket_path,server_pid,session_index`) points
@@ -397,6 +405,10 @@ impl Tmux {
 }
 
 /// Parse `#{window_id} #{pane_id} #{pane_pid}`.
+#[expect(
+    clippy::similar_names,
+    reason = "The names distinguish related domain values and match the surrounding workflow terminology."
+)]
 fn parse_window_info(line: &str) -> Result<WindowInfo> {
     let mut parts = line.split_whitespace();
     let (Some(window_id), Some(pane_id), Some(pid)) = (parts.next(), parts.next(), parts.next()) else {
@@ -433,7 +445,7 @@ fn parse_pane_line(line: &str) -> Result<PaneInfo> {
 
 /// Quote a string for `sh -c`.
 pub fn shell_quote(s: &str) -> String {
-    shlex::try_quote(s).map(|c| c.into_owned()).unwrap_or_else(|_| format!("'{}'", s.replace('\'', "'\\''")))
+    shlex::try_quote(s).map_or_else(|_| format!("'{}'", s.replace('\'', "'\\''")), std::borrow::Cow::into_owned)
 }
 
 #[cfg(test)]

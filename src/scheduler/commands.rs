@@ -66,6 +66,10 @@ pub fn source_deferral_events(before: &Task, after: &Task) -> Vec<Effect> {
 /// Change an unstarted task's project after the caller validates the target.
 /// Refuses live, previously bound or artifact-bearing tasks: moving existing
 /// work requires a new task so transcripts and branches cannot cross repos.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing on_set_project flag interface during lint adoption; callers already supply named state predicates."
+)]
 pub fn on_set_project(task: &mut Task, project: &str, has_session: bool) -> Result<Vec<Effect>, Refused> {
     if has_session
         || task.execution_repo.is_some()
@@ -102,6 +106,10 @@ pub fn on_set_project(task: &mut Task, project: &str, has_session: bool) -> Resu
 
 /// Reconcile current automatic routing advice for unstarted work, withholding unresolved replacements.
 /// Explicit human selections, stale input and any session/history refuse the change.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing on_analysis_project flag interface during lint adoption; callers already supply named state predicates."
+)]
 pub fn on_analysis_project(
     task: &mut Task,
     cfg: &crate::config::Config,
@@ -318,6 +326,10 @@ fn non_empty(text: Option<&str>) -> Option<&str> {
 /// `task pause`. `live` says whether the task has a live session (it
 /// finishes its turn and is not relaunched). Terminal and already paused
 /// tasks are left alone.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing on_pause flag interface during lint adoption; callers already supply named state predicates."
+)]
 pub fn on_pause(task: &mut Task, live: bool) -> Vec<Effect> {
     if task.state.is_terminal() || task.state == TaskState::Paused {
         return Vec::new();
@@ -332,6 +344,10 @@ pub fn on_pause(task: &mut Task, live: bool) -> Vec<Effect> {
 /// when its session is still alive (`live`), to `in_review` when it was
 /// parked by the PR watcher (with a fresh staleness clock), else `queued`.
 /// A priority.toml skip marker is cleared. Other states are left alone.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing on_resume flag interface during lint adoption; callers already supply named state predicates."
+)]
 pub fn on_resume(task: &mut Task, live: bool, now: DateTime<Utc>) -> Vec<Effect> {
     if !matches!(task.state, TaskState::Paused | TaskState::NeedsAttention) {
         return Vec::new();
@@ -442,8 +458,12 @@ fn end_live(session: Option<&mut Session>, now: DateTime<Utc>, effects: &mut Vec
 
 /// `task model <tier>` / `task model --clear`: the override for the next
 /// attempt (the policy may still downgrade it).
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Keep the established ownership-taking boundary for callers and serialized inputs."
+)]
 pub fn on_set_model(task: &mut Task, model: Option<ModelTier>) -> Vec<Effect> {
-    task.model_override = model.clone();
+    task.model_override.clone_from(&model);
     let msg = match &model {
         Some(m) => format!("model forced to {m} for the next attempt"),
         None => "model override cleared".to_string(),
@@ -523,7 +543,7 @@ mod tests {
         assert_eq!(t.not_before, None);
         for state in [TaskState::Completed, TaskState::Failed, TaskState::Cancelled, TaskState::Paused] {
             let mut t = task(state);
-            assert!(on_pause(&mut t, false).is_empty());
+            assert_eq!((on_pause(&mut t, false)).len(), 0);
             assert_eq!(t.state, state);
         }
     }
@@ -553,7 +573,7 @@ mod tests {
         assert_eq!(t.last_error, None);
 
         let mut t = task(TaskState::Running);
-        assert!(on_resume(&mut t, true, now()).is_empty());
+        assert_eq!((on_resume(&mut t, true, now())).len(), 0);
     }
 
     #[test]
@@ -573,7 +593,7 @@ mod tests {
         assert_eq!(s.state, SessionState::Exited);
 
         let mut t = task(TaskState::Completed);
-        assert!(on_cancel(&mut t, None, now()).is_empty());
+        assert_eq!((on_cancel(&mut t, None, now())).len(), 0);
     }
 
     #[test]
@@ -722,7 +742,7 @@ mod properties {
             let before = task.clone();
             let effects = on_set_project(&mut task, &project, false).unwrap();
             prop_assert_eq!(&task.execution_project, &project);
-            prop_assert_eq!(&task, &Task { execution_project: project.clone(), project_assignment: Some(crate::routing::ProjectAssignment::Explicit {project: project.clone()}), routing: None, ..before.clone() });
+            prop_assert_eq!(&task, &Task { execution_project: project.clone(), project_assignment: Some(crate::routing::ProjectAssignment::Explicit {project: project.clone()}), routing: None, ..before });
             prop_assert!(!effects.is_empty());
             prop_assert!(on_set_project(&mut task, "other", true).is_err());
         }
@@ -764,8 +784,8 @@ mod properties {
             prop_assert!(on_cancel(&mut t, Some(&mut s), now).is_empty());
             prop_assert_eq!(&t, &task);
             prop_assert_eq!(&s, &session);
-            let mut t = task.clone();
-            let mut s = session.clone();
+            let mut t = task;
+            let mut s = session;
             let effects = on_retry(&mut t, Some(&mut s), now);
             prop_assert_eq!(t.state, TaskState::Queued);
             prop_assert_eq!(t.attempts, 0);
@@ -790,14 +810,14 @@ mod properties {
                 prop_assert_eq!((paused.state, paused.not_before), (TaskState::Paused, None));
             }
             let mut t = task.clone();
-            if !matches!(task.state, TaskState::Paused | TaskState::NeedsAttention) {
-                prop_assert!(on_resume(&mut t, live, now).is_empty());
-                prop_assert_eq!(&t, &task);
-            } else {
+            if matches!(task.state, TaskState::Paused | TaskState::NeedsAttention) {
                 on_resume(&mut t, live, now);
                 prop_assert_eq!(t.not_before, None);
                 prop_assert!(matches!(t.state, TaskState::Running | TaskState::InReview | TaskState::Queued));
                 prop_assert_eq!(t.state == TaskState::Running, live);
+            } else {
+                prop_assert!(on_resume(&mut t, live, now).is_empty());
+                prop_assert_eq!(&t, &task);
             }
         }
 
@@ -826,7 +846,7 @@ mod properties {
             }
             // Retry.
             let mut t = task.clone();
-            let mut s = session.clone();
+            let mut s = session;
             let effects = on_retry(&mut t, Some(&mut s), now);
             let applies = task.state.is_terminal()
                 || matches!(task.state, TaskState::Crashed | TaskState::Throttled | TaskState::Paused | TaskState::NeedsAttention)

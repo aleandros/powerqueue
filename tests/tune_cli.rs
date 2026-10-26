@@ -14,11 +14,15 @@ fn fixture() -> PathBuf {
 
 struct Env {
     home: tempfile::TempDir,
-    _repo: tempfile::TempDir,
+    repo: tempfile::TempDir,
     state: tempfile::TempDir,
 }
 
 impl Env {
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+    )]
     fn new() -> Env {
         let home = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
@@ -31,7 +35,7 @@ impl Env {
         )
         .unwrap();
         std::fs::write(config_dir.join("priority.toml"), "version = 1\ndefault_criticality = \"normal\"\n[[criticality]]\nlevel = \"low\"\nall = [{ field = \"label\", op = \"eq\", value = \"chore\" }]\n[jev]\nenabled = false\nquestion = \"How important is it to ship this ticket this week?\"\nlevels = [\"can wait indefinitely\", \"nice to have\", \"important this week\", \"blocking customers or revenue\"]\n").unwrap();
-        let env = Env { home, _repo: repo, state };
+        let env = Env { home, repo, state };
         for (title, key, label) in [("Fix outage", "FAKE-1", "incident"), ("Tidy docs", "CH-2", "chore")] {
             env.pq().args(["add", title, "-k", key, "-l", label]).assert().success();
         }
@@ -56,12 +60,24 @@ impl Env {
         cmd
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+    )]
     fn priority(&self) -> String {
         std::fs::read_to_string(self.home.path().join("config/priority.toml")).unwrap()
     }
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+    )]
     fn config(&self) -> String {
         std::fs::read_to_string(self.home.path().join("config/config.toml")).unwrap()
     }
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+    )]
     fn drafts(&self) -> Vec<PathBuf> {
         let dir = self.home.path().join("state/tune");
         let mut out: Vec<PathBuf> = match std::fs::read_dir(&dir) {
@@ -72,11 +88,23 @@ impl Env {
         out
     }
     /// The draft whose `meta.json` has `status`, panicking when there is not exactly one.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+    )]
     fn draft_with_status(&self, status: &str) -> PathBuf {
         let found: Vec<PathBuf> = self.drafts().into_iter().filter(|d| self.meta(d)["status"] == status).collect();
         assert_eq!(found.len(), 1, "drafts with status {status}: {found:?}");
         found.into_iter().next().unwrap()
     }
+    #[expect(
+        clippy::unused_self,
+        reason = "Keep this helper on its context so callers use the same interface as adjacent context-dependent operations."
+    )]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+    )]
     fn meta(&self, draft: &Path) -> serde_json::Value {
         serde_json::from_str(&std::fs::read_to_string(draft.join("meta.json")).unwrap()).unwrap()
     }
@@ -248,7 +276,7 @@ fn tune_rejects_invalid_drafts() {
 }
 
 #[test]
-fn tune_reports_no_change_failures_and_timeouts() {
+fn tunereports_no_change_failures_and_timeouts() {
     let env = Env::new();
     env.tune("noop")
         .args(["tune", "do nothing", "-y", "--no-budget"])
@@ -266,7 +294,7 @@ fn tune_reports_no_change_failures_and_timeouts() {
         .stderr(predicate::str::contains("simulated failure"))
         .stderr(predicate::str::contains("draft is kept"));
     let failed = env.draft_with_status("failed");
-    assert_eq!(env.meta(&failed)["problems"][0], "`".to_string() + fixture().to_str().unwrap() + "` exited with 1");
+    assert_eq!(env.meta(&failed)["problems"][0], format!("`{}` exited with 1", fixture().display()));
 
     env.tune("hang")
         .env("FAKE_CLAUDE_IDLE_SECS", "30")
@@ -423,7 +451,7 @@ fn project_selection_simulation_apply_and_undo_are_isolated() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("unknown execution project"));
-    assert!(env.drafts().is_empty());
+    assert_eq!((env.drafts()).len(), 0);
     let out = env
         .tune("priority")
         .args(["--json", "tune", "translate intent", "--project", "api", "--scope", "priority", "--dry-run", "--no-budget"])
@@ -465,7 +493,7 @@ fn committed_policy_apply_prepares_a_reviewable_change() {
         return;
     }
     let env = Env::new();
-    let repo = env._repo.path();
+    let repo = env.repo.path();
     let git = |args: &[&str]| {
         let output = std::process::Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -492,7 +520,7 @@ fn committed_policy_apply_prepares_a_reviewable_change() {
     env.pq().args(["priority", "show"]).assert().success().stdout(predicate::str::contains("FAKE-1").not());
     env.pq().args(["tune", "--undo"]).assert().success();
     assert_eq!(std::fs::read_to_string(repo.join("priority.toml")).unwrap(), before);
-    assert!(git(&["diff", "--", "priority.toml"]).is_empty());
+    assert_eq!(git(&["diff", "--", "priority.toml"]), "");
     std::fs::write(repo.join("priority.toml"), "version = 1\ndefault_criticality = 'low'\n").unwrap();
     env.tune("priority")
         .args(["tune", "x", "--scope", "priority", "-y"])
@@ -546,13 +574,13 @@ fn invalid_overrides_refuse_all_policy_mutations() {
     let env = Env::new();
     let policy = env.priority();
     let config = env.config();
-    std::fs::write(env._repo.path().join(".powerqueue.toml"), "priority_file = 'docs/priority.toml'\n[broken\n").unwrap();
+    std::fs::write(env.repo.path().join(".powerqueue.toml"), "priority_file = 'docs/priority.toml'\n[broken\n").unwrap();
     for args in
         [vec!["tune", "change something", "--dry-run"], vec!["tune", "--apply"], vec!["tune", "--undo"], vec!["priority", "edit"]]
     {
         env.pq().args(args).assert().failure().stderr(predicate::str::contains("invalid repository overrides"));
     }
-    assert!(env.drafts().is_empty());
+    assert_eq!((env.drafts()).len(), 0);
     assert_eq!(env.priority(), policy);
     assert_eq!(env.config(), config);
 }

@@ -91,6 +91,10 @@ pub fn on_execution_selected(task: &mut Task, cfg: &Config) -> anyhow::Result<Ve
 
 /// Record routing evidence without changing an existing project or execution state.
 /// A fresh intake may set its initial assignment; subsequent conflicts hold future starts.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing on_routing flag interface during lint adoption; callers already supply named state predicates."
+)]
 pub fn on_routing(task: &mut Task, mut decision: crate::routing::RoutingDecision, fresh: bool) -> Vec<Effect> {
     if fresh {
         task.execution_project = decision.project.clone().unwrap_or_default();
@@ -151,6 +155,10 @@ pub fn on_github_admission(task: &mut Task, admission: crate::domain::GitHubAdmi
 
 /// Replace verified GitHub prerequisites and reconcile dependency waits.
 /// Active, paused and crashed tasks retain their state; future starts still check blockers.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing on_github_dependencies flag interface during lint adoption; callers already supply named state predicates."
+)]
 pub fn on_github_dependencies(task: &mut Task, blockers: Vec<crate::domain::LinkedIssue>, live_session: bool) -> Vec<Effect> {
     let mut effects = Vec::new();
     if task.blocked_by != blockers {
@@ -235,6 +243,15 @@ pub fn pane_waits_for_usage_reset(pane_tail: &str) -> bool {
 
 /// Apply a hook outcome. `period_end` is the end of the session provider's
 /// period and caps rate-limit cooldowns (the allowance resets there anyway).
+#[expect(
+    clippy::as_conversions,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(clippy::too_many_lines, reason = "Keep the on_hook_outcome workflow and its early exits together in execution order.")]
 pub fn on_hook_outcome(
     task: &mut Task,
     session: &mut Session,
@@ -281,7 +298,7 @@ pub fn on_hook_outcome(
     match outcome {
         HookOutcome::Started { transcript_path, source } => {
             if transcript_path.is_some() {
-                session.transcript_path = transcript_path.clone();
+                session.transcript_path.clone_from(transcript_path);
             }
             // A SessionStart drained after the daemon already saw this
             // session die (crash right after launch) must not revive the
@@ -551,6 +568,14 @@ pub fn note_waiting(task: &Task, session: &mut Session, now: DateTime<Utc>) {
 /// True when the attempt exceeded `max_session_secs` of *working* time.
 /// A waiting task (`needs_attention`, paused, throttled) never times out, and time spent
 /// waiting does not count (see [`Session::working_time`]).
+#[expect(
+    clippy::as_conversions,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
 pub fn session_timed_out(task: &Task, session: &Session, cfg: &SchedulerConfig, now: DateTime<Utc>) -> bool {
     cfg.max_session_secs > 0
         && !task.state.is_handed_off()
@@ -584,6 +609,10 @@ pub fn on_progress(task: &mut Task, session: &mut Session) -> Vec<Effect> {
 
 /// [`Effect::Question`] for the last paragraph of `message` (or `reason`
 /// when the message has nothing left); nothing when both are empty.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Keep the existing question_effect flag interface during lint adoption; callers already supply named state predicates."
+)]
 fn question_effect(message: &str, reason: Option<&str>, confirmed: bool) -> Option<Effect> {
     let text = crate::scheduler::relay::question_text(message, reason)?;
     Some(Effect::Question { text, reason: reason.map(str::to_string).filter(|r| !r.trim().is_empty()), confirmed })
@@ -619,6 +648,15 @@ fn resume_after_activity(task: &mut Task, session: &mut Session) -> Vec<Effect> 
 }
 
 /// Apply a liveness probe for a live session.
+#[expect(
+    clippy::as_conversions,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(clippy::too_many_lines, reason = "Keep the on_probe workflow and its early exits together in execution order.")]
 pub fn on_probe(
     task: &mut Task,
     session: &mut Session,
@@ -786,6 +824,14 @@ pub fn on_probe(
 /// An attempt died (dead pane, stale session, setup failure). Either schedule
 /// a retry with backoff or give up after `max_attempts`. `session` is `None`
 /// when the failure happened before a session existed (worktree/setup).
+#[expect(
+    clippy::as_conversions,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "Preserve the existing time or counter conversion semantics during lint adoption; overflow policy is unchanged."
+)]
 pub fn on_crash(
     task: &mut Task,
     session: Option<&mut Session>,
@@ -945,12 +991,12 @@ pub fn on_evaluation(task: &mut Task, eval: &Evaluation) -> Vec<Effect> {
         effects.push(Effect::log(
             EventLevel::Info,
             "task.models_changed",
-            new_model.clone().unwrap_or_else(|| "no preferred model from priority.toml".to_string()),
+            new_model.unwrap_or_else(|| "no preferred model from priority.toml".to_string()),
             serde_json::json!({ "models": eval.models, "source": eval.model_source, "previous": old_model }),
         ));
     }
     if changed {
-        task.score_reasons = eval.reasons.clone();
+        task.score_reasons.clone_from(&eval.reasons);
     }
     if eval.skip && task.state != TaskState::Paused && !task.state.is_handed_off() {
         task.state = TaskState::Paused;
@@ -1168,7 +1214,7 @@ mod tests {
         let mut t = task(TaskState::Throttled, 0);
         t.not_before = Some(now());
         t.blocked_by = vec![linked("ENG-0", "canceled")];
-        assert!(on_dependencies(&mut t).is_empty());
+        assert_eq!((on_dependencies(&mut t)).len(), 0);
         assert_eq!(t.state, TaskState::Throttled);
     }
 
@@ -1177,7 +1223,7 @@ mod tests {
         for state in [TaskState::Paused, TaskState::Crashed, TaskState::Running, TaskState::NeedsAttention] {
             let mut t = task(state, 1);
             t.blocked_by = vec![linked("ENG-0", "started")];
-            assert!(on_dependencies(&mut t).is_empty());
+            assert_eq!((on_dependencies(&mut t)).len(), 0);
             assert_eq!(t.state, state);
         }
     }
@@ -1194,7 +1240,7 @@ mod tests {
         );
         assert_eq!(t.waiting_on(), vec!["ENG-3"]);
         t.children[1].state_type = "completed".into();
-        assert!(on_dependencies(&mut t).is_empty());
+        assert_eq!((on_dependencies(&mut t)).len(), 0);
         assert_eq!(t.state, TaskState::Blocked, "the daemon closes containers; they never run");
     }
 
@@ -1259,7 +1305,7 @@ mod tests {
         assert_eq!((t.state, kinds(&fx)), (TaskState::InReview, vec!["hook.duplicate".to_string()]));
         // Late activity never revives it.
         let late = HookOutcome::TurnEnded { last_message: "x".into() };
-        assert!(on_hook_outcome(&mut t, &mut s, &late, &cfg(), now(), period_end()).is_empty());
+        assert_eq!((on_hook_outcome(&mut t, &mut s, &late, &cfg(), now(), period_end())).len(), 0);
 
         // A dead pane of a task in review is released, not counted as a crash.
         let mut t = task(TaskState::InReview, 1);
@@ -1539,7 +1585,7 @@ mod tests {
         assert_eq!(t.not_before, Some(until));
         assert_eq!(s.state, SessionState::Running, "the session is left alone");
         // Re-probing while still waiting changes nothing (no duplicate events).
-        assert!(on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx).is_empty());
+        assert_eq!((on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx)).len(), 0);
 
         // The cooldown passes: the task resumes and staleness counts from now.
         let later = ProbeContext { now: until + Duration::seconds(1), ..ctx.clone() };
@@ -1648,7 +1694,7 @@ mod tests {
         }
         let mut t = task(TaskState::NeedsAttention, 1);
         let mut s = session(SessionState::Exited, 1);
-        assert!(on_progress(&mut t, &mut s).is_empty());
+        assert_eq!((on_progress(&mut t, &mut s)).len(), 0);
         assert_eq!(t.state, TaskState::NeedsAttention);
     }
 
@@ -1675,7 +1721,7 @@ mod tests {
             on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), period_end());
             assert_eq!(t.state, TaskState::NeedsAttention);
         }
-        assert!(on_progress(&mut t, &mut s).is_empty());
+        assert_eq!((on_progress(&mut t, &mut s)).len(), 0);
         let reply = HookOutcome::Activity { event: HookEvent::UserPromptSubmit };
         on_hook_outcome(&mut t, &mut s, &reply, &cfg(), now(), period_end());
         assert_eq!(t.state, TaskState::Running);
@@ -1692,7 +1738,7 @@ mod tests {
         assert_eq!(kinds(&fx), vec!["session.permission_prompt"]);
 
         let mut t = task(TaskState::Running, 1);
-        let out = HookOutcome::Notification { kind: "idle_prompt".into(), message: "".into() };
+        let out = HookOutcome::Notification { kind: "idle_prompt".into(), message: String::new() };
         on_hook_outcome(&mut t, &mut s, &out, &cfg(), now(), period_end());
         assert_eq!(t.state, TaskState::Idle);
         assert_eq!(s.state, SessionState::Idle);
@@ -1909,9 +1955,9 @@ mod tests {
         let mut t = task(TaskState::Idle, 1);
         let mut s = session(SessionState::Idle, 1);
         let ctx = ProbeContext { now: now(), ..Default::default() };
-        assert!(on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx).is_empty());
+        assert_eq!((on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx)).len(), 0);
         let mut t = task(TaskState::Running, 1);
-        assert!(on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx).is_empty());
+        assert_eq!((on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx)).len(), 0);
     }
 
     #[test]
@@ -1927,7 +1973,7 @@ mod tests {
 
         let mut t = task(TaskState::Throttled, 1);
         t.not_before = Some(now() + Duration::minutes(5));
-        assert!(on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx).is_empty());
+        assert_eq!((on_probe(&mut t, &mut s, &alive(), &cfg().scheduler, &ctx)).len(), 0);
         assert_eq!(t.state, TaskState::Throttled);
     }
 
@@ -1936,7 +1982,7 @@ mod tests {
         let mut t = task(TaskState::Running, 1);
         let mut s = session(SessionState::Crashed, 1);
         let ctx = ProbeContext { now: now(), ..Default::default() };
-        assert!(on_probe(&mut t, &mut s, &dead(Some(1)), &cfg().scheduler, &ctx).is_empty());
+        assert_eq!((on_probe(&mut t, &mut s, &dead(Some(1)), &cfg().scheduler, &ctx)).len(), 0);
     }
 
     #[test]
@@ -1958,6 +2004,10 @@ mod tests {
         assert_eq!(preview("abcdefghij", 5), "abcde…");
     }
 
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "Test helpers take boolean inputs to exercise both sides of the production transition."
+    )]
     fn evaluation(criticality: crate::domain::Criticality, score: f64, skip: bool, reasons: &[&str]) -> Evaluation {
         Evaluation {
             criticality,
@@ -1966,7 +2016,7 @@ mod tests {
             models: Vec::new(),
             model_source: None,
             skip,
-            reasons: reasons.iter().map(|r| r.to_string()).collect(),
+            reasons: reasons.iter().map(std::string::ToString::to_string).collect(),
         }
     }
 
@@ -1976,7 +2026,7 @@ mod tests {
         let mut t = task(TaskState::Queued, 0);
         let before = t.clone();
         let same = evaluation(t.criticality, t.score + 0.2, false, &["age +0.2"]);
-        assert!(on_evaluation(&mut t, &same).is_empty());
+        assert_eq!((on_evaluation(&mut t, &same)).len(), 0);
         assert_eq!(t, before, "a score move under half a point is not a change");
 
         let eval = evaluation(Criticality::High, 500.0, false, &["label urgent", "model fable (## Models)"]);
@@ -2015,11 +2065,11 @@ mod tests {
         // handed-off task is never skipped.
         let mut t = task(TaskState::Paused, 0);
         let eval = keep(&t, false);
-        assert!(on_evaluation(&mut t, &eval).is_empty());
+        assert_eq!((on_evaluation(&mut t, &eval)).len(), 0);
         assert_eq!(t.state, TaskState::Paused);
         let mut t = task(TaskState::InReview, 1);
         let eval = keep(&t, true);
-        assert!(on_evaluation(&mut t, &eval).is_empty());
+        assert_eq!((on_evaluation(&mut t, &eval)).len(), 0);
         assert_eq!(t.state, TaskState::InReview);
     }
 
@@ -2051,7 +2101,7 @@ mod tests {
         assert_eq!(kinds(&effects), ["task.completed"], "never ran: nothing to clean up");
 
         let mut t = task(TaskState::Completed, 0);
-        assert!(on_container_closed(&mut t, &children, now()).is_empty());
+        assert_eq!((on_container_closed(&mut t, &children, now())).len(), 0);
     }
 
     #[test]
@@ -2087,7 +2137,7 @@ mod tests {
         assert!(!watch.parked && watch.last_change_at == now(), "the answer wins over a parked watch");
 
         let mut t = task(TaskState::Running, 1);
-        assert!(on_answer_queued(&mut t, &[], now()).is_empty());
+        assert_eq!((on_answer_queued(&mut t, &[], now())).len(), 0);
         assert_eq!(t.state, TaskState::Running);
     }
 
@@ -2119,7 +2169,7 @@ mod tests {
 
         let t = task(TaskState::Running, 1);
         let mut s = session(SessionState::Running, 1);
-        assert!(release_session(&t, &mut s, now()).is_empty());
+        assert_eq!((release_session(&t, &mut s, now())).len(), 0);
         assert_eq!(s.state, SessionState::Running, "a live task keeps its session");
     }
 
@@ -2332,6 +2382,8 @@ mod properties {
         /// marked blocked); the session (when there is one) is closed as
         /// crashed. When to give up is [`crash_gives_up_exactly_at_max_attempts`].
         #[test]
+        #[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+        #[expect(clippy::cast_sign_loss, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
         fn crash_backs_off_or_gives_up(
             (task, session) in task_with_session_among(&[TaskState::Starting, TaskState::Running, TaskState::Idle, TaskState::NeedsAttention, TaskState::Crashed]),
             with_session in any::<bool>(),
@@ -2376,6 +2428,8 @@ mod properties {
         /// repeats). A review round starts the count again at its
         /// `attempt_base`, so a relaunch never eats into the attempts.
         #[test]
+        #[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+        #[expect(clippy::cast_possible_wrap, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
         fn crash_gives_up_exactly_at_max_attempts(
             task in task_in(TaskState::Queued),
             cfg in scheduler_config(),
@@ -2383,20 +2437,17 @@ mod properties {
             review_round in prop::option::of((review_watch(), review_relaunch(), 0u32..=3)),
         ) {
             let now = origin();
-            let mut t = task.clone();
+            let mut t = task;
             t.max_attempts = max;
             let max = max.unwrap_or(cfg.max_attempts).max(1);
             // Attempts used before this run: none for a fresh task, the
             // round's base for a review relaunch.
-            let base = match review_round {
-                Some((watch, relaunch, base)) => {
-                    t.review = Some(ReviewWatch { attempt_base: base, relaunch: Some(relaunch), ..watch });
-                    base
-                }
-                None => {
-                    t.review = None;
-                    0
-                }
+            let base = if let Some((watch, relaunch, base)) = review_round {
+                t.review = Some(ReviewWatch { attempt_base: base, relaunch: Some(relaunch), ..watch });
+                base
+            } else {
+                t.review = None;
+                0
             };
             t.attempts = base;
             for n in 1..=max {
@@ -2487,6 +2538,8 @@ mod properties {
         /// crashes the attempt (unless the task is done, paused or in
         /// review); nudges and kills are justified by what was observed.
         #[test]
+        #[expect(clippy::as_conversions, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
+        #[expect(clippy::cast_possible_wrap, reason = "Fixture counts and timestamps are bounded to small values by the test inputs.")]
         fn probes_make_legal_moves(
             (task, session) in task_with_session_among(&[
                 TaskState::Starting, TaskState::Running, TaskState::Idle, TaskState::NeedsAttention, TaskState::Throttled,
@@ -2643,7 +2696,7 @@ mod properties {
         #[test]
         fn waiting_is_not_working((task, session) in task_with_session(), cfg in scheduler_config(), ahead in 0i64..7200) {
             let now = origin() + Duration::seconds(ahead);
-            let mut s = session.clone();
+            let mut s = session;
             note_waiting(&task, &mut s, now);
             let once = s.clone();
             note_waiting(&task, &mut s, now);

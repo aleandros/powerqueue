@@ -17,6 +17,10 @@ fn pq(home: &Path) -> Command {
     cmd
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "Fixture setup and assertions intentionally fail the test immediately on invalid data or I/O."
+)]
 fn git_repo() -> Option<tempfile::TempDir> {
     which::which("git").ok()?;
     let dir = tempfile::tempdir().unwrap();
@@ -24,8 +28,7 @@ fn git_repo() -> Option<tempfile::TempDir> {
         .args(["init", "-q", "-b", "main"])
         .current_dir(dir.path())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .is_ok_and(|s| s.success());
     ok.then_some(dir)
 }
 
@@ -225,6 +228,10 @@ fn git(cwd: &Path, args: &[&str]) {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the repo_overrides_are_attributed_validated_and_read_from_the_default_branch workflow and its early exits together in execution order."
+)]
 fn repo_overrides_are_attributed_validated_and_read_from_the_default_branch() {
     let Some(repo) = git_repo() else {
         eprintln!("git not available; skipping");
