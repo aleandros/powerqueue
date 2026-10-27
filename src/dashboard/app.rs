@@ -13,6 +13,26 @@ use crate::config::Config;
 use crate::domain::{Criticality, Event, ModelTier, Provider, ResourceSample, Session, Task, TaskId, TaskSource, TaskState};
 use crate::store::Store;
 
+/// [`Snapshot::session_modes`]: frozen modes as they are; the others from
+/// each project's configuration (resolved once per project; the global
+/// configuration when a project does not resolve).
+fn session_modes(cfg: &Config, tasks: &[Task]) -> BTreeMap<TaskId, crate::execution::SessionModeChoice> {
+    let paths = crate::paths::Paths::resolve();
+    let mut projects: BTreeMap<&str, Config> = BTreeMap::new();
+    let mut out = BTreeMap::new();
+    for task in tasks.iter().filter(|t| !t.state.is_terminal()) {
+        let choice = match &task.session_mode {
+            Some(frozen) => frozen.clone(),
+            None => projects
+                .entry(task.execution_project.as_str())
+                .or_insert_with(|| cfg.for_project(&task.execution_project, &paths).unwrap_or_else(|_| cfg.clone()))
+                .resolve_session_mode(task),
+        };
+        out.insert(task.id, choice);
+    }
+    out
+}
+
 /// Everything the UI needs for one frame. Serialises to JSON for
 /// `dashboard --once --json`.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -48,6 +68,9 @@ pub struct Snapshot {
     /// enabled provider), for gauge labels.
     pub shares: BTreeMap<ModelTier, f64>,
     pub tmux_session: String,
+    /// Session mode of each open task and why: the mode frozen at its first
+    /// start, else what that start would choose under its project's config.
+    pub session_modes: BTreeMap<TaskId, crate::execution::SessionModeChoice>,
 }
 
 impl Snapshot {
@@ -109,6 +132,7 @@ impl Snapshot {
         let daemon_alive = store.daemon_alive(max_age)?;
         let daemon_pid = store.daemon_heartbeat()?.map(|(pid, _)| pid);
         let scheduling_pause = store.scheduling_pause()?;
+        let session_modes = session_modes(cfg, &tasks);
         Ok(Snapshot {
             taken_at: Some(now),
             daemon_alive,
@@ -127,6 +151,7 @@ impl Snapshot {
             resources,
             shares: model_shares(cfg),
             tmux_session: cfg.tmux.session_name.clone(),
+            session_modes,
         })
     }
 

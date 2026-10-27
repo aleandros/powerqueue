@@ -1,4 +1,4 @@
-//! Pure transitions for user commands (`task pause|resume|cancel|retry|model`)
+//! Pure transitions for user commands (`task pause|resume|cancel|retry|model|mode`)
 //! and the direct writes (`task complete`, `task complete --pr`, `task block`).
 //!
 //! Each function mutates the in-memory [`Task`] (and the live [`Session`],
@@ -11,6 +11,7 @@
 
 use chrono::{DateTime, Utc};
 
+use crate::config::{ClaudeSessionMode, Config};
 use crate::domain::{EventLevel, ModelTier, Session, SessionState, Task, TaskState};
 use crate::github::PrRef;
 
@@ -475,6 +476,31 @@ pub fn on_set_model(task: &mut Task, model: Option<ModelTier>) -> Vec<Effect> {
     vec![Effect::log(EventLevel::Info, "task.model_override", msg, serde_json::json!({ "model": model }))]
 }
 
+/// `task mode <interactive|headless>` / `task mode auto`: the task's own
+/// session-mode override, which beats every rule. A task that has started
+/// gets its mode chosen again now under `cfg` (its project's configuration):
+/// the override, or with `auto` the rules. One that has not started chooses
+/// at its first start. A live session keeps running in its mode until it
+/// ends; the next start uses the new one. Nothing else changes.
+pub fn on_set_session_mode(task: &mut Task, mode: Option<ClaudeSessionMode>, cfg: &Config) -> Vec<Effect> {
+    let previous = task.session_mode.take();
+    task.session_mode_override = mode;
+    if task.attempts > 0 || task.started_at.is_some() {
+        task.session_mode = Some(cfg.resolve_session_mode(task));
+    }
+    let msg = match (mode, &task.session_mode) {
+        (Some(m), _) => format!("session mode forced to {m} from the next start"),
+        (None, Some(chosen)) => format!("session mode override cleared; the next start runs {chosen}"),
+        (None, None) => "session mode override cleared; the rules choose at the first start".to_string(),
+    };
+    vec![Effect::log(
+        EventLevel::Info,
+        "task.session_mode_override",
+        msg,
+        serde_json::json!({ "mode": mode, "previous": previous, "session_mode": task.session_mode }),
+    )]
+}
+
 /// Watch the PR again from `now` (see [`crate::domain::ReviewWatch::rearm`]).
 pub fn rearm_watch(task: &mut Task, now: DateTime<Utc>) {
     if let Some(watch) = task.review.as_mut() {
@@ -879,6 +905,31 @@ mod properties {
                 prop_assert_eq!(watch.rounds, task.review.as_ref().map_or(0, |w| w.rounds));
                 prop_assert!(!watch.parked);
             }
+        }
+
+        /// `task mode` records the override and chooses the mode again: now for
+        /// a started task (the override first, else the rules), at the first
+        /// start otherwise; nothing else, not even a live session, changes.
+        #[test]
+        fn set_session_mode_only_changes_the_override(
+            (task, session) in task_with_session(),
+            mode in prop::option::of(session_mode()),
+            cfg in session_mode_config(),
+        ) {
+            let mut t = task.clone();
+            let effects = on_set_session_mode(&mut t, mode, &cfg);
+            prop_assert_eq!(t.session_mode_override, mode);
+            let started = task.attempts > 0 || task.started_at.is_some();
+            prop_assert_eq!(t.session_mode.is_some(), started);
+            prop_assert_eq!(cfg.session_mode_for(&t), cfg.resolve_session_mode(&t));
+            if let Some(mode) = mode {
+                prop_assert_eq!(cfg.session_mode_for(&t).mode, mode);
+            }
+            t.session_mode_override = task.session_mode_override;
+            t.session_mode.clone_from(&task.session_mode);
+            prop_assert_eq!(&t, &task);
+            prop_assert_eq!(session.task_id, task.id);
+            prop_assert!(matches!(&effects[..], [Effect::Log { kind, .. }] if kind == "task.session_mode_override"), "{:?}", effects);
         }
 
         /// `task model` only records the override and logs it.

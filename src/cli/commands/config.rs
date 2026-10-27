@@ -547,6 +547,8 @@ pub fn run(ctx: &mut Context, cmd: ConfigCommand) -> Result<i32> {
                     serde_json::json!({
                         "ok": problems.is_empty(), "file": shown, "problems": problems,
                         "claude_session_mode": merged.claude.session_mode,
+                        "claude_session_mode_rules": merged.claude.session_mode_rules,
+                        "claude_session_mode_overrides": merged.claude.session_mode_overrides,
                         "repo_overrides": {
                             "file": merged.overrides.file, "source": merged.repo.overrides_from,
                             "rev": merged.overrides.rev, "keys": merged.overrides.keys,
@@ -565,6 +567,17 @@ pub fn run(ctx: &mut Context, cmd: ConfigCommand) -> Result<i32> {
                     );
                 }
                 println!("claude sessions: {}", session_mode_summary(merged.claude.session_mode));
+                for (i, rule) in merged.claude.session_mode_rules.iter().enumerate() {
+                    let conditions = crate::priority::policy::predicates(&rule.all)
+                        .map_or_else(|e| e, |c| crate::priority::fmt_conditions(&c));
+                    println!("  rule[{i}]: {} if {conditions}", rule.mode);
+                }
+                for (key, mode) in &merged.claude.session_mode_overrides {
+                    println!("  override: {key} → {mode}");
+                }
+                if !merged.claude.session_mode_rules.is_empty() || !merged.claude.session_mode_overrides.is_empty() {
+                    println!("  (first match wins; `powerqueue priority simulate` shows each task's mode)");
+                }
             } else {
                 print_problems(&problems);
             }

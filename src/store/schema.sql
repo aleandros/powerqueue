@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     attempts        INTEGER NOT NULL DEFAULT 0,
     max_attempts    INTEGER,
     free_attempts   INTEGER NOT NULL DEFAULT 0, -- resumes of stopped headless sessions (v13)
+    session_mode_override TEXT,                -- `task mode`: interactive | headless (v14)
+    session_mode    TEXT,                      -- JSON SessionModeChoice frozen at the first start (v14)
     not_before      TEXT,
     deferral        TEXT, -- explicit local hold (v11)
     last_error      TEXT,

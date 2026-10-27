@@ -414,3 +414,104 @@ fn deferral_set_inspect_change_clear_and_resume_preserves_hold() {
         .success()
         .stdout(predicate::str::contains("\"deferral\": null"));
 }
+
+/// `claude.session_mode_rules` / `session_mode_overrides` and `task mode`:
+/// `config validate`, `priority simulate`, `task show` and `task explain`
+/// show each task's mode and why; `config validate` rejects bad rules.
+#[test]
+fn session_mode_rules_and_task_mode() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let config_dir = home.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let base = format!("[repo]\npath = \"{}\"\n", repo.path().display());
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "{base}[claude]\nsession_mode = \"interactive\"\n\
+             [[claude.session_mode_rules]]\nmode = \"interactive\"\nall = [{{ field = \"label\", op = \"eq\", value = \"spike\" }}]\n\
+             [[claude.session_mode_rules]]\nmode = \"headless\"\nall = [{{ field = \"label\", op = \"matches\", value = \"^(chore|docs|deps)$\" }}]\n\
+             [claude.session_mode_overrides]\n\"OV-1\" = \"headless\"\n"
+        ),
+    )
+    .unwrap();
+    pq(home.path())
+        .args(["config", "validate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rule[1]: headless if label ~ ^(chore|docs|deps)$"))
+        .stdout(predicate::str::contains("override: OV-1 → headless"));
+    for (title, key, label) in
+        [("Bump deps", "CH-1", "deps"), ("Explore", "SP-1", "spike"), ("Plain", "PL-1", "bug"), ("Forced", "OV-1", "bug")]
+    {
+        pq(home.path()).args(["add", title, "-k", key, "-l", label]).assert().success();
+    }
+
+    let out = pq(home.path()).args(["--json", "priority", "simulate", "--no-budget"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mode_of = |key: &str| {
+        let row = v["rows"].as_array().unwrap().iter().find(|r| r["key"] == key).unwrap().clone();
+        (
+            row["session_mode"]["mode"].as_str().unwrap().to_string(),
+            row["session_mode"]["source"]["kind"].as_str().unwrap().to_string(),
+        )
+    };
+    assert_eq!(mode_of("CH-1"), ("headless".into(), "rule".into()));
+    assert_eq!(mode_of("SP-1"), ("interactive".into(), "rule".into()));
+    assert_eq!(mode_of("PL-1"), ("interactive".into(), "default".into()));
+    assert_eq!(mode_of("OV-1"), ("headless".into(), "override".into()));
+    pq(home.path())
+        .args(["priority", "simulate", "--no-budget", "--reasons"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("headless (rule[1])"))
+        .stdout(predicate::str::contains("session mode headless (claude.session_mode_rules[1] (label ~ ^(chore|docs|deps)$))"));
+    pq(home.path()).args(["task", "show", "CH-1"]).assert().success().stdout(predicate::str::contains(
+        "headless (claude.session_mode_rules[1] (label ~ ^(chore|docs|deps)$)) at its first start",
+    ));
+
+    // `task mode` beats the rules; `auto` hands the choice back.
+    pq(home.path())
+        .args(["task", "mode", "CH-1", "interactive"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("runs interactive"));
+    pq(home.path())
+        .args(["task", "explain", "CH-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("session mode interactive (`task mode` override) at its first start"));
+    let out = pq(home.path()).args(["--json", "task", "show", "CH-1"]).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["session_mode"]["mode"], "interactive");
+    assert_eq!(v["session_mode"]["source"]["kind"], "command");
+    assert_eq!(v["session_mode"]["frozen"], false);
+    assert_eq!(v["task"]["session_mode_override"], "interactive");
+    pq(home.path())
+        .args(["task", "mode", "CH-1", "batch"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("unknown session mode"));
+    pq(home.path()).args(["task", "mode", "CH-1", "auto"]).assert().success().stdout(predicate::str::contains("rules choose"));
+    pq(home.path())
+        .args(["task", "show", "CH-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("headless (claude.session_mode_rules[1]"));
+
+    // Invalid rules and unknown modes are rejected.
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!("{base}[[claude.session_mode_rules]]\nmode = \"headless\"\nall = [{{ field = \"colour\", op = \"eq\", value = \"red\" }}]\n"),
+    )
+    .unwrap();
+    pq(home.path())
+        .args(["config", "validate"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("claude.session_mode_rules[0].all: unknown field `colour`"));
+    std::fs::write(config_dir.join("config.toml"), format!("{base}[claude.session_mode_overrides]\n\"X-1\" = \"batch\"\n"))
+        .unwrap();
+    pq(home.path()).args(["config", "validate"]).assert().code(1);
+}

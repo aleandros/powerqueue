@@ -19,6 +19,8 @@ src/
   linear/            GraphQL client; issue → task sync
   github/            REST issue client; GitHub intake and synchronization
   priority/          priority.toml parser/evaluator; file watcher
+  execution.rs       queue/workflow selection and per-task session mode (claude.session_mode_rules,
+                     overrides, `task mode`), both by the priority predicates
   jev.rs             Jev "score" client (optional)
 github.rs          `gh api graphql` PR status (state, mergeability, checks, threads)
   budget/            period clock, ledger, estimator, policy (pure, plain data in and out);
@@ -36,8 +38,8 @@ github.rs          `gh api graphql` PR status (state, mergeability, checks, thre
   scheduler/         daemon.rs (Daemon, tick loop, applies Effects against the store,
                      tmux, git, Linear and GitHub) around a pure core: transitions.rs
                      (hook outcomes, probes, crashes, re-scoring, finalize → Effect
-                     list), commands.rs (pause/resume/cancel/retry/model, the direct writes complete/hand-off/block), launch.rs
-                     (LaunchPlanner, on_starting/on_launched, resume plan and prompt),
+                     list), commands.rs (pause/resume/cancel/retry/model/mode, the direct writes complete/hand-off/block), launch.rs
+                     (LaunchPlanner, on_starting (freezes the task's session mode)/on_launched, resume plan and prompt),
                      review.rs (PR watcher), lifecycle.rs (pick_next, cleanup_plan;
                      cleanup_task is the git/tmux half)
   hook.rs            `powerqueue hook` entry (Claude Code hooks, Codex notify, agy hooks;

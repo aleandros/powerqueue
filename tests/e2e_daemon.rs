@@ -910,6 +910,41 @@ fn headless_question_waits_for_a_human_and_resume_continues_the_session() {
     assert_eq!(v["sessions"].as_array().unwrap().len(), 1);
 }
 
+/// `claude.session_mode_rules` routes a labelled task headless while the
+/// default stays interactive; when it blocks, `task mode <key> interactive`
+/// and `task resume` continue the same session in a tmux window.
+#[test]
+fn a_rule_routes_a_task_headless_and_task_mode_moves_it_to_a_window() {
+    let rules = "session_mode_rules = [{ mode = \"headless\", all = [{ field = \"label\", op = \"eq\", value = \"chore\" }] }]";
+    let Some(mut env) = Env::with_opts(Opts { mode: "idle", extra_claude: rules, ..Opts::default() }, |_| String::new()) else {
+        return;
+    };
+    let key = add_task(&env, "Tidy up headless", &["-l", "chore"]);
+    env.start_daemon();
+    assert_eq!(env.wait_for_state(&key, "needs_attention", Duration::from_secs(60)), "needs_attention", "{}", env.daemon_log());
+    let v = env.wait_for_show(&key, |v| last_session(v)["state"] == "stopped");
+    assert_eq!(last_session(&v)["runtime"], "headless", "{}", env.daemon_log());
+    assert_eq!(v["task"]["session_mode"]["mode"], "headless");
+    assert_eq!(v["task"]["session_mode"]["source"]["kind"], "rule");
+    let starting = v["events"].as_array().unwrap().iter().find(|e| e["kind"] == "task.starting").expect("a start event");
+    assert!(
+        starting["message"].as_str().unwrap().contains("headless (claude.session_mode_rules[0] (label: chore))"),
+        "{starting}"
+    );
+    let doctor = env.cmd().args(["doctor"]).output().unwrap();
+    let doctor = String::from_utf8_lossy(&doctor.stdout);
+    assert!(doctor.contains(&format!("task mode {key} interactive")), "{doctor}");
+
+    env.run_ok(&["task", "mode", &key, "interactive"]);
+    env.run_ok(&["task", "resume", &key]);
+    let v = env.wait_for_show(&key, |v| launch_messages(v).len() == 2);
+    let launched = launch_messages(&v);
+    assert!(launched[1].contains("resumed") && launched[1].contains("in window"), "{launched:?}\n{}", env.daemon_log());
+    assert_eq!(v["sessions"].as_array().unwrap().len(), 1, "the headless session is resumed, not replaced");
+    assert_eq!(last_session(&v)["runtime"], "tmux");
+    assert_eq!(v["task"]["session_mode"]["source"]["kind"], "command");
+}
+
 #[test]
 fn headless_rate_limit_throttles_instead_of_crashing() {
     let Some(mut env) = headless_env("ratelimit", "") else { return };

@@ -243,6 +243,21 @@ fn execution_location(ctx: &mut Context, task: &Task) -> Result<serde_json::Valu
     })
 }
 
+/// The task's session mode under its project's configuration (the global
+/// one when the project does not resolve): frozen once the task started,
+/// else what its first start would choose.
+fn session_mode_of(ctx: &mut Context, task: &Task) -> Result<crate::execution::SessionModeChoice> {
+    let cfg = ctx.config_or_default()?.clone();
+    let cfg = cfg.for_task(task, &ctx.paths).unwrap_or(cfg);
+    Ok(cfg.session_mode_for(task))
+}
+
+/// `task show`'s session mode line: `headless (why)`, or for a task that has
+/// not started yet `interactive (why) at its first start`.
+fn session_mode_line(choice: &crate::execution::SessionModeChoice, task: &Task) -> String {
+    if task.session_mode.is_some() { choice.to_string() } else { format!("{choice} at its first start") }
+}
+
 #[expect(
     clippy::as_conversions,
     reason = "These estimates and display ratios intentionally use floating point rather than exact integer accounting."
@@ -256,6 +271,7 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let store = ctx.store()?.clone();
     let task = find_task(&store, &task_ref.task)?;
     let location = execution_location(ctx, &task)?;
+    let session_mode = session_mode_of(ctx, &task)?;
     let analysis = store.kv_get::<crate::analysis::AnalysisRecord>(&crate::analysis::record_key(task.id))?;
     let analysis_cfg = Config::load(&ctx.paths)?;
     let analysis_status = analysis.as_ref().map(|r| r.status(&analysis_cfg, &task));
@@ -295,6 +311,7 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
             "source_route": source_route,
             "current_routing": current_routing,
             "execution_location": location,
+            "session_mode": { "mode": session_mode.mode, "source": session_mode.source, "reason": session_mode.source.to_string(), "frozen": task.session_mode.is_some() },
             "provider": effective_model(&task).map(crate::domain::ModelTier::provider),
             "usage": usage,
             "weighted_tokens": usage.weighted(),
@@ -354,6 +371,7 @@ fn show(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
         (None, None) => "auto".to_string(),
     };
     kv("model", model_line);
+    kv("session mode", session_mode_line(&session_mode, &task));
     let source = match &task.source {
         crate::domain::TaskSource::Linear { identifier, url, team_key, .. } => format!("linear {identifier} ({team_key}) {url}"),
         crate::domain::TaskSource::GitHub { repository, number, url } => format!("github {repository}#{number} {url}"),
@@ -566,6 +584,7 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
     let store = ctx.store()?.clone();
     let task = find_task(&store, &task_ref.task)?;
     let location = execution_location(ctx, &task)?;
+    let session_mode = session_mode_of(ctx, &task)?;
     let mut routed = task.clone();
     let decision = ctx.config_or_default()?.route(&task);
     crate::scheduler::transitions::on_routing(&mut routed, decision, false);
@@ -587,6 +606,7 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
             "score_reasons": task.score_reasons,
             "model": task.model,
             "model_override": task.model_override,
+            "session_mode": { "mode": session_mode.mode, "source": session_mode.source, "reason": session_mode.source.to_string(), "frozen": task.session_mode.is_some() },
             "provider": effective_model(&task).map(crate::domain::ModelTier::provider),
             "not_before": task.not_before,
             "deferral": task.deferral,
@@ -642,6 +662,7 @@ fn explain(ctx: &mut Context, task_ref: &TaskRef) -> Result<i32> {
             task.model.as_ref().map_or("not chosen yet".into(), model_with_provider)
         );
     }
+    println!("  session mode {}", session_mode_line(&session_mode, &task));
     if let Some(nb) = task.not_before {
         println!("  not before   {}", opt_ts(Some(nb)));
     }
@@ -774,6 +795,15 @@ pub fn parse_model_arg(s: &str) -> Result<Option<ModelTier>> {
     match s.trim().to_ascii_lowercase().as_str() {
         "auto" | "none" | "clear" => Ok(None),
         other => other.parse::<ModelTier>().map(Some).map_err(|e| anyhow!(e)),
+    }
+}
+
+/// `task mode`'s argument: `interactive`, `headless`, or `auto` (also
+/// `none`/`clear`) to drop the override.
+pub fn parse_session_mode_arg(s: &str) -> Result<Option<crate::config::ClaudeSessionMode>> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "auto" | "none" | "clear" => Ok(None),
+        other => other.parse().map(Some).map_err(|e: String| anyhow!("{e} (or auto)")),
     }
 }
 
@@ -994,6 +1024,45 @@ pub fn run(ctx: &mut Context, cmd: TaskCommand) -> Result<i32> {
                     "ok".if_supports_color(Stream::Stdout, |t| t.green()),
                     t.key.if_supports_color(Stream::Stdout, |t| t.bold())
                 ),
+            }
+            Ok(0)
+        }
+        TaskCommand::Mode { task, mode } => {
+            let mode = parse_session_mode_arg(&mode)?;
+            let store = ctx.store()?.clone();
+            let mut t = find_task(&store, &task.task)?;
+            store.enqueue_command(&DaemonCommand::SetSessionMode { task_id: t.id, mode })?;
+            let cfg = ctx.config_or_default()?.clone();
+            let cfg = cfg.for_task(&t, &ctx.paths).unwrap_or(cfg);
+            let effects = commands::on_set_session_mode(&mut t, mode, &cfg);
+            store.update_task(&t)?;
+            for effect in effects {
+                if let Effect::Log { level, kind, message, data } = effect {
+                    store.log_event(Some(t.id), None, level, &kind, &message, data)?;
+                }
+            }
+            let live = store.latest_session(t.id)?.is_some_and(|s| s.state.is_live());
+            if ctx.json {
+                println!("{}", serde_json::json!({ "ok": true, "key": t.key, "mode": mode, "live_session": live }));
+                return Ok(0);
+            }
+            let key = t.key.if_supports_color(Stream::Stdout, |t| t.bold()).to_string();
+            let ok = "ok".if_supports_color(Stream::Stdout, |t| t.green()).to_string();
+            match mode {
+                Some(m) => println!("{ok} {key} runs {m} from its next start (Claude Code sessions only)"),
+                None => match &t.session_mode {
+                    Some(chosen) => println!("{ok} {key} runs {chosen} from its next start"),
+                    None => println!("{ok} {key} lets claude.session_mode_rules choose its mode at its first start"),
+                },
+            }
+            if live {
+                println!("  its current session keeps running in its mode until it ends");
+            }
+            if matches!(t.state, TaskState::NeedsAttention | TaskState::Failed | TaskState::Crashed) {
+                println!(
+                    "  `powerqueue task resume {0}` continues the stopped session, `powerqueue task retry {0}` starts over",
+                    t.key
+                );
             }
             Ok(0)
         }

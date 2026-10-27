@@ -404,6 +404,12 @@ pub struct SimRow {
     pub policy: String,
     /// `true` for the first `scheduler.max_concurrent` schedulable rows.
     pub would_start_now: bool,
+    /// How its Claude Code sessions run and why (see
+    /// [`crate::config::Config::session_mode_for`]).
+    pub session_mode: crate::execution::SessionModeChoice,
+    /// True when the task has started and its mode is frozen; otherwise
+    /// `session_mode` is what its first start would choose.
+    pub session_mode_frozen: bool,
     pub reasons: Vec<String>,
 }
 
@@ -623,6 +629,7 @@ pub(crate) fn simulate_target(
         }
         let is_new = new_keys.contains(&task.key);
         let stored_rank = stored_order.iter().position(|i| i == idx).map(|r| r + 1);
+        let session_mode = policies.get(&task.execution_project).map_or(cfg, |(effective, _)| effective).session_mode_for(task);
         rows.push(SimRow {
             rank: rank + 1,
             key: task.key.clone(),
@@ -641,6 +648,8 @@ pub(crate) fn simulate_target(
             model,
             policy: policy_reason,
             would_start_now,
+            session_mode,
+            session_mode_frozen: task.session_mode.is_some(),
             reasons: eval.reasons.clone(),
         });
     }
@@ -717,6 +726,20 @@ fn fetch_unqueued_linear_tasks(ctx: &mut Context, cfg: &Config, store: &Store) -
     Ok(out)
 }
 
+/// `headless (rule[0])`, `interactive (default)`, ... with `, started` when
+/// the mode is frozen on the task.
+fn session_mode_cell(r: &SimRow) -> String {
+    use crate::execution::SessionModeSource;
+    let source = match &r.session_mode.source {
+        SessionModeSource::Command => "task mode".to_string(),
+        SessionModeSource::Override => "override".to_string(),
+        SessionModeSource::Rule { index, .. } => format!("rule[{index}]"),
+        SessionModeSource::Default => "default".to_string(),
+    };
+    let started = if r.session_mode_frozen { ", started" } else { "" };
+    format!("{} ({source}{started})", r.session_mode.mode)
+}
+
 /// The table `priority simulate` prints, plus the `--reasons` detail and the
 /// summary line, as text (colours follow the stdout colour setting).
 pub fn render_simulation(sim: &Simulation, args: &SimulateArgs) -> String {
@@ -731,7 +754,7 @@ pub fn render_simulation(sim: &Simulation, args: &SimulateArgs) -> String {
         format!("(max {} concurrent; nothing was written)", sim.max_concurrent).if_supports_color(Stream::Stdout, |t| t.dimmed())
     );
     let mut t = table();
-    let mut header = vec!["#", "was", "task", "state", "criticality", "score", "prefers"];
+    let mut header = vec!["#", "was", "task", "state", "criticality", "score", "prefers", "mode"];
     if !args.no_budget {
         header.push("policy would run");
     }
@@ -766,7 +789,7 @@ pub fn render_simulation(sim: &Simulation, args: &SimulateArgs) -> String {
             Some(src) if src.starts_with("if ") => with_model_source(model_list_colored(&r.preferred_models), Some(src)),
             _ => model_list_colored(&r.preferred_models),
         };
-        let mut row = vec![rank, was, r.key.clone(), state, crit, score, preferred];
+        let mut row = vec![rank, was, r.key.clone(), state, crit, score, preferred, session_mode_cell(r)];
         if !args.no_budget {
             let policy = match (&r.model, r.schedulable) {
                 (Some(m), _) => model_colored(Some(m)),
@@ -785,6 +808,8 @@ pub fn render_simulation(sim: &Simulation, args: &SimulateArgs) -> String {
             for reason in &r.reasons {
                 let _ = writeln!(out, "    · {reason}");
             }
+            let started = if r.session_mode_frozen { ", chosen at its first start" } else { "" };
+            let _ = writeln!(out, "    · session mode {}{started}", r.session_mode);
             if !r.policy.is_empty() {
                 let _ = writeln!(out, "    · policy: {}", r.policy);
             }

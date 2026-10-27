@@ -1159,23 +1159,33 @@ fn check_session_inbox(cfg: &Config, paths: &Paths) -> Option<CheckResult> {
     ))
 }
 
-/// `claude.session_mode`: interactive (tmux) or headless (`claude -p`), and
-/// the settings that break unattended headless runs: a permission mode that
-/// denies every prompted tool call, and a `claude.binary` that asks for a
-/// terminal (`docker exec -t`) a background process does not have.
+/// `claude.session_mode` (interactive in tmux or headless `claude -p`) and
+/// the `claude.session_mode_rules` / `session_mode_overrides` that route
+/// tasks to the other mode, then the settings that break unattended headless
+/// runs whenever any task can run headless: a permission mode that denies
+/// every prompted tool call, and a `claude.binary` that asks for a terminal
+/// (`docker exec -t`) a background process does not have.
 pub fn check_session_mode(cfg: &Config) -> CheckResult {
     const NAME: &str = "claude session mode";
-    if cfg.claude.session_mode == crate::config::ClaudeSessionMode::Interactive {
-        return CheckResult::ok(CONF, NAME, "interactive: Claude Code runs in a tmux window you can attach to");
+    let routed = match (cfg.claude.session_mode_rules.len(), cfg.claude.session_mode_overrides.len()) {
+        (0, 0) => String::new(),
+        (rules, overrides) => format!(" by default; {rules} rule(s) and {overrides} override(s) choose per task"),
+    };
+    if !cfg.headless_possible() {
+        return CheckResult::ok(CONF, NAME, format!("interactive{routed}: Claude Code runs in a tmux window you can attach to"));
     }
+    let mode = cfg.claude.session_mode;
     let tty =
         shlex::split(&cfg.claude.binary).unwrap_or_default().iter().any(|a| matches!(a.as_str(), "-t" | "-it" | "-ti" | "--tty"));
     if tty {
         return CheckResult::warn(
             CONF,
             NAME,
-            format!("headless, but claude.binary `{}` asks for a terminal; a headless session has none", cfg.claude.binary),
-            "drop `-t`/`-it` from claude.binary (keep `-i` only if the command needs stdin), or set claude.session_mode = \"interactive\"",
+            format!(
+                "{mode}{routed}; headless tasks run claude.binary `{}`, which asks for a terminal a headless session does not have",
+                cfg.claude.binary
+            ),
+            "drop `-t`/`-it` from claude.binary (keep `-i` only if the command needs stdin), or run tasks interactive (claude.session_mode and its rules)",
         );
     }
     if matches!(cfg.claude.permission_mode.as_str(), "default" | "manual" | "plan") {
@@ -1183,18 +1193,18 @@ pub fn check_session_mode(cfg: &Config) -> CheckResult {
             CONF,
             NAME,
             format!(
-                "headless with claude.permission_mode `{}`: every tool call that needs approval is denied, nobody can answer",
+                "{mode}{routed}; headless tasks run with claude.permission_mode `{}`: every tool call that needs approval is denied, nobody can answer",
                 cfg.claude.permission_mode
             ),
-            "use acceptEdits or auto with claude.allowed_tools for the commands tasks need, or set claude.session_mode = \"interactive\"",
+            "use acceptEdits or auto with claude.allowed_tools for the commands tasks need, or run tasks interactive (claude.session_mode and its rules)",
         );
     }
     CheckResult::ok(
         CONF,
         NAME,
         format!(
-            "headless: `claude -p --output-format stream-json` in the background (permission mode {}); no window to attach to, \
-             questions and permission prompts cannot be answered mid-run",
+            "{mode}{routed}; headless tasks run `claude -p --output-format stream-json` in the background (permission mode {}); \
+             no window to attach to, questions and permission prompts cannot be answered mid-run",
             cfg.claude.permission_mode
         ),
     )
@@ -1755,6 +1765,40 @@ pub fn question_relay_status(
             format!("{} question(s) waiting for a reply on Linear: {}", waiting.len(), waiting.join(", ")),
         )
     }
+}
+
+/// Tasks that need a human while their last session ran headless: there is
+/// no window to attach to, so the way out is `task mode <key> interactive`
+/// and a resume (or retry) in a window, or an answer relayed from Linear.
+pub fn headless_attention_status(waiting: &[String]) -> CheckResult {
+    const NAME: &str = "headless tasks needing attention";
+    match waiting {
+        [] => CheckResult::ok(STATE, NAME, "none"),
+        keys => CheckResult::warn(
+            STATE,
+            NAME,
+            format!("{} headless task(s) blocked or asking a question: {}", keys.len(), keys.join(", ")),
+            format!(
+                "headless sessions cannot be attached to: `powerqueue task mode {0} interactive`, then `powerqueue task resume {0}` \
+                 continues the session in a tmux window (`task retry` starts over); or answer on Linear",
+                keys[0]
+            ),
+        ),
+    }
+}
+
+fn check_headless_attention(store: &Store) -> CheckResult {
+    let tasks = match store.list_open_tasks() {
+        Ok(t) => t,
+        Err(e) => return CheckResult::fail(STATE, "headless tasks needing attention", format!("{e:#}"), "check the database"),
+    };
+    let waiting: Vec<String> = tasks
+        .iter()
+        .filter(|t| t.state == TaskState::NeedsAttention && t.session_mode_override.is_none())
+        .filter(|t| store.latest_session(t.id).ok().flatten().is_some_and(|s| s.is_headless()))
+        .map(|t| t.key.clone())
+        .collect();
+    headless_attention_status(&waiting)
 }
 
 fn check_question_relay(cfg: &Config, store: &Store) -> CheckResult {
@@ -2576,6 +2620,7 @@ pub async fn run_all(
     results.push(check_worktree_base(store));
     results.push(check_superseded_launches(store));
     results.push(check_question_relay(cfg, store));
+    results.push(check_headless_attention(store));
     for id in cfg.project_ids() {
         if let Ok(project) = cfg.for_project(&id, paths) {
             let mut check = check_orphan_worktrees(&project, paths, store, fix && isolated);
@@ -2638,6 +2683,14 @@ mod tests {
         let result = check_stuck_tasks(&cfg, &paths, &store, true);
         assert_eq!(result.status, Status::Ok, "{}", result.detail);
         assert_eq!(store.get_task(waiting.id).unwrap().unwrap().state, TaskState::NeedsAttention, "--fix leaves it alone");
+        let result = check_headless_attention(&store);
+        assert_eq!(result.status, Status::Warn);
+        assert!(result.detail.contains("HL-1"), "{}", result.detail);
+        // Once the user switched it to interactive, the advice is taken.
+        let mut switched = store.get_task(waiting.id).unwrap().unwrap();
+        crate::scheduler::commands::on_set_session_mode(&mut switched, Some(crate::config::ClaudeSessionMode::Interactive), &cfg);
+        store.update_task(&switched).unwrap();
+        assert_eq!(check_headless_attention(&store).status, Status::Ok);
         // Running with a headless process that is gone: stuck.
         let mut running = Task::new("HL-2", "lost its process", crate::domain::TaskSource::Manual);
         running.state = TaskState::Running;
@@ -2663,6 +2716,31 @@ mod tests {
         assert_eq!(check_session_mode(&cfg).status, Status::Warn);
         assert_eq!(headless_denials_status(0).status, Status::Ok);
         assert_eq!(headless_denials_status(3).status, Status::Warn);
+        // Interactive by default, but a rule routes some tasks headless: the
+        // same settings still break those tasks.
+        cfg.claude.session_mode = crate::config::ClaudeSessionMode::Interactive;
+        assert_eq!(check_session_mode(&cfg).status, Status::Ok);
+        cfg.claude.session_mode_rules = vec![crate::execution::SessionModeRule {
+            mode: crate::config::ClaudeSessionMode::Headless,
+            all: vec![crate::priority::Predicate {
+                field: "label".into(),
+                op: crate::priority::policy::Operator::Eq,
+                value: crate::priority::policy::Value::Text("chore".into()),
+            }],
+        }];
+        let result = check_session_mode(&cfg);
+        assert_eq!(result.status, Status::Warn);
+        assert!(result.detail.contains("1 rule(s)"), "{}", result.detail);
+        cfg.claude.permission_mode = "acceptEdits".into();
+        assert_eq!(check_session_mode(&cfg).status, Status::Ok);
+    }
+
+    #[test]
+    fn headless_tasks_needing_attention_point_to_interactive_mode() {
+        assert_eq!(headless_attention_status(&[]).status, Status::Ok);
+        let result = headless_attention_status(&["ENG-7".into()]);
+        assert_eq!(result.status, Status::Warn);
+        assert!(result.fix_hint.as_deref().is_some_and(|h| h.contains("task mode ENG-7 interactive")), "{:?}", result.fix_hint);
     }
 
     #[test]

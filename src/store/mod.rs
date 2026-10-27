@@ -41,7 +41,10 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// * v13: `sessions.runtime` (`tmux` or `headless`; see
 ///   [`crate::domain::SessionRuntime`]) and `tasks.free_attempts` (resumes of
 ///   stopped headless sessions, not counted against `max_attempts`).
-pub const SCHEMA_VERSION: i64 = 13;
+/// * v14: `tasks.session_mode_override` (`task mode`) and
+///   `tasks.session_mode` (the mode frozen at the first start, with its
+///   reason; see [`crate::execution::SessionModeChoice`]).
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// kv key of the Claude calibration before schema v2.
 const LEGACY_CALIBRATION_KEY: &str = "budget.calibration";
@@ -262,6 +265,8 @@ impl Store {
                 ("project_assignment", "ALTER TABLE tasks ADD COLUMN project_assignment TEXT"),
                 ("execution", "ALTER TABLE tasks ADD COLUMN execution TEXT"),
                 ("deferral", "ALTER TABLE tasks ADD COLUMN deferral TEXT"),
+                ("session_mode_override", "ALTER TABLE tasks ADD COLUMN session_mode_override TEXT"),
+                ("session_mode", "ALTER TABLE tasks ADD COLUMN session_mode TEXT"),
             ] {
                 if !cols.iter().any(|c| c == name) {
                     conn.execute(sql, []).with_context(|| format!("add tasks.{name}"))?;
@@ -298,9 +303,9 @@ impl Store {
                 labels, linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts,
                 not_before, last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number,
                 blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing, execution, deferral, project_assignment,
-                free_attempts)
+                free_attempts, session_mode_override, session_mode)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-                ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43)",
+                ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)",
             params![
                 task.id.to_string(),
                 task.key,
@@ -345,6 +350,8 @@ impl Store {
                 task.deferral.as_ref().map(json),
                 task.project_assignment.as_ref().map(json),
                 task.free_attempts,
+                task.session_mode_override.map(|m| m.as_str()),
+                task.session_mode.as_ref().map(json),
             ],
         )
         .with_context(|| format!("insert task {}", task.key))?;
@@ -382,7 +389,7 @@ impl Store {
                 model=?16, worktree_path=?17, branch=?18, attempts=?19, max_attempts=?20, not_before=?21, last_error=?22,
                 summary=?23, score_reasons=?24, updated_at=?25, started_at=?26, completed_at=?27, cycle=?28, cycle_number=?29,
                 blocked_by=?30, children=?31, parent=?32, pr_url=?33, review=?34, execution_project=?35, execution_repo=?36, github_admission=?37, routing=?38, execution=?39, project_assignment=?40,
-                free_attempts=?41
+                free_attempts=?41, session_mode_override=?42, session_mode=?43
              WHERE id=?1",
             params![
                 task.id.to_string(),
@@ -426,6 +433,8 @@ impl Store {
                 task.execution.as_ref().map(json),
                 current.project_assignment.as_ref().map(json),
                 task.free_attempts,
+                task.session_mode_override.map(|m| m.as_str()),
+                task.session_mode.as_ref().map(json),
             ],
         )?;
         if n == 0 {
@@ -701,7 +710,7 @@ impl Store {
         let changed = tx
             .execute(
                 "UPDATE tasks SET state=?5, model=?6, not_before=?7, review=?8, updated_at=?9,
-             attempts=?13, branch=?14, worktree_path=?15, execution=?20
+             attempts=?13, branch=?14, worktree_path=?15, execution=?20, session_mode=?25
              WHERE id=?1 AND execution_project=?2 AND state=?3 AND attempts=?4
              AND github_admission IS ?10 AND title=?11 AND description=?12
              AND routing IS ?16 AND labels=?17 AND project IS ?18 AND source=?19 AND deferral IS ?21 AND project_assignment IS ?22
@@ -730,7 +739,8 @@ impl Store {
                     before.deferral.as_ref().map(json),
                     before.project_assignment.as_ref().map(json),
                     json(&before.blocked_by),
-                    json(&before.children)
+                    json(&before.children),
+                    starting.session_mode.as_ref().map(json)
                 ],
             )
             .context("claim task start in its execution project")?;
@@ -839,6 +849,13 @@ impl Store {
             children: from_json(&children).map_err(conv)?,
             parent: row.get("parent")?,
             model_override: model_override.map(|m| ModelTier::from_str(&m)).transpose().map_err(|e| conv(anyhow!(e)))?,
+            session_mode_override: row
+                .get::<_, Option<String>>("session_mode_override")?
+                .as_deref()
+                .map(crate::config::ClaudeSessionMode::from_str)
+                .transpose()
+                .map_err(|e| conv(anyhow!(e)))?,
+            session_mode: row.get::<_, Option<String>>("session_mode")?.as_deref().map(from_json).transpose().map_err(conv)?,
             model: model.map(|m| ModelTier::from_str(&m)).transpose().map_err(|e| conv(anyhow!(e)))?,
             worktree_path: row.get("worktree_path")?,
             branch: row.get("branch")?,
@@ -863,7 +880,8 @@ impl Store {
         "id, key, title, description, source, source_kind, linear_issue_id, state, criticality, score, labels,
         linear_priority, estimate, project, model_override, model, worktree_path, branch, attempts, max_attempts, not_before,
         last_error, summary, score_reasons, created_at, updated_at, started_at, completed_at, cycle, cycle_number,
-        blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing, execution, deferral, project_assignment, free_attempts";
+        blocked_by, children, parent, pr_url, review, execution_project, execution_repo, github_admission, routing, execution, deferral, project_assignment, free_attempts,
+        session_mode_override, session_mode";
 
     pub fn get_task(&self, id: TaskId) -> Result<Option<Task>> {
         let conn = self.lock();
@@ -2285,6 +2303,52 @@ mod tests {
         stored.free_attempts = 2;
         store.update_task(&stored).unwrap();
         assert_eq!(store.get_task(task.id).unwrap().unwrap().free_attempts, 2);
+    }
+
+    /// v13 → v14: the session-mode columns are added (empty for existing
+    /// tasks), then round-trip through insert, update and a start claim.
+    #[test]
+    fn migrates_to_v14_and_round_trips_the_session_mode() {
+        use crate::config::ClaudeSessionMode;
+        use crate::execution::{SessionModeChoice, SessionModeSource};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pq.db");
+        let task = Task::new("ENG-14", "mode", crate::domain::TaskSource::Manual);
+        Store::open(&path).unwrap().insert_task(&task).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE tasks DROP COLUMN session_mode_override; ALTER TABLE tasks DROP COLUMN session_mode; PRAGMA user_version = 13;",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let mut stored = store.get_task(task.id).unwrap().unwrap();
+        assert_eq!((stored.session_mode_override, &stored.session_mode), (None, &None));
+
+        stored.session_mode_override = Some(ClaudeSessionMode::Headless);
+        store.update_task(&stored).unwrap();
+        let before = store.get_task(task.id).unwrap().unwrap();
+        assert_eq!(before.session_mode_override, Some(ClaudeSessionMode::Headless));
+        let mut starting = before.clone();
+        starting.state = TaskState::Starting;
+        starting.attempts = 1;
+        let choice = SessionModeChoice {
+            mode: ClaudeSessionMode::Headless,
+            source: SessionModeSource::Rule { index: 2, conditions: "estimate < 3".into() },
+        };
+        starting.session_mode = Some(choice.clone());
+        assert!(store.claim_task_start(&before, &starting).unwrap());
+        let claimed = store.get_task(task.id).unwrap().unwrap();
+        assert_eq!(claimed.session_mode, Some(choice));
+
+        let mut fresh = Task::new("ENG-15", "inserted", crate::domain::TaskSource::Manual);
+        fresh.session_mode_override = Some(ClaudeSessionMode::Interactive);
+        fresh.session_mode = Some(SessionModeChoice { mode: ClaudeSessionMode::Interactive, source: SessionModeSource::Command });
+        store.insert_task(&fresh).unwrap();
+        let read = store.get_task(fresh.id).unwrap().unwrap();
+        assert_eq!((read.session_mode_override, read.session_mode), (fresh.session_mode_override, fresh.session_mode));
     }
 
     /// The v1 schema as `powerqueue` 0.1.0 created it (no `agent_session_id`,

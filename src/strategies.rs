@@ -70,6 +70,36 @@ pub(crate) fn session_state() -> impl Strategy<Value = SessionState> {
 }
 
 /// Where a session runs: mostly tmux, sometimes headless.
+/// A session-mode configuration: a default, at most one rule on a label the
+/// generated tasks may carry (`label` from [`word`]) and at most one
+/// override for a generated key.
+pub(crate) fn session_mode_config() -> impl Strategy<Value = crate::config::Config> {
+    (session_mode(), prop::option::of((session_mode(), word())), prop::option::of((session_mode(), word()))).prop_map(
+        |(default, rule, over)| {
+            let mut cfg = crate::config::Config::default();
+            cfg.claude.session_mode = default;
+            cfg.claude.session_mode_rules = rule
+                .into_iter()
+                .map(|(mode, label)| crate::execution::SessionModeRule {
+                    mode,
+                    all: vec![crate::priority::Predicate {
+                        field: "label".into(),
+                        op: crate::priority::policy::Operator::Eq,
+                        value: crate::priority::policy::Value::Text(label),
+                    }],
+                })
+                .collect();
+            cfg.claude.session_mode_overrides = over.into_iter().map(|(mode, key)| (format!("ENG-{key}"), mode)).collect();
+            cfg
+        },
+    )
+}
+
+/// `claude.session_mode` / a rule's or `task mode`'s mode.
+pub(crate) fn session_mode() -> impl Strategy<Value = crate::config::ClaudeSessionMode> {
+    prop::sample::select(vec![crate::config::ClaudeSessionMode::Interactive, crate::config::ClaudeSessionMode::Headless])
+}
+
 pub(crate) fn session_runtime() -> impl Strategy<Value = SessionRuntime> {
     prop::bool::weighted(0.25).prop_map(|headless| if headless { SessionRuntime::Headless } else { SessionRuntime::Tmux })
 }
@@ -296,12 +326,15 @@ pub(crate) fn task_in(state: TaskState) -> impl Strategy<Value = Task> {
         vec(word(), 0..3),
         prop::option::of(prop::sample::select(vec![1.0, 2.0, 3.0, 5.0, 8.0])),
     );
-    (identity, bookkeeping, links, execution_project()).prop_map(
+    let frozen = if ran { prop::option::weighted(0.7, session_mode()).boxed() } else { Just(None).boxed() };
+    let modes = (prop::option::weighted(0.2, session_mode()), frozen);
+    (identity, bookkeeping, links, execution_project(), modes).prop_map(
         move |(
             (id, key, criticality, score, attempts, max_attempts, created_at),
             (not_before, last_error, summary, model_override, pr_url, review),
             (blocked_by, children, labels, estimate),
             project,
+            (session_mode_override, frozen),
         )| {
             let mut t = Task::new(format!("ENG-{key}"), "t", TaskSource::Manual);
             t.id = TaskId(uuid::Uuid::from_u128(id));
@@ -315,6 +348,15 @@ pub(crate) fn task_in(state: TaskState) -> impl Strategy<Value = Task> {
             t.last_error = last_error;
             t.summary = summary;
             t.model_override = model_override;
+            t.session_mode_override = session_mode_override;
+            // `task mode` chooses a started task's mode again at once, so a
+            // frozen mode always agrees with the override.
+            t.session_mode = frozen.map(|mode| match session_mode_override {
+                Some(forced) => {
+                    crate::execution::SessionModeChoice { mode: forced, source: crate::execution::SessionModeSource::Command }
+                }
+                None => crate::execution::SessionModeChoice { mode, source: crate::execution::SessionModeSource::Default },
+            });
             t.pr_url = pr_url;
             t.review = review;
             t.blocked_by = blocked_by;
