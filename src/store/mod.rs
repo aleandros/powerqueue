@@ -756,7 +756,7 @@ impl Store {
              WHERE id=?1 AND execution_project=?2 AND state=?3 AND attempts=?4
              AND github_admission IS ?10 AND title=?11 AND description=?12
              AND routing IS ?16 AND labels=?17 AND project IS ?18 AND source=?19 AND deferral IS ?21 AND project_assignment IS ?22
-             AND blocked_by=?23 AND children=?24 AND session_mode_override IS ?26",
+             AND blocked_by=?23 AND children=?24 AND session_mode_override IS ?26 AND session_mode IS ?27",
                 params![
                     before.id.to_string(),
                     before.execution_project,
@@ -783,7 +783,8 @@ impl Store {
                     json(&before.blocked_by),
                     json(&before.children),
                     starting.session_mode.as_ref().map(json),
-                    before.session_mode_override.map(|m| m.as_str())
+                    before.session_mode_override.map(|m| m.as_str()),
+                    before.session_mode.as_ref().map(json)
                 ],
             )
             .context("claim task start in its execution project")?;
@@ -2395,7 +2396,8 @@ mod tests {
     }
 
     /// `task mode` writes only its two columns, logs once, and a start claim
-    /// that read the row before it is refused, so the next start honours it.
+    /// that read the row before it is refused (whether it changed the
+    /// override or only chose the mode again), so the next start honours it.
     #[test]
     fn task_mode_is_a_targeted_write_that_supersedes_a_stale_claim() {
         use crate::config::ClaudeSessionMode;
@@ -2439,6 +2441,25 @@ mod tests {
         starting.session_mode = Some(cfg.session_mode_for(&fresh));
         assert!(store.claim_task_start(&fresh, &starting).unwrap());
         assert_eq!(store.get_task(task.id).unwrap().unwrap().session_mode.map(|m| m.mode), Some(ClaudeSessionMode::Interactive));
+
+        // A crashed task with no override: `task mode auto` chooses again by
+        // the rules without changing the override; a claim from before is refused.
+        let mut crashed = store.get_task(task.id).unwrap().unwrap();
+        crashed.state = TaskState::Crashed;
+        crashed.session_mode_override = None;
+        crashed.session_mode = Some(crate::execution::SessionModeChoice {
+            mode: ClaudeSessionMode::Interactive,
+            source: crate::execution::SessionModeSource::Default,
+        });
+        store.update_task(&crashed).unwrap();
+        let stale = store.get_task(task.id).unwrap().unwrap();
+        let rechosen = store.set_task_session_mode(task.id, None, &cfg).unwrap();
+        assert_eq!(rechosen.session_mode.as_ref().map(|m| m.mode), Some(ClaudeSessionMode::Headless));
+        assert_eq!(rechosen.session_mode_override, None);
+        let mut starting = stale.clone();
+        starting.state = TaskState::Starting;
+        starting.attempts += 1;
+        assert!(!store.claim_task_start(&stale, &starting).unwrap(), "a claim from before `task mode auto` is refused");
     }
 
     /// The v1 schema as `powerqueue` 0.1.0 created it (no `agent_session_id`,
