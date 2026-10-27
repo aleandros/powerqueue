@@ -589,4 +589,21 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn render_once_disambiguates_three_repositories_with_shared_prefixes_and_suffixes() {
+        let repositories = [
+            "owner/api-production-east-infrastructure",
+            "owner/api-production-west-infrastructure",
+            "owner/web-production-infrastructure",
+        ];
+        for ascii in [true, false] {
+            let tasks = repositories.iter().map(|repo| github_task(repo, 83, "execution", "Same title")).collect();
+            let text = render_once(Snapshot { tasks, ..Default::default() }, Options { ascii, ..Default::default() }, 80, 12);
+            let keys: std::collections::BTreeSet<String> =
+                text.lines().skip(3).take(3).map(|line| line.chars().skip(3).take(16).collect()).collect();
+            assert_eq!(keys.len(), 3, "{text}");
+            assert!(keys.iter().all(|key| key.contains("#83")), "{text}");
+        }
+    }
 }

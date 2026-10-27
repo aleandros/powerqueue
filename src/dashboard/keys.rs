@@ -96,26 +96,44 @@ pub fn fit_labels(labels: &[&str], max: usize, ellipsis: &str) -> Vec<String> {
     for (i, label) in fitted.iter().enumerate() {
         groups.entry(label.clone()).or_default().push(i);
     }
+    // Reserve even labels outside a collision group, so a replacement cannot
+    // introduce a new collision with an otherwise distinct row.
+    let mut used: BTreeSet<String> = fitted.iter().cloned().collect();
     for group in groups.values().filter(|group| group.len() > 1) {
-        let first = labels[group[0]];
-        if group.iter().all(|&i| labels[i] == first) {
-            continue;
-        }
+        let distinct: BTreeSet<_> = group.iter().map(|&i| labels[i]).collect();
+        let Some(first) = distinct.first() else { continue };
         let shared =
-            group.iter().map(|&i| first.chars().zip(labels[i].chars()).take_while(|(a, b)| a == b).count()).min().unwrap_or(0);
-        for &i in group {
-            let Some((prefix, number)) = labels[i].rsplit_once('#') else { continue };
-            let suffix = format!("#{number}");
-            let leading = if shared == 0 { "" } else { ellipsis };
-            let budget = max.saturating_sub(leading.width() + ellipsis.width() + suffix.width());
-            if budget == 0 {
-                continue;
+            distinct.iter().map(|label| first.chars().zip(label.chars()).take_while(|(a, b)| a == b).count()).min().unwrap_or(0);
+        // Sorting full labels makes the choice independent of row ordering.
+        for label in distinct.iter().skip(1) {
+            let Some(replacement) = unused_label(label, shared, max, ellipsis, &used) else { continue };
+            used.insert(replacement.clone());
+            for &i in group.iter().filter(|&&i| labels[i] == *label) {
+                fitted[i].clone_from(&replacement);
             }
-            let distinct = take_width(prefix.chars().skip(shared), budget);
-            fitted[i] = format!("{leading}{distinct}{ellipsis}{suffix}");
         }
     }
     fitted
+}
+
+/// Prefer the first differing part, then try other windows if that would still
+/// collide. Each candidate keeps the number and marks omitted repository text.
+fn unused_label(label: &str, shared: usize, max: usize, ellipsis: &str, used: &BTreeSet<String>) -> Option<String> {
+    let (prefix, number) = label.rsplit_once('#')?;
+    let suffix = format!("#{number}");
+    for start in std::iter::once(shared).chain(0..prefix.chars().count()) {
+        let leading = if start == 0 { "" } else { ellipsis };
+        let budget = max.saturating_sub(leading.width() + ellipsis.width() + suffix.width());
+        if budget == 0 {
+            continue;
+        }
+        let distinct = take_width(prefix.chars().skip(start), budget);
+        let candidate = format!("{leading}{distinct}{ellipsis}{suffix}");
+        if !used.contains(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn truncate_right(s: &str, max: usize, ellipsis: &str) -> String {
@@ -177,6 +195,22 @@ mod tests {
             }
         }
         assert_eq!(fit_labels(&["app#1", "app#1"], 16, "…"), ["app#1", "app#1"]);
+    }
+
+    #[test]
+    fn collision_replacements_are_unique_across_the_whole_set_and_order_independent() {
+        let labels = [
+            "api-production-east-infrastructure#83",
+            "api-production-west-infrastructure#83",
+            "web-production-infrastructure#83",
+            "api-produc...#83",
+            "web-produc...#83",
+        ];
+        let fitted = fit_labels(&labels, 16, "...");
+        assert_eq!(fitted.iter().collect::<BTreeSet<_>>().len(), labels.len());
+        assert!(fitted.iter().all(|label| label.width() <= 16 && label.ends_with("#83")));
+        let reversed: Vec<_> = labels.iter().copied().rev().collect();
+        assert_eq!(fit_labels(&reversed, 16, "..."), fitted.into_iter().rev().collect::<Vec<_>>());
     }
 
     #[test]
