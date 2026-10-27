@@ -67,8 +67,9 @@ Project filters on `status`, `task list` and `dashboard` affect only the task li
 | `attach [<task>] [--print]` | open the task's tmux window; no task = the powerqueue session. A headless task has no window: `attach` says so and prints its log paths (`task mode <task> interactive` moves its next start to a window) |
 
 The dashboard's task table shows GitHub keys as `repo#83`, with the owner only
-when two owners have a repository of the same name; a label that does not fit
-loses its start or middle, never the issue number. The PROJECT column is hidden
+when visible tasks come from repositories of the same name under different
+owners. A label that does not fit loses its start or middle, preserving the issue
+number and differing text when shortened names would otherwise collide. The PROJECT column is hidden
 when every task's project is its repository's name. The selected-task pane,
 `task show`, `status` and logs keep the full `owner/repo#83` key.
 

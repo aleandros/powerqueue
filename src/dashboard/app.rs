@@ -249,6 +249,8 @@ pub struct RowData {
     pub key: String,
     /// What the KEY column shows (see [`super::keys::KeyLabels`]).
     pub label: String,
+    /// GitHub issue number, used to reserve enough KEY columns for every digit.
+    pub github_number: Option<u64>,
     pub execution_project: String,
     /// The PROJECT cell repeats the KEY column: a GitHub task whose repository
     /// has the project's name. An empty (unrouted) project never does.
@@ -274,7 +276,11 @@ pub struct RowData {
     reason = "Keep the existing rows_for flag interface during lint adoption; callers already supply named state predicates."
 )]
 pub fn rows_for(snapshot: &Snapshot, hide_terminal: bool, now: DateTime<Utc>) -> Vec<RowData> {
-    let mut tasks: Vec<Task> = snapshot.tasks.iter().filter(|t| !hide_terminal || !t.state.is_terminal()).cloned().collect();
+    let tasks = snapshot.tasks.iter().filter(|t| !hide_terminal || !t.state.is_terminal()).cloned().collect();
+    rows_for_tasks(snapshot, tasks, now)
+}
+
+fn rows_for_tasks(snapshot: &Snapshot, mut tasks: Vec<Task>, now: DateTime<Utc>) -> Vec<RowData> {
     // Only shown tasks decide whether a repository name needs its owner.
     let labels = super::keys::KeyLabels::new(&tasks);
     crate::cli::commands::status::sort_for_display(&mut tasks);
@@ -291,6 +297,10 @@ pub fn rows_for(snapshot: &Snapshot, hide_terminal: bool, now: DateTime<Utc>) ->
                 task_id: t.id,
                 key: t.key.clone(),
                 label: labels.label(&t),
+                github_number: match &t.source {
+                    TaskSource::GitHub { number, .. } => Some(*number),
+                    TaskSource::Linear { .. } | TaskSource::Manual => None,
+                },
                 execution_project: t.execution_project.clone(),
                 project_in_key: !t.execution_project.is_empty()
                     && super::keys::github_repo(&t).is_some_and(|r| r.eq_ignore_ascii_case(&t.execution_project)),
@@ -368,10 +378,15 @@ impl DashboardApp {
 
     /// Current table rows.
     pub fn rows(&self) -> Vec<RowData> {
-        rows_for(&self.snapshot, self.filter_terminal, self.now())
-            .into_iter()
-            .filter(|r| self.project_filter.as_ref().is_none_or(|p| p == &r.execution_project))
-            .collect()
+        let tasks = self
+            .snapshot
+            .tasks
+            .iter()
+            .filter(|t| !self.filter_terminal || !t.state.is_terminal())
+            .filter(|t| self.project_filter.as_ref().is_none_or(|p| p == &t.execution_project))
+            .cloned()
+            .collect();
+        rows_for_tasks(&self.snapshot, tasks, self.now())
     }
 
     /// Keep the selection inside the row range.

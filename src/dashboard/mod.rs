@@ -522,4 +522,71 @@ mod tests {
             "{text}"
         );
     }
+
+    #[test]
+    fn render_once_preserves_long_issue_numbers_and_manual_prefixes() {
+        let mut github = github_task("owner/long-repository-name", 123_456_789, "execution-project", "GitHub issue");
+        github.state = TaskState::NeedsAttention;
+        let manual = Task::new("MANUAL-long-key#987654321", "Manual task", TaskSource::Manual);
+        let text = render_once(
+            Snapshot { tasks: vec![github, manual], ..Default::default() },
+            Options { ascii: true, ..Default::default() },
+            80,
+            12,
+        );
+        let table: Vec<String> = text.lines().skip(3).take(2).map(|line| line.chars().take(50).collect()).collect();
+        assert!(table.iter().any(|line| line.contains("#123456789")), "{text}");
+        assert!(table.iter().any(|line| line.contains("MANUAL-")), "{text}");
+        assert!(!table.iter().any(|line| line.contains("#987654321")), "manual keys retain right clipping: {text}");
+    }
+
+    #[test]
+    fn project_filter_removes_unneeded_owners() {
+        let snapshot = Snapshot {
+            tasks: vec![github_task("alice/app", 83, "app", "Visible"), github_task("bob/app", 83, "fork", "Hidden")],
+            ..Default::default()
+        };
+        let mut app = DashboardApp::new(snapshot.clone());
+        assert_eq!(app.rows()[0].label, "alice/app#83");
+        app.project_filter = Some("app".into());
+        assert_eq!(app.rows()[0].label, "app#83");
+        let text = render_once(snapshot, Options { ascii: true, project: Some("app".into()) }, 80, 12);
+        let row: String = text.lines().nth(3).unwrap().chars().take(50).collect();
+        assert!(row.contains("app#83") && !row.contains("alice/"), "{text}");
+        assert!(text.contains("alice/app#83"), "detail preserves full key: {text}");
+    }
+
+    #[test]
+    fn render_once_disambiguates_colliding_truncated_names() {
+        for repositories in
+            [["alice-dev/powerqueue", "alice-prod/powerqueue"], ["owner/web-infrastructure", "owner/api-infrastructure"]]
+        {
+            for ascii in [true, false] {
+                let tasks = repositories.iter().map(|repo| github_task(repo, 83, "execution", "Same title")).collect();
+                let text = render_once(Snapshot { tasks, ..Default::default() }, Options { ascii, ..Default::default() }, 80, 12);
+                let rows: Vec<String> =
+                    text.lines().skip(3).take(2).map(|line| line.chars().skip(3).take(16).collect()).collect();
+                assert_ne!(rows[0], rows[1], "{text}");
+                assert!(rows.iter().all(|row| row.contains("#83")), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn render_once_keeps_every_issue_digit_when_metadata_must_shrink() {
+        for width in [60, 80] {
+            for number in [1_234_567, u64::MAX] {
+                let task = github_task("owner/repo", number, "different-project", "Long issue number");
+                let text = render_once(
+                    Snapshot { tasks: vec![task], ..Default::default() },
+                    Options { ascii: true, ..Default::default() },
+                    width,
+                    12,
+                );
+                let table_width = (usize::from(width) * 62 + 50) / 100;
+                let row: String = text.lines().nth(3).unwrap().chars().take(table_width).collect();
+                assert!(row.contains(&format!("#{number}")), "{text}");
+            }
+        }
+    }
 }

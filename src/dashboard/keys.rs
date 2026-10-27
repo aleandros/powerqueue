@@ -87,6 +87,37 @@ pub fn fit_key(label: &str, max: usize, ellipsis: &str) -> String {
     format!("{start}{ellipsis}{end}{suffix}")
 }
 
+/// Fit a set of GitHub labels, retaining the differing part when ordinary
+/// truncation would make distinct labels identical (such as two fork owners).
+/// Identical full labels still share a display label.
+pub fn fit_labels(labels: &[&str], max: usize, ellipsis: &str) -> Vec<String> {
+    let mut fitted: Vec<_> = labels.iter().map(|label| fit_key(label, max, ellipsis)).collect();
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, label) in fitted.iter().enumerate() {
+        groups.entry(label.clone()).or_default().push(i);
+    }
+    for group in groups.values().filter(|group| group.len() > 1) {
+        let first = labels[group[0]];
+        if group.iter().all(|&i| labels[i] == first) {
+            continue;
+        }
+        let shared =
+            group.iter().map(|&i| first.chars().zip(labels[i].chars()).take_while(|(a, b)| a == b).count()).min().unwrap_or(0);
+        for &i in group {
+            let Some((prefix, number)) = labels[i].rsplit_once('#') else { continue };
+            let suffix = format!("#{number}");
+            let leading = if shared == 0 { "" } else { ellipsis };
+            let budget = max.saturating_sub(leading.width() + ellipsis.width() + suffix.width());
+            if budget == 0 {
+                continue;
+            }
+            let distinct = take_width(prefix.chars().skip(shared), budget);
+            fitted[i] = format!("{leading}{distinct}{ellipsis}{suffix}");
+        }
+    }
+    fitted
+}
+
 fn truncate_right(s: &str, max: usize, ellipsis: &str) -> String {
     let mut out = take_width(s.chars(), max.saturating_sub(ellipsis.width()));
     out.push_str(ellipsis);
@@ -132,6 +163,20 @@ mod tests {
         assert_eq!(labels.label(&manual), "ENG-7");
         assert_eq!(github_repo(&tasks[0]), Some("powerqueue"));
         assert_eq!(github_repo(&manual), None);
+    }
+
+    #[test]
+    fn fitted_collisions_retain_the_differing_part() {
+        for labels in
+            [["alice-dev/powerqueue#83", "alice-prod/powerqueue#83"], ["web-infrastructure#83", "api-infrastructure#83"]]
+        {
+            for ellipsis in ["…", "..."] {
+                let fitted = fit_labels(&labels, 16, ellipsis);
+                assert_ne!(fitted[0], fitted[1]);
+                assert!(fitted.iter().all(|label| label.width() <= 16 && label.ends_with("#83")));
+            }
+        }
+        assert_eq!(fit_labels(&["app#1", "app#1"], 16, "…"), ["app#1", "app#1"]);
     }
 
     #[test]

@@ -364,8 +364,11 @@ const SHRINK_ORDER: [(&str, Option<u16>); 16] = [
 /// exactly `avail` columns when possible: every column but the last (TITLE)
 /// gets its want up to its cap, TITLE gets the rest; when that does not fit,
 /// columns shrink in [`SHRINK_ORDER`].
-fn fit_columns(headings: &[&str], wants: &[u16], avail: u16) -> Vec<u16> {
-    let limits = |h: &str| COLUMN_LIMITS.iter().find(|(name, ..)| *name == h).map_or((u16::MAX, 0), |(_, cap, min)| (*cap, *min));
+fn fit_columns(headings: &[&str], wants: &[u16], avail: u16, key_min: u16) -> Vec<u16> {
+    let limits = |h: &str| {
+        let (cap, min) = COLUMN_LIMITS.iter().find(|(name, ..)| *name == h).map_or((u16::MAX, 0), |(_, cap, min)| (*cap, *min));
+        if h == "KEY" { (cap.max(key_min), min.max(key_min)) } else { (cap, min) }
+    };
     let last = headings.len().saturating_sub(1);
     let mut widths: Vec<u16> = headings
         .iter()
@@ -383,12 +386,47 @@ fn fit_columns(headings: &[&str], wants: &[u16], avail: u16) -> Vec<u16> {
             break;
         }
         let Some(i) = headings.iter().position(|h| *h == heading) else { continue };
-        let floor = floor.unwrap_or(limits(heading).1);
+        let floor = floor.unwrap_or(limits(heading).1).max(if heading == "KEY" { key_min } else { 0 });
         let cut = widths[i].saturating_sub(floor).min(excess);
         widths[i] -= cut;
         excess -= cut;
     }
+    // If even the normal floors do not fit, give metadata space to the issue
+    // number. Ratatui must not silently shrink KEY below the suffix width.
+    if key_min > 0 {
+        for i in (0..widths.len()).rev().filter(|&i| headings[i] != "KEY") {
+            let cut = widths[i].min(excess);
+            widths[i] -= cut;
+            excess -= cut;
+        }
+    }
     widths
+}
+
+fn table_cells(row: &super::app::RowData, headings: &[&str]) -> Vec<(String, Style)> {
+    headings
+        .iter()
+        .map(|heading| {
+            let plain = |text: &str| (text.to_string(), Style::default());
+            match *heading {
+                "KEY" => plain(&row.label),
+                "PROJECT" => plain(&row.execution_project),
+                "QUEUE" => plain(&row.queue),
+                "STATE" => (row.state.as_str().to_string(), state_style(row.state)),
+                "CRIT" => (row.criticality.as_str().to_string(), criticality_style(row.criticality)),
+                "MODEL" => (row.model.as_ref().map_or("-", ModelTier::as_str).to_string(), model_style(row.model.as_ref())),
+                "WTOK" => plain(&row.tokens),
+                "CPU" => plain(&row.cpu),
+                "RSS" => plain(&row.rss),
+                "AGE" => plain(&row.age),
+                "WAITING ON" => (
+                    row.waiting.clone(),
+                    if row.waiting == "-" { Style::default().fg(Color::DarkGray) } else { state_style(TaskState::Blocked) },
+                ),
+                _ => (if row.deferred { format!("[deferred] {}", row.title) } else { row.title.clone() }, Style::default()),
+            }
+        })
+        .collect()
 }
 
 fn draw_table(frame: &mut Frame<'_>, app: &DashboardApp, area: Rect, sym: &Symbols) {
@@ -410,34 +448,7 @@ fn draw_table(frame: &mut Frame<'_>, app: &DashboardApp, area: Rect, sym: &Symbo
         headings.extend(["WTOK", "CPU", "RSS", "AGE", "WAITING ON"]);
     }
     headings.push("TITLE");
-    let cells: Vec<Vec<(String, Style)>> = rows
-        .iter()
-        .map(|r| {
-            let mut cells = vec![(r.label.clone(), Style::default())];
-            if project {
-                cells.push((r.execution_project.clone(), Style::default()));
-            }
-            cells.extend([(r.queue.clone(), Style::default()), (r.state.as_str().to_string(), state_style(r.state))]);
-            if !compact {
-                cells.push((r.criticality.as_str().to_string(), criticality_style(r.criticality)));
-            }
-            cells.push((r.model.as_ref().map_or("-", ModelTier::as_str).to_string(), model_style(r.model.as_ref())));
-            if !compact {
-                let waiting =
-                    if r.waiting == "-" { Style::default().fg(Color::DarkGray) } else { state_style(TaskState::Blocked) };
-                cells.extend([
-                    (r.tokens.clone(), Style::default()),
-                    (r.cpu.clone(), Style::default()),
-                    (r.rss.clone(), Style::default()),
-                    (r.age.clone(), Style::default()),
-                    (r.waiting.clone(), waiting),
-                ]);
-            }
-            let title = if r.deferred { format!("[deferred] {}", r.title) } else { r.title.clone() };
-            cells.push((title, Style::default()));
-            cells
-        })
-        .collect();
+    let cells: Vec<_> = rows.iter().map(|r| table_cells(r, &headings)).collect();
     let wants: Vec<u16> = headings
         .iter()
         .enumerate()
@@ -450,12 +461,27 @@ fn draw_table(frame: &mut Frame<'_>, app: &DashboardApp, area: Rect, sym: &Symbo
     let spacing = u16::try_from(headings.len().saturating_sub(1)).unwrap_or(u16::MAX);
     let pointer = if rows.is_empty() { 0 } else { u16::try_from(sym.pointer.width()).unwrap_or(2) };
     let avail = area.width.saturating_sub(2 + pointer + spacing);
-    let widths = fit_columns(&headings, &wants, avail);
+    let key_min = rows
+        .iter()
+        .filter_map(|r| r.github_number)
+        .map(|n| u16::try_from(format!("#{n}").len()).unwrap_or(u16::MAX))
+        .max()
+        .unwrap_or(0);
+    let widths = fit_columns(&headings, &wants, avail, key_min);
+    let github_labels: Vec<_> = rows.iter().filter(|r| r.github_number.is_some()).map(|r| r.label.as_str()).collect();
+    let mut github_labels = keys::fit_labels(&github_labels, usize::from(widths[0]), sym.ellipsis).into_iter();
     let header = Row::new(headings.iter().map(|h| Cell::from(*h).bold())).style(Style::default().fg(Color::DarkGray));
-    let body = cells.into_iter().map(|row| {
+    let body = cells.into_iter().zip(&rows).map(|(row, data)| {
+        let github_label = if data.github_number.is_some() { github_labels.next() } else { None };
         Row::new(row.into_iter().zip(&widths).enumerate().map(|(i, ((text, style), width))| {
             let width = usize::from(*width);
-            let text = if i == 0 { keys::fit_key(&text, width, sym.ellipsis) } else { sym.truncate(&text, width) };
+            let text = if i == 0 && data.github_number.is_some() {
+                github_label.clone().unwrap_or(text)
+            } else if i == 0 {
+                text
+            } else {
+                sym.truncate(&text, width)
+            };
             Cell::from(text).style(style)
         }))
     });
@@ -890,15 +916,15 @@ mod tests {
     fn columns_fill_the_table_and_key_shrinks_last() {
         let compact = ["KEY", "PROJECT", "QUEUE", "STATE", "MODEL", "TITLE"];
         // Room to spare: every column gets its widest cell, TITLE the rest.
-        assert_eq!(fit_columns(&compact, &[13, 10, 7, 6, 5, 30], 80), [13, 10, 7, 6, 5, 39]);
+        assert_eq!(fit_columns(&compact, &[13, 10, 7, 6, 5, 30], 80, 0), [13, 10, 7, 6, 5, 39]);
         // Caps apply even with room to spare.
-        assert_eq!(fit_columns(&compact, &[40, 10, 7, 6, 5, 30], 80)[0], 24);
+        assert_eq!(fit_columns(&compact, &[40, 10, 7, 6, 5, 30], 80, 0)[0], 24);
         // An 80-column terminal: TITLE, QUEUE and PROJECT give way before KEY.
-        let widths = fit_columns(&compact, &[13, 10, 7, 6, 5, 30], 41);
+        let widths = fit_columns(&compact, &[13, 10, 7, 6, 5, 30], 41, 0);
         assert_eq!(widths, [13, 8, 5, 6, 5, 4]);
         assert_eq!(widths.iter().sum::<u16>(), 41);
         // Hopelessly narrow: everything at its minimum, never panicking.
-        assert_eq!(fit_columns(&compact, &[23, 10, 7, 6, 5, 30], 0), [6, 4, 4, 6, 4, 4]);
+        assert_eq!(fit_columns(&compact, &[23, 10, 7, 6, 5, 30], 0, 0), [6, 4, 4, 6, 4, 4]);
     }
 }
 
@@ -915,7 +941,7 @@ mod properties {
             avail in 0u16..200,
         ) {
             let headings = ["KEY", "PROJECT", "QUEUE", "STATE", "MODEL", "TITLE"];
-            let widths = fit_columns(&headings, &wants, avail);
+            let widths = fit_columns(&headings, &wants, avail, 0);
             prop_assert_eq!(widths.len(), headings.len());
             // Each column can shrink to its minimum (TITLE to 4) but never grows past its want.
             let floor: u16 = headings
