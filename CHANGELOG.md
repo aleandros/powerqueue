@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-10-26
+
+### Fixed
+
+- The dashboard's KEY column tells GitHub tasks apart (#88). It shows
+  `repo#83` instead of `owner/repo#83`, adds the owner only when two owners
+  have a repository with the same name, and shortens a label that still does
+  not fit from the left or the middle (`…queue#83`), never cutting the issue
+  number. Column widths now follow their contents, and KEY is the last column
+  to shrink, so tasks stay distinguishable at 80 columns. The PROJECT column is
+  hidden when every task's project is its repository's name, and other cells
+  end with an ellipsis instead of being clipped. The selected-task pane, CLI
+  output and stored keys keep the full key.
+
 ## [0.23.0] - 2026-10-26
 
 ### Added
@@ -1181,7 +1195,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.23.1...HEAD
+[0.23.1]: https://github.com/aleandros/powerqueue/compare/v0.23.0...v0.23.1
 [0.23.0]: https://github.com/aleandros/powerqueue/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/aleandros/powerqueue/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/aleandros/powerqueue/compare/v0.20.1...v0.21.0

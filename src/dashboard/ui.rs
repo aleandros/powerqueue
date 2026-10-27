@@ -15,6 +15,7 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table
 use crate::domain::{Criticality, ModelTier, Provider, TaskState};
 
 use super::app::DashboardApp;
+use super::keys;
 
 /// Footer key legend (Unicode variant; see [`Symbols::keys`]).
 pub const KEYS: &str =
@@ -322,46 +323,141 @@ fn draw_header(frame: &mut Frame<'_>, app: &DashboardApp, area: Rect) {
     frame.render_widget(Paragraph::new(right), area);
 }
 
+/// Widest each table column grows, and how narrow it may get, by heading.
+/// TITLE takes whatever is left.
+const COLUMN_LIMITS: [(&str, u16, u16); 11] = [
+    ("KEY", 24, 6),
+    ("PROJECT", 12, 4),
+    ("QUEUE", 10, 4),
+    ("STATE", 15, 6),
+    ("CRIT", 8, 4),
+    ("MODEL", 12, 4),
+    ("WTOK", 6, 4),
+    ("CPU", 4, 3),
+    ("RSS", 8, 4),
+    ("AGE", 6, 3),
+    ("WAITING ON", 12, 4),
+];
+
+/// When the columns do not fit, shrink them in this order, each to its floor
+/// (`None` = the column's minimum), so KEY keeps its width the longest.
+const SHRINK_ORDER: [(&str, Option<u16>); 16] = [
+    ("TITLE", Some(10)),
+    ("WAITING ON", None),
+    ("QUEUE", Some(6)),
+    ("PROJECT", Some(8)),
+    ("AGE", None),
+    ("RSS", None),
+    ("WTOK", None),
+    ("CRIT", None),
+    ("MODEL", Some(6)),
+    ("KEY", Some(16)),
+    ("TITLE", Some(4)),
+    ("QUEUE", None),
+    ("PROJECT", None),
+    ("MODEL", None),
+    ("STATE", None),
+    ("KEY", None),
+];
+
+/// Column widths for `headings` whose widest cells are `wants`, filling
+/// exactly `avail` columns when possible: every column but the last (TITLE)
+/// gets its want up to its cap, TITLE gets the rest; when that does not fit,
+/// columns shrink in [`SHRINK_ORDER`].
+fn fit_columns(headings: &[&str], wants: &[u16], avail: u16) -> Vec<u16> {
+    let limits = |h: &str| COLUMN_LIMITS.iter().find(|(name, ..)| *name == h).map_or((u16::MAX, 0), |(_, cap, min)| (*cap, *min));
+    let last = headings.len().saturating_sub(1);
+    let mut widths: Vec<u16> = headings
+        .iter()
+        .zip(wants)
+        .enumerate()
+        .map(|(i, (h, want))| if i == last { 0 } else { (*want).min(limits(h).0) })
+        .collect();
+    let fixed: u16 = widths.iter().sum();
+    if let Some(title) = widths.get_mut(last) {
+        *title = avail.saturating_sub(fixed).max(10);
+    }
+    let mut excess = widths.iter().sum::<u16>().saturating_sub(avail);
+    for (heading, floor) in SHRINK_ORDER {
+        if excess == 0 {
+            break;
+        }
+        let Some(i) = headings.iter().position(|h| *h == heading) else { continue };
+        let floor = floor.unwrap_or(limits(heading).1);
+        let cut = widths[i].saturating_sub(floor).min(excess);
+        widths[i] -= cut;
+        excess -= cut;
+    }
+    widths
+}
+
 fn draw_table(frame: &mut Frame<'_>, app: &DashboardApp, area: Rect, sym: &Symbols) {
+    use unicode_width::UnicodeWidthStr;
     let rows = app.rows();
     let compact = area.width < 145;
-    let title_width = area.width.saturating_sub(if compact { 67 } else { 136 }).max(10);
-    let headings = if compact {
-        vec!["KEY", "PROJECT", "QUEUE", "STATE", "MODEL", "TITLE"]
-    } else {
-        vec!["KEY", "PROJECT", "QUEUE", "STATE", "CRIT", "MODEL", "WTOK", "CPU", "RSS", "AGE", "WAITING ON", "TITLE"]
-    };
-    let header = Row::new(headings.into_iter().map(|h| Cell::from(h).bold())).style(Style::default().fg(Color::DarkGray));
-    let body = rows.iter().map(|r| {
-        let mut cells = vec![
-            Cell::from(r.key.clone()),
-            Cell::from(r.execution_project.clone()),
-            Cell::from(r.queue.clone()),
-            Cell::from(r.state.as_str()).style(state_style(r.state)),
-        ];
-        if !compact {
-            cells.push(Cell::from(r.criticality.as_str()).style(criticality_style(r.criticality)));
-        }
-        cells.push(
-            Cell::from(r.model.as_ref().map_or("-", super::super::domain::ModelTier::as_str))
-                .style(model_style(r.model.as_ref())),
-        );
-        if !compact {
-            cells.extend([
-                Cell::from(r.tokens.clone()),
-                Cell::from(r.cpu.clone()),
-                Cell::from(r.rss.clone()),
-                Cell::from(r.age.clone()),
-                Cell::from(sym.truncate(&r.waiting, 12)).style(if r.waiting == "-" {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    state_style(TaskState::Blocked)
-                }),
-            ]);
-        }
-        let title = if r.deferred { format!("[deferred] {}", r.title) } else { r.title.clone() };
-        cells.push(Cell::from(sym.truncate(&title, usize::from(title_width))));
-        Row::new(cells)
+    // PROJECT only repeats KEY when every task's project is its repository's name.
+    let project = rows.is_empty() || !rows.iter().all(|r| r.project_in_key);
+    let mut headings = vec!["KEY"];
+    if project {
+        headings.push("PROJECT");
+    }
+    headings.extend(["QUEUE", "STATE"]);
+    if !compact {
+        headings.push("CRIT");
+    }
+    headings.push("MODEL");
+    if !compact {
+        headings.extend(["WTOK", "CPU", "RSS", "AGE", "WAITING ON"]);
+    }
+    headings.push("TITLE");
+    let cells: Vec<Vec<(String, Style)>> = rows
+        .iter()
+        .map(|r| {
+            let mut cells = vec![(r.label.clone(), Style::default())];
+            if project {
+                cells.push((r.execution_project.clone(), Style::default()));
+            }
+            cells.extend([(r.queue.clone(), Style::default()), (r.state.as_str().to_string(), state_style(r.state))]);
+            if !compact {
+                cells.push((r.criticality.as_str().to_string(), criticality_style(r.criticality)));
+            }
+            cells.push((r.model.as_ref().map_or("-", ModelTier::as_str).to_string(), model_style(r.model.as_ref())));
+            if !compact {
+                let waiting =
+                    if r.waiting == "-" { Style::default().fg(Color::DarkGray) } else { state_style(TaskState::Blocked) };
+                cells.extend([
+                    (r.tokens.clone(), Style::default()),
+                    (r.cpu.clone(), Style::default()),
+                    (r.rss.clone(), Style::default()),
+                    (r.age.clone(), Style::default()),
+                    (r.waiting.clone(), waiting),
+                ]);
+            }
+            let title = if r.deferred { format!("[deferred] {}", r.title) } else { r.title.clone() };
+            cells.push((title, Style::default()));
+            cells
+        })
+        .collect();
+    let wants: Vec<u16> = headings
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let widest = cells.iter().map(|row| row[i].0.width()).chain([h.width()]).max().unwrap_or(0);
+            u16::try_from(widest).unwrap_or(u16::MAX)
+        })
+        .collect();
+    // Inside the borders, minus the selection pointer and one space between columns.
+    let spacing = u16::try_from(headings.len().saturating_sub(1)).unwrap_or(u16::MAX);
+    let pointer = if rows.is_empty() { 0 } else { u16::try_from(sym.pointer.width()).unwrap_or(2) };
+    let avail = area.width.saturating_sub(2 + pointer + spacing);
+    let widths = fit_columns(&headings, &wants, avail);
+    let header = Row::new(headings.iter().map(|h| Cell::from(*h).bold())).style(Style::default().fg(Color::DarkGray));
+    let body = cells.into_iter().map(|row| {
+        Row::new(row.into_iter().zip(&widths).enumerate().map(|(i, ((text, style), width))| {
+            let width = usize::from(*width);
+            let text = if i == 0 { keys::fit_key(&text, width, sym.ellipsis) } else { sym.truncate(&text, width) };
+            Cell::from(text).style(style)
+        }))
     });
     let count = rows.len();
     let title = if app.filter_terminal { format!(" tasks ({count} open) ") } else { format!(" tasks ({count}, all) ") };
@@ -369,32 +465,7 @@ fn draw_table(frame: &mut Frame<'_>, app: &DashboardApp, area: Rect, sym: &Symbo
         Some(project) => format!("{title} project {project} "),
         None => title,
     };
-    let widths = if compact {
-        vec![
-            Constraint::Length(16),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(11),
-            Constraint::Length(12),
-            Constraint::Min(10),
-        ]
-    } else {
-        vec![
-            Constraint::Length(16),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(11),
-            Constraint::Length(8),
-            Constraint::Length(12),
-            Constraint::Length(6),
-            Constraint::Length(4),
-            Constraint::Length(8),
-            Constraint::Length(6),
-            Constraint::Length(12),
-            Constraint::Min(10),
-        ]
-    };
-    let table = Table::new(body, widths)
+    let table = Table::new(body, widths.iter().copied().map(Constraint::Length))
         .header(header)
         .block(sym.panel(title))
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
@@ -742,8 +813,9 @@ mod tests {
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text: String = terminal.backend().buffer().content().iter().map(ratatui::buffer::Cell::symbol).collect();
         let ours: String = text.chars().filter(|c| !c.is_ascii()).collect();
-        // The only non-ASCII characters on screen come from user data (the title).
-        assert_eq!(ours, "—", "{text}");
+        // The only non-ASCII characters on screen come from user data (the title,
+        // shown in the table and the detail pane).
+        assert_eq!(ours, "——", "{text}");
         assert!(text.contains("+-"), "ascii border: {text}");
         assert!(text.contains("* daemon not running"), "{text}");
         assert!(text.contains("> ENG-2"), "ascii pointer: {text}");
@@ -799,5 +871,54 @@ mod tests {
         assert_eq!(pacing_color(0.8, 0.5), Color::LightRed);
         assert_eq!(pacing_color(0.1, 0.5), Color::Blue);
         assert_eq!(pacing_color(0.5, 0.5), Color::Green);
+    }
+
+    #[test]
+    fn columns_fill_the_table_and_key_shrinks_last() {
+        let compact = ["KEY", "PROJECT", "QUEUE", "STATE", "MODEL", "TITLE"];
+        // Room to spare: every column gets its widest cell, TITLE the rest.
+        assert_eq!(fit_columns(&compact, &[13, 10, 7, 6, 5, 30], 80), [13, 10, 7, 6, 5, 39]);
+        // Caps apply even with room to spare.
+        assert_eq!(fit_columns(&compact, &[40, 10, 7, 6, 5, 30], 80)[0], 24);
+        // An 80-column terminal: TITLE, QUEUE and PROJECT give way before KEY.
+        let widths = fit_columns(&compact, &[13, 10, 7, 6, 5, 30], 41);
+        assert_eq!(widths, [13, 8, 5, 6, 5, 4]);
+        assert_eq!(widths.iter().sum::<u16>(), 41);
+        // Hopelessly narrow: everything at its minimum, never panicking.
+        assert_eq!(fit_columns(&compact, &[23, 10, 7, 6, 5, 30], 0), [6, 4, 4, 6, 4, 4]);
+    }
+}
+
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    proptest! {
+        #[test]
+        fn fitted_columns_fill_the_space_and_respect_limits(
+            wants in prop::collection::vec(0u16..40, 6),
+            avail in 0u16..200,
+        ) {
+            let headings = ["KEY", "PROJECT", "QUEUE", "STATE", "MODEL", "TITLE"];
+            let widths = fit_columns(&headings, &wants, avail);
+            prop_assert_eq!(widths.len(), headings.len());
+            // Each column can shrink to its minimum (TITLE to 4) but never grows past its want.
+            let floor: u16 = headings
+                .iter()
+                .zip(&wants)
+                .map(|(h, want)| match COLUMN_LIMITS.iter().find(|(n, ..)| n == h) {
+                    Some((_, cap, min)) => (*want).min(*cap).min(*min),
+                    None => 4,
+                })
+                .sum();
+            prop_assert_eq!(widths.iter().sum::<u16>(), avail.max(floor), "{:?} for {}", widths, avail);
+            for ((h, want), width) in headings.iter().zip(&wants).zip(&widths) {
+                if let Some((_, cap, _)) = COLUMN_LIMITS.iter().find(|(n, ..)| n == h) {
+                    prop_assert!(*width <= (*want).min(*cap), "{} got {} (want {})", h, width, want);
+                }
+            }
+        }
     }
 }

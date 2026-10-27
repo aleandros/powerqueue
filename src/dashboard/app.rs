@@ -218,8 +218,14 @@ pub fn provider_cooldowns(
 #[derive(Debug, Clone, PartialEq)]
 pub struct RowData {
     pub task_id: TaskId,
+    /// The stored key (`owner/repo#83`); the detail pane and CLI show this.
     pub key: String,
+    /// What the KEY column shows (see [`super::keys::KeyLabels`]).
+    pub label: String,
     pub execution_project: String,
+    /// The PROJECT cell repeats the KEY column: no project, or a GitHub task
+    /// whose repository has the project's name.
+    pub project_in_key: bool,
     pub queue: String,
     pub state: TaskState,
     pub deferred: bool,
@@ -241,6 +247,7 @@ pub struct RowData {
     reason = "Keep the existing rows_for flag interface during lint adoption; callers already supply named state predicates."
 )]
 pub fn rows_for(snapshot: &Snapshot, hide_terminal: bool, now: DateTime<Utc>) -> Vec<RowData> {
+    let labels = super::keys::KeyLabels::new(&snapshot.tasks);
     let mut tasks: Vec<Task> = snapshot.tasks.iter().filter(|t| !hide_terminal || !t.state.is_terminal()).cloned().collect();
     crate::cli::commands::status::sort_for_display(&mut tasks);
     tasks
@@ -255,7 +262,10 @@ pub fn rows_for(snapshot: &Snapshot, hide_terminal: bool, now: DateTime<Utc>) ->
             RowData {
                 task_id: t.id,
                 key: t.key.clone(),
+                label: labels.label(&t),
                 execution_project: t.execution_project.clone(),
+                project_in_key: t.execution_project.is_empty()
+                    || super::keys::github_repo(&t).is_some_and(|r| r.eq_ignore_ascii_case(&t.execution_project)),
                 queue: t.execution.as_ref().map_or_else(|| "default".into(), |e| e.queue.clone()),
                 state: t.state,
                 deferred: !t.deferral_allows(now),

@@ -65,6 +65,12 @@ Project filters on `status`, `task list` and `dashboard` affect only the task li
 | `task send <task> "message"` | type a message into the running session (refused for a headless session, which takes no input) |
 | `attach [<task>] [--print]` | open the task's tmux window; no task = the powerqueue session. A headless task (`claude.session_mode = "headless"`) has no window: `attach` says so and prints its log paths |
 
+The dashboard's task table shows GitHub keys as `repo#83`, with the owner only
+when two owners have a repository of the same name; a label that does not fit
+loses its start or middle, never the issue number. The PROJECT column is hidden
+when every task's project is its repository's name. The selected-task pane,
+`task show`, `status` and logs keep the full `owner/repo#83` key.
+
 In the dashboard, **P** opens the repository picker for unstarted work; arrows or
 `j`/`k` navigate, Enter selects, Escape cancels. Explicit routing mode opens the
 picker after adding an unassigned task.

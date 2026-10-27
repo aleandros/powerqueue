@@ -17,6 +17,7 @@
 //! frame into an in-memory buffer for `dashboard --once` and bug reports.
 
 pub mod app;
+pub mod keys;
 pub mod ui;
 
 pub use app::{Action, DashboardApp, RowData, Snapshot, rows_for};
@@ -451,5 +452,60 @@ mod tests {
         assert!(unicode.contains('┌'), "{unicode}");
         // Degenerate sizes are clamped, not panicking.
         assert_ne!(render_once(Snapshot::default(), Options::default(), 0, 0), "");
+    }
+
+    fn github_task(repository: &str, number: u64, project: &str, title: &str) -> Task {
+        let source = TaskSource::GitHub { repository: repository.into(), number, url: String::new() };
+        let mut t = Task::new(format!("{repository}#{number}"), title, source);
+        t.state = TaskState::Queued;
+        t.execution_project = project.into();
+        t
+    }
+
+    #[test]
+    fn render_once_tells_github_tasks_apart_at_80_columns() {
+        let tasks = vec![
+            github_task("aleandros/powerqueue", 83, "powerqueue", "Dashboard keys"),
+            github_task("aleandros/acerosvs", 83, "acerosvs", "Invoice export"),
+            github_task("aleandros/powerqueue", 84, "powerqueue", "Budget pacing"),
+        ];
+        let snapshot = Snapshot { tasks: tasks.clone(), max_concurrent: 2, ..Default::default() };
+        let text = render_once(snapshot, Options { ascii: true, ..Default::default() }, 80, 12);
+        // The table is the left 62% of the frame; the header line carries the clock.
+        let table: Vec<String> = text.lines().skip(1).take(5).map(|l| l.chars().take(50).collect()).collect();
+        assert_eq!(
+            table,
+            [
+                "+ tasks (3 open) --------------------------------+",
+                "|  KEY           QUEUE   STATE  MODEL TITLE      |",
+                "|> powerqueue#83 default queued -     Dashboar...|",
+                "|  acerosvs#83   default queued -     Invoice ...|",
+                "|  powerqueue#84 default queued -     Budget p...|",
+            ],
+            "{text}"
+        );
+        // Only the table is shortened: the selected task keeps its full key.
+        assert!(text.contains("|aleandros/powerqueue#83"), "{text}");
+        assert_eq!(tasks[0].key, "aleandros/powerqueue#83");
+
+        // Same repository name under two owners: the owner comes back. A project
+        // that is not the repository's name keeps the PROJECT column, and a
+        // narrow table cuts labels in the middle, never the number.
+        let mut tasks = tasks;
+        tasks.push(github_task("alice/powerqueue", 83, "fork", "Fork sync"));
+        let snapshot = Snapshot { tasks, max_concurrent: 2, ..Default::default() };
+        let text = render_once(snapshot, Options { ascii: true, ..Default::default() }, 80, 12);
+        let table: Vec<String> = text.lines().skip(2).take(5).map(|l| l.chars().take(50).collect()).collect();
+        assert_eq!(
+            table,
+            [
+                "|  KEY              PROJEC QUEU STATE  MODEL TITL|",
+                "|> alean...queue#83 pow... d... queued -     D...|",
+                "|  acerosvs#83      ace... d... queued -     I...|",
+                "|  alean...queue#84 pow... d... queued -     B...|",
+                "|  alice...queue#83 fork   d... queued -     F...|",
+            ],
+            "{text}"
+        );
     }
 }
