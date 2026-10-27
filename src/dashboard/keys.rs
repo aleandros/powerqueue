@@ -1,0 +1,255 @@
+//! Short task-key labels for the task table (display only).
+//!
+//! GitHub keys (`owner/repo#83`) share a long prefix, so a narrow column cut
+//! from the right shows the same owner on every row. The table shows
+//! `repo#83` instead, adds the owner only when two owners have a repository
+//! with the same name, and truncates from the left so the number stays
+//! visible. Stored keys, the detail pane and CLI output keep the full key.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::domain::{Task, TaskSource};
+
+/// Labels for one set of tasks; repository names are compared case-insensitively.
+#[derive(Debug, Clone, Default)]
+pub struct KeyLabels {
+    /// Lower-cased repository names that exist under more than one owner.
+    ambiguous: BTreeSet<String>,
+}
+
+impl KeyLabels {
+    /// Look at the GitHub tasks in `tasks` (the ones the table shows) to find
+    /// repository names that need their owner.
+    pub fn new(tasks: &[Task]) -> Self {
+        let mut owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for task in tasks {
+            if let TaskSource::GitHub { repository, .. } = &task.source {
+                let (owner, repo) = split_repository(repository);
+                owners.entry(repo.to_lowercase()).or_default().insert(owner.to_lowercase());
+            }
+        }
+        let ambiguous = owners.into_iter().filter(|(_, o)| o.len() > 1).map(|(repo, _)| repo).collect();
+        Self { ambiguous }
+    }
+
+    /// Table label for `task`: `repo#N` or `owner/repo#N` for GitHub issues,
+    /// the stored key for everything else.
+    pub fn label(&self, task: &Task) -> String {
+        match &task.source {
+            TaskSource::GitHub { repository, number, .. } => {
+                let (owner, repo) = split_repository(repository);
+                if owner.is_empty() || !self.ambiguous.contains(&repo.to_lowercase()) {
+                    format!("{repo}#{number}")
+                } else {
+                    format!("{owner}/{repo}#{number}")
+                }
+            }
+            TaskSource::Linear { .. } | TaskSource::Manual => task.key.clone(),
+        }
+    }
+}
+
+/// The repository name of a GitHub task, if `task` is one.
+pub fn github_repo(task: &Task) -> Option<&str> {
+    match &task.source {
+        TaskSource::GitHub { repository, .. } => Some(split_repository(repository).1),
+        TaskSource::Linear { .. } | TaskSource::Manual => None,
+    }
+}
+
+fn split_repository(repository: &str) -> (&str, &str) {
+    repository.split_once('/').unwrap_or(("", repository))
+}
+
+/// Fit `label` into `max` columns. A trailing `#N` is never cut: the part
+/// before it loses its start (`…queue#83`), or its middle when it names an
+/// owner (`al…/app#1`), and gets `ellipsis` in place of what was removed.
+/// Labels without `#N` are cut from the right. When even `#N` does not fit,
+/// it is returned whole and the column clips it.
+pub fn fit_key(label: &str, max: usize, ellipsis: &str) -> String {
+    if label.width() <= max {
+        return label.to_string();
+    }
+    let Some((prefix, number)) = label.rsplit_once('#').filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    else {
+        return truncate_right(label, max, ellipsis);
+    };
+    let suffix = format!("#{number}");
+    let budget = max.saturating_sub(suffix.width() + ellipsis.width());
+    if budget == 0 {
+        return if max >= suffix.width() + ellipsis.width() { format!("{ellipsis}{suffix}") } else { suffix };
+    }
+    let head = if prefix.contains('/') { budget / 2 } else { 0 };
+    let start = take_width(prefix.chars(), head);
+    let end: String = take_width(prefix.chars().rev(), budget - start.width()).chars().rev().collect();
+    format!("{start}{ellipsis}{end}{suffix}")
+}
+
+/// Fit a set of GitHub labels, retaining the differing part when ordinary
+/// truncation would make distinct labels identical (such as two fork owners).
+/// Identical full labels still share a display label.
+pub fn fit_labels(labels: &[&str], max: usize, ellipsis: &str) -> Vec<String> {
+    let mut fitted: Vec<_> = labels.iter().map(|label| fit_key(label, max, ellipsis)).collect();
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, label) in fitted.iter().enumerate() {
+        groups.entry(label.clone()).or_default().push(i);
+    }
+    // Reserve even labels outside a collision group, so a replacement cannot
+    // introduce a new collision with an otherwise distinct row.
+    let mut used: BTreeSet<String> = fitted.iter().cloned().collect();
+    for group in groups.values().filter(|group| group.len() > 1) {
+        let distinct: BTreeSet<_> = group.iter().map(|&i| labels[i]).collect();
+        let Some(first) = distinct.first() else { continue };
+        let shared =
+            distinct.iter().map(|label| first.chars().zip(label.chars()).take_while(|(a, b)| a == b).count()).min().unwrap_or(0);
+        // Sorting full labels makes the choice independent of row ordering.
+        for label in distinct.iter().skip(1) {
+            let Some(replacement) = unused_label(label, shared, max, ellipsis, &used) else { continue };
+            used.insert(replacement.clone());
+            for &i in group.iter().filter(|&&i| labels[i] == *label) {
+                fitted[i].clone_from(&replacement);
+            }
+        }
+    }
+    fitted
+}
+
+/// Prefer the first differing part, then try other windows if that would still
+/// collide. Each candidate keeps the number and marks omitted repository text.
+fn unused_label(label: &str, shared: usize, max: usize, ellipsis: &str, used: &BTreeSet<String>) -> Option<String> {
+    let (prefix, number) = label.rsplit_once('#')?;
+    let suffix = format!("#{number}");
+    for start in std::iter::once(shared).chain(0..prefix.chars().count()) {
+        let leading = if start == 0 { "" } else { ellipsis };
+        let budget = max.saturating_sub(leading.width() + ellipsis.width() + suffix.width());
+        if budget == 0 {
+            continue;
+        }
+        let distinct = take_width(prefix.chars().skip(start), budget);
+        let candidate = format!("{leading}{distinct}{ellipsis}{suffix}");
+        if !used.contains(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn truncate_right(s: &str, max: usize, ellipsis: &str) -> String {
+    let mut out = take_width(s.chars(), max.saturating_sub(ellipsis.width()));
+    out.push_str(ellipsis);
+    out
+}
+
+/// The longest run of `chars` (in order) that fits in `width` columns.
+fn take_width(chars: impl Iterator<Item = char>, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in chars {
+        let w = ch.width().unwrap_or(0);
+        if used + w > width {
+            break;
+        }
+        used += w;
+        out.push(ch);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn github(repository: &str, number: u64) -> Task {
+        let source = TaskSource::GitHub { repository: repository.into(), number, url: String::new() };
+        Task::new(format!("{repository}#{number}"), "t", source)
+    }
+
+    #[test]
+    fn owner_is_dropped_unless_two_owners_share_a_repo_name() {
+        let tasks = vec![
+            github("aleandros/powerqueue", 83),
+            github("aleandros/acerosvs", 83),
+            github("alice/app", 1),
+            github("Bob/App", 2),
+        ];
+        let labels = KeyLabels::new(&tasks);
+        let got: Vec<_> = tasks.iter().map(|t| labels.label(t)).collect();
+        assert_eq!(got, ["powerqueue#83", "acerosvs#83", "alice/app#1", "Bob/App#2"]);
+        let manual = Task::new("ENG-7", "t", TaskSource::Manual);
+        assert_eq!(labels.label(&manual), "ENG-7");
+        assert_eq!(github_repo(&tasks[0]), Some("powerqueue"));
+        assert_eq!(github_repo(&manual), None);
+    }
+
+    #[test]
+    fn fitted_collisions_retain_the_differing_part() {
+        for labels in
+            [["alice-dev/powerqueue#83", "alice-prod/powerqueue#83"], ["web-infrastructure#83", "api-infrastructure#83"]]
+        {
+            for ellipsis in ["…", "..."] {
+                let fitted = fit_labels(&labels, 16, ellipsis);
+                assert_ne!(fitted[0], fitted[1]);
+                assert!(fitted.iter().all(|label| label.width() <= 16 && label.ends_with("#83")));
+            }
+        }
+        assert_eq!(fit_labels(&["app#1", "app#1"], 16, "…"), ["app#1", "app#1"]);
+    }
+
+    #[test]
+    fn collision_replacements_are_unique_across_the_whole_set_and_order_independent() {
+        let labels = [
+            "api-production-east-infrastructure#83",
+            "api-production-west-infrastructure#83",
+            "web-production-infrastructure#83",
+            "api-produc...#83",
+            "web-produc...#83",
+        ];
+        let fitted = fit_labels(&labels, 16, "...");
+        assert_eq!(fitted.iter().collect::<BTreeSet<_>>().len(), labels.len());
+        assert!(fitted.iter().all(|label| label.width() <= 16 && label.ends_with("#83")));
+        let reversed: Vec<_> = labels.iter().copied().rev().collect();
+        assert_eq!(fit_labels(&reversed, 16, "..."), fitted.into_iter().rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn fitting_keeps_the_issue_number() {
+        assert_eq!(fit_key("powerqueue#83", 13, "…"), "powerqueue#83");
+        assert_eq!(fit_key("powerqueue#83", 9, "…"), "…queue#83");
+        assert_eq!(fit_key("powerqueue#83", 9, "..."), "...eue#83");
+        assert_eq!(fit_key("alice/app#1", 8, "…"), "al…app#1");
+        assert_eq!(fit_key("powerqueue#83", 4, "…"), "…#83");
+        assert_eq!(fit_key("powerqueue#12345", 4, "…"), "#12345");
+        assert_eq!(fit_key("LONG-KEY-123", 6, "…"), "LONG-…");
+        assert_eq!(fit_key("note#draft", 6, "…"), "note#…");
+    }
+}
+
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    proptest! {
+        #[test]
+        fn fitted_github_labels_fit_and_keep_the_number(
+            owner in "[a-z]{0,12}",
+            repo in "[a-z-]{1,24}",
+            number in 1u64..100_000,
+            max in 0usize..30,
+            ascii in any::<bool>(),
+        ) {
+            let ellipsis = if ascii { "..." } else { "…" };
+            let label = if owner.is_empty() { format!("{repo}#{number}") } else { format!("{owner}/{repo}#{number}") };
+            let fitted = fit_key(&label, max, ellipsis);
+            let suffix = format!("#{number}");
+            prop_assert!(fitted.ends_with(&suffix), "{fitted:?} lost {suffix}");
+            prop_assert!(fitted.width() <= max.max(suffix.width()), "{fitted:?} wider than {max}");
+            if label.width() <= max {
+                prop_assert_eq!(fitted, label);
+            }
+        }
+    }
+}

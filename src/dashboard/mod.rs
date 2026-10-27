@@ -17,6 +17,7 @@
 //! frame into an in-memory buffer for `dashboard --once` and bug reports.
 
 pub mod app;
+pub mod keys;
 pub mod ui;
 
 pub use app::{Action, DashboardApp, RowData, Snapshot, rows_for};
@@ -451,5 +452,158 @@ mod tests {
         assert!(unicode.contains('┌'), "{unicode}");
         // Degenerate sizes are clamped, not panicking.
         assert_ne!(render_once(Snapshot::default(), Options::default(), 0, 0), "");
+    }
+
+    fn github_task(repository: &str, number: u64, project: &str, title: &str) -> Task {
+        let source = TaskSource::GitHub { repository: repository.into(), number, url: String::new() };
+        let mut t = Task::new(format!("{repository}#{number}"), title, source);
+        t.state = TaskState::Queued;
+        t.execution_project = project.into();
+        t
+    }
+
+    #[test]
+    fn render_once_tells_github_tasks_apart_at_80_columns() {
+        let tasks = vec![
+            github_task("aleandros/powerqueue", 83, "powerqueue", "Dashboard keys"),
+            github_task("aleandros/acerosvs", 83, "acerosvs", "Invoice export"),
+            github_task("aleandros/powerqueue", 84, "powerqueue", "Budget pacing"),
+        ];
+        // A hidden (cancelled) task from another owner does not bring owners back.
+        let mut cancelled = github_task("alice/powerqueue", 5, "fork", "Old fork");
+        cancelled.state = TaskState::Cancelled;
+        let shown = [tasks.clone(), vec![cancelled]].concat();
+        let snapshot = Snapshot { tasks: shown, max_concurrent: 2, ..Default::default() };
+        let text = render_once(snapshot, Options { ascii: true, ..Default::default() }, 80, 12);
+        // The table is the left 62% of the frame; the header line carries the clock.
+        let table: Vec<String> = text.lines().skip(1).take(5).map(|l| l.chars().take(50).collect()).collect();
+        assert_eq!(
+            table,
+            [
+                "+ tasks (3 open) --------------------------------+",
+                "|  KEY           QUEUE   STATE  MODEL TITLE      |",
+                "|> powerqueue#83 default queued -     Dashboar...|",
+                "|  acerosvs#83   default queued -     Invoice ...|",
+                "|  powerqueue#84 default queued -     Budget p...|",
+            ],
+            "{text}"
+        );
+        // Only the table is shortened: the selected task keeps its full key.
+        assert!(text.contains("|aleandros/powerqueue#83"), "{text}");
+        assert_eq!(tasks[0].key, "aleandros/powerqueue#83");
+        // An unrouted task (empty project) keeps the PROJECT column visible.
+        let mut unrouted = tasks.clone();
+        unrouted[1].execution_project.clear();
+        let text = render_once(
+            Snapshot { tasks: unrouted, max_concurrent: 2, ..Default::default() },
+            Options { ascii: true, ..Default::default() },
+            80,
+            12,
+        );
+        assert!(text.lines().nth(2).is_some_and(|l| l.contains("PROJECT")), "{text}");
+
+        // Same repository name under two owners: the owner comes back. A project
+        // that is not the repository's name keeps the PROJECT column, and a
+        // narrow table cuts labels in the middle, never the number.
+        let mut tasks = tasks;
+        tasks.push(github_task("alice/powerqueue", 83, "fork", "Fork sync"));
+        let snapshot = Snapshot { tasks, max_concurrent: 2, ..Default::default() };
+        let text = render_once(snapshot, Options { ascii: true, ..Default::default() }, 80, 12);
+        let table: Vec<String> = text.lines().skip(2).take(5).map(|l| l.chars().take(50).collect()).collect();
+        assert_eq!(
+            table,
+            [
+                "|  KEY              PROJEC QUEU STATE  MODEL TITL|",
+                "|> alean...queue#83 pow... d... queued -     D...|",
+                "|  acerosvs#83      ace... d... queued -     I...|",
+                "|  alean...queue#84 pow... d... queued -     B...|",
+                "|  alice...queue#83 fork   d... queued -     F...|",
+            ],
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn render_once_preserves_long_issue_numbers_and_manual_prefixes() {
+        let mut github = github_task("owner/long-repository-name", 123_456_789, "execution-project", "GitHub issue");
+        github.state = TaskState::NeedsAttention;
+        let manual = Task::new("MANUAL-long-key#987654321", "Manual task", TaskSource::Manual);
+        let text = render_once(
+            Snapshot { tasks: vec![github, manual], ..Default::default() },
+            Options { ascii: true, ..Default::default() },
+            80,
+            12,
+        );
+        let table: Vec<String> = text.lines().skip(3).take(2).map(|line| line.chars().take(50).collect()).collect();
+        assert!(table.iter().any(|line| line.contains("#123456789")), "{text}");
+        assert!(table.iter().any(|line| line.contains("MANUAL-")), "{text}");
+        assert!(!table.iter().any(|line| line.contains("#987654321")), "manual keys retain right clipping: {text}");
+    }
+
+    #[test]
+    fn project_filter_removes_unneeded_owners() {
+        let snapshot = Snapshot {
+            tasks: vec![github_task("alice/app", 83, "app", "Visible"), github_task("bob/app", 83, "fork", "Hidden")],
+            ..Default::default()
+        };
+        let mut app = DashboardApp::new(snapshot.clone());
+        assert_eq!(app.rows()[0].label, "alice/app#83");
+        app.project_filter = Some("app".into());
+        assert_eq!(app.rows()[0].label, "app#83");
+        let text = render_once(snapshot, Options { ascii: true, project: Some("app".into()) }, 80, 12);
+        let row: String = text.lines().nth(3).unwrap().chars().take(50).collect();
+        assert!(row.contains("app#83") && !row.contains("alice/"), "{text}");
+        assert!(text.contains("alice/app#83"), "detail preserves full key: {text}");
+    }
+
+    #[test]
+    fn render_once_disambiguates_colliding_truncated_names() {
+        for repositories in
+            [["alice-dev/powerqueue", "alice-prod/powerqueue"], ["owner/web-infrastructure", "owner/api-infrastructure"]]
+        {
+            for ascii in [true, false] {
+                let tasks = repositories.iter().map(|repo| github_task(repo, 83, "execution", "Same title")).collect();
+                let text = render_once(Snapshot { tasks, ..Default::default() }, Options { ascii, ..Default::default() }, 80, 12);
+                let rows: Vec<String> =
+                    text.lines().skip(3).take(2).map(|line| line.chars().skip(3).take(16).collect()).collect();
+                assert_ne!(rows[0], rows[1], "{text}");
+                assert!(rows.iter().all(|row| row.contains("#83")), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn render_once_keeps_every_issue_digit_when_metadata_must_shrink() {
+        for width in [60, 80] {
+            for number in [1_234_567, u64::MAX] {
+                let task = github_task("owner/repo", number, "different-project", "Long issue number");
+                let text = render_once(
+                    Snapshot { tasks: vec![task], ..Default::default() },
+                    Options { ascii: true, ..Default::default() },
+                    width,
+                    12,
+                );
+                let table_width = (usize::from(width) * 62 + 50) / 100;
+                let row: String = text.lines().nth(3).unwrap().chars().take(table_width).collect();
+                assert!(row.contains(&format!("#{number}")), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn render_once_disambiguates_three_repositories_with_shared_prefixes_and_suffixes() {
+        let repositories = [
+            "owner/api-production-east-infrastructure",
+            "owner/api-production-west-infrastructure",
+            "owner/web-production-infrastructure",
+        ];
+        for ascii in [true, false] {
+            let tasks = repositories.iter().map(|repo| github_task(repo, 83, "execution", "Same title")).collect();
+            let text = render_once(Snapshot { tasks, ..Default::default() }, Options { ascii, ..Default::default() }, 80, 12);
+            let keys: std::collections::BTreeSet<String> =
+                text.lines().skip(3).take(3).map(|line| line.chars().skip(3).take(16).collect()).collect();
+            assert_eq!(keys.len(), 3, "{text}");
+            assert!(keys.iter().all(|key| key.contains("#83")), "{text}");
+        }
     }
 }
