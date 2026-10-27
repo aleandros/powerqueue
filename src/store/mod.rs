@@ -473,6 +473,48 @@ impl Store {
         Ok(task)
     }
 
+    /// Atomically apply `task mode` ([`crate::scheduler::commands::on_set_session_mode`]
+    /// under `cfg`, the task's project configuration) to the latest row and
+    /// log its events. Only `session_mode_override` and `session_mode`
+    /// change, so a concurrent start claim or lifecycle write survives (and a
+    /// claim that read the row before this write is refused: it checks the
+    /// override). Fails if the task is absent or persistence fails.
+    pub fn set_task_session_mode(
+        &self,
+        id: TaskId,
+        mode: Option<crate::config::ClaudeSessionMode>,
+        cfg: &crate::config::Config,
+    ) -> Result<Task> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut task = tx
+            .query_row(&format!("SELECT {} FROM tasks WHERE id=?1", Self::TASK_COLS), params![id.to_string()], Self::row_to_task)
+            .context("load task for session mode")?;
+        let effects = crate::scheduler::commands::on_set_session_mode(&mut task, mode, cfg);
+        if !effects.is_empty() {
+            task.updated_at = Utc::now();
+            tx.execute(
+                "UPDATE tasks SET session_mode_override=?2, session_mode=?3, updated_at=?4 WHERE id=?1",
+                params![
+                    id.to_string(),
+                    task.session_mode_override.map(|m| m.as_str()),
+                    task.session_mode.as_ref().map(json),
+                    ts(&task.updated_at)
+                ],
+            )?;
+            for effect in effects {
+                if let crate::scheduler::transitions::Effect::Log { level, kind, message, data } = effect {
+                    tx.execute(
+                        "INSERT INTO events (task_id, timestamp, level, kind, message, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![id.to_string(), ts(&task.updated_at), level.as_str(), kind, message, json(&data)],
+                    )?;
+                }
+            }
+        }
+        tx.commit().context("persist task session mode and audit event")?;
+        Ok(task)
+    }
+
     /// Atomically change an unstarted task's execution project. Refuses if a
     /// daemon started it or another command changed its assignment meanwhile.
     /// The explicit assignment and routing cache change; task state and source data are preserved.
@@ -714,7 +756,7 @@ impl Store {
              WHERE id=?1 AND execution_project=?2 AND state=?3 AND attempts=?4
              AND github_admission IS ?10 AND title=?11 AND description=?12
              AND routing IS ?16 AND labels=?17 AND project IS ?18 AND source=?19 AND deferral IS ?21 AND project_assignment IS ?22
-             AND blocked_by=?23 AND children=?24",
+             AND blocked_by=?23 AND children=?24 AND session_mode_override IS ?26",
                 params![
                     before.id.to_string(),
                     before.execution_project,
@@ -740,7 +782,8 @@ impl Store {
                     before.project_assignment.as_ref().map(json),
                     json(&before.blocked_by),
                     json(&before.children),
-                    starting.session_mode.as_ref().map(json)
+                    starting.session_mode.as_ref().map(json),
+                    before.session_mode_override.map(|m| m.as_str())
                 ],
             )
             .context("claim task start in its execution project")?;
@@ -2349,6 +2392,53 @@ mod tests {
         store.insert_task(&fresh).unwrap();
         let read = store.get_task(fresh.id).unwrap().unwrap();
         assert_eq!((read.session_mode_override, read.session_mode), (fresh.session_mode_override, fresh.session_mode));
+    }
+
+    /// `task mode` writes only its two columns, logs once, and a start claim
+    /// that read the row before it is refused, so the next start honours it.
+    #[test]
+    fn task_mode_is_a_targeted_write_that_supersedes_a_stale_claim() {
+        use crate::config::ClaudeSessionMode;
+        let store = Store::open_in_memory().unwrap();
+        let cfg = crate::execution::tests::mode_config();
+        let mut task = Task::new("ENG-16", "chore", crate::domain::TaskSource::Manual);
+        task.labels = vec!["chore".into()];
+        store.insert_task(&task).unwrap();
+        let before = store.get_task(task.id).unwrap().unwrap();
+
+        // A lifecycle field changed elsewhere survives the write.
+        let mut moved = before.clone();
+        moved.score = 42.0;
+        store.update_task(&moved).unwrap();
+        let after = store.set_task_session_mode(task.id, Some(ClaudeSessionMode::Interactive), &cfg).unwrap();
+        let read = store.get_task(task.id).unwrap().unwrap();
+        assert_eq!((read.score, read.session_mode_override), (42.0, Some(ClaudeSessionMode::Interactive)));
+        assert_eq!(read.session_mode, after.session_mode);
+        let logged = |store: &Store| {
+            store.events_for_task(task.id, 50).unwrap().iter().filter(|e| e.kind == "task.session_mode_override").count()
+        };
+        assert_eq!(logged(&store), 1);
+        // The same command again (the daemon draining it) changes and logs nothing.
+        store.set_task_session_mode(task.id, Some(ClaudeSessionMode::Interactive), &cfg).unwrap();
+        assert_eq!(logged(&store), 1);
+
+        // A daemon that picked the task before the command cannot claim it with
+        // the mode it chose from the stale row.
+        let mut stale = before;
+        stale.score = 42.0;
+        let mut starting = stale.clone();
+        starting.state = TaskState::Starting;
+        starting.attempts = 1;
+        starting.session_mode = Some(cfg.session_mode_for(&stale));
+        assert_eq!(starting.session_mode.as_ref().map(|m| m.mode), Some(ClaudeSessionMode::Headless));
+        assert!(!store.claim_task_start(&stale, &starting).unwrap(), "a claim from before `task mode` is refused");
+        let fresh = store.get_task(task.id).unwrap().unwrap();
+        let mut starting = fresh.clone();
+        starting.state = TaskState::Starting;
+        starting.attempts = 1;
+        starting.session_mode = Some(cfg.session_mode_for(&fresh));
+        assert!(store.claim_task_start(&fresh, &starting).unwrap());
+        assert_eq!(store.get_task(task.id).unwrap().unwrap().session_mode.map(|m| m.mode), Some(ClaudeSessionMode::Interactive));
     }
 
     /// The v1 schema as `powerqueue` 0.1.0 created it (no `agent_session_id`,

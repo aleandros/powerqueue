@@ -222,12 +222,14 @@ enum Op {
     SetModel(Option<ModelTier>),
     /// `task mode <interactive|headless|auto>`.
     SetSessionMode(Option<ClaudeSessionMode>),
-    /// A configuration reload changes `claude.session_mode` and whether a
-    /// `claude.session_mode_rules` row matches the task (the world's business,
-    /// like `Tick`).
+    /// A configuration reload changes `claude.session_mode`, whether a
+    /// `claude.session_mode_rules` row matches the task and whether
+    /// `claude.session_mode_overrides` names it (the world's business, like
+    /// `Tick`).
     ReloadSessionModes {
         default: ClaudeSessionMode,
         rule: Option<ClaudeSessionMode>,
+        keyed: Option<ClaudeSessionMode>,
     },
     SetProject(String),
     Defer(Option<crate::deferral::Deferral>),
@@ -338,7 +340,8 @@ fn op() -> impl Strategy<Value = Op> {
         21 => launch_op(),
         41 => task_op(),
         4 => (1i64..3 * 3600).prop_map(Op::Tick),
-        2 => (session_mode(), prop::option::of(session_mode())).prop_map(|(default, rule)| Op::ReloadSessionModes { default, rule }),
+        2 => (session_mode(), prop::option::of(session_mode()), prop::option::of(session_mode()))
+            .prop_map(|(default, rule, keyed)| Op::ReloadSessionModes { default, rule, keyed }),
     ]
 }
 
@@ -1001,8 +1004,9 @@ proptest! {
                 now += Duration::seconds(*secs);
                 continue;
             }
-            if let Op::ReloadSessionModes { default, rule } = op {
+            if let Op::ReloadSessionModes { default, rule, keyed } = op {
                 cfg.claude.session_mode = *default;
+                cfg.claude.session_mode_overrides = keyed.iter().map(|m| (world.task.key.to_ascii_uppercase(), *m)).collect();
                 cfg.claude.session_mode_rules = rule
                     .iter()
                     .map(|mode| crate::execution::SessionModeRule {

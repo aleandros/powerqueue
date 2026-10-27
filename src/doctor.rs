@@ -1794,7 +1794,9 @@ fn check_headless_attention(store: &Store) -> CheckResult {
     };
     let waiting: Vec<String> = tasks
         .iter()
-        .filter(|t| t.state == TaskState::NeedsAttention && t.session_mode_override.is_none())
+        .filter(|t| {
+            t.state == TaskState::NeedsAttention && t.session_mode_override != Some(crate::config::ClaudeSessionMode::Interactive)
+        })
         .filter(|t| store.latest_session(t.id).ok().flatten().is_some_and(|s| s.is_headless()))
         .map(|t| t.key.clone())
         .collect();

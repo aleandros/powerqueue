@@ -13,9 +13,10 @@ use crate::config::Config;
 use crate::domain::{Criticality, Event, ModelTier, Provider, ResourceSample, Session, Task, TaskId, TaskSource, TaskState};
 use crate::store::Store;
 
-/// [`Snapshot::session_modes`]: frozen modes as they are; the others from
-/// each project's configuration (resolved once per project; the global
-/// configuration when a project does not resolve).
+/// [`Snapshot::session_modes`]: [`Config::session_mode_for`] under each
+/// task's project configuration (resolved once per project and refresh, only
+/// for tasks with no frozen mode; the global configuration when a project
+/// does not resolve).
 fn session_modes(cfg: &Config, tasks: &[Task]) -> BTreeMap<TaskId, crate::execution::SessionModeChoice> {
     let paths = crate::paths::Paths::resolve();
     let mut projects: BTreeMap<&str, Config> = BTreeMap::new();
@@ -23,10 +24,11 @@ fn session_modes(cfg: &Config, tasks: &[Task]) -> BTreeMap<TaskId, crate::execut
     for task in tasks.iter().filter(|t| !t.state.is_terminal()) {
         let choice = match &task.session_mode {
             Some(frozen) => frozen.clone(),
+            None if cfg.projects.is_empty() => cfg.session_mode_for(task),
             None => projects
                 .entry(task.execution_project.as_str())
                 .or_insert_with(|| cfg.for_project(&task.execution_project, &paths).unwrap_or_else(|_| cfg.clone()))
-                .resolve_session_mode(task),
+                .session_mode_for(task),
         };
         out.insert(task.id, choice);
     }

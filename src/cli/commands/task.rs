@@ -1030,17 +1030,13 @@ pub fn run(ctx: &mut Context, cmd: TaskCommand) -> Result<i32> {
         TaskCommand::Mode { task, mode } => {
             let mode = parse_session_mode_arg(&mode)?;
             let store = ctx.store()?.clone();
-            let mut t = find_task(&store, &task.task)?;
-            store.enqueue_command(&DaemonCommand::SetSessionMode { task_id: t.id, mode })?;
+            let found = find_task(&store, &task.task)?;
             let cfg = ctx.config_or_default()?.clone();
-            let cfg = cfg.for_task(&t, &ctx.paths).unwrap_or(cfg);
-            let effects = commands::on_set_session_mode(&mut t, mode, &cfg);
-            store.update_task(&t)?;
-            for effect in effects {
-                if let Effect::Log { level, kind, message, data } = effect {
-                    store.log_event(Some(t.id), None, level, &kind, &message, data)?;
-                }
-            }
+            let cfg = cfg.for_task(&found, &ctx.paths).unwrap_or(cfg);
+            // Applied here (two columns, atomically); the queued command lets a
+            // daemon holding an older snapshot apply it again, a no-op then.
+            let t = store.set_task_session_mode(found.id, mode, &cfg)?;
+            store.enqueue_command(&DaemonCommand::SetSessionMode { task_id: t.id, mode })?;
             let live = store.latest_session(t.id)?.is_some_and(|s| s.state.is_live());
             if ctx.json {
                 println!("{}", serde_json::json!({ "ok": true, "key": t.key, "mode": mode, "live_session": live }));
@@ -1058,11 +1054,16 @@ pub fn run(ctx: &mut Context, cmd: TaskCommand) -> Result<i32> {
             if live {
                 println!("  its current session keeps running in its mode until it ends");
             }
-            if matches!(t.state, TaskState::NeedsAttention | TaskState::Failed | TaskState::Crashed) {
-                println!(
-                    "  `powerqueue task resume {0}` continues the stopped session, `powerqueue task retry {0}` starts over",
+            match t.state {
+                TaskState::NeedsAttention | TaskState::Paused => println!(
+                    "  `powerqueue task resume {0}` continues its session in the new mode; `powerqueue task retry {0}` starts over",
                     t.key
-                );
+                ),
+                TaskState::Failed | TaskState::Cancelled | TaskState::Completed => {
+                    println!("  `powerqueue task retry {}` runs it again in the new mode", t.key);
+                }
+                TaskState::Crashed => println!("  its relaunch after the backoff runs in the new mode"),
+                _ => {}
             }
             Ok(0)
         }

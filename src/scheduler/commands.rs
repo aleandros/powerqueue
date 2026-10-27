@@ -481,12 +481,17 @@ pub fn on_set_model(task: &mut Task, model: Option<ModelTier>) -> Vec<Effect> {
 /// gets its mode chosen again now under `cfg` (its project's configuration):
 /// the override, or with `auto` the rules. One that has not started chooses
 /// at its first start. A live session keeps running in its mode until it
-/// ends; the next start uses the new one. Nothing else changes.
+/// ends; the next start uses the new one. Nothing else changes, and a
+/// command that changes nothing (the CLI already applied it, the daemon
+/// drains it later) returns no effects.
 pub fn on_set_session_mode(task: &mut Task, mode: Option<ClaudeSessionMode>, cfg: &Config) -> Vec<Effect> {
     let previous = task.session_mode.take();
-    task.session_mode_override = mode;
+    let previous_override = std::mem::replace(&mut task.session_mode_override, mode);
     if task.attempts > 0 || task.started_at.is_some() {
         task.session_mode = Some(cfg.resolve_session_mode(task));
+    }
+    if previous_override == mode && previous == task.session_mode {
+        return Vec::new();
     }
     let msg = match (mode, &task.session_mode) {
         (Some(m), _) => format!("session mode forced to {m} from the next start"),
@@ -925,11 +930,19 @@ mod properties {
             if let Some(mode) = mode {
                 prop_assert_eq!(cfg.session_mode_for(&t).mode, mode);
             }
+            let changed = t.session_mode_override != task.session_mode_override || t.session_mode != task.session_mode;
+            let mut again = t.clone();
+            prop_assert!(on_set_session_mode(&mut again, mode, &cfg).is_empty(), "a repeated command logs nothing");
+            prop_assert_eq!(&again, &t);
             t.session_mode_override = task.session_mode_override;
             t.session_mode.clone_from(&task.session_mode);
             prop_assert_eq!(&t, &task);
             prop_assert_eq!(session.task_id, task.id);
-            prop_assert!(matches!(&effects[..], [Effect::Log { kind, .. }] if kind == "task.session_mode_override"), "{:?}", effects);
+            if changed {
+                prop_assert!(matches!(&effects[..], [Effect::Log { kind, .. }] if kind == "task.session_mode_override"), "{:?}", effects);
+            } else {
+                prop_assert!(effects.is_empty(), "{:?}", effects);
+            }
         }
 
         /// `task model` only records the override and logs it.

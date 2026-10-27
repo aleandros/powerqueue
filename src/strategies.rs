@@ -69,7 +69,6 @@ pub(crate) fn session_state() -> impl Strategy<Value = SessionState> {
     ])
 }
 
-/// Where a session runs: mostly tmux, sometimes headless.
 /// A session-mode configuration: a default, at most one rule on a label the
 /// generated tasks may carry (`label` from [`word`]) and at most one
 /// override for a generated key.
@@ -100,6 +99,7 @@ pub(crate) fn session_mode() -> impl Strategy<Value = crate::config::ClaudeSessi
     prop::sample::select(vec![crate::config::ClaudeSessionMode::Interactive, crate::config::ClaudeSessionMode::Headless])
 }
 
+/// Where a session runs: mostly tmux, sometimes headless.
 pub(crate) fn session_runtime() -> impl Strategy<Value = SessionRuntime> {
     prop::bool::weighted(0.25).prop_map(|headless| if headless { SessionRuntime::Headless } else { SessionRuntime::Tmux })
 }
