@@ -20,9 +20,8 @@ pub struct KeyLabels {
 }
 
 impl KeyLabels {
-    /// Look at every GitHub task in `tasks` (visible or not, so labels do not
-    /// change when a filter hides a row) to find repository names that need
-    /// their owner.
+    /// Look at the GitHub tasks in `tasks` (the ones the table shows) to find
+    /// repository names that need their owner.
     pub fn new(tasks: &[Task]) -> Self {
         let mut owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for task in tasks {

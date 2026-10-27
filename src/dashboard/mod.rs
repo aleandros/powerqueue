@@ -469,7 +469,11 @@ mod tests {
             github_task("aleandros/acerosvs", 83, "acerosvs", "Invoice export"),
             github_task("aleandros/powerqueue", 84, "powerqueue", "Budget pacing"),
         ];
-        let snapshot = Snapshot { tasks: tasks.clone(), max_concurrent: 2, ..Default::default() };
+        // A hidden (cancelled) task from another owner does not bring owners back.
+        let mut cancelled = github_task("alice/powerqueue", 5, "fork", "Old fork");
+        cancelled.state = TaskState::Cancelled;
+        let shown = [tasks.clone(), vec![cancelled]].concat();
+        let snapshot = Snapshot { tasks: shown, max_concurrent: 2, ..Default::default() };
         let text = render_once(snapshot, Options { ascii: true, ..Default::default() }, 80, 12);
         // The table is the left 62% of the frame; the header line carries the clock.
         let table: Vec<String> = text.lines().skip(1).take(5).map(|l| l.chars().take(50).collect()).collect();
@@ -487,6 +491,16 @@ mod tests {
         // Only the table is shortened: the selected task keeps its full key.
         assert!(text.contains("|aleandros/powerqueue#83"), "{text}");
         assert_eq!(tasks[0].key, "aleandros/powerqueue#83");
+        // An unrouted task (empty project) keeps the PROJECT column visible.
+        let mut unrouted = tasks.clone();
+        unrouted[1].execution_project.clear();
+        let text = render_once(
+            Snapshot { tasks: unrouted, max_concurrent: 2, ..Default::default() },
+            Options { ascii: true, ..Default::default() },
+            80,
+            12,
+        );
+        assert!(text.lines().nth(2).is_some_and(|l| l.contains("PROJECT")), "{text}");
 
         // Same repository name under two owners: the owner comes back. A project
         // that is not the repository's name keeps the PROJECT column, and a

@@ -373,11 +373,11 @@ fn fit_columns(headings: &[&str], wants: &[u16], avail: u16) -> Vec<u16> {
         .enumerate()
         .map(|(i, (h, want))| if i == last { 0 } else { (*want).min(limits(h).0) })
         .collect();
-    let fixed: u16 = widths.iter().sum();
+    let fixed = widths.iter().fold(0u16, |sum, w| sum.saturating_add(*w));
     if let Some(title) = widths.get_mut(last) {
         *title = avail.saturating_sub(fixed).max(10);
     }
-    let mut excess = widths.iter().sum::<u16>().saturating_sub(avail);
+    let mut excess = widths.iter().fold(0u16, |sum, w| sum.saturating_add(*w)).saturating_sub(avail);
     for (heading, floor) in SHRINK_ORDER {
         if excess == 0 {
             break;
