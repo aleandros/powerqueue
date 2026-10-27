@@ -755,6 +755,13 @@ impl Daemon {
                 let effects = commands::on_set_model(&mut task, model.clone());
                 self.commit(&before, &mut task, None, effects).await?;
             }
+            DaemonCommand::SetSessionMode { task_id, mode } => {
+                let mut task = self.require_task(*task_id)?;
+                let before = task.clone();
+                let cfg = self.cfg.for_task(&task, &self.paths).unwrap_or_else(|_| self.cfg.clone());
+                let effects = commands::on_set_session_mode(&mut task, *mode, &cfg);
+                self.commit(&before, &mut task, None, effects).await?;
+            }
             DaemonCommand::SyncNow => self.rt.force_sync = true,
             DaemonCommand::Reload => {
                 self.reload_config()?;

@@ -532,7 +532,7 @@ impl Launcher {
             self_bin: powerqueue_bin,
         };
         let launch = agent.prepare(&ctx).with_context(|| format!("prepare {provider} launch for {}", task.key))?;
-        let runtime = cfg.session_runtime(provider);
+        let runtime = cfg.session_runtime_for(task, provider);
         let headless = (runtime == SessionRuntime::Headless).then(|| HeadlessFiles::new(&task_dir, session_id, attempt));
         if let Some(files) = &headless {
             files.reset()?;
@@ -714,13 +714,13 @@ impl Launcher {
     /// last element is the prompt, expressed as the shell snippet
     /// `$(cat '<prompt_path>')` so the script (and a human re-running it)
     /// reads the prompt from disk. Everything in between is a literal
-    /// argument. With `claude.session_mode = "headless"` the program is
+    /// argument. When the task runs headless ([`Config::session_runtime_for`]) the program is
     /// followed by [`crate::session::headless::HEADLESS_FLAGS`]. Fails when
     /// `claude.binary` does not parse.
     pub fn claude_command(ctx: &LaunchContext<'_>, settings_path: &Path) -> Result<Vec<String>> {
         let c = &ctx.cfg.claude;
         let mut argv = crate::session::binary::launch_argv(&c.binary, ctx).context("claude.binary")?;
-        if ctx.cfg.session_runtime(Provider::Claude) == SessionRuntime::Headless {
+        if ctx.cfg.session_runtime_for(ctx.task, Provider::Claude) == SessionRuntime::Headless {
             argv.extend(crate::session::headless::HEADLESS_FLAGS.iter().map(std::string::ToString::to_string));
         }
         argv.push(if ctx.resume.is_some() { "--resume" } else { "--session-id" }.to_string());
@@ -1204,6 +1204,41 @@ mod tests {
         let script = std::fs::read_to_string(&plan.script_path).unwrap();
         assert!(script.lines().last().unwrap().starts_with("exec "), "{script}");
         assert!(!script.contains("stream-json"));
+    }
+
+    /// The task's own mode decides, not `claude.session_mode`: a rule routes
+    /// a chore headless under an interactive default, and a mode frozen
+    /// interactive stays in tmux after the default turns headless.
+    #[test]
+    fn the_task_mode_decides_the_runtime() {
+        use crate::config::ClaudeSessionMode::{Headless, Interactive};
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = Launcher {
+            paths: Paths::rooted(dir.path()),
+            tmux: Tmux::new("tmux", None),
+            self_bin: PathBuf::from("/bin/powerqueue"),
+        };
+        let mut cfg = config();
+        cfg.claude.session_mode_rules = crate::execution::tests::mode_config().claude.session_mode_rules;
+        let mut t = task();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        t.worktree_path = Some(wt.to_string_lossy().to_string());
+        t.labels = vec!["chore".into()];
+        let sid = uuid::Uuid::new_v4();
+        let plan = launcher.prepare(&cfg, &t, sid, &ModelTier::sonnet(), 1, false, None).unwrap();
+        assert_eq!(plan.runtime, SessionRuntime::Headless);
+        assert!(std::fs::read_to_string(&plan.script_path).unwrap().contains(" -p --output-format stream-json"));
+        // Other providers ignore the mode.
+        let plan = launcher.prepare(&cfg, &t, sid, &ModelTier::new("gpt-6.1-sol"), 1, false, None).unwrap();
+        assert_eq!(plan.runtime, SessionRuntime::Tmux);
+
+        t.session_mode =
+            Some(crate::execution::SessionModeChoice { mode: Interactive, source: crate::execution::SessionModeSource::Default });
+        cfg.claude.session_mode = Headless;
+        let plan = launcher.prepare(&cfg, &t, sid, &ModelTier::sonnet(), 2, true, None).unwrap();
+        assert_eq!((plan.runtime, plan.headless), (SessionRuntime::Tmux, None));
+        assert!(!std::fs::read_to_string(&plan.script_path).unwrap().contains("stream-json"));
     }
 
     #[test]

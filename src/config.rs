@@ -736,6 +736,18 @@ impl ClaudeSessionMode {
     }
 }
 
+impl std::str::FromStr for ClaudeSessionMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "interactive" => Ok(ClaudeSessionMode::Interactive),
+            "headless" => Ok(ClaudeSessionMode::Headless),
+            other => Err(format!("unknown session mode `{other}`; expected interactive or headless")),
+        }
+    }
+}
+
 impl std::fmt::Display for ClaudeSessionMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
@@ -757,6 +769,15 @@ pub struct ClaudeConfig {
     /// -p --output-format stream-json` as a background process whose output
     /// goes to `<task dir>/headless/`; it cannot be attached to.
     pub session_mode: ClaudeSessionMode,
+    /// Per-task session mode by the task's fields
+    /// (`[[claude.session_mode_rules]]`: `mode` plus `all = [...]`
+    /// predicates in the `priority.toml` syntax). The first matching row
+    /// wins; a task no row matches uses `session_mode`. See
+    /// [`crate::execution::SessionModeRule`].
+    pub session_mode_rules: Vec<crate::execution::SessionModeRule>,
+    /// Task key → session mode (`[claude.session_mode_overrides]`,
+    /// case-insensitive keys); beats every rule.
+    pub session_mode_overrides: BTreeMap<String, ClaudeSessionMode>,
     /// The session runs where the daemon's `powerqueue` binary cannot (a
     /// container): write a shell shim to `<task dir>/bin/powerqueue` and
     /// route the hooks, the status line and `powerqueue task complete|block`
@@ -791,6 +812,8 @@ impl Default for ClaudeConfig {
         Self {
             binary: "claude".to_string(),
             session_mode: ClaudeSessionMode::Interactive,
+            session_mode_rules: Vec::new(),
+            session_mode_overrides: BTreeMap::new(),
             shim: false,
             permission_mode: "acceptEdits".to_string(),
             effort: None,
@@ -1560,6 +1583,7 @@ pub struct CleanupOverrides {
 #[serde(default, deny_unknown_fields)]
 pub struct ClaudeOverrides {
     pub session_mode: Option<ClaudeSessionMode>,
+    pub session_mode_rules: Option<Vec<crate::execution::SessionModeRule>>,
     pub permission_mode: Option<String>,
     pub effort: Option<String>,
     pub extra_args: Option<Vec<String>>,
@@ -1920,6 +1944,7 @@ impl Config {
         }
         if let Some(c) = ov.claude {
             take!(self.claude.session_mode, c.session_mode, "claude.session_mode");
+            take!(self.claude.session_mode_rules, c.session_mode_rules, "claude.session_mode_rules");
             take!(self.claude.permission_mode, c.permission_mode, "claude.permission_mode");
             take!(self.claude.effort, c.effort.map(Some), "claude.effort");
             take!(self.claude.extra_args, c.extra_args, "claude.extra_args");
@@ -2093,8 +2118,9 @@ impl Config {
         }
     }
 
-    /// Where sessions of `provider` run: headless only for Claude with
-    /// `claude.session_mode = "headless"`; every other provider uses tmux.
+    /// Where sessions of `provider` run by default: headless only for Claude
+    /// with `claude.session_mode = "headless"`; every other provider uses
+    /// tmux. A task's own mode ([`Config::session_runtime_for`]) can differ.
     pub fn session_runtime(&self, provider: Provider) -> crate::domain::SessionRuntime {
         match (provider, self.claude.session_mode) {
             (Provider::Claude, ClaudeSessionMode::Headless) => crate::domain::SessionRuntime::Headless,
@@ -2162,6 +2188,7 @@ impl Config {
             ));
         }
         problems.extend(self.execution_problems());
+        problems.extend(self.session_mode_problems());
         if self.scheduler.max_concurrent == 0 {
             problems.push("scheduler.max_concurrent must be >= 1".to_string());
         }

@@ -45,9 +45,11 @@ lifecycle, with hooks and completion commands delivered through the task inbox.
    `exec`s `claude --session-id <uuid> --model <tier> --permission-mode <mode> --settings settings.json --name <key> …`
    with the prompt (read from `prompt.md`) as the last argument, so it is the
    first message. The session is interactive, so `powerqueue attach` drops
-   you into it at any time. With `claude.session_mode = "headless"` there is
-   no window: `sh launch.sh` runs `claude -p --output-format stream-json
-   --verbose …` in the background instead (see [Headless sessions](#headless-sessions)).
+   you into it at any time. When the task runs headless (`claude.session_mode
+   = "headless"`, or a `claude.session_mode_rules` row or `task mode` chose it
+   for this task) there is no window: `sh launch.sh` runs `claude -p
+   --output-format stream-json --verbose …` in the background instead (see
+   [Headless sessions](#headless-sessions)).
 6. Hooks (`SessionStart`, `Stop`, `StopFailure`, `SessionEnd`, `Notification`,
    `PreCompact`, `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`) call `powerqueue hook`, which stores the
    payload in SQLite. The daemon drains these, tails the transcript JSONL for
@@ -101,7 +103,14 @@ with your own Markdown (see [`[prompt]`](configuration.md#prompt)); `powerqueue 
 
 ## Headless sessions
 
-With `claude.session_mode = "headless"` (see
+Each task's mode is chosen when it first starts: `task mode`, then
+`claude.session_mode_overrides`, then the first matching
+`claude.session_mode_rules` row, then `claude.session_mode` (see
+[choosing the mode per task](configuration.md#choosing-the-mode-per-task)).
+The choice and its reason are recorded on the task and kept by every later
+attempt, so a crashed headless task resumes headless and a configuration
+reload never flips a started task; only `task mode` changes it, from the next
+start. In headless mode (see
 [configuration](configuration.md#headless-sessions)) a Claude Code attempt is
 one `claude -p` run. Its process leads its own process group; the daemon
 records the pid on the session row (`tmux_window` stays empty) and reads the
@@ -153,6 +162,12 @@ and `powerqueue task send` refuses. Questions and permission prompts cannot be
 answered mid-run; permission requests are denied (`session.permission_denied`
 events, counted by `doctor`). Keep headless mode for tasks that can run
 unattended.
+
+To take over a headless task that needs attention, move it to a window:
+`powerqueue task mode <task> interactive`, then `powerqueue task resume
+<task>` continues the same session (`claude --resume <session id>`) in tmux,
+where `attach` works; `task retry` starts over instead. `doctor` lists headless
+tasks waiting on a human.
 
 ## Review (pull requests)
 
@@ -227,7 +242,10 @@ powerqueue task send ENG-123 "Use the v2 endpoint, then finish."
 powerqueue attach ENG-123                   # interact with permission dialogs
 ```
 
-Use `task send` for text replies and `attach` for permission menus. The daemon
+Use `task send` for text replies and `attach` for permission menus. A
+headless task has no window to answer in: answer on the issue, or run
+`powerqueue task mode ENG-123 interactive` and `task resume ENG-123` to
+continue its session in a window you can attach to. The daemon
 clears attention after it observes resumed activity, not merely when text is
 sent. `task resume` remains available for explicitly resuming a task.
 
