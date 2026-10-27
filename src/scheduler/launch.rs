@@ -293,7 +293,9 @@ pub struct Start {
 /// The policy chose `model` for the task: it goes `starting` on that model,
 /// and the branch, worktree path and attempt number of this try are settled
 /// (not yet on the task: [`claim`] puts them there before the shell atomically
-/// persists the start). `resuming_with_prompt` says a review round or a relayed
+/// persists the start). The task's session mode is frozen here on its first
+/// start ([`Config::session_mode_for`]) and kept by every later attempt.
+/// `resuming_with_prompt` says a review round or a relayed
 /// answer is about to be resumed, which un-parks a review watch (`task
 /// retry` of a task parked with its rounds used up). `root` is the worktree
 /// root directory. Returns `None` without mutation when source approval is missing.
@@ -316,6 +318,8 @@ pub fn on_starting(
         let execution = cfg.execution_for(task).ok()?;
         task.execution = Some(execution);
     }
+    let mode = cfg.session_mode_for(task);
+    task.session_mode = Some(mode.clone());
     let attempt = task.attempts + 1;
     if resuming_with_prompt && let Some(watch) = task.review.as_mut() {
         watch.parked = false;
@@ -333,10 +337,16 @@ pub fn on_starting(
     let effects = vec![Effect::log(
         EventLevel::Info,
         "task.starting",
-        format!("starting attempt {attempt} with {model}"),
-        serde_json::json!({ "model": model, "attempt": attempt, "reasons": decision.reasons, "prediction": decision.prediction, "execution": task.execution }),
+        format!("starting attempt {attempt} with {model}{}", runtime_note(&mode, model)),
+        serde_json::json!({ "model": model, "attempt": attempt, "reasons": decision.reasons, "prediction": decision.prediction, "execution": task.execution, "session_mode": mode }),
     )];
     Some(Start { branch, worktree, attempt, effects })
+}
+
+/// `, headless (<why>)` / `, interactive (<why>)` for a Claude model; other
+/// providers always run in tmux, so nothing.
+fn runtime_note(mode: &crate::execution::SessionModeChoice, model: &ModelTier) -> String {
+    if model.provider() == crate::domain::Provider::Claude { format!(", {mode}") } else { String::new() }
 }
 
 /// Whether a setup result still belongs to the current claimed attempt.
@@ -875,7 +885,7 @@ mod tests {
         assert!(start.worktree.starts_with(root));
         assert_eq!((t.attempts, t.branch.as_deref(), t.worktree_path.as_deref()), (0, None, None), "settled, not yet claimed");
         assert!(
-            matches!(&start.effects[..], [Effect::Log { kind, message, .. }] if kind == "task.starting" && message == "starting attempt 1 with opus")
+            matches!(&start.effects[..], [Effect::Log { kind, message, .. }] if kind == "task.starting" && message == "starting attempt 1 with opus, interactive (claude.session_mode default)")
         );
         claim(&mut t, &start);
         assert_eq!(t.attempts, 1);
@@ -1194,8 +1204,9 @@ mod properties {
 
         /// Starting is two-phase: `on_starting` settles the attempt without
         /// touching the task's bookkeeping (only the state, the model, the
-        /// retry time that is now over and, when resuming, the parking
-        /// flag); `claim` puts it on the task.
+        /// retry time that is now over, the session mode chosen on the first
+        /// start and, when resuming, the parking flag); `claim` puts it on
+        /// the task.
         #[test]
         fn starting_settles_then_claims(
             task in task_among(&[TaskState::Queued, TaskState::Crashed, TaskState::Throttled]),
@@ -1230,6 +1241,8 @@ mod properties {
             normalised.state = task.state;
             normalised.model = task.model.clone();
             normalised.not_before = task.not_before;
+            prop_assert_eq!(normalised.session_mode.take(), Some(cfg.session_mode_for(&task)));
+            normalised.session_mode.clone_from(&task.session_mode);
             if let (Some(w), Some(before)) = (normalised.review.as_mut(), task.review.as_ref()) {
                 prop_assert!(!w.parked || !resuming, "resuming un-parks the watch");
                 prop_assert!(w.parked == before.parked || resuming, "the parking flag only moves when resuming");
@@ -1241,6 +1254,37 @@ mod properties {
             prop_assert_eq!(t.attempts, task.attempts + 1);
             prop_assert_eq!(t.branch.as_deref(), Some(start.branch.as_str()));
             prop_assert_eq!(t.worktree_path.clone(), Some(start.worktree.display().to_string()));
+        }
+
+        /// The session mode is chosen on the first start by the rules as they
+        /// are then (`task mode` > override > rule > default) and kept by
+        /// every later start, whatever the configuration says by then.
+        #[test]
+        fn first_start_freezes_the_session_mode(
+            task in task_among(&[TaskState::Queued, TaskState::Crashed, TaskState::Throttled]),
+            model in model(),
+            decision in decision(),
+            first in session_mode_config(),
+            reloaded in session_mode_config(),
+        ) {
+            let root = Path::new("/wt");
+            let mut t = task;
+            t.session_mode = None;
+            t.blocked_by.clear();
+            t.children.clear();
+            let expected = first.session_mode_for(&t);
+            on_starting(&mut t, &model, &decision, &first, root, false).expect("approved, waiting on nothing");
+            prop_assert_eq!(t.session_mode.as_ref(), Some(&expected));
+            if let Some(mode) = t.session_mode_override {
+                prop_assert_eq!(expected.mode, mode, "`task mode` beats every rule");
+            }
+            let headless = model.provider() == crate::domain::Provider::Claude
+                && expected.mode == crate::config::ClaudeSessionMode::Headless;
+            prop_assert_eq!(reloaded.session_runtime_for(&t, model.provider()) == crate::domain::SessionRuntime::Headless, headless);
+            // A crash and a relaunch under a reloaded configuration keep it.
+            t.state = TaskState::Crashed;
+            on_starting(&mut t, &model, &decision, &reloaded, root, false).expect("still approved");
+            prop_assert_eq!(t.session_mode, Some(expected));
         }
 
         /// Throttling sets the retry time from the decision and logs once.

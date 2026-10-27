@@ -876,6 +876,8 @@ mod tests {
                 model: None,
                 policy: String::new(),
                 would_start_now: true,
+                session_mode: Config::default().session_mode_for(&t),
+                session_mode_frozen: false,
                 reasons: vec!["matched rule at line 2".into()],
             }],
         };

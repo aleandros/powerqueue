@@ -70,7 +70,7 @@ use proptest::prelude::*;
 use proptest::test_runner::Config as ProptestConfig;
 
 use crate::budget::{Decision, Estimator, Ledgers, RateLimitState, WINDOW_RECHECK};
-use crate::config::{Config, SchedulerConfig};
+use crate::config::{ClaudeSessionMode, Config, SchedulerConfig};
 use crate::domain::{
     Criticality, LinkedIssue, ModelTier, Session, SessionRuntime, SessionState, Task, TaskId, TaskSource, TaskState,
 };
@@ -220,6 +220,17 @@ enum Op {
     Cancel,
     Retry,
     SetModel(Option<ModelTier>),
+    /// `task mode <interactive|headless|auto>`.
+    SetSessionMode(Option<ClaudeSessionMode>),
+    /// A configuration reload changes `claude.session_mode`, whether a
+    /// `claude.session_mode_rules` row matches the task and whether
+    /// `claude.session_mode_overrides` names it (the world's business, like
+    /// `Tick`).
+    ReloadSessionModes {
+        default: ClaudeSessionMode,
+        rule: Option<ClaudeSessionMode>,
+        keyed: Option<ClaudeSessionMode>,
+    },
     SetProject(String),
     Defer(Option<crate::deferral::Deferral>),
     SourceDeferral(String),
@@ -304,6 +315,7 @@ fn task_op() -> impl Strategy<Value = Op> {
         1 => Just(Op::Cancel),
         3 => Just(Op::Retry),
         1 => prop::option::of(claude_model()).prop_map(Op::SetModel),
+        1 => prop::option::of(session_mode()).prop_map(Op::SetSessionMode),
         4 => execution_project().prop_map(Op::SetProject),
         2 => any::<bool>().prop_map(|changed| Op::CheckBinding { changed }),
         8 => hook_outcome().prop_map(Op::Hook),
@@ -328,6 +340,8 @@ fn op() -> impl Strategy<Value = Op> {
         21 => launch_op(),
         41 => task_op(),
         4 => (1i64..3 * 3600).prop_map(Op::Tick),
+        2 => (session_mode(), prop::option::of(session_mode()), prop::option::of(session_mode()))
+            .prop_map(|(default, rule, keyed)| Op::ReloadSessionModes { default, rule, keyed }),
     ]
 }
 
@@ -428,6 +442,7 @@ impl TaskWorld {
             Op::Cancel => Some(commands::on_cancel(&mut self.task, self.session.as_mut(), now)),
             Op::Retry => Some(commands::on_retry(&mut self.task, self.session.as_mut(), now)),
             Op::SetModel(m) => Some(commands::on_set_model(&mut self.task, m.clone())),
+            Op::SetSessionMode(mode) => Some(commands::on_set_session_mode(&mut self.task, *mode, cfg)),
             Op::SetProject(project) => {
                 Some(commands::on_set_project(&mut self.task, project, self.session.is_some()).unwrap_or_default())
             }
@@ -484,7 +499,7 @@ impl TaskWorld {
                 let (id, resume, agent_session_id) = launch::resume_plan(self.session.as_ref(), &model, true, review);
                 let resumed_stopped =
                     resume && self.session.as_ref().is_some_and(|p| p.id == id && p.state == SessionState::Stopped);
-                let runtime = cfg.session_runtime(model.provider());
+                let runtime = cfg.session_runtime_for(&self.task, model.provider());
                 let headless = runtime == SessionRuntime::Headless;
                 let session = Session {
                     id,
@@ -606,7 +621,7 @@ impl TaskWorld {
                     self.task.children.iter().map(|c| LinkedIssue { state_type: "completed".into(), ..c.clone() }).collect();
                 Some(transitions::on_container_closed(&mut self.task, &children, now))
             }
-            Op::Tick(_) => None,
+            Op::Tick(_) | Op::ReloadSessionModes { .. } => None,
         }
     }
 
@@ -851,6 +866,40 @@ fn check(
         prop_assert_eq!(previous.id, launched.id, "{}", ctx("a crashed or stopped session was not resumed"));
     }
 
+    // Session mode: chosen on the first start (`on_starting`), then kept by
+    // every attempt and configuration reload; only `task mode` chooses again
+    // (now for a started task, else at the first start). A launched Claude
+    // session runs in it.
+    if let Op::SetSessionMode(mode) = op {
+        let mut expected = b.clone();
+        expected.session_mode_override = *mode;
+        expected.session_mode = None;
+        if b.attempts > 0 || b.started_at.is_some() {
+            expected.session_mode = Some(cfg.resolve_session_mode(&expected));
+        }
+        prop_assert_eq!(a, &expected, "{}", ctx("`task mode` changed more than the override"));
+        prop_assert_eq!(&before.session, &after.session, "{}", ctx("`task mode` touched the session"));
+    } else if b.session_mode.is_some() {
+        prop_assert_eq!(&a.session_mode, &b.session_mode, "{}", ctx("the frozen session mode changed"));
+    }
+    if matches!(op, Op::Start(..)) {
+        let choice = a.session_mode.as_ref();
+        prop_assert!(choice.is_some(), "{}", ctx("started without choosing a session mode"));
+        if b.session_mode.is_none() {
+            prop_assert_eq!(choice, Some(&cfg.session_mode_for(b)), "{}", ctx("first start did not follow the rules"));
+        }
+        if let Some(mode) = b.session_mode_override {
+            prop_assert_eq!(choice.map(|c| c.mode), Some(mode), "{}", ctx("`task mode` override lost to a rule"));
+        }
+    }
+    if let (Op::Launched { .. }, Some(s)) = (op, &after.session)
+        && after.session_live()
+    {
+        let headless = s.model.provider() == crate::domain::Provider::Claude
+            && a.session_mode.as_ref().is_some_and(|m| m.mode == ClaudeSessionMode::Headless);
+        prop_assert_eq!(s.is_headless(), headless, "{}", ctx("session runtime differs from the task's session mode"));
+    }
+
     // Backoff and retry times only while crashed or throttled.
     if a.not_before.is_some() {
         prop_assert!(matches!(a.state, TaskState::Crashed | TaskState::Throttled), "{}", ctx("not_before set"));
@@ -953,6 +1002,22 @@ proptest! {
         for (step, op) in ops.iter().enumerate() {
             if let Op::Tick(secs) = op {
                 now += Duration::seconds(*secs);
+                continue;
+            }
+            if let Op::ReloadSessionModes { default, rule, keyed } = op {
+                cfg.claude.session_mode = *default;
+                cfg.claude.session_mode_overrides = keyed.iter().map(|m| (world.task.key.to_ascii_uppercase(), *m)).collect();
+                cfg.claude.session_mode_rules = rule
+                    .iter()
+                    .map(|mode| crate::execution::SessionModeRule {
+                        mode: *mode,
+                        all: vec![crate::priority::Predicate {
+                            field: "key".into(),
+                            op: crate::priority::policy::Operator::Matches,
+                            value: crate::priority::policy::Value::Text(".".into()),
+                        }],
+                    })
+                    .collect();
                 continue;
             }
             let before = world.clone();

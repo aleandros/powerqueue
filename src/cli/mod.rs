@@ -333,6 +333,14 @@ pub enum TaskCommand {
         /// warns when that provider is disabled in config
         model: String,
     },
+    /// Force how the task's Claude Code sessions run from its next start (interactive | headless),
+    /// or clear the override with `auto`; beats `claude.session_mode_rules` and overrides.
+    Mode {
+        #[command(flatten)]
+        task: TaskRef,
+        /// interactive | headless | auto
+        mode: String,
+    },
     /// Print the prompt the next attempt would receive (renders `prompt.template`; nothing is launched).
     Prompt(TaskRef),
     /// Print the last screen of the task's tmux pane.

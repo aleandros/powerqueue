@@ -641,7 +641,9 @@ without it the session has no way to tell powerqueue it is done.
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `binary` | `"claude"` | the command that runs Claude Code: a program, or a command line with leading arguments and per-task placeholders (`{key}`, `{slug}`, `{task_id}`, `{session_id}`, `{worktree}`, `{task_dir}`, `{repo}`, `{attempt}`, `{model}`), e.g. `"docker exec -it --env-file {task_dir}/env -w {worktree} pq-{slug} claude"`; see [Running sessions in containers](containers.md) |
-| `session_mode` | `"interactive"` | `interactive`: Claude Code runs in a tmux window you can attach to. `headless`: `claude -p --output-format stream-json --verbose` runs as a background process with no window; see [Headless sessions](#headless-sessions) |
+| `session_mode` | `"interactive"` | `interactive`: Claude Code runs in a tmux window you can attach to. `headless`: `claude -p --output-format stream-json --verbose` runs as a background process with no window; see [Headless sessions](#headless-sessions). The default for tasks no `session_mode_rules` row matches |
+| `session_mode_rules` | `[]` | `[[claude.session_mode_rules]]` rows, each a `mode` and `all = [...]` predicates; the first matching row picks a task's mode; see [Choosing the mode per task](#choosing-the-mode-per-task) |
+| `session_mode_overrides` | `{}` | `[claude.session_mode_overrides]`: task key → mode (keys are case-insensitive); beats every rule |
 | `shim` | `false` | the session runs where the daemon's `powerqueue` binary cannot (a container): hooks, the status line and `powerqueue task complete\|block` go through a shell shim at `<task dir>/bin/powerqueue` and the task inbox the daemon drains |
 | `permission_mode` | `"acceptEdits"` | `--permission-mode`; `auto` is the unattended choice, `bypassPermissions` never asks at all |
 | `effort` | none | `--effort` value |
@@ -727,6 +729,74 @@ Use headless mode for work that can run unattended. A repository can opt in
 or out with `[claude] session_mode` in `.powerqueue.toml`. `claude.binary`
 must not ask for a terminal (`docker exec -t`/`-it`): a headless session has
 none, and `doctor` warns about it.
+
+### Choosing the mode per task
+
+Small, well-defined tasks can run headless while ambiguous or exploratory
+ones stay interactive so you can attach. `[[claude.session_mode_rules]]` picks
+the mode from the task's fields with the same predicates as `priority.toml`
+(`all = [{ field, op, value }]`; fields `label`, `priority`, `estimate`,
+`project`, `cycle`, `cycle_number`, `team`, `title`, `description`, `source`,
+`key`, `repository`; ops `eq`, `ne`, `matches`, `gt`, `lt`; see
+[priority rules](priority.md)). Every predicate of a row must hold; the
+**first matching row wins**, so put the interactive exceptions first:
+
+```toml
+[claude]
+session_mode = "interactive"          # tasks no rule matches
+permission_mode = "auto"              # headless runs cannot answer prompts
+
+# Exploratory work stays interactive, even when it is small or a chore.
+[[claude.session_mode_rules]]
+mode = "interactive"
+all = [{ field = "label", op = "matches", value = "^(spike|design|needs-decision)$" }]
+
+# Chores, docs and dependency bumps run headless.
+[[claude.session_mode_rules]]
+mode = "headless"
+all = [{ field = "label", op = "matches", value = "^(chore|docs|deps)$" }]
+
+# So does anything estimated at 2 points or less (estimate < 3).
+[[claude.session_mode_rules]]
+mode = "headless"
+all = [{ field = "estimate", op = "lt", value = 3 }]
+
+# One task, whatever the rules say.
+[claude.session_mode_overrides]
+"ENG-123" = "interactive"
+```
+
+Precedence, highest first:
+
+1. `powerqueue task mode <task> interactive|headless` (`auto` clears it);
+2. the task's key in `[claude.session_mode_overrides]`;
+3. the first matching `[[claude.session_mode_rules]]` row;
+4. `claude.session_mode`.
+
+The mode is chosen when the task **first starts** and recorded on the task
+with the reason (event `task.starting`), then kept for every later attempt:
+a crashed headless task resumes headless, a review round runs in the same
+mode, and a configuration reload never flips a started task. Only `task mode`
+changes it, from the task's next start: a running session keeps its mode
+until it ends. The mode applies to Claude Code sessions only; Codex and
+Antigravity always run in tmux.
+
+A headless task that blocks or asks a question goes to `needs_attention`
+with its session stopped. To take it over in a window, switch it and resume:
+
+```sh
+powerqueue task mode ENG-123 interactive
+powerqueue task resume ENG-123    # continues the same session in tmux; `task retry` starts over
+powerqueue attach ENG-123
+```
+
+`powerqueue doctor` lists headless tasks waiting on a human with this advice.
+`priority simulate` (a `mode` column; `--reasons` prints the full reason),
+`task show`, `task explain` and the dashboard show each task's mode and what
+chose it, or what its first start would choose. `config validate` lists the
+rules and rejects unknown modes, invalid predicates and duplicate override
+keys. A repository's `.powerqueue.toml` may replace the list with its own
+`[claude] session_mode_rules`; `session_mode_overrides` stays global.
 
 ## `[codex]`
 
@@ -1014,7 +1084,7 @@ review_rounds_max = 5
 remove_worktree = false     # also: push_branch, delete_branch, keep_failed, run, close_tmux_window
 
 [claude]
-permission_mode = "plan"    # also: session_mode, effort, extra_args, allowed_tools, append_system_prompt
+permission_mode = "plan"    # also: session_mode, session_mode_rules, effort, extra_args, allowed_tools, append_system_prompt
 
 [codex]
 approval = "on-request"     # also: reasoning_effort, extra_args

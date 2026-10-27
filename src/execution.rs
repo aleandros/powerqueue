@@ -6,8 +6,8 @@ use std::path::{Component, Path};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
-use crate::domain::Task;
+use crate::config::{ClaudeSessionMode, Config};
+use crate::domain::{Provider, SessionRuntime, Task};
 use crate::priority::{Predicate, policy::predicates, rules::condition_matches};
 
 /// A dedicated pool of execution slots. `default` receives unmatched tasks.
@@ -92,6 +92,137 @@ impl Task {
     /// Persisted lifecycle policy; legacy tasks retain standard completion behavior.
     pub fn leaves_ticket_open(&self) -> bool {
         self.execution.as_ref().is_some_and(Execution::leaves_ticket_open)
+    }
+}
+
+/// One `[[claude.session_mode_rules]]` row: tasks matching every predicate
+/// in `all` run their Claude Code sessions in `mode`. First match wins.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionModeRule {
+    pub mode: ClaudeSessionMode,
+    pub all: Vec<Predicate>,
+}
+
+/// Why a task runs in its session mode, most specific first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionModeSource {
+    /// `powerqueue task mode <task> <mode>`.
+    Command,
+    /// The task's key in `[claude.session_mode_overrides]`.
+    Override,
+    /// The first matching `[[claude.session_mode_rules]]` row (0-based) and
+    /// its predicates as written.
+    Rule { index: usize, conditions: String },
+    /// No override or rule: `claude.session_mode`.
+    Default,
+}
+
+impl std::fmt::Display for SessionModeSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Command => f.write_str("`task mode` override"),
+            Self::Override => f.write_str("claude.session_mode_overrides"),
+            Self::Rule { index, conditions } => write!(f, "claude.session_mode_rules[{index}] ({conditions})"),
+            Self::Default => f.write_str("claude.session_mode default"),
+        }
+    }
+}
+
+/// The session mode chosen for a task and why. Frozen on the task
+/// ([`Task::session_mode`]) when it first starts, so crashes, resumes and
+/// configuration reloads keep it; only `task mode` replaces it. It applies
+/// to Claude Code sessions only: other providers always run in tmux.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionModeChoice {
+    pub mode: ClaudeSessionMode,
+    pub source: SessionModeSource,
+}
+
+impl std::fmt::Display for SessionModeChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.mode, self.source)
+    }
+}
+
+impl Config {
+    /// The session mode of `task`: the choice frozen on it at its first
+    /// start, else what [`Config::resolve_session_mode`] picks now. A task
+    /// that started before modes were recorded (attempts or a start time but
+    /// nothing frozen) keeps `claude.session_mode`, the mode it ran in, unless
+    /// `task mode` forces one.
+    pub fn session_mode_for(&self, task: &Task) -> SessionModeChoice {
+        match &task.session_mode {
+            Some(frozen) => frozen.clone(),
+            None if task.session_mode_override.is_none() && (task.attempts > 0 || task.started_at.is_some()) => {
+                SessionModeChoice { mode: self.claude.session_mode, source: SessionModeSource::Default }
+            }
+            None => self.resolve_session_mode(task),
+        }
+    }
+
+    /// Pick a session mode ignoring any frozen choice: the task's `task mode`
+    /// override, else its key in `claude.session_mode_overrides`
+    /// (case-insensitive), else the first `claude.session_mode_rules` row
+    /// whose predicates all match, else `claude.session_mode`. A row whose
+    /// predicates do not compile never matches (`config validate` reports it).
+    pub fn resolve_session_mode(&self, task: &Task) -> SessionModeChoice {
+        if let Some(mode) = task.session_mode_override {
+            return SessionModeChoice { mode, source: SessionModeSource::Command };
+        }
+        if let Some(mode) =
+            self.claude.session_mode_overrides.iter().find(|(key, _)| key.trim().eq_ignore_ascii_case(&task.key)).map(|(_, m)| *m)
+        {
+            return SessionModeChoice { mode, source: SessionModeSource::Override };
+        }
+        for (index, rule) in self.claude.session_mode_rules.iter().enumerate() {
+            let Ok(conditions) = predicates(&rule.all) else { continue };
+            if conditions.iter().all(|c| condition_matches(c, task)) {
+                let conditions = crate::priority::fmt_conditions(&conditions);
+                return SessionModeChoice { mode: rule.mode, source: SessionModeSource::Rule { index, conditions } };
+            }
+        }
+        SessionModeChoice { mode: self.claude.session_mode, source: SessionModeSource::Default }
+    }
+
+    /// Where `task`'s next session on `provider` runs: headless only for a
+    /// Claude Code session whose task mode ([`Config::session_mode_for`]) is
+    /// headless; every other provider uses tmux.
+    pub fn session_runtime_for(&self, task: &Task, provider: Provider) -> SessionRuntime {
+        match (provider, self.session_mode_for(task).mode) {
+            (Provider::Claude, ClaudeSessionMode::Headless) => SessionRuntime::Headless,
+            _ => SessionRuntime::Tmux,
+        }
+    }
+
+    /// Whether any task can run headless: the default mode, a rule or an
+    /// override says so.
+    pub fn headless_possible(&self) -> bool {
+        self.claude.session_mode == ClaudeSessionMode::Headless
+            || self.claude.session_mode_rules.iter().any(|r| r.mode == ClaudeSessionMode::Headless)
+            || self.claude.session_mode_overrides.values().any(|m| *m == ClaudeSessionMode::Headless)
+    }
+
+    /// Invalid `claude.session_mode_rules` predicates and blank or duplicate
+    /// (case-insensitive) `claude.session_mode_overrides` keys.
+    pub fn session_mode_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        for (i, rule) in self.claude.session_mode_rules.iter().enumerate() {
+            if let Err(e) = predicates(&rule.all) {
+                problems.push(format!("claude.session_mode_rules[{i}].all: {e}"));
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for key in self.claude.session_mode_overrides.keys() {
+            let normal = key.trim().to_ascii_lowercase();
+            if normal.is_empty() || normal.contains(char::is_whitespace) {
+                problems.push(format!("claude.session_mode_overrides: `{key}` must be a single task key"));
+            } else if !seen.insert(normal) {
+                problems.push(format!("claude.session_mode_overrides: `{key}` is listed twice (keys are case-insensitive)"));
+            }
+        }
+        problems
     }
 }
 
@@ -377,6 +508,180 @@ comment_prefix = "[interno]"
         assert!(execution.policy.is_none());
     }
 
+    /// The issue's typical rules: chores, docs and dependency bumps and small
+    /// estimates headless; spikes and design work interactive (listed first:
+    /// first match wins).
+    pub(crate) fn mode_config() -> Config {
+        Config::from_toml(
+            r#"
+[repo]
+path = "/repo"
+[claude]
+session_mode = "interactive"
+[[claude.session_mode_rules]]
+mode = "interactive"
+all = [{ field = "label", op = "matches", value = "^(spike|design|needs-decision)$" }]
+[[claude.session_mode_rules]]
+mode = "headless"
+all = [{ field = "label", op = "matches", value = "^(chore|docs|deps)$" }]
+[[claude.session_mode_rules]]
+mode = "headless"
+all = [{ field = "estimate", op = "lt", value = 3 }]
+[claude.session_mode_overrides]
+"ENG-9" = "interactive"
+"#,
+        )
+        .unwrap()
+    }
+
+    fn manual(key: &str, labels: &[&str], estimate: Option<f64>) -> Task {
+        let mut t = Task::new(key, "t", crate::domain::TaskSource::Manual);
+        t.labels = labels.iter().map(|l| (*l).to_string()).collect();
+        t.estimate = estimate;
+        t
+    }
+
+    #[test]
+    fn session_mode_rules_match_labels_and_estimates_first_match_wins() {
+        use crate::config::ClaudeSessionMode::{Headless, Interactive};
+        let cfg = mode_config();
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+        let mode = |t: &Task| cfg.resolve_session_mode(t);
+        assert_eq!(mode(&manual("ENG-1", &["chore"], None)).mode, Headless);
+        assert!(matches!(mode(&manual("ENG-1", &["docs"], None)).source, SessionModeSource::Rule { index: 1, .. }));
+        assert_eq!(mode(&manual("ENG-1", &["bug"], Some(2.0))).mode, Headless);
+        assert!(matches!(mode(&manual("ENG-1", &["bug"], Some(2.0))).source, SessionModeSource::Rule { index: 2, .. }));
+        // estimate 3 is not < 3; no estimate never matches a numeric predicate.
+        assert_eq!(
+            mode(&manual("ENG-1", &["bug"], Some(3.0))),
+            SessionModeChoice { mode: Interactive, source: SessionModeSource::Default }
+        );
+        assert_eq!(mode(&manual("ENG-1", &[], None)).source, SessionModeSource::Default);
+        // A spike that is also a small chore: the first matching row wins.
+        let spike = mode(&manual("ENG-1", &["spike", "chore"], Some(1.0)));
+        assert_eq!(
+            (spike.mode, &spike.source),
+            (Interactive, &SessionModeSource::Rule { index: 0, conditions: "label ~ ^(spike|design|needs-decision)$".into() })
+        );
+        assert_eq!(spike.to_string(), "interactive (claude.session_mode_rules[0] (label ~ ^(spike|design|needs-decision)$))");
+    }
+
+    #[test]
+    fn session_mode_precedence_is_task_mode_then_override_then_rule_then_default() {
+        use crate::config::ClaudeSessionMode::{Headless, Interactive};
+        let mut cfg = mode_config();
+        // Config override (case-insensitive key) beats a matching headless rule.
+        let mut task = manual("eng-9", &["chore"], Some(1.0));
+        assert_eq!(cfg.resolve_session_mode(&task), SessionModeChoice { mode: Interactive, source: SessionModeSource::Override });
+        // `task mode` beats the override.
+        task.session_mode_override = Some(Headless);
+        assert_eq!(cfg.resolve_session_mode(&task), SessionModeChoice { mode: Headless, source: SessionModeSource::Command });
+        // The default applies only when nothing matches, and follows claude.session_mode.
+        cfg.claude.session_mode = Headless;
+        let plain = manual("ENG-2", &["bug"], None);
+        assert_eq!(cfg.resolve_session_mode(&plain), SessionModeChoice { mode: Headless, source: SessionModeSource::Default });
+    }
+
+    #[test]
+    fn frozen_session_mode_survives_reloads_and_only_claude_runs_headless() {
+        use crate::config::ClaudeSessionMode::{Headless, Interactive};
+        let mut cfg = mode_config();
+        let mut task = manual("ENG-1", &["chore"], None);
+        task.session_mode = Some(cfg.session_mode_for(&task));
+        assert_eq!(cfg.session_runtime_for(&task, Provider::Claude), SessionRuntime::Headless);
+        assert_eq!(cfg.session_runtime_for(&task, Provider::Codex), SessionRuntime::Tmux);
+        // A reload that drops the rules and flips the default changes nothing.
+        cfg.claude.session_mode_rules.clear();
+        cfg.claude.session_mode = Interactive;
+        assert_eq!(cfg.session_mode_for(&task).mode, Headless);
+        assert_eq!(cfg.session_runtime_for(&task, Provider::Claude), SessionRuntime::Headless);
+        // Unfrozen tasks follow the configuration as it is now.
+        task.session_mode = None;
+        assert_eq!(cfg.session_runtime_for(&task, Provider::Claude), SessionRuntime::Tmux);
+    }
+
+    #[test]
+    fn tasks_started_before_modes_were_recorded_keep_the_default() {
+        use crate::config::ClaudeSessionMode::{Headless, Interactive};
+        let cfg = mode_config();
+        let mut legacy = manual("ENG-1", &["chore"], None);
+        legacy.attempts = 1;
+        legacy.started_at = Some(chrono::Utc::now());
+        assert_eq!(cfg.session_mode_for(&legacy), SessionModeChoice { mode: Interactive, source: SessionModeSource::Default });
+        assert_eq!(cfg.resolve_session_mode(&legacy).mode, Headless, "the rules would pick headless");
+        // `task mode` still applies, and `auto` chooses by the rules right away.
+        crate::scheduler::commands::on_set_session_mode(&mut legacy, Some(Headless), &cfg);
+        assert_eq!(legacy.session_mode, Some(SessionModeChoice { mode: Headless, source: SessionModeSource::Command }));
+        crate::scheduler::commands::on_set_session_mode(&mut legacy, None, &cfg);
+        assert!(matches!(
+            legacy.session_mode,
+            Some(SessionModeChoice { mode: Headless, source: SessionModeSource::Rule { index: 1, .. } })
+        ));
+        // A task that never started chooses at its first start.
+        let mut fresh = manual("ENG-2", &["chore"], None);
+        crate::scheduler::commands::on_set_session_mode(&mut fresh, Some(Interactive), &cfg);
+        assert_eq!((fresh.session_mode_override, fresh.session_mode), (Some(Interactive), None));
+    }
+
+    #[test]
+    fn invalid_session_mode_rules_and_unknown_modes_are_reported() {
+        let err = format!(
+            "{:#}",
+            Config::from_toml(
+                "[[claude.session_mode_rules]]\nmode = \"batch\"\nall = [{ field = \"label\", op = \"eq\", value = \"x\" }]\n"
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("batch") || err.contains("mode"), "{err}");
+        let err = format!("{:#}", Config::from_toml("[claude.session_mode_overrides]\n\"ENG-1\" = \"tmux\"\n").unwrap_err());
+        assert!(err.contains("tmux") || err.contains("session_mode_overrides"), "{err}");
+        let cfg = Config::from_toml(
+            r#"
+[repo]
+path = "/repo"
+[[claude.session_mode_rules]]
+mode = "headless"
+all = []
+[[claude.session_mode_rules]]
+mode = "headless"
+all = [{ field = "colour", op = "eq", value = "red" }]
+[[claude.session_mode_rules]]
+mode = "headless"
+all = [{ field = "label", op = "gt", value = 2 }]
+[claude.session_mode_overrides]
+"ENG-1" = "headless"
+"eng-1" = "interactive"
+"two words" = "headless"
+"#,
+        )
+        .unwrap();
+        let problems = cfg.validate();
+        for needle in [
+            "session_mode_rules[0].all",
+            "session_mode_rules[1].all: unknown field `colour`",
+            "session_mode_rules[2].all",
+            "listed twice",
+            "single task key",
+        ] {
+            assert!(problems.iter().any(|p| p.contains(needle)), "{needle}: {problems:?}");
+        }
+        // Rows that do not compile never match.
+        assert_eq!(cfg.resolve_session_mode(&manual("ENG-2", &["red"], None)).source, SessionModeSource::Default);
+    }
+
+    #[test]
+    fn repo_overrides_may_replace_the_session_mode_rules() {
+        let mut cfg = mode_config();
+        let ov: crate::config::RepoOverrides = toml::from_str(
+            "[claude]\nsession_mode_rules = [{ mode = 'headless', all = [{ field = 'label', op = 'eq', value = 'bug' }] }]\n",
+        )
+        .unwrap();
+        cfg.merge_overrides(ov);
+        assert_eq!(cfg.claude.session_mode_rules.len(), 1);
+        assert_eq!(cfg.resolve_session_mode(&manual("ENG-1", &["bug"], None)).mode, crate::config::ClaudeSessionMode::Headless);
+        assert!(cfg.overrides.keys.contains(&"claude.session_mode_rules".to_string()), "{:?}", cfg.overrides.keys);
+    }
+
     #[test]
     fn binding_round_trips_and_survives_an_atomic_start_claim() {
         let store = crate::store::Store::open_in_memory().unwrap();
@@ -410,6 +715,50 @@ mod properties {
             prop_assert_eq!(&task, &bound);
             task.execution = before.execution.clone();
             prop_assert_eq!(task, before);
+        }
+
+        /// `task mode` > `claude.session_mode_overrides` > the first matching
+        /// rule > `claude.session_mode`; a frozen choice beats them all.
+        #[test]
+        fn session_mode_precedence(
+            mut task in crate::strategies::task(),
+            command in prop::option::of(crate::strategies::session_mode()),
+            keyed in prop::option::of(crate::strategies::session_mode()),
+            ruled in prop::option::of(crate::strategies::session_mode()),
+            default in crate::strategies::session_mode(),
+        ) {
+            task.session_mode_override = command;
+            task.labels.push("pq-mode".into());
+            let mut cfg = Config::default();
+            cfg.claude.session_mode = default;
+            cfg.claude.session_mode_overrides = keyed.map(|m| (task.key.to_ascii_lowercase(), m)).into_iter().collect();
+            cfg.claude.session_mode_rules = ruled
+                .map(|mode| SessionModeRule {
+                    mode,
+                    all: vec![Predicate {
+                        field: "label".into(),
+                        op: crate::priority::policy::Operator::Eq,
+                        value: crate::priority::policy::Value::Text("pq-mode".into()),
+                    }],
+                })
+                .into_iter()
+                .collect();
+            let expected = command
+                .map(|m| (m, SessionModeSource::Command))
+                .or_else(|| keyed.map(|m| (m, SessionModeSource::Override)))
+                .or_else(|| ruled.map(|m| (m, SessionModeSource::Rule { index: 0, conditions: "label: pq-mode".into() })))
+                .unwrap_or((default, SessionModeSource::Default));
+            let resolved = cfg.resolve_session_mode(&task);
+            prop_assert_eq!((resolved.mode, resolved.source), expected);
+            // A frozen choice beats them all; a task that started before modes
+            // were recorded keeps the default it ran in unless `task mode` says otherwise.
+            if let Some(frozen) = &task.session_mode {
+                prop_assert_eq!(&cfg.session_mode_for(&task), frozen);
+            } else if command.is_none() && (task.attempts > 0 || task.started_at.is_some()) {
+                prop_assert_eq!(cfg.session_mode_for(&task), SessionModeChoice { mode: default, source: SessionModeSource::Default });
+            } else {
+                prop_assert_eq!(cfg.session_mode_for(&task), cfg.resolve_session_mode(&task));
+            }
         }
 
         #[test]

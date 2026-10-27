@@ -26,6 +26,7 @@ src/
   store/             SQLite (rusqlite, WAL): tasks, sessions, usage, resource_samples, events, commands, hook_events, kv, jev_scores
   linear/            GraphQL client + issue→task sync
   priority/          priority.toml parser/evaluator + live reload
+  execution.rs       queues/workflows and per-task session mode (headless/interactive) by priority predicates; frozen on the task
   jev.rs             TypeSafe Jev "score" client (optional scoring)
   github.rs          `gh api graphql` PR status for the PR watcher
   github/            REST issue client, intake and sync

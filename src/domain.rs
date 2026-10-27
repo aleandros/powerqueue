@@ -686,6 +686,14 @@ pub struct Task {
     pub parent: Option<String>,
     /// Model forced by the user or `priority.toml`; `None` lets the budget policy choose.
     pub model_override: Option<ModelTier>,
+    /// Session mode forced with `task mode`; beats every rule and override.
+    #[serde(default)]
+    pub session_mode_override: Option<crate::config::ClaudeSessionMode>,
+    /// Session mode chosen (and why) when the task first started; crashes,
+    /// resumes and configuration reloads keep it. See
+    /// [`crate::config::Config::session_mode_for`].
+    #[serde(default)]
+    pub session_mode: Option<crate::execution::SessionModeChoice>,
     /// Model actually used by the latest session.
     pub model: Option<ModelTier>,
     pub worktree_path: Option<String>,
@@ -755,6 +763,8 @@ impl Task {
             children: Vec::new(),
             parent: None,
             model_override: None,
+            session_mode_override: None,
+            session_mode: None,
             model: None,
             worktree_path: None,
             branch: None,
@@ -1357,6 +1367,11 @@ pub enum DaemonCommand {
     SetModel {
         task_id: TaskId,
         model: Option<ModelTier>,
+    },
+    /// Force (or clear) the task's session mode from its next start.
+    SetSessionMode {
+        task_id: TaskId,
+        mode: Option<crate::config::ClaudeSessionMode>,
     },
     /// Re-read enabled issue sources immediately.
     SyncNow,

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-10-26
+
+### Added
+
+- Route each task headless or interactive (#84). `[[claude.session_mode_rules]]`
+  rows (a `mode` plus `all = [...]` predicates in the `priority.toml` syntax,
+  first match wins) pick the mode from a task's labels, estimate, project and
+  other fields; `[claude.session_mode_overrides]` pins one task key; `powerqueue
+  task mode <task> interactive|headless|auto` forces it from the CLI. Precedence:
+  `task mode` > override > rule > `claude.session_mode`. The mode and its reason
+  are frozen on the task at its first start and kept across crashes, resumes,
+  review rounds and configuration reloads; only `task mode` changes it, from the
+  next start. A headless task that needs attention can be switched to
+  interactive and resumed in a tmux window (`task mode` + `task resume`), and
+  `doctor` lists such tasks. `priority simulate` (new `mode` column), `task
+  show`, `task explain` and the dashboard show each task's mode and what chose
+  it; `config validate` lists the rules and rejects unknown modes, invalid
+  predicates and duplicate override keys. A repository's `.powerqueue.toml` may
+  replace `claude.session_mode_rules`. `doctor` checks headless-breaking
+  settings whenever any rule or override can run a task headless.
+
+### Changed
+
+- The database schema is v14: tasks record `session_mode_override` (`task
+  mode`) and the frozen `session_mode` with its reason; existing tasks start
+  without one and choose on their next first start (tasks already started keep
+  following `claude.session_mode` until they next start).
+
 ## [0.23.0] - 2026-10-26
 
 ### Added

@@ -515,6 +515,14 @@ fn draw_detail(frame: &mut Frame<'_>, app: &DashboardApp, area: Rect, sym: &Symb
     if let Some(summary) = task.deferral_summary(Utc::now()) {
         lines.push(Line::from(Span::styled(summary, Style::default().fg(Color::Yellow))));
     }
+    if let Some(mode) = app.snapshot.session_modes.get(&task.id) {
+        let when = if task.session_mode.is_some() { "" } else { " at its first start" };
+        lines.push(Line::from(vec![
+            Span::raw("mode "),
+            Span::styled(mode.mode.as_str(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {}{when}", mode.source), Style::default().fg(Color::DarkGray)),
+        ]));
+    }
     if let Some(b) = &task.branch {
         lines.push(Line::from(Span::styled(format!("branch {b}"), Style::default().fg(Color::DarkGray))));
     }
@@ -522,7 +530,12 @@ fn draw_detail(frame: &mut Frame<'_>, app: &DashboardApp, area: Rect, sym: &Symb
         lines.push(Line::from(Span::styled(format!("error {e}"), Style::default().fg(Color::Red))));
     }
     if task.state == TaskState::NeedsAttention {
-        lines.push(Line::from(Span::styled("press Enter to attach and respond", Style::default().fg(Color::Yellow))));
+        let hint = if app.snapshot.latest_session(task.id).is_some_and(crate::domain::Session::is_headless) {
+            format!("headless: `powerqueue task mode {} interactive`, then resume it to attach", task.key)
+        } else {
+            "press Enter to attach and respond".to_string()
+        };
+        lines.push(Line::from(Span::styled(hint, Style::default().fg(Color::Yellow))));
     }
     match app.snapshot.latest_session(task.id) {
         Some(s) => {
