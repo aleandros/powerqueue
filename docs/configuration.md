@@ -921,6 +921,26 @@ omit keep the provider's defaults:
 | `window_weighted_tokens` | `12000000` | `8000000` | `6000000` | weighted tokens the window may consume |
 | `rate_limit_cooldown_mins` | `30` | `30` | `30` | pause the provider after a `rate_limit` error (never past the period end) |
 
+Paid usage controls use the same provider table (currently implemented only
+for Claude; `allow_overflow = true` on another provider is a validation error):
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `allow_overflow` | `false` | allow eligible launches beyond the subscription period/window allowance |
+| `overflow_max_usd` | unset | optional finite, nonnegative estimated credit allocation cap per period; zero prevents overflow; unset is uncapped and triggers a doctor warning |
+| `overflow_min_criticality` | `"normal"` | least important credit-eligible task (`critical`, `high`, `normal`, `low`); never relaxed |
+
+Credit spend is estimated from recorded weighted tokens after the first
+credit allocation, at a nominal $3 per million model-weighted tokens. Claude's
+status-line `cost.total_cost_usd` estimates all session usage and does not
+identify paid credits; gateway spend-limit fields are not subscription credit
+charges. The estimate conservatively includes later subscription usage after a
+window reset. The cap includes predicted launch costs, survives daemon restarts
+and expires at the period reset; it does not stop running/admitted sessions or
+measure outside usage. See [cost source and limitations](budget.md#cost-source-and-cap-limits).
+Model shares and hard hook/pane cooldowns still apply. Enable credits in the
+Claude account separately.
+
 Per model (`[budget.providers.claude.models.fable]`, `.opus`, `.sonnet`,
 `.haiku`); a model you mention keeps the shipped values for keys you omit,
 models you do not mention stay as shipped (disable one with `enabled = false`):

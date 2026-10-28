@@ -140,7 +140,11 @@ fn probe_task(crit: Criticality) -> Task {
 /// or its observation says the allowance is exhausted (the later wins).
 fn provider_cooldown(cfg: &Config, ledger: &Ledger, limits: &RateLimitState, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let marks = limits.provider_blocked_until(&cfg.budget, ledger.provider, now);
-    let observed = ledger.observed.as_ref().and_then(crate::budget::probe::ObservedUsage::cooldown_until).filter(|u| *u > now);
+    let observed = ledger
+        .observed
+        .as_ref()
+        .and_then(|o| crate::budget::overflow::observed_cooldown(&cfg.budget, ledger.provider, o))
+        .filter(|u| *u > now);
     match (marks, observed) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (a, b) => a.or(b),
@@ -368,6 +372,9 @@ fn show_provider(
         ledger.measured_period_fraction() * 100.0,
         if ledger.learned.period.is_some() { "learned" } else { "configured" },
     );
+    if ledger.overflow.enabled || ledger.overflow.started_at.is_some() {
+        println!("{}", ledger.overflow.description());
+    }
     let readings = load_observations(store, provider)?.iter().filter(|r| ledger.period.contains(r.at)).count();
     match ledger.learned.period {
         Some(r) => println!(

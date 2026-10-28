@@ -230,7 +230,7 @@ pub fn provider_cooldowns(
             let observed = ledger
                 .observed
                 .as_ref()
-                .and_then(super::super::budget::probe::ObservedUsage::cooldown_until)
+                .and_then(|o| crate::budget::overflow::observed_cooldown(&cfg.budget, p, o))
                 .filter(|u| *u > now);
             let until = match (marks, observed) {
                 (Some(a), Some(b)) => Some(a.max(b)),

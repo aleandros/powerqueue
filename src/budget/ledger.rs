@@ -177,6 +177,9 @@ impl SpendSeries {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Ledger {
     pub provider: Provider,
+    /// Credit allocation for this subscription period.
+    #[serde(default)]
+    pub overflow: super::overflow::Overflow,
     pub now: DateTime<Utc>,
     pub period: Period,
     pub window: Period,
@@ -341,6 +344,11 @@ impl Ledger {
         };
         let mut ledger = Ledger {
             provider,
+            overflow: super::overflow::Overflow {
+                enabled: super::overflow::enabled(cfg, provider),
+                max_usd: budget.overflow_max_usd,
+                ..Default::default()
+            },
             now,
             period,
             window,
@@ -368,6 +376,7 @@ impl Ledger {
     pub fn blank(provider: Provider, now: DateTime<Utc>, period: Period, window: Period) -> Ledger {
         Ledger {
             provider,
+            overflow: super::overflow::Overflow::default(),
             now,
             period,
             window,
@@ -395,6 +404,9 @@ impl Ledger {
     /// daemon reserves predicted costs so several launches in one tick do
     /// not each think they are the only one).
     pub fn add_spend(&mut self, tier: &ModelTier, weighted_cost: f64) {
+        if self.overflow.enabled {
+            self.overflow.reserved_usd += weighted_cost * super::overflow::USD_PER_WEIGHTED_TOKEN;
+        }
         if let Some(t) = self.tiers.iter_mut().find(|t| t.tier == *tier) {
             t.period_weighted += weighted_cost;
             t.window_weighted += weighted_cost;

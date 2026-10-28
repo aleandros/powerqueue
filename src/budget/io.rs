@@ -39,8 +39,57 @@ impl Ledger {
             _ => Vec::new(),
         };
         let source = LedgerSource { observed, history, period_rows, window_rows, minute_rows, since_observation_rows };
-        Ok(Ledger::build(cfg, provider, now, &clock, source))
+        let mut ledger = Ledger::build(cfg, provider, now, &clock, source);
+        if let Some(entry) = store.kv_get::<super::overflow::Entry>(&overflow_key(provider))?
+            && entry.current(&ledger)
+        {
+            ledger.overflow.started_at = Some(entry.started_at);
+            let rows = store.usage_by_tier(entry.started_at, ledger.period.end)?;
+            ledger.overflow.estimated_spend_usd = rows
+                .iter()
+                .filter(|r| r.tier.provider() == provider)
+                .map(|r| r.usage.weighted() * super::ledger::tier_weight(cfg, &r.tier))
+                .sum::<f64>()
+                .max(0.0)
+                * super::overflow::USD_PER_WEIGHTED_TOKEN;
+        }
+        Ok(ledger)
     }
+}
+
+fn overflow_key(provider: Provider) -> String {
+    format!("budget.overflow.{provider}")
+}
+
+/// Record the first credit allocation in the current period and its event.
+/// Only the daemon writes this marker; budget displays remain read-only.
+/// Fails on storage errors, so a credit-funded launch must not proceed then.
+pub fn enter_overflow(store: &Store, ledger: &Ledger) -> Result<()> {
+    let key = overflow_key(ledger.provider);
+    if store.kv_get::<super::overflow::Entry>(&key)?.is_some_and(|entry| entry.current(ledger)) {
+        return Ok(());
+    }
+    let entry = super::overflow::Entry { started_at: ledger.now, period_end: ledger.period.end };
+    store
+        .kv_set_with_event(
+            &key,
+            &entry,
+            "budget.overflow",
+            &format!("{} entered usage credits; spend is estimated from the ledger", ledger.provider),
+        )
+        .context("record first budget overflow and event")
+}
+
+/// Detect allowance exhaustion even when all slots are occupied. Running
+/// sessions can cross into credits without another task being launched.
+pub fn record_overflow(store: &Store, cfg: &BudgetConfig, now: DateTime<Utc>) -> Result<()> {
+    for provider in cfg.providers.enabled().into_iter().filter(|p| super::overflow::enabled(cfg, *p)) {
+        let ledger = Ledger::load(store, cfg, provider, now)?;
+        if ledger.overflow_reason(cfg, 0.0).is_some() {
+            enter_overflow(store, &ledger)?;
+        }
+    }
+    Ok(())
 }
 
 impl Ledgers {
@@ -123,6 +172,124 @@ mod tests {
 
     fn at(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn overflow_spend_survives_reload_late_usage_and_window_reset_but_not_period_reset() {
+        use crate::domain::{ModelTier, Task, TaskSource, TokenUsage, UsageRecord};
+        let store = Store::open_in_memory().unwrap();
+        let mut cfg = BudgetConfig::default();
+        cfg.providers.claude.allow_overflow = true;
+        cfg.providers.claude.period_anchor = Some("2026-10-01T00:00:00Z".into());
+        let t0 = at("2026-10-01T12:00:00Z");
+        let task = Task::new("overflow", "test", TaskSource::Manual);
+        store.insert_task(&task).unwrap();
+        let ledger = Ledger::load(&store, &cfg, Provider::Claude, t0).unwrap();
+        enter_overflow(&store, &ledger).unwrap();
+        enter_overflow(&store, &ledger).unwrap();
+        let usage = |id: &str, tier, timestamp| UsageRecord {
+            session_id: uuid::Uuid::new_v4(),
+            task_id: task.id,
+            message_id: id.into(),
+            model_id: "test".into(),
+            tier,
+            usage: TokenUsage { input_tokens: 1_000_000, ..TokenUsage::default() },
+            timestamp,
+        };
+        store.record_usage(&usage("subscription", ModelTier::sonnet(), t0 - Duration::minutes(1))).unwrap();
+        let paid = usage("credits", ModelTier::sonnet(), t0 + Duration::minutes(1));
+        assert!(store.record_usage(&paid).unwrap());
+        assert!(!store.record_usage(&paid).unwrap());
+        store.record_usage(&usage("other provider", ModelTier::new("gpt-6-astra"), t0 + Duration::minutes(1))).unwrap();
+        let later = t0 + Duration::hours(6);
+        let loaded = Ledger::load(&store, &cfg, Provider::Claude, later).unwrap();
+        assert!((loaded.overflow.estimated_spend_usd - 3.0).abs() < 1e-9);
+        assert_eq!(loaded.overflow.started_at, Some(t0));
+        assert_eq!(loaded.overflow.reserved_usd, 0.0);
+        // Late transcript tails are charged by timestamp, not by polling order.
+        store.record_usage(&usage("late", ModelTier::opus(), t0 + Duration::minutes(2))).unwrap();
+        cfg.providers.claude.allow_overflow = false;
+        let reloaded = Ledger::load(&store, &cfg, Provider::Claude, later).unwrap();
+        assert!((reloaded.overflow.estimated_spend_usd - 12.0).abs() < 1e-9);
+        assert!(!reloaded.overflow.enabled);
+        assert_eq!(store.recent_events(100).unwrap().iter().filter(|e| e.kind == "budget.overflow").count(), 1);
+        let next = Ledger::load(&store, &cfg, Provider::Claude, ledger.period.end).unwrap();
+        assert_eq!(next.overflow.started_at, None);
+        assert_eq!(next.overflow.estimated_spend_usd, 0.0);
+        enter_overflow(&store, &next).unwrap();
+        assert_eq!(store.recent_events(100).unwrap().iter().filter(|e| e.kind == "budget.overflow").count(), 2);
+    }
+
+    #[test]
+    fn overflow_anchor_learning_does_not_reset_the_cap_mid_period() {
+        let store = Store::open_in_memory().unwrap();
+        let mut cfg = BudgetConfig::default();
+        cfg.providers.claude.allow_overflow = true;
+        cfg.providers.claude.period_anchor = Some("2026-10-01T00:00:00Z".into());
+        let start = at("2026-10-07T12:00:00Z");
+        let initial = Ledger::load(&store, &cfg, Provider::Claude, start).unwrap();
+        enter_overflow(&store, &initial).unwrap();
+        let actual_reset = initial.period.end + Duration::days(1);
+        save_observed(
+            &store,
+            Provider::Claude,
+            &ObservedUsage { period_used: Some(1.0), period_resets_at: Some(actual_reset), ..ObservedUsage::empty(start) },
+        )
+        .unwrap();
+        let learned = Ledger::load(&store, &cfg, Provider::Claude, initial.period.end).unwrap();
+        assert_eq!(learned.overflow.started_at, Some(start));
+        enter_overflow(&store, &learned).unwrap();
+        assert_eq!(store.recent_events(10).unwrap().len(), 1);
+        let reset = Ledger::load(&store, &cfg, Provider::Claude, actual_reset).unwrap();
+        assert_eq!(reset.overflow.started_at, None);
+    }
+
+    #[test]
+    fn overflow_expires_at_an_earlier_learned_reset_and_stays_expired() {
+        let store = Store::open_in_memory().unwrap();
+        let mut cfg = BudgetConfig::default();
+        cfg.providers.claude.allow_overflow = true;
+        cfg.providers.claude.period_anchor = Some("2026-10-01T00:00:00Z".into());
+        let start = at("2026-10-03T12:00:00Z");
+        let initial = Ledger::load(&store, &cfg, Provider::Claude, start).unwrap();
+        enter_overflow(&store, &initial).unwrap();
+        let actual_reset = start + Duration::days(1);
+        save_observed(
+            &store,
+            Provider::Claude,
+            &ObservedUsage { period_used: Some(1.0), period_resets_at: Some(actual_reset), ..ObservedUsage::empty(start) },
+        )
+        .unwrap();
+        let before_reset = Ledger::load(&store, &cfg, Provider::Claude, actual_reset - Duration::seconds(1)).unwrap();
+        assert_eq!(before_reset.overflow.started_at, Some(start));
+        let reset = Ledger::load(&store, &cfg, Provider::Claude, actual_reset).unwrap();
+        assert_eq!(reset.overflow.started_at, None);
+        save_observed(
+            &store,
+            Provider::Claude,
+            &ObservedUsage {
+                period_used: Some(0.1),
+                period_resets_at: Some(actual_reset + Duration::days(7)),
+                ..ObservedUsage::empty(actual_reset)
+            },
+        )
+        .unwrap();
+        let refreshed = Ledger::load(&store, &cfg, Provider::Claude, actual_reset + Duration::minutes(1)).unwrap();
+        assert_eq!(refreshed.overflow.started_at, None);
+    }
+
+    #[test]
+    fn overflow_recording_detects_running_session_exhaustion_and_is_opt_in() {
+        let store = Store::open_in_memory().unwrap();
+        let mut cfg = BudgetConfig::default();
+        let now = at("2026-10-01T12:00:00Z");
+        save_observed(&store, Provider::Claude, &ObservedUsage { period_used: Some(1.0), ..ObservedUsage::empty(now) }).unwrap();
+        record_overflow(&store, &cfg, now).unwrap();
+        assert_eq!(store.recent_events(10).unwrap().len(), 0);
+        cfg.providers.claude.allow_overflow = true;
+        record_overflow(&store, &cfg, now).unwrap();
+        record_overflow(&store, &cfg, now + Duration::minutes(1)).unwrap();
+        assert_eq!(store.recent_events(10).unwrap().len(), 1);
     }
 
     #[test]

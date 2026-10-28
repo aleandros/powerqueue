@@ -580,6 +580,7 @@ impl Daemon {
         let r = self.sample_resources(now);
         self.report_phase("resources", r);
         self.run_usage_probes(now);
+        crate::budget::io::record_overflow(&self.store, &self.cfg.budget, now)?;
         let r = Box::pin(self.launch_tasks(now)).await;
         self.report_phase("launch", r);
         // Reports are delivered after session release and launch allocation.
@@ -643,7 +644,11 @@ impl Daemon {
     /// later of the two wins.
     fn provider_cooldown(&self, provider: Provider, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         let marks = self.rt.rate_limits.provider_blocked_until(&self.cfg.budget, provider, now);
-        let observed = load_observed(&self.store, provider).ok().flatten().and_then(|o| o.cooldown_until()).filter(|u| *u > now);
+        let observed = load_observed(&self.store, provider)
+            .ok()
+            .flatten()
+            .and_then(|o| crate::budget::overflow::observed_cooldown(&self.cfg.budget, provider, &o))
+            .filter(|u| *u > now);
         match (marks, observed) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
@@ -3864,6 +3869,12 @@ impl Daemon {
             match decision.model.clone() {
                 None => self.throttle(task, &decision, now)?,
                 Some(model) => {
+                    if crate::budget::overflow::enabled(&self.cfg.budget, model.provider())
+                        && let Some(ledger) = planner.ledgers().for_model(&model)
+                        && ledger.overflow_reason(&self.cfg.budget, candidate.weighted_cost(&self.cfg.budget)).is_some()
+                    {
+                        crate::budget::io::enter_overflow(&self.store, ledger)?;
+                    }
                     let (key, id) = (task.key.clone(), task.id);
                     match Box::pin(self.start_task(task, model, &decision, now)).await {
                         Ok(Started::Preparing) => {

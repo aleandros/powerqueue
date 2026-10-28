@@ -2330,6 +2330,14 @@ fn ledger_checks(cfg: &Config, ledger: &Ledger, readings: usize, typical_weighte
     } else {
         out.push(CheckResult::ok(ALGO, &name, format!("{:.0}% of the {p} window used ({source})", window * 100.0)));
     }
+    if crate::budget::overflow::enabled(&cfg.budget, p) && cfg.budget.provider(p).overflow_max_usd.is_none() {
+        out.push(CheckResult::warn(
+            ALGO,
+            &format!("{p} usage credits"),
+            "paid usage overflow is enabled without a spending cap",
+            format!("set budget.providers.{p}.overflow_max_usd; the cap is an estimate and does not stop running sessions"),
+        ));
+    }
     out.push(rate_check(ledger, readings));
     if let Some(top) = cfg.budget.provider(p).enabled_models().into_iter().next() {
         out.push(affordability_check(cfg, ledger, &top, typical_weighted));

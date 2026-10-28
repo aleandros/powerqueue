@@ -1115,3 +1115,8 @@ pub(crate) fn github_blockers() -> impl Strategy<Value = Vec<LinkedIssue>> {
             .collect()
     })
 }
+
+/// Overflow admission inputs: priority boundary, finite credit amounts and hard cooldown.
+pub(crate) fn overflow_case() -> impl Strategy<Value = (Criticality, Criticality, f64, f64, bool)> {
+    (criticality(), criticality(), 0.0f64..100.0, 0.0f64..100.0, any::<bool>())
+}
