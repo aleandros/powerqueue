@@ -558,6 +558,21 @@ pub(crate) fn simulate_target(
     let mut evaluated: Vec<Evaluation> = Vec::with_capacity(tasks.len());
     let mut simulated_tasks: Vec<Task> = Vec::with_capacity(tasks.len());
     for task in &tasks {
+        // Intake can leave a task unassigned while repository analysis is pending.
+        // There is no project policy to evaluate until routing succeeds.
+        if task.execution_project.is_empty() {
+            evaluated.push(Evaluation {
+                criticality: task.criticality,
+                score: task.score,
+                model: None,
+                models: Vec::new(),
+                model_source: None,
+                skip: false,
+                reasons: vec!["no execution project assigned; waiting for routing".into()],
+            });
+            simulated_tasks.push(task.clone());
+            continue;
+        }
         if !policies.contains_key(&task.execution_project) {
             let effective = cfg.for_task(task, &ctx.paths)?;
             let use_draft = match target {
@@ -595,7 +610,11 @@ pub(crate) fn simulate_target(
     let mut rows = Vec::with_capacity(order.len());
     for (rank, idx) in order.iter().enumerate() {
         let (task, eval, stored) = (&simulated_tasks[*idx], &evaluated[*idx], &tasks[*idx]);
-        let schedulable = task.state.is_schedulable() && task.not_before.is_none_or(|nb| nb <= now) && task.deferral_allows(now);
+        let schedulable = !task.execution_project.is_empty()
+            && task.execution_approved()
+            && task.state.is_schedulable()
+            && task.not_before.is_none_or(|nb| nb <= now)
+            && task.deferral_allows(now);
         // `evaluate` already falls back to the criticality row.
         let preferred = eval.models.clone();
         let model_source = eval.model_source.clone();

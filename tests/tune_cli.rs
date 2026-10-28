@@ -114,6 +114,81 @@ impl Env {
 }
 
 #[test]
+fn unassigned_tasks_do_not_break_tuning_or_become_launch_candidates() {
+    use powerqueue::domain::{Criticality, Task, TaskSource, TaskState};
+
+    let env = Env::new();
+    let paths = powerqueue::paths::Paths::rooted(env.home.path());
+    let store = powerqueue::store::Store::open(&paths.database()).unwrap();
+    for state in [TaskState::Blocked, TaskState::Queued] {
+        let mut task = Task::new(format!("UNASSIGNED-{state}"), "Needs routing", TaskSource::Manual);
+        task.execution_project.clear();
+        task.state = state;
+        task.criticality = Criticality::High;
+        task.score = 123.0;
+        store.insert_task(&task).unwrap();
+    }
+    let before = store.list_tasks().unwrap();
+    for budget_args in [vec![], vec!["--no-budget"]] {
+        let out =
+            env.pq().args(["--json", "priority", "simulate"]).args(budget_args).assert().success().get_output().stdout.clone();
+        let sim: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let rows = sim["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 4);
+        let unassigned: Vec<_> = rows.iter().filter(|r| r["key"].as_str().unwrap().starts_with("UNASSIGNED-")).collect();
+        assert_eq!(unassigned.len(), 2);
+        for row in unassigned {
+            assert_eq!(row["criticality"], "high");
+            assert_eq!(row["score"], 123.0);
+            assert_eq!(row["schedulable"], false);
+            assert_eq!(row["would_start_now"], false);
+            assert!(row["model"].is_null());
+            assert!(row["reasons"].to_string().contains("no execution project assigned"));
+        }
+    }
+    env.tune("priority").args(["tune", "prioritize FAKE-1", "--dry-run"]).assert().success();
+    let prompt = env.state_file("tune-prompt.md").unwrap();
+    assert!(prompt.contains("UNASSIGNED-blocked"));
+    assert!(prompt.contains("no execution project assigned"));
+    assert_eq!(store.list_tasks().unwrap(), before, "simulation and dry-run must not change tasks");
+}
+
+#[test]
+fn simulation_does_not_offer_unapproved_tasks_a_launch_slot() {
+    use powerqueue::domain::{Task, TaskSource};
+
+    let env = Env::new();
+    env.pq().args(["config", "set", "scheduler.max_concurrent", "3"]).assert().success();
+    let paths = powerqueue::paths::Paths::rooted(env.home.path());
+    let store = powerqueue::store::Store::open(&paths.database()).unwrap();
+    let task = Task::new(
+        "example/repo#1",
+        "Needs source approval",
+        TaskSource::GitHub {
+            repository: "example/repo".into(),
+            number: 1,
+            url: "https://github.com/example/repo/issues/1".into(),
+        },
+    );
+    store.insert_task(&task).unwrap();
+    let before = store.list_tasks().unwrap();
+    for budget_args in [vec![], vec!["--no-budget"]] {
+        let out =
+            env.pq().args(["--json", "priority", "simulate"]).args(&budget_args).assert().success().get_output().stdout.clone();
+        let sim: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let rows = sim["rows"].as_array().unwrap();
+        let row = rows.iter().find(|row| row["key"] == task.key).unwrap();
+        assert_eq!(row["schedulable"], false);
+        assert_eq!(row["would_start_now"], false);
+        assert!(row["model"].is_null());
+        if !budget_args.is_empty() {
+            assert_eq!(rows.iter().filter(|row| row["would_start_now"] == true).count(), 2);
+        }
+    }
+    assert_eq!(store.list_tasks().unwrap(), before, "simulation must not change source approval or task state");
+}
+
+#[test]
 fn tune_needs_an_instruction_and_a_claude_binary() {
     let env = Env::new();
     // No instruction and stdin is a pipe with nothing on it → empty instruction.
