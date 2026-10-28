@@ -115,6 +115,10 @@ fn tune(ctx: &mut Context, args: TuneArgs) -> Result<i32> {
     context_md.push_str("\n### Execution-project policies\n\n");
     let projects: std::collections::BTreeSet<_> = tasks.iter().map(|task| &task.execution_project).collect();
     for project in projects {
+        if project.is_empty() {
+            context_md.push_str("- unassigned: no execution project assigned; waiting for routing\n");
+            continue;
+        }
         match cfg.for_project(project, &paths) {
             Ok(project_cfg) => {
                 let _ = writeln!(context_md, "- `{project}`: {}", project_cfg.rules_source(&paths));

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.1] - 2026-10-28
+
+### Fixed
+
+- `tune` and `priority simulate` no longer fail with an invalid execution
+  project ID when tasks are awaiting repository assignment. Unassigned tasks
+  retain their stored priority and appear as waiting for routing; unassigned
+  or unapproved tasks are excluded from simulated launches.
+- Update `pulldown-cmark` to 0.13.5 to address RUSTSEC-2026-0414
+  (exponential Markdown parser output when wikilinks are enabled).
+
 ## [0.25.0] - 2026-10-28
 
 ### Added
