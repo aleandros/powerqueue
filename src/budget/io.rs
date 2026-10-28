@@ -95,10 +95,16 @@ fn refresh_overflow_entry(store: &Store, ledger: &Ledger) -> Result<Option<super
 /// Detect allowance exhaustion even when all slots are occupied. Running
 /// sessions can cross into credits without another task being launched.
 pub fn record_overflow(store: &Store, cfg: &BudgetConfig, now: DateTime<Utc>) -> Result<()> {
-    for provider in cfg.providers.enabled().into_iter().filter(|p| super::overflow::enabled(cfg, *p)) {
+    for provider in Provider::ALL {
+        let enabled = cfg.provider(provider).enabled && super::overflow::enabled(cfg, provider);
+        // Disabling overflow or the provider stops new allocations, but must
+        // not forget the real reset of credits already allocated this period.
+        if !enabled && store.kv_get::<super::overflow::Entry>(&overflow_key(provider))?.is_none() {
+            continue;
+        }
         let ledger = Ledger::load(store, cfg, provider, now)?;
         refresh_overflow_entry(store, &ledger)?;
-        if ledger.overflow_reason(cfg, 0.0).is_some() {
+        if enabled && ledger.overflow_reason(cfg, 0.0).is_some() {
             enter_overflow(store, &ledger)?;
         }
     }
@@ -285,6 +291,39 @@ mod tests {
         assert_eq!(partial.overflow.started_at, Some(start));
         let reset = Ledger::load(&store, &cfg, Provider::Claude, actual_reset).unwrap();
         assert_eq!(reset.overflow.started_at, None);
+        assert_eq!(store.recent_events(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn disabled_overflow_and_provider_still_preserve_learned_credit_expiry() {
+        let store = Store::open_in_memory().unwrap();
+        let mut cfg = BudgetConfig::default();
+        cfg.providers.claude.allow_overflow = true;
+        cfg.providers.claude.period_anchor = Some("2026-10-01T00:00:00Z".into());
+        let start = at("2026-10-07T12:00:00Z");
+        let initial = Ledger::load(&store, &cfg, Provider::Claude, start).unwrap();
+        enter_overflow(&store, &initial).unwrap();
+        cfg.providers.claude.allow_overflow = false;
+        cfg.providers.claude.enabled = false;
+        let actual_reset = initial.period.end + Duration::days(1);
+        save_observed(
+            &store,
+            Provider::Claude,
+            &ObservedUsage { period_used: Some(1.0), period_resets_at: Some(actual_reset), ..ObservedUsage::empty(start) },
+        )
+        .unwrap();
+        record_overflow(&store, &cfg, start + Duration::minutes(1)).unwrap();
+        save_observed(
+            &store,
+            Provider::Claude,
+            &ObservedUsage { window_used: Some(1.0), ..ObservedUsage::empty(initial.period.end) },
+        )
+        .unwrap();
+        record_overflow(&store, &cfg, initial.period.end).unwrap();
+        cfg.providers.claude.allow_overflow = true;
+        cfg.providers.claude.enabled = true;
+        let reenabled = Ledger::load(&store, &cfg, Provider::Claude, initial.period.end).unwrap();
+        assert_eq!(reenabled.overflow.started_at, Some(start));
         assert_eq!(store.recent_events(10).unwrap().len(), 1);
     }
 
