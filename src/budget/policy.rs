@@ -301,7 +301,13 @@ impl<'a> Policy<'a> {
 
     fn credit_verdict(&self, task: &Task, ledger: &Ledger, cost: f64, reason: &str) -> Verdict {
         let budget = self.cfg.provider(ledger.provider);
-        let blocked = |reason| Verdict { eligible: false, reason, retry_at: Some(ledger.period.end) };
+        let margin = (1.0 - self.cfg.safety_margin).max(0.0);
+        let retry_at = if ledger.period_fraction() + cost / ledger.period_budget.max(1.0) > margin {
+            ledger.period.end
+        } else {
+            window_retry(ledger)
+        };
+        let blocked = |reason| Verdict { eligible: false, reason, retry_at: Some(retry_at) };
         if task.criticality > budget.overflow_min_criticality {
             return blocked(format!(
                 "usage credits require {} criticality or above; task is {}",
@@ -415,7 +421,6 @@ impl<'a> Policy<'a> {
         if ledger.has_window() {
             let window_after = ledger.window_fraction() + cost / ledger.window_divisor();
             if window_after > margin {
-                let reset = ledger.observed.as_ref().and_then(|o| o.window_resets_at).filter(|r| *r > now);
                 return blocked(
                     format!(
                         "window: {:.0}% used ({}), this task would push it to {:.0}%",
@@ -423,7 +428,7 @@ impl<'a> Policy<'a> {
                         ledger.window_fraction_source(),
                         window_after * 100.0
                     ),
-                    Some(reset.map_or(now + WINDOW_RECHECK, |r| r.min(now + WINDOW_RECHECK))),
+                    Some(window_retry(ledger)),
                 );
             }
         }
@@ -479,6 +484,11 @@ fn observed_block(cfg: &BudgetConfig, ledger: &Ledger) -> Option<(String, Option
         )),
         Some(_) | None => None,
     }
+}
+
+fn window_retry(ledger: &Ledger) -> DateTime<Utc> {
+    let recheck = ledger.now + WINDOW_RECHECK;
+    ledger.observed.as_ref().and_then(|o| o.window_resets_at).filter(|r| *r > ledger.now).map_or(recheck, |r| r.min(recheck))
 }
 
 fn level_index(c: Criticality) -> usize {
@@ -663,6 +673,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn denied_overflow_rechecks_window_before_weekly_reset() {
+        let mut cfg = BudgetConfig::default();
+        cfg.providers.claude.allow_overflow = true;
+        let mut ledgers = ledger(&cfg, 0.1, &[]);
+        claude_mut(&mut ledgers).observed = Some(ObservedUsage {
+            period_used: Some(0.1),
+            window_used: Some(1.0),
+            window_resets_at: Some(now() + Duration::minutes(5)),
+            ..ObservedUsage::empty(now())
+        });
+        let limits = RateLimitState::default();
+        for crit in [Criticality::Low, Criticality::Normal] {
+            // Low misses the floor; normal reaches the cap. Both can use the
+            // subscription again when its short window resets.
+            cfg.providers.claude.overflow_max_usd = if crit == Criticality::Low { None } else { Some(0.0) };
+            let t = task(crit);
+            let verdict = Policy::new(&cfg, &ledgers, &limits).verdict(&t, &sonnet(), 100_000.0);
+            assert!(!verdict.eligible);
+            assert_eq!(verdict.retry_at, Some(now() + Duration::minutes(5)));
+        }
+        claude_mut(&mut ledgers).observed.as_mut().unwrap().window_resets_at = Some(now() + Duration::hours(1));
+        let verdict = Policy::new(&cfg, &ledgers, &limits).verdict(&task(Criticality::Normal), &sonnet(), 100_000.0);
+        assert_eq!(verdict.retry_at, Some(now() + WINDOW_RECHECK));
+        claude_mut(&mut ledgers).observed.as_mut().unwrap().period_used = Some(1.0);
+        let verdict = Policy::new(&cfg, &ledgers, &limits).verdict(&task(Criticality::Normal), &sonnet(), 100_000.0);
+        assert_eq!(verdict.retry_at, Some(claude(&ledgers).period.end));
     }
 
     #[test]

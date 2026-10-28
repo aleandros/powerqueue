@@ -66,7 +66,7 @@ fn overflow_key(provider: Provider) -> String {
 /// Fails on storage errors, so a credit-funded launch must not proceed then.
 pub fn enter_overflow(store: &Store, ledger: &Ledger) -> Result<()> {
     let key = overflow_key(ledger.provider);
-    if store.kv_get::<super::overflow::Entry>(&key)?.is_some_and(|entry| entry.current(ledger)) {
+    if refresh_overflow_entry(store, ledger)?.is_some_and(|entry| entry.current(ledger)) {
         return Ok(());
     }
     let entry = super::overflow::Entry { started_at: ledger.now, period_end: ledger.period.end };
@@ -80,11 +80,24 @@ pub fn enter_overflow(store: &Store, ledger: &Ledger) -> Result<()> {
         .context("record first budget overflow and event")
 }
 
+// The daemon persists learned expiry even when it is currently using the
+// subscription, so a later partial reading cannot erase or revive allocation.
+fn refresh_overflow_entry(store: &Store, ledger: &Ledger) -> Result<Option<super::overflow::Entry>> {
+    let key = overflow_key(ledger.provider);
+    let Some(entry) = store.kv_get::<super::overflow::Entry>(&key)? else { return Ok(None) };
+    let refreshed = entry.refreshed(ledger);
+    if refreshed != entry {
+        store.kv_set(&key, &refreshed).context("persist learned credit period reset")?;
+    }
+    Ok(Some(refreshed))
+}
+
 /// Detect allowance exhaustion even when all slots are occupied. Running
 /// sessions can cross into credits without another task being launched.
 pub fn record_overflow(store: &Store, cfg: &BudgetConfig, now: DateTime<Utc>) -> Result<()> {
     for provider in cfg.providers.enabled().into_iter().filter(|p| super::overflow::enabled(cfg, *p)) {
         let ledger = Ledger::load(store, cfg, provider, now)?;
+        refresh_overflow_entry(store, &ledger)?;
         if ledger.overflow_reason(cfg, 0.0).is_some() {
             enter_overflow(store, &ledger)?;
         }
@@ -242,6 +255,37 @@ mod tests {
         assert_eq!(store.recent_events(10).unwrap().len(), 1);
         let reset = Ledger::load(&store, &cfg, Provider::Claude, actual_reset).unwrap();
         assert_eq!(reset.overflow.started_at, None);
+    }
+
+    #[test]
+    fn partial_readings_preserve_learned_overflow_expiry_without_another_credit_launch() {
+        let store = Store::open_in_memory().unwrap();
+        let mut cfg = BudgetConfig::default();
+        cfg.providers.claude.allow_overflow = true;
+        cfg.providers.claude.period_anchor = Some("2026-10-01T00:00:00Z".into());
+        let start = at("2026-10-07T12:00:00Z");
+        let initial = Ledger::load(&store, &cfg, Provider::Claude, start).unwrap();
+        enter_overflow(&store, &initial).unwrap();
+        let actual_reset = initial.period.end + Duration::days(1);
+        save_observed(
+            &store,
+            Provider::Claude,
+            &ObservedUsage { period_used: Some(0.2), period_resets_at: Some(actual_reset), ..ObservedUsage::empty(start) },
+        )
+        .unwrap();
+        // Even without current exhaustion, a tick preserves the learned date.
+        record_overflow(&store, &cfg, start + Duration::minutes(1)).unwrap();
+        save_observed(
+            &store,
+            Provider::Claude,
+            &ObservedUsage { window_used: Some(0.1), ..ObservedUsage::empty(initial.period.end) },
+        )
+        .unwrap();
+        let partial = Ledger::load(&store, &cfg, Provider::Claude, initial.period.end).unwrap();
+        assert_eq!(partial.overflow.started_at, Some(start));
+        let reset = Ledger::load(&store, &cfg, Provider::Claude, actual_reset).unwrap();
+        assert_eq!(reset.overflow.started_at, None);
+        assert_eq!(store.recent_events(10).unwrap().len(), 1);
     }
 
     #[test]

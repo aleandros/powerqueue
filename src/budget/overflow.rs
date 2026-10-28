@@ -32,14 +32,24 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// Follow a learned reset for this entry, including an expired reading
-    /// after the clock falls back to its configured anchor. Otherwise use the
-    /// reset saved at entry, so removing an observation cannot erase spend.
-    pub fn current(&self, ledger: &Ledger) -> bool {
+    /// Fold an authoritative reset into the durable entry, including expiry.
+    /// A later observation in a new period must never revive an old entry.
+    #[must_use]
+    pub fn refreshed(&self, ledger: &Ledger) -> Self {
+        let mut entry = self.clone();
         if let Some(reset) = ledger.observed.as_ref().and_then(|o| o.period_resets_at).filter(|r| *r > self.started_at) {
-            return ledger.now < reset && ledger.period.contains(self.started_at);
+            entry.period_end = if reset <= ledger.now || ledger.period.contains(self.started_at) {
+                reset
+            } else {
+                self.period_end.min(ledger.period.start)
+            };
         }
-        ledger.now < self.period_end
+        entry
+    }
+
+    /// Whether this allocation still belongs to the current credit period.
+    pub fn current(&self, ledger: &Ledger) -> bool {
+        ledger.now < self.refreshed(ledger).period_end
     }
 }
 
