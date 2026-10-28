@@ -11,7 +11,8 @@
 //!    enabled with a positive share.
 //! 2. The provider must not be on an observed cooldown: a probe reported the
 //!    allowance `blocked` or a window/period fully used
-//!    ([`super::ObservedUsage::cooldown_until`]).
+//!    ([`super::ObservedUsage::cooldown_until`]). Claude overflow ignores
+//!    percentage-only exhaustion, but never an explicit blocked reading.
 //! 3. A model that reported `rate_limit` is unavailable until its cooldown
 //!    ends (account-wide errors mark every model of the provider).
 //! 4. Criticality gate with relaxation: a model is *eligible* for a task when
@@ -26,6 +27,8 @@
 //!    window. A task *borrowing* a model reserved for more critical work
 //!    (relaxation) must also fit what is left of that model's share; work
 //!    the model is reserved for is never capped by the share.
+//!    Claude overflow can bypass period/window gates when the credit floor
+//!    and estimated spending cap permit it; the borrowed share still applies.
 //!
 //! Choice: the preference list is the hard override (`task.model_override`)
 //! when set, else the rules' list (`priority.toml`, in order), else the
@@ -296,6 +299,37 @@ impl<'a> Policy<'a> {
         fallback
     }
 
+    fn credit_verdict(&self, task: &Task, ledger: &Ledger, cost: f64, reason: &str) -> Verdict {
+        let budget = self.cfg.provider(ledger.provider);
+        let margin = (1.0 - self.cfg.safety_margin).max(0.0);
+        let retry_at = if ledger.period_fraction() + cost / ledger.period_budget.max(1.0) > margin {
+            ledger.period.end
+        } else {
+            window_retry(ledger)
+        };
+        let blocked = |reason| Verdict { eligible: false, reason, retry_at: Some(retry_at) };
+        if task.criticality > budget.overflow_min_criticality {
+            return blocked(format!(
+                "usage credits require {} criticality or above; task is {}",
+                budget.overflow_min_criticality, task.criticality,
+            ));
+        }
+        let spent = ledger.overflow.estimated_spend_usd + ledger.overflow.reserved_usd;
+        let predicted = cost * super::overflow::USD_PER_WEIGHTED_TOKEN;
+        if let Some(cap) = budget.overflow_max_usd
+            && (spent >= cap || spent + predicted > cap)
+        {
+            return blocked(format!(
+                "usage credit cap ${cap:.2}: estimated spend/reservations ${spent:.2}, task ~${predicted:.2}",
+            ));
+        }
+        Verdict {
+            eligible: true,
+            reason: format!("{reason}; running on usage credits (ledger estimate ~${:.2})", ledger.overflow.estimated_spend_usd),
+            retry_at: None,
+        }
+    }
+
     fn verdict(&self, task: &Task, tier: &ModelTier, predicted_weighted: f64) -> Verdict {
         let blocked = |reason: String, retry_at: Option<DateTime<Utc>>| Verdict { eligible: false, reason, retry_at };
         // A stale ledger of a provider that was disabled since must not make
@@ -309,7 +343,7 @@ impl<'a> Policy<'a> {
         let Some(model) = self.cfg.model_budget(tier).filter(|m| m.enabled && m.share > 0.0) else {
             return blocked("disabled or no budget share".to_string(), None);
         };
-        if let Some((reason, retry_at)) = observed_block(ledger) {
+        if let Some((reason, retry_at)) = observed_block(self.cfg, ledger) {
             return blocked(reason, retry_at);
         }
         if let Some(until) = self.rate_limits.until(tier, now) {
@@ -367,6 +401,11 @@ impl<'a> Policy<'a> {
                 Some(period.end),
             );
         }
+        if super::overflow::enabled(self.cfg, tier.provider())
+            && let Some(reason) = ledger.overflow_reason(self.cfg, cost)
+        {
+            return self.credit_verdict(task, ledger, cost, reason);
+        }
         let overall_after = ledger.period_fraction() + cost / ledger.period_budget.max(1.0);
         if overall_after > margin {
             return blocked(
@@ -382,7 +421,6 @@ impl<'a> Policy<'a> {
         if ledger.has_window() {
             let window_after = ledger.window_fraction() + cost / ledger.window_divisor();
             if window_after > margin {
-                let reset = ledger.observed.as_ref().and_then(|o| o.window_resets_at).filter(|r| *r > now);
                 return blocked(
                     format!(
                         "window: {:.0}% used ({}), this task would push it to {:.0}%",
@@ -390,7 +428,7 @@ impl<'a> Policy<'a> {
                         ledger.window_fraction_source(),
                         window_after * 100.0
                     ),
-                    Some(reset.map_or(now + WINDOW_RECHECK, |r| r.min(now + WINDOW_RECHECK))),
+                    Some(window_retry(ledger)),
                 );
             }
         }
@@ -409,8 +447,11 @@ impl<'a> Policy<'a> {
 /// change. An exhausted observation without a reset instant counts for
 /// [`OBSERVED_EXHAUSTED_TTL`] after it was taken; one whose reset has passed
 /// counts no more.
-fn observed_block(ledger: &Ledger) -> Option<(String, Option<DateTime<Utc>>)> {
+fn observed_block(cfg: &BudgetConfig, ledger: &Ledger) -> Option<(String, Option<DateTime<Utc>>)> {
     let obs = ledger.observed.as_ref()?;
+    if super::overflow::enabled(cfg, ledger.provider) && !obs.blocked {
+        return None;
+    }
     let now = ledger.now;
     let window_out = obs.window_used.is_some_and(|u| u >= 1.0);
     let period_out = obs.period_used.is_some_and(|u| u >= 1.0);
@@ -443,6 +484,11 @@ fn observed_block(ledger: &Ledger) -> Option<(String, Option<DateTime<Utc>>)> {
         )),
         Some(_) | None => None,
     }
+}
+
+fn window_retry(ledger: &Ledger) -> DateTime<Utc> {
+    let recheck = ledger.now + WINDOW_RECHECK;
+    ledger.observed.as_ref().and_then(|o| o.window_resets_at).filter(|r| *r > ledger.now).map_or(recheck, |r| r.min(recheck))
 }
 
 fn level_index(c: Criticality) -> usize {
@@ -595,6 +641,140 @@ mod tests {
 
     fn decide(cfg: &BudgetConfig, ledgers: &Ledgers, limits: &RateLimitState, t: &Task, preferred: &[ModelTier]) -> Decision {
         Policy::new(cfg, ledgers, limits).decide(t, prediction(100_000.0), preferred)
+    }
+
+    #[test]
+    fn overflow_observations_and_criticality() {
+        for window in [false, true] {
+            for enabled in [false, true] {
+                let mut cfg = BudgetConfig::default();
+                cfg.providers.claude.allow_overflow = enabled;
+                let mut ledgers = ledger(&cfg, 0.1, &[]);
+                claude_mut(&mut ledgers).observed = Some(ObservedUsage {
+                    period_used: if window { None } else { Some(1.0) },
+                    window_used: if window { Some(1.0) } else { None },
+                    period_resets_at: Some(claude(&ledgers).period.end),
+                    window_resets_at: Some(now() + Duration::hours(1)),
+                    ..ObservedUsage::empty(now())
+                });
+                for crit in Criticality::ALL {
+                    let mut t = task(crit);
+                    t.model_override = Some(sonnet());
+                    let d = decide(&cfg, &ledgers, &RateLimitState::default(), &t, &[]);
+                    assert_eq!(
+                        d.model.is_some(),
+                        enabled && crit <= Criticality::Normal,
+                        "{window} {enabled} {crit}: {:?}",
+                        d.reasons
+                    );
+                    if d.model.is_some() {
+                        assert!(d.reasons.iter().any(|r| r.contains("running on usage credits")));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn denied_overflow_rechecks_window_before_weekly_reset() {
+        let mut cfg = BudgetConfig::default();
+        cfg.providers.claude.allow_overflow = true;
+        let mut ledgers = ledger(&cfg, 0.1, &[]);
+        claude_mut(&mut ledgers).observed = Some(ObservedUsage {
+            period_used: Some(0.1),
+            window_used: Some(1.0),
+            window_resets_at: Some(now() + Duration::minutes(5)),
+            ..ObservedUsage::empty(now())
+        });
+        let limits = RateLimitState::default();
+        for crit in [Criticality::Low, Criticality::Normal] {
+            // Low misses the floor; normal reaches the cap. Both can use the
+            // subscription again when its short window resets.
+            cfg.providers.claude.overflow_max_usd = if crit == Criticality::Low { None } else { Some(0.0) };
+            let t = task(crit);
+            let verdict = Policy::new(&cfg, &ledgers, &limits).verdict(&t, &sonnet(), 100_000.0);
+            assert!(!verdict.eligible);
+            assert_eq!(verdict.retry_at, Some(now() + Duration::minutes(5)));
+        }
+        claude_mut(&mut ledgers).observed.as_mut().unwrap().window_resets_at = Some(now() + Duration::hours(1));
+        let verdict = Policy::new(&cfg, &ledgers, &limits).verdict(&task(Criticality::Normal), &sonnet(), 100_000.0);
+        assert_eq!(verdict.retry_at, Some(now() + WINDOW_RECHECK));
+        claude_mut(&mut ledgers).observed.as_mut().unwrap().period_used = Some(1.0);
+        let verdict = Policy::new(&cfg, &ledgers, &limits).verdict(&task(Criticality::Normal), &sonnet(), 100_000.0);
+        assert_eq!(verdict.retry_at, Some(claude(&ledgers).period.end));
+    }
+
+    #[test]
+    fn overflow_cap_counts_spend_prediction_and_pass_reservations() {
+        let mut cfg = BudgetConfig::default();
+        cfg.providers.claude.allow_overflow = true;
+        cfg.providers.claude.overflow_max_usd = Some(1.0);
+        let mut ledgers = ledger(&cfg, 0.1, &[]);
+        let l = claude_mut(&mut ledgers);
+        l.observed = Some(ObservedUsage { period_used: Some(1.0), ..ObservedUsage::empty(now()) });
+        l.overflow.enabled = true;
+        let limits = RateLimitState::default();
+        let t = task(Criticality::Normal);
+        assert!(Policy::new(&cfg, &ledgers, &limits).eligibility(&t, &sonnet(), 100_000.0).0);
+        claude_mut(&mut ledgers).overflow.estimated_spend_usd = 1.0;
+        let (ok, why) = Policy::new(&cfg, &ledgers, &limits).eligibility(&t, &sonnet(), 0.0);
+        assert!(!ok && why.contains("credit cap"), "{why}");
+        claude_mut(&mut ledgers).overflow.estimated_spend_usd = 0.5;
+        claude_mut(&mut ledgers).add_spend(&sonnet(), 100_000.0);
+        let (ok, why) = Policy::new(&cfg, &ledgers, &limits).eligibility(&t, &sonnet(), 100_000.0);
+        assert!(!ok && why.contains("credit cap"), "{why}");
+        // A cheaper model can still fit; preferences and downgrade chains survive.
+        let mut t = t;
+        t.model_override = Some(sonnet());
+        assert_eq!(decide(&cfg, &ledgers, &limits, &t, &[]).model, Some(haiku()));
+    }
+
+    #[test]
+    fn usage_limit_hook_still_cools_down_while_overflowing() {
+        use crate::domain::{HookEvent, Session, TaskState};
+        use crate::scheduler::{Effect, on_hook_outcome};
+        use crate::session::hooks::interpret_hook;
+        let mut cfg = crate::config::Config::default();
+        cfg.budget.providers.claude.allow_overflow = true;
+        let mut ledgers = ledger(&cfg.budget, 0.1, &[]);
+        claude_mut(&mut ledgers).observed = Some(ObservedUsage { period_used: Some(1.0), ..ObservedUsage::empty(now()) });
+        for error in ["usage_limit", "quota", "rate_limit"] {
+            let mut t = task(Criticality::Normal);
+            t.state = TaskState::Running;
+            let mut session: Session = serde_json::from_value(serde_json::json!({
+                "id": uuid::Uuid::new_v4(), "task_id": t.id, "attempt": 1, "model": "sonnet",
+                "state": "running", "tmux_session": "test", "tmux_window": "test",
+                "started_at": now(), "last_activity_at": now()
+            }))
+            .unwrap();
+            let outcome = interpret_hook(HookEvent::StopFailure, &serde_json::json!({ "error_type": error }));
+            let effects = on_hook_outcome(&mut t, &mut session, &outcome, &cfg, now(), claude(&ledgers).period.end);
+            let mut limits = RateLimitState::default();
+            for effect in effects {
+                if let Effect::RateLimitProvider { provider, until } = effect {
+                    limits.mark_provider(&cfg.budget, provider, until);
+                }
+            }
+            let d = decide(&cfg.budget, &ledgers, &limits, &t, &[]);
+            assert!(d.model.is_none(), "{error}: {:?}", d.reasons);
+            assert!(d.reasons.iter().any(|r| r.contains("account-wide")));
+            assert_eq!(t.state, TaskState::Throttled);
+        }
+    }
+
+    #[test]
+    fn overflow_keeps_model_shares_and_explicit_blocked_readings() {
+        let mut cfg = BudgetConfig::default();
+        cfg.providers.claude.allow_overflow = true;
+        let mut ledgers = ledger(&cfg, 0.9, &[(opus(), 1.0)]);
+        claude_mut(&mut ledgers).observed = Some(ObservedUsage { period_used: Some(1.0), ..ObservedUsage::empty(now()) });
+        let limits = RateLimitState::default();
+        let (ok, why) = Policy::new(&cfg, &ledgers, &limits).eligibility(&task(Criticality::Normal), &opus(), 100_000.0);
+        assert!(!ok && why.contains("share"), "{why}");
+        claude_mut(&mut ledgers).observed.as_mut().unwrap().blocked = true;
+        let d = decide(&cfg, &ledgers, &limits, &task(Criticality::Critical), &[]);
+        assert!(d.model.is_none());
+        assert!(d.reasons.iter().any(|r| r.contains("blocked")));
     }
 
     #[test]
@@ -1171,6 +1351,28 @@ mod properties {
     use proptest::prelude::*;
 
     proptest! {
+        #[test]
+        fn overflow_never_bypasses_priority_cap_or_hard_cooldown(
+            (criticality, minimum, spent, cap, cooling) in crate::strategies::overflow_case(),
+        ) {
+            let mut cfg = BudgetConfig::default();
+            cfg.providers.claude.allow_overflow = true;
+            cfg.providers.claude.overflow_min_criticality = minimum;
+            cfg.providers.claude.overflow_max_usd = Some(cap);
+            let now = origin();
+            let clock = super::super::PeriodClock::from_provider(&cfg.providers.claude, now);
+            let mut ledger = Ledger::build(&cfg, Provider::Claude, now, &clock, super::super::LedgerSource::default());
+            ledger.observed = Some(super::super::ObservedUsage { period_used: Some(1.0), ..super::super::ObservedUsage::empty(now) });
+            ledger.overflow.estimated_spend_usd = spent;
+            let ledgers = Ledgers::single(ledger);
+            let mut limits = RateLimitState::default();
+            if cooling { limits.mark_provider(&cfg, Provider::Claude, now + Duration::hours(1)); }
+            let mut task = Task::new("overflow", "test", crate::domain::TaskSource::Manual);
+            task.criticality = criticality;
+            let (eligible, _) = Policy::new(&cfg, &ledgers, &limits).eligibility(&task, &ModelTier::sonnet(), 100_000.0);
+            prop_assert_eq!(eligible, !cooling && criticality <= minimum && spent < cap && spent + 0.3 <= cap);
+        }
+
         /// The policy never picks what it cannot use: a chosen model is on an
         /// enabled provider that has a ledger, is not rate limited, and is
         /// eligible by the policy's own `eligibility`. A hard override is

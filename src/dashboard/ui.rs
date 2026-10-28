@@ -222,7 +222,11 @@ pub fn budget_rows(app: &DashboardApp) -> u16 {
     if ledgers.is_empty() {
         return 1;
     }
-    ledgers.iter().map(|l| 1 + l.tiers.len()).sum::<usize>().min(usize::from(u16::MAX)) as u16
+    ledgers
+        .iter()
+        .map(|l| 1 + l.tiers.len() + usize::from(l.overflow.enabled || l.overflow.started_at.is_some()))
+        .sum::<usize>()
+        .min(usize::from(u16::MAX)) as u16
 }
 
 /// Gauge colour from pacing: spent fraction vs elapsed fraction of the period.
@@ -530,6 +534,11 @@ fn draw_budget(frame: &mut Frame<'_>, app: &DashboardApp, area: Rect, sym: &Symb
         let Some(r) = rows.get(next_row) else { break };
         next_row += 1;
         frame.render_widget(Paragraph::new(provider_header(app, ledger, sym)), *r);
+        if ledger.overflow.enabled || ledger.overflow.started_at.is_some() {
+            let Some(r) = rows.get(next_row) else { break };
+            next_row += 1;
+            frame.render_widget(Paragraph::new(ledger.overflow.description()).style(Style::default().fg(Color::Yellow)), *r);
+        }
         let elapsed = ledger.elapsed_fraction();
         let name_width = ledger.tiers.iter().map(|t| t.tier.alias().len()).max().unwrap_or(6).clamp(6, 12);
         for tier in &ledger.tiers {

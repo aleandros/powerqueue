@@ -1828,6 +1828,25 @@ impl Store {
         Ok((true, applied))
     }
 
+    /// Persist a daemon-owned value and its informational event atomically.
+    /// Fails without either write when serialization or the transaction fails.
+    pub fn kv_set_with_event<T: Serialize>(&self, key: &str, value: &T, kind: &str, message: &str) -> Result<()> {
+        let value = serde_json::to_string(value).context("serialize event state")?;
+        let mut conn = self.lock();
+        let tx = conn.transaction().context("begin state/event transaction")?;
+        let now = ts(&Utc::now());
+        tx.execute(
+            "INSERT INTO kv (key, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![key, value, now],
+        )?;
+        tx.execute(
+            "INSERT INTO events (timestamp, level, kind, message, data) VALUES (?1, 'info', ?2, ?3, ?4)",
+            params![now, kind, message, value],
+        )?;
+        tx.commit().context("commit state and event")
+    }
+
     pub fn kv_set<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
         let conn = self.lock();
         conn.execute(

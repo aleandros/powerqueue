@@ -1098,6 +1098,15 @@ impl From<RawProviderBudgets> for ProviderBudgets {
 pub struct ProviderBudget {
     /// Schedule tasks on this provider.
     pub enabled: bool,
+    /// Permit paid usage after the subscription allowance (currently Claude only).
+    #[serde(default)]
+    pub allow_overflow: bool,
+    /// Optional estimated credit-spend cap per subscription period.
+    #[serde(default)]
+    pub overflow_max_usd: Option<f64>,
+    /// Least important task allowed to use credits; never relaxed.
+    #[serde(default = "default_overflow_criticality")]
+    pub overflow_min_criticality: Criticality,
     /// Length of the usage period in hours (subscriptions reset weekly).
     pub period_hours: u64,
     /// RFC 3339 instant at which a period starts; later periods repeat every
@@ -1115,6 +1124,10 @@ pub struct ProviderBudget {
     pub rate_limit_cooldown_mins: u64,
     /// Per-model policy, keyed by model alias.
     pub models: BTreeMap<ModelTier, ModelBudget>,
+}
+
+fn default_overflow_criticality() -> Criticality {
+    Criticality::Normal
 }
 
 impl ProviderBudget {
@@ -1139,6 +1152,9 @@ impl ProviderBudget {
                 models.insert(ModelTier::haiku(), model(40, 0.05, Criticality::Low, 0.0, 0.2));
                 ProviderBudget {
                     enabled: true,
+                    allow_overflow: false,
+                    overflow_max_usd: None,
+                    overflow_min_criticality: Criticality::Normal,
                     period_hours: 24 * 7,
                     period_anchor: None,
                     window_hours: 5,
@@ -1154,6 +1170,9 @@ impl ProviderBudget {
                 models.insert(ModelTier::new("gpt-6-luna"), model(30, 0.2, Criticality::Low, 0.0, 0.5));
                 ProviderBudget {
                     enabled: false,
+                    allow_overflow: false,
+                    overflow_max_usd: None,
+                    overflow_min_criticality: Criticality::Normal,
                     period_hours: 24 * 7,
                     period_anchor: None,
                     window_hours: 5,
@@ -1168,6 +1187,9 @@ impl ProviderBudget {
                 models.insert(ModelTier::new("gemini-3-flash"), model(20, 0.3, Criticality::Low, 0.0, 0.2));
                 ProviderBudget {
                     enabled: false,
+                    allow_overflow: false,
+                    overflow_max_usd: None,
+                    overflow_min_criticality: Criticality::Normal,
                     period_hours: 24 * 7,
                     period_anchor: None,
                     window_hours: 5,
@@ -1196,6 +1218,9 @@ impl ProviderBudget {
 #[serde(default, deny_unknown_fields)]
 struct RawProviderBudget {
     enabled: Option<bool>,
+    allow_overflow: Option<bool>,
+    overflow_max_usd: Option<f64>,
+    overflow_min_criticality: Option<Criticality>,
     period_hours: Option<u64>,
     period_anchor: Option<String>,
     window_hours: Option<u64>,
@@ -1209,6 +1234,13 @@ impl RawProviderBudget {
     fn apply_to(self, mut base: ProviderBudget) -> ProviderBudget {
         if let Some(v) = self.enabled {
             base.enabled = v;
+        }
+        if let Some(v) = self.allow_overflow {
+            base.allow_overflow = v;
+        }
+        base.overflow_max_usd = self.overflow_max_usd;
+        if let Some(v) = self.overflow_min_criticality {
+            base.overflow_min_criticality = v;
         }
         if let Some(v) = self.period_hours {
             base.period_hours = v;
@@ -2224,6 +2256,12 @@ impl Config {
         let b = &self.budget;
         for (p, pb) in b.providers.iter() {
             let prefix = format!("budget.providers.{p}");
+            if pb.allow_overflow && p != Provider::Claude {
+                problems.push(format!("{prefix}.allow_overflow is supported only for claude"));
+            }
+            if pb.overflow_max_usd.is_some_and(|v| !v.is_finite() || v < 0.0) {
+                problems.push(format!("{prefix}.overflow_max_usd must be finite and >= 0"));
+            }
             if pb.period_hours == 0 {
                 problems.push(format!("{prefix}.period_hours must be >= 1"));
             }
@@ -2376,6 +2414,29 @@ pub fn config_template(repo_path: &str, team_keys: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overflow_config_defaults_partial_tables_and_validation() {
+        let defaults = Config::default();
+        assert!(!defaults.budget.providers.claude.allow_overflow);
+        assert_eq!(defaults.budget.providers.claude.overflow_max_usd, None);
+        assert_eq!(defaults.budget.providers.claude.overflow_min_criticality, Criticality::Normal);
+        let mut cfg: Config = toml::from_str(
+            "[budget.providers.claude]\nallow_overflow = true\noverflow_max_usd = 50.0\noverflow_min_criticality = 'high'\n",
+        )
+        .unwrap();
+        assert!(cfg.budget.providers.claude.allow_overflow);
+        assert_eq!(cfg.budget.providers.claude.overflow_max_usd, Some(50.0));
+        assert_eq!(cfg.budget.providers.claude.overflow_min_criticality, Criticality::High);
+        for invalid in [-1.0, f64::INFINITY, f64::NAN] {
+            cfg.budget.providers.claude.overflow_max_usd = Some(invalid);
+            assert!(cfg.validate().iter().any(|p| p.contains("overflow_max_usd")));
+        }
+        cfg.budget.providers.claude.overflow_max_usd = Some(0.0);
+        assert!(!cfg.validate().iter().any(|p| p.contains("overflow_max_usd")));
+        cfg.budget.providers.codex.allow_overflow = true;
+        assert!(cfg.validate().iter().any(|p| p.contains("supported only for claude")));
+    }
 
     #[test]
     fn default_config_is_valid_except_repo_path() {

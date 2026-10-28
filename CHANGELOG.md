@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-10-28
+
+### Added
+
+- Opt-in Claude paid usage overflow (#91): `allow_overflow`, an optional
+  `overflow_max_usd` cap and `overflow_min_criticality` per provider. Eligible
+  tasks can pass exhausted subscription allowances while model reservations,
+  downgrade chains and hard hook/pane cooldowns remain in force. Credit
+  allocation uses a conservative, persistent ledger estimate with launch
+  reservations; it is not a billing limit on running sessions. Budget output,
+  task explanations and the dashboard expose overflow, `budget.overflow`
+  records first entry per period, and doctor warns about uncapped usage.
+
 ## [0.24.1] - 2026-10-27
 
 ### Fixed
@@ -1224,7 +1237,8 @@ it: older versions reject them and fail to load the whole file.
   `POWERQUEUE_SECRETS=file`.
 - XDG paths with `POWERQUEUE_HOME` override; rotating JSON logs.
 
-[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.24.1...HEAD
+[Unreleased]: https://github.com/aleandros/powerqueue/compare/v0.25.0...HEAD
+[0.25.0]: https://github.com/aleandros/powerqueue/compare/v0.24.1...v0.25.0
 [0.24.1]: https://github.com/aleandros/powerqueue/compare/v0.24.0...v0.24.1
 [0.24.0]: https://github.com/aleandros/powerqueue/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/aleandros/powerqueue/compare/v0.22.0...v0.23.0

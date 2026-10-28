@@ -254,7 +254,6 @@ impl LaunchPlanner {
     }
 
     /// The ledgers with every confirmed start reserved.
-    #[cfg(test)]
     pub fn ledgers(&self) -> &Ledgers {
         &self.ledgers
     }

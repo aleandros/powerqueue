@@ -205,7 +205,8 @@ ways:
 3. **Cooldown.** `blocked`, or a window or period at 100%, keeps the whole
    provider off the candidate list until the matching reset (`claude reports
    its allowance blocked; skipped until the reset at …`). An exhausted
-   reading without a reset time counts for an hour.
+   reading without a reset time counts for an hour. With Claude overflow enabled,
+   percentages alone do not create a cooldown; explicit `blocked` still does.
 
 `budget show` prints each provider's observed line with its age (`observed
 window 17% · period 40% (resets …) (3m ago)`), the anchor source (`config`,
@@ -249,7 +250,7 @@ the task waits.
 first failing gate gives the reason:
 
 1. **Observed cooldown.** The provider's latest observation says blocked or
-   fully used (see above).
+   fully used (see above), except percentage-only exhaustion with Claude overflow enabled.
 2. **Rate limit.** A model on cooldown is out until it ends
    (`rate limited until <time>`, with `(claude account-wide)` when every
    model of the provider is cooling down).
@@ -278,6 +279,9 @@ first failing gate gives the reason:
    below `1 - safety_margin` (`window: 91% used (observed), this task would
    push it to 97%`); the retry waits for the reported window reset when it
    comes sooner than the 15-minute recheck.
+
+With [paid usage overflow](#paid-usage-overflow-claude), gates 5 and 6 can pass
+for eligible tasks within the credit cap. Gates 2–4 remain unchanged.
 
 An eligible tier reads `eligible; 20% of its budget spent at 68% of the
 period` (or `eligible (relaxed to high); ...`).
@@ -320,6 +324,85 @@ neither marked stale (`scheduler.stale_session_secs`) nor killed for
 `max_session_secs`; the task shows as `throttled` until the cooldown ends
 (event `session.waiting_for_reset`). If no hook reported the limit, the pane
 text itself starts the provider's cooldown.
+
+## Paid usage overflow (Claude)
+
+Enable extra usage in your Claude account first, then opt in to powerqueue:
+
+```toml
+[budget.providers.claude]
+allow_overflow = true             # default false
+overflow_max_usd = 50.0          # optional; omit for no cap (doctor warns)
+overflow_min_criticality = "normal" # default; critical/high/normal/low
+```
+
+`allow_overflow` defaults to `false`, preserving subscription-only scheduling.
+The config shape is shared by providers, but enabling it for Codex or Gemini
+is rejected. powerqueue does not buy credits or change your Claude account.
+
+With overflow enabled, a 100% window/period observation no longer causes a
+provider cooldown. Tasks that meet `overflow_min_criticality` can pass the
+period and window allowance gates, including the safety margin. This floor
+never relaxes. Model preferences, model criticality, borrowed tier shares and
+downgrades still apply. `task explain` shows, for example, `period allowance
+exhausted; running on usage credits`. Below the credit floor or cap, a task
+waits or uses another eligible provider under the normal preference rules.
+
+Hard signals still stop launches: an explicit blocked observation,
+`StopFailure` with `usage_limit`, `quota` or `rate_limit`, and the pane text
+`Usage limit reached` retain the normal cooldown. With overflow enabled they
+mean that credits may be exhausted or disabled. `budget clear-limits` only
+clears hook/pane cooldowns; it does not clear credit accounting or a blocked
+observation. Already-running sessions retain the existing waiting/recovery
+behavior, so a percentage reading alone cannot repeatedly restart them.
+
+### Cost source and cap limits
+
+Verified against the [Claude Code status-line documentation](https://code.claude.com/docs/en/statusline):
+`cost.total_cost_usd` is a client-side session estimate, can differ from the
+bill and resets on `/clear`. It does not separate included usage from paid
+credits. The optional `rate_limits.spend_limit.used_usd` describes a Claude
+apps gateway spend limit, not subscription extra usage. Neither gives a
+reliable per-session **credit charge**, and interactive status-line delivery
+is not available for every execution mode.
+
+powerqueue therefore uses a **ledger estimate**, not a measured charge:
+
+```text
+estimated credit USD = sum(tier_weighted tokens since first credit allocation) × 3 / 1,000,000
+```
+
+The nominal $3 per million Sonnet-equivalent weighted tokens is a planning
+conversion, not a current price table. It uses the token/cache/output weights
+and configured model weights described above. Adjusting model weights also
+changes this estimate; provider discounts, pricing changes and work outside
+powerqueue are not measured.
+
+The daemon persists the first credit allocation time and its period reset in
+`budget.overflow.claude`, atomically logging one `budget.overflow` event. Entry
+occurs when a selected launch needs overflow, or a daemon tick detects that
+running work has exhausted an allowance. Usage before this detection is not
+retroactively classified. After entry, **all** recorded Claude usage through
+the period end counts, even if a window later resets or a prepared launch
+fails. This deliberately conservative allocation can include subscription
+usage. Transcript message deduplication prevents double counting; late tails
+are included by their timestamps. Restarting, disabling/re-enabling overflow,
+or clearing cooldowns does not erase the entry; its period reset expires it.
+
+`overflow_max_usd` must be finite and nonnegative; zero disables credit-funded
+launches. Admission checks estimated spend plus launch-pass reservations plus
+the next task's predicted cost against the cap. Pending setup reservations
+also count. Cheaper models may fit when the preferred one would exceed it.
+The cap only controls **new allocations**: it does not kill sessions or revoke
+already admitted setup work. Predictions can be wrong and running sessions
+can spend beyond the cap; use the account's own extra-usage limit for a hard
+billing limit. When subscription allowance becomes available, normal launches
+can resume even if the credit cap is reached.
+
+`budget show` and its JSON (`providers.claude.overflow`) show whether overflow
+is off, ready, active or capped, estimated credit spend and the configured cap.
+The dashboard has a separate overflow row. `active` means credit allocation
+has begun this period, not that every current response is billed to credits.
 
 ## Learning the rate
 

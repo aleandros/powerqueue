@@ -375,3 +375,70 @@ fn stop_without_a_daemon_reports_and_exits_one() {
     store.heartbeat(4242).unwrap();
     home.cmd().arg("stop").assert().success().stdout(predicate::str::contains("shutdown requested"));
 }
+
+#[test]
+fn overflow_is_visible_in_budget_explain_dashboard_and_doctor() {
+    use powerqueue::budget::{Ledger, save_observed};
+    use powerqueue::dashboard::app::Snapshot;
+    let home = Home::new();
+    let store = home.store();
+    let mut cfg = Config::load(&home.paths()).unwrap();
+    cfg.budget.providers.claude.allow_overflow = true;
+    cfg.save(&home.paths()).unwrap();
+    let now = Utc::now();
+    let task = Task::new("CREDITS-1", "overflow", TaskSource::Manual);
+    store.insert_task(&task).unwrap();
+    save_observed(
+        &store,
+        Provider::Claude,
+        &ObservedUsage {
+            period_used: Some(1.0),
+            period_resets_at: Some(now + chrono::Duration::days(2)),
+            ..ObservedUsage::empty(now)
+        },
+    )
+    .unwrap();
+    let ledger = Ledger::load(&store, &cfg.budget, Provider::Claude, now).unwrap();
+    powerqueue::budget::io::enter_overflow(&store, &ledger).unwrap();
+    home.cmd().args(["budget", "show"]).assert().success().stdout(predicate::str::contains("overflow active: credits ~$0.00"));
+    let output = home.cmd().args(["budget", "show", "--json"]).assert().success().get_output().stdout.clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(json["providers"]["claude"]["overflow"]["enabled"], true);
+    assert_eq!(json["providers"]["claude"]["cooldown_until"], serde_json::Value::Null);
+    // Explain replays the last scheduling decision, rather than predicting a launch.
+    let ledgers = powerqueue::budget::Ledgers::single(ledger);
+    let limits = RateLimitState::default();
+    let decision = powerqueue::budget::Policy::new(&cfg.budget, &ledgers, &limits).decide(
+        &task,
+        powerqueue::budget::Prediction { weighted_tokens: 100_000.0, wall_secs: 60.0, confidence: 1.0, basis: "test".into() },
+        &[],
+    );
+    let mut starting = task.clone();
+    let start = powerqueue::scheduler::launch::on_starting(
+        &mut starting,
+        decision.model.as_ref().unwrap(),
+        &decision,
+        &cfg,
+        home.path(),
+        false,
+    )
+    .unwrap();
+    for effect in start.effects {
+        if let powerqueue::scheduler::Effect::Log { level, kind, message, data } = effect {
+            store.log_event(Some(task.id), None, level, &kind, &message, data).unwrap();
+        }
+    }
+    home.cmd()
+        .args(["task", "explain", "CREDITS-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("running on usage credits"));
+    let snapshot = Snapshot::load(&store, &cfg, now).unwrap();
+    assert!(snapshot.cooldowns.is_empty());
+    assert!(snapshot.ledger.as_ref().unwrap().overflow.description().contains("overflow active"));
+    let rendered = powerqueue::dashboard::render_once(snapshot, powerqueue::dashboard::Options::default(), 160, 40);
+    assert!(rendered.contains("overflow active: credits ~$0.00"), "{rendered}");
+    let output = home.cmd().args(["doctor", "--offline", "--json"]).output().unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("paid usage overflow is enabled without a spending cap"), "{text}");
+}
